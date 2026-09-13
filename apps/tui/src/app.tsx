@@ -4,7 +4,7 @@
  * ```
  * ┌ header ── logo · tagline ─────────────────────────── directory ────┐
  * │ conversations│ transcript viewport (bottom-anchored, scrolls)       │
- * │  ▾ folder    │                                                     │
+ * │  ▾ folder    │ ⠹ Explore  auth call sites    1m 12s · Grep · 24k   │
  * │    session   │ permission card / picker / agent view, when open    │
  * │  ▸ folder    │ ╭ composer ─────────────────────────────────────╮   │
  * │              │ ╰────────────────────────────────────────────────╯   │
@@ -35,8 +35,10 @@
  *    sidebar shows every project's, worktrees folded into their repository as
  *    the desktop does, and opens one on Enter — moving the working directory
  *    to wherever it ran.
- *  - `/tasks`   — background work as the provider last listed it. A delegated
- *    agent's row opens what it did; a live row offers to stop it.
+ *  - `/tasks`   — background work as the provider last listed it, settled rows
+ *    included. A delegated agent's row opens what it did; a live row offers to
+ *    stop it. What is *running* needs no command: the strip over the composer
+ *    draws it while it runs and disappears when the last of it settles.
  *  - `/usage`   — every plan window, fetched now; the line under the composer
  *    keeps the 5-hour, the week and Fable's bucket, as the desktop's rings do.
  *  - `/attach`  — a path, read now, sent with the next message.
@@ -79,6 +81,7 @@ import type { ModelListing } from './host.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
 import { ACCENT } from './theme.js';
 import { Composer } from './components/Composer.js';
+import { DelegatedStrip } from './components/Delegated.js';
 import { Header } from './components/Header.js';
 import { PermissionCard } from './components/PermissionCard.js';
 import { Picker, type PickerItem } from './components/Picker.js';
@@ -1533,6 +1536,16 @@ export function App({ launched }: AppProps): React.JSX.Element {
 
         <Box flexDirection="column" width={mainWidth} height={bodyRows}>
           <TranscriptViewport transcript={transcript} live={live} offset={scroll} onExtent={onScrollExtent} />
+
+          {/*
+           * Above the card and the pickers rather than directly over the
+           * composer, which is where the mockup put it. Those are the surfaces
+           * the keys are addressing when they are open, and a readout that
+           * nothing can be typed at must not sit between a question and the
+           * thing that answers it. With nothing open — the ordinary case —
+           * this is the line above the composer either way.
+           */}
+          <DelegatedStrip tasks={state.tasks} columns={mainWidth} />
 
           {pendingRequest !== undefined && modal === null && (
             <Box paddingX={1} flexShrink={0}>

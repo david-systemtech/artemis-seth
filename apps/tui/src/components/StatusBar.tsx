@@ -19,13 +19,13 @@
  * out of its fixed height, and a clipped account name costs less than that.
  */
 
-import { useEffect, useState } from 'react';
 import { Box, Text } from 'ink';
 import { isTaskLive, planMeterSlots, type PermissionMode, type PlanMeterSlot } from '@rx-artemis/protocol';
 import { contextRatio, formatTokens, formatUsd, totalInputTokens } from '@rx-artemis/transcript';
 
 import type { ConversationState } from '../conversation.js';
-import { ACCENT, SPINNER, SPINNER_MS } from '../theme.js';
+import { useSpinner } from '../hooks/useSpinner.js';
+import { ACCENT } from '../theme.js';
 
 const MODE_LABEL: Readonly<Record<PermissionMode, string>> = {
   default: 'ask',
@@ -139,17 +139,6 @@ function PlanReading({ slot, cells }: { readonly slot: PlanMeterSlot; readonly c
       </Text>
     </Text>
   );
-}
-
-/** A braille spinner that only ticks while something is happening. */
-function useSpinner(active: boolean): string {
-  const [frame, setFrame] = useState(0);
-  useEffect(() => {
-    if (!active) return undefined;
-    const timer = setInterval(() => setFrame((f) => (f + 1) % SPINNER.length), SPINNER_MS);
-    return () => clearInterval(timer);
-  }, [active]);
-  return active ? SPINNER[frame] ?? '' : '';
 }
 
 function describeStatus(state: ConversationState): string {
