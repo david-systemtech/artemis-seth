@@ -94,6 +94,12 @@ const PHASES_SHOWN = 3;
 const KIND_LABELS: Readonly<Record<string, string>> = {
   local_bash: 'Shell',
   local_workflow: 'Workflow',
+  // Both spellings. `local_agent` is what the CLI actually sends for a
+  // delegated agent — observed on a live run — and it arrives a beat before
+  // `subagentType` does, so the first frame of every fan-out is a row this map
+  // is the only thing naming. `local_subagent` is kept because it costs one
+  // line and the kind is an open string the CLI may respell.
+  local_agent: 'Subagent',
   local_subagent: 'Subagent',
   monitor: 'Monitor',
 };

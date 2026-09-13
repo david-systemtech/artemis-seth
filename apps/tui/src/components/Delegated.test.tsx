@@ -111,6 +111,17 @@ describe('delegatedRows', () => {
     expect(rows[0]?.description).toBe('');
   });
 
+  it('names a delegated agent before its type has arrived', () => {
+    // The first `background.tasks` of a fan-out carries `kind: 'local_agent'`
+    // and no `subagentType` — observed on a live run — so for one frame this
+    // map is the only thing standing between the reader and a row labelled
+    // `local_agent`. The type takes over the moment it lands.
+    expect(delegatedRows([task({ id: 'a', kind: 'local_agent' })], NOW).rows[0]?.label).toBe('Subagent');
+    expect(
+      delegatedRows([task({ id: 'a', kind: 'local_agent', subagentType: 'Explore' })], NOW).rows[0]?.label,
+    ).toBe('Explore');
+  });
+
   it('shows a kind it has never heard of rather than a shrug', () => {
     // `kind` is an open string by contract: a row reading `local_sandbox` is a
     // fact, and one reading "Task" tells the reader nothing.

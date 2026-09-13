@@ -520,10 +520,26 @@ export class Conversation {
         this.#status = 'idle';
         this.#pending = [];
         this.#queued = 0;
-        // Released now rather than left for the registry's retention: a run
-        // belongs to the one conversation that started it, and nothing else
-        // in this process will ever re-attach to it.
-        if (ended !== undefined) void this.#driver.dispose(ended).catch(() => undefined);
+        /*
+         * And nothing else. The run is *not* disposed here, and that omission
+         * is load-bearing.
+         *
+         * `dispose()` is the one call that overrules a provider's retention of
+         * its process — `ClaudeRun.release` exists, as a deliberate no-op, to
+         * stop the registry reaching for it at every turn boundary. Reaching
+         * for it here killed the CLI the instant a turn ended, taking with it
+         * every subagent the turn had left running in the background: the
+         * `Agent` tool backgrounds by default, so "delegate this and carry on"
+         * is the ordinary case, not an exotic one. The next turn then spawned a
+         * fresh process whose ledger had never heard of the work, and reported
+         * the conversation's own subagents as `stopped`, `0 tools`, `0 tokens`.
+         *
+         * The registry retires a finished run without help: the pump's
+         * `finally` calls `#finalize`, which releases rather than disposes, and
+         * the process then decides for itself whether it still holds work worth
+         * staying open for. That decision is the whole of the feature; this
+         * used to overrule it one line after it was made.
+         */
         break;
       }
       default:
