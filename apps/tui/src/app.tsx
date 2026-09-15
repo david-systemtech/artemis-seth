@@ -88,6 +88,7 @@ import { PermissionCard } from './components/PermissionCard.js';
 import { Picker, type PickerItem } from './components/Picker.js';
 import { QueuedStrip } from './components/QueuedStrip.js';
 import { Sidebar, railRows, type RailRow } from './components/Sidebar.js';
+import { TodoStrip } from './components/TodoStrip.js';
 import { basename } from 'node:path';
 import { homedir } from 'node:os';
 import { readdir, stat } from 'node:fs/promises';
@@ -301,6 +302,8 @@ export function App({ launched }: AppProps): React.JSX.Element {
   const [update, setUpdate] = useState<string | undefined>(undefined);
   const [focus, setFocus] = useState<Focus>('composer');
   const [scroll, setScroll] = useState(0);
+  /** The agent's checklist, opened into its rows with Ctrl+T; one line otherwise. */
+  const [todoExpanded, setTodoExpanded] = useState(false);
   /** How far back the viewport can go, as it last measured itself. */
   const scrollExtent = useRef({ maxOffset: 0, viewportLines: 0 });
   const onScrollExtent = useCallback((extent: { readonly maxOffset: number; readonly viewportLines: number }) => {
@@ -1495,6 +1498,13 @@ export function App({ launched }: AppProps): React.JSX.Element {
       return;
     }
 
+    // Ctrl+T opens and closes the checklist. The composer has no Ctrl+T of
+    // its own, so the key reaches here whatever has focus.
+    if (key.ctrl && input === 't') {
+      setTodoExpanded((open) => !open);
+      return;
+    }
+
     /*
      * Esc belongs to the composer while it is capturing one — its reverse
      * search is open — and to nothing else. Ink has no stop-propagation, so
@@ -1611,6 +1621,13 @@ export function App({ launched }: AppProps): React.JSX.Element {
            * this is the line above the composer either way.
            */}
           <DelegatedStrip tasks={state.tasks} columns={mainWidth} />
+
+          {/*
+           * Between what the agent is doing and what it has not read yet: what
+           * it plans. The strip is one line until Ctrl+T opens it, and nothing
+           * at all when the list is done or was never written.
+           */}
+          <TodoStrip transcript={conversation.transcript} expanded={todoExpanded} columns={mainWidth} />
 
           {/*
            * Under the delegated strip, for the same reason and in the order
