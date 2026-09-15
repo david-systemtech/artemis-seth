@@ -12,7 +12,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { COMMANDS } from './commands.js';
-import { KEYMAP, SLASH_GROUP_TITLE, type KeyContext } from './keymap.js';
+import { KEYMAP, SLASH_GROUP_TITLE, nextFocus, type KeyContext } from './keymap.js';
 
 describe('KEYMAP', () => {
   it('gives every group a title and something to put under it', () => {
@@ -112,5 +112,87 @@ describe('KEYMAP: the keys the terminal grew', () => {
     const does = inContext('composer').get('Ctrl+S') ?? '';
     expect(does).toContain('search');
     expect(does).toContain('stash');
+  });
+
+  /*
+   * The rail can be typed at now, which moves three of its keys: `a`, `d` and
+   * `p` are letters somebody is typing while a filter is on, so archive, delete
+   * and pin are reached by their Ctrl chords there. Both readings are in the
+   * map, because both are true — of different moments.
+   */
+  it('writes down the rail as a thing you type at', () => {
+    const sidebar = inContext('sidebar');
+    expect(sidebar.get('/')).toContain('Filter');
+    expect(sidebar.get('Esc')).toContain('filter');
+    expect(sidebar.get('p')).toContain('Pin');
+    expect(sidebar.get('Space')).toBeDefined();
+    expect(sidebar.get('Ctrl+A')).toContain('Archive');
+    expect(sidebar.get('Ctrl+D')).toContain('Delete');
+    expect(sidebar.get('Ctrl+P')).toContain('Pin');
+    // `k` and `j` stop being movement under a filter, and the row says so
+    // rather than leaving somebody to discover it by typing a name with a j
+    // in it.
+    expect(sidebar.get('j')).toContain('filter');
+  });
+
+  it('writes down what a list can do to a row without leaving it', () => {
+    const picker = inContext('picker');
+    expect(picker.get('Letters')).toContain('filter');
+    expect(picker.get('Space')).toContain('Preview');
+    expect(picker.get('Ctrl+R')).toContain('Rename');
+    expect(picker.get('Ctrl+A')).toContain('Archive');
+    expect(picker.get('Ctrl+P')).toContain('Pin');
+  });
+
+  it('writes down the strip that can now be pointed at', () => {
+    const delegated = inContext('delegated');
+    expect(delegated.get('Tab')).toBeDefined();
+    expect(delegated.get('Enter')).toContain('Open');
+    expect(delegated.get('x')).toContain('Stop');
+    expect(delegated.get('→')).toContain('Unfold');
+    expect(delegated.get('←')).toContain('Fold');
+    expect(delegated.get('Esc')).toContain('composer');
+  });
+});
+
+/*
+ * The ring Tab walks.
+ *
+ * Two of its three stops come and go — the rail is dropped on a narrow terminal
+ * and the delegated strip exists only while something is running — so what is
+ * worth checking is that Tab never lands on a surface that is not drawn, and
+ * that it can always get back to the composer from wherever it is.
+ */
+describe('nextFocus', () => {
+  const both = { sidebar: true, delegated: true };
+
+  it('walks composer → list → strip → composer', () => {
+    expect(nextFocus('composer', both)).toBe('sidebar');
+    expect(nextFocus('sidebar', both)).toBe('delegated');
+    expect(nextFocus('delegated', both)).toBe('composer');
+  });
+
+  it('steps over a rail the terminal is too narrow to draw', () => {
+    const stops = { sidebar: false, delegated: true };
+    expect(nextFocus('composer', stops)).toBe('delegated');
+    expect(nextFocus('delegated', stops)).toBe('composer');
+  });
+
+  it('steps over a strip with nothing in it', () => {
+    const stops = { sidebar: true, delegated: false };
+    expect(nextFocus('composer', stops)).toBe('sidebar');
+    expect(nextFocus('sidebar', stops)).toBe('composer');
+  });
+
+  it('leaves Tab doing nothing when the composer is all there is', () => {
+    const stops = { sidebar: false, delegated: false };
+    expect(nextFocus('composer', stops)).toBe('composer');
+  });
+
+  it('leads out of a surface that has just gone', () => {
+    // The last task settled while the strip had the keys, or the terminal was
+    // narrowed while the rail did.
+    expect(nextFocus('delegated', { sidebar: true, delegated: false })).toBe('composer');
+    expect(nextFocus('sidebar', { sidebar: false, delegated: true })).toBe('composer');
   });
 });

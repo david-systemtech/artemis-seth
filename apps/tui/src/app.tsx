@@ -14,11 +14,21 @@
  * ```
  *
  * Who has the keys is decided in exactly one place, here. A modal or a
- * permission card, when open, has them; otherwise focus is either the
- * composer or the sidebar (Tab toggles). Every child takes an `isActive` prop
- * and touches nothing when it is false, so two components never answer the
- * same keystroke. Esc, Ctrl+C and the scrolling arrows are handled globally
- * only when no modal owns them.
+ * permission card, when open, has them; otherwise focus is the composer, the
+ * sidebar or the delegated strip, and Tab walks the ring — `nextFocus` in
+ * `keymap.ts`, which skips the two stops that come and go: the rail is dropped
+ * on a narrow terminal and the strip exists only while something is running.
+ * Every child takes an `isActive` prop and touches nothing when it is false, so
+ * two components never answer the same keystroke. Esc, Ctrl+C and the scrolling
+ * arrows are handled globally only when no modal owns them.
+ *
+ * The rail can be typed at, which moves three of its keys. A printable
+ * character with the focus in the rail is a query, so `a`, `d` and `p` — the
+ * archive, delete and pin they used to be — become letters somebody is
+ * spelling a title with, and the actions move to Ctrl+A, Ctrl+D and Ctrl+P for
+ * as long as a query is on screen. That is the only place in this file where
+ * one key means two things depending on state, and it is why the rail's own
+ * legend has two forms: the rule is unlearnable unless the screen says it.
  *
  * Two keys are *shared* with the composer rather than taken from it, because
  * Ink has no stop-propagation and both handlers see every press: Esc, which
@@ -63,7 +73,9 @@
  *  - `/tasks`   — background work as the provider last listed it, settled rows
  *    included. A delegated agent's row opens what it did; a live row offers to
  *    stop it. What is *running* needs no command: the strip over the composer
- *    draws it while it runs and disappears when the last of it settles.
+ *    draws it while it runs and disappears when the last of it settles — and
+ *    Tab reaches it, so Enter opens an agent and `x` stops a task without the
+ *    command and the modal it puts over the conversation.
  *  - `/usage`   — every plan window, fetched now; the line under the composer
  *    keeps the 5-hour, the week and Fable's bucket, as the desktop's rings do.
  *  - `/attach`  — a path, read now, sent with the next message.
@@ -143,14 +155,17 @@ import { runShell } from './shell.js';
 import { AttentionTimer, notify, progressState, setTitle, titleFor } from './terminal.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
 import { ACCENT } from './theme.js';
+import { nextFocus, type Focus } from './keymap.js';
 import { Composer, type ComposerHandle, type FileIndex, type PastedImage } from './components/Composer.js';
-import { DelegatedStrip } from './components/Delegated.js';
+import { DelegatedStrip, delegatedRows, type DelegatedRow } from './components/Delegated.js';
 import { Header } from './components/Header.js';
 import { Help, helpLines } from './components/Help.js';
 import { Pager } from './components/Pager.js';
 import { PermissionCard } from './components/PermissionCard.js';
-import { Picker, type PickerItem } from './components/Picker.js';
+import { Picker, isTypable, type PickerAction, type PickerItem } from './components/Picker.js';
+import { Prompt } from './components/Prompt.js';
 import { QueuedStrip } from './components/QueuedStrip.js';
+import { SessionPreview } from './components/SessionPreview.js';
 import { Sidebar, railRows, type RailRow } from './components/Sidebar.js';
 import { TodoStrip } from './components/TodoStrip.js';
 import { basename, isAbsolute, resolve as resolvePath } from 'node:path';
@@ -190,6 +205,39 @@ interface PickerModal {
    * the picker on screen, which the token is how the refresh can tell.
    */
   readonly token?: number;
+  /*
+   * What a list can do *to* a row without leaving it. All four are the
+   * picker's own keys — see `components/Picker.tsx` — and are carried here
+   * rather than answered here, because a modal is a description of a list and
+   * this file is the one place that knows what archiving a conversation means.
+   * A picker that passes none of them advertises none of them.
+   */
+  /** Let the list be typed at. Costs it `j` and `k`, which become letters. */
+  readonly filterable?: boolean;
+  /** Space. */
+  readonly onPreview?: (item: PickerItem) => void;
+  /** Ctrl+R. */
+  readonly onRename?: (item: PickerItem) => void;
+  /** Ctrl+A, Ctrl+P, and whatever else a caller wants a chord for. */
+  readonly onSecondary?: readonly PickerAction[];
+}
+
+/**
+ * One line, asked for: what Ctrl+R opens over the conversation list.
+ *
+ * A modal rather than the composer, because the composer is holding a message
+ * somebody is part-way through writing and a name is not that message. See
+ * `components/Prompt.tsx`, which is the box; what is here is what the answer
+ * is for.
+ */
+interface PromptModal {
+  readonly kind: 'prompt';
+  readonly title: string;
+  readonly initial: string;
+  /** The line as it was typed, the empty one included. */
+  readonly onSubmit: (text: string) => void;
+  /** Esc. Never carries a value, because nothing was agreed to. */
+  readonly onCancel: () => void;
 }
 
 interface LoadingModal {
@@ -235,8 +283,7 @@ interface TextModal {
   readonly lines: readonly string[];
 }
 
-type Modal = PickerModal | LoadingModal | ReplayModal | PagerModal | HelpModal | TextModal;
-type Focus = 'composer' | 'sidebar';
+type Modal = PickerModal | PromptModal | LoadingModal | ReplayModal | PagerModal | HelpModal | TextModal;
 
 /** The row that leaves the recents list for the filesystem. Not a path, so it cannot be one. */
 const BROWSE_KEY = '\u0000browse';
@@ -283,6 +330,23 @@ const USAGE_SEED_MAX_AGE_MS = 24 * 60 * 60_000;
 const MODELS_WARM_MAX_AGE_MS = 24 * 60 * 60_000;
 /** The key legend, for a picker whose hint has something else to say first. */
 const PICKER_KEYS = '↑↓ · Enter · Esc';
+/**
+ * Rows a list keeps while a preview is open beneath it.
+ *
+ * The two share the slot between the transcript and the composer, and what
+ * falls off the bottom of an Ink column is whatever is last in it — which here
+ * is the composer and the line under it. So the list is what gives way: it is
+ * the thing that already scrolls, and the preview is the thing that was just
+ * asked for. Eight rather than the picker's own twelve, which is still most of
+ * a directory's conversations.
+ */
+const PICKER_ROWS_WITH_PREVIEW = 8;
+/**
+ * What the preview and the furniture round it need out of the pane: ten lines
+ * for the box, five for the list's title, query and legend, and six for the
+ * composer, the status line and the strips above them.
+ */
+const PREVIEW_SLOT_ROWS = 21;
 /**
  * Below this many columns the rail is dropped; the pickers cover the same
  * ground. The conversation needs about ninety columns to read as prose, and
@@ -529,6 +593,41 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   const [accounts, setAccounts] = useState<readonly ProfileMetadata[]>([]);
   const [railLoading, setRailLoading] = useState(true);
   const [railIndex, setRailIndex] = useState(0);
+  /**
+   * What is being typed at the rail; empty when nothing is.
+   *
+   * One string rather than a mode flag and a string, because a rail of two
+   * hundred conversations is searched rather than walked and there is nothing
+   * to enter or leave: any printable key with the focus in the rail starts a
+   * query, and Esc ends one. `/` is the exception only in that it does not type
+   * itself, so `/foo` and `foo` reach the same place.
+   */
+  const [railQuery, setRailQuery] = useState('');
+  /**
+   * The query, and the cursor put back on the first row of what it found.
+   *
+   * The two go together every single time — a cursor left at row forty of a
+   * list that has just become three rows long is a selection nobody can see —
+   * so they are one function rather than two calls somebody has to remember to
+   * make in the same breath.
+   */
+  const setRailFilter = useCallback((next: string | ((current: string) => string)) => {
+    setRailQuery(next);
+    setRailIndex(0);
+  }, []);
+  /**
+   * The conversation Space is showing, unopened.
+   *
+   * Drawn in the same slot the pickers use — under the picker, when one is
+   * open — rather than inside the rail, and for the rail's own reason: the rail
+   * is thirty-two columns wide and a preview is a title, a branch, a model, a
+   * folder and four lines of the opening prompt. Cut to thirty columns none of
+   * that is worth reading, and a box that grew the rail to fit it would push
+   * the conversation sideways every time the cursor passed a row. The slot over
+   * the composer has the width, and it means Space shows the same box wherever
+   * it is pressed. See `components/SessionPreview.tsx`.
+   */
+  const [preview, setPreview] = useState<SessionSummary | null>(null);
   // Folders unfolded in the rail, keyed by project root. The current one is
   // always open.
   const [openFolders, setOpenFolders] = useState<ReadonlySet<string>>(() => new Set());
@@ -653,8 +752,107 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     [preferences, pinTick],
   );
   const rail: readonly RailRow[] = useMemo(
-    () => railRows(sessions, openFolders, projectOf, accountOf, expandedFolders, { pinned }),
-    [sessions, openFolders, projectOf, accountOf, expandedFolders, pinned],
+    () => railRows(sessions, openFolders, projectOf, accountOf, expandedFolders, { pinned, query: railQuery }),
+    [sessions, openFolders, projectOf, accountOf, expandedFolders, pinned, railQuery],
+  );
+
+  /**
+   * Pin a conversation, or unpin it, whichever it is.
+   *
+   * The whole of `/pin`'s doing, taken apart from `/pin`'s knowing *which*: the
+   * rail's `p` and the conversation list's Ctrl+P both name a row that is not
+   * the conversation on screen, and a second copy of "write it down, re-derive,
+   * say which way it went" is a second chance for the three to drift.
+   */
+  const togglePinFor = useCallback(
+    (sessionId: string) => {
+      const nowPinned = preferences.togglePin(sessionId);
+      setPinTick((tick) => tick + 1);
+      showFlash(nowPinned ? 'pinned' : 'unpinned');
+    },
+    [preferences, showFlash],
+  );
+
+  /**
+   * Put a conversation away, or take it back out.
+   *
+   * A tag written into the provider's own store — the same one the desktop
+   * writes — so a row archived here is archived there. Nothing is destroyed
+   * and the conversation is still resumable from the archive folder, which is
+   * what makes this the safe half of the pair and why it asks nothing before
+   * doing it.
+   *
+   * Up here, above the pickers, because it is no longer the rail's alone: the
+   * conversation list offers the same thing on Ctrl+A, and a list that archived
+   * by a different route than the rail's would be two answers to one question.
+   */
+  const archiveRailSession = useCallback(
+    async (session: SessionSummary) => {
+      const archived = isArchived(session);
+      if (host.capabilitiesFor(session.providerId)?.tagSession !== true) {
+        setNotice(`${state.settings.providerLabel} cannot archive a conversation.`);
+        return;
+      }
+      try {
+        const done = await host.archiveSession(session.profileId, session.providerId, session.id, session.cwd, !archived);
+        if (!done) {
+          setNotice('That conversation could not be archived; it may already be gone.');
+          return;
+        }
+        say('info', `${archived ? 'Restored' : 'Archived'} ${oneLine(session.title, 60)}.`);
+        await refreshRail();
+      } catch (error) {
+        say('error', `Could not archive that conversation: ${describeError(error)}`);
+      }
+    },
+    [host, state.settings.providerLabel, say, refreshRail],
+  );
+
+  /**
+   * Name a stored conversation, whichever one it is.
+   *
+   * Written into the provider's own store, through the same door the automatic
+   * namer uses and the desktop's rename menu item uses: a typed title and a
+   * generated one are the same fact about a session, and a second store kept
+   * here would be a fact about one installation — invisible to the desktop,
+   * absent on another machine. A provider whose store has no such field says
+   * so and nothing is written; see `Capabilities.renameSession`.
+   *
+   * It takes an id rather than reading the conversation on screen, because
+   * `/title` is no longer the only way in: Ctrl+R over a row of the
+   * conversation list names *that* row, which is very often not this one.
+   */
+  const renameStoredSession = useCallback(
+    async (sessionId: SessionId, name: string): Promise<void> => {
+      if (name.length === 0) {
+        showFlash('a name cannot be empty');
+        return;
+      }
+      if (host.capabilitiesFor(state.settings.providerId)?.renameSession !== true) {
+        showFlash('this provider does not let a conversation be renamed');
+        return;
+      }
+      try {
+        const done = await host.renameSession(
+          state.settings.profileId,
+          state.settings.providerId,
+          sessionId,
+          state.settings.cwd,
+          name,
+        );
+        if (!done) {
+          showFlash('this provider does not let a conversation be renamed');
+          return;
+        }
+        showFlash(`named ${oneLine(name, 48)}`);
+        // The rail is where the name is read back from, and it is what
+        // `/export` takes its title and its filename from.
+        await refreshRail();
+      } catch (error) {
+        say('error', `Could not rename this conversation: ${describeError(error)}`);
+      }
+    },
+    [host, state.settings.profileId, state.settings.providerId, state.settings.cwd, showFlash, say, refreshRail],
   );
 
   /* ---------------------------------------------------------------------- */
@@ -810,6 +1008,17 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     [host, pool, makeConversation, switchTo, say],
   );
 
+  /**
+   * The conversation list, opened again.
+   *
+   * A ref because the list has to be able to reopen itself — naming a row
+   * replaces it with the one-line box, and what comes back afterwards has to be
+   * a list re-read from the store rather than the stale one that was on screen
+   * — and a `useCallback` cannot name itself in its own body. Assigned just
+   * below, on every render, so it is always the current closure.
+   */
+  const resumeAgain = useRef<() => void>(() => undefined);
+
   const openResumePicker = useCallback(
     async (latest = false) => {
       setModal({ kind: 'loading', title: 'Conversations — reading the store…' });
@@ -835,14 +1044,84 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
             .join(' · '),
           ...(session.id === state.sessionId ? { note: 'this conversation' } : {}),
         }));
+        const found = (key: string): SessionSummary | undefined => list.find((candidate) => candidate.id === key);
         setModal({
           kind: 'picker',
           title: `Conversations in ${workspace}`,
           items,
           ...(state.sessionId === undefined ? {} : { initialKey: state.sessionId }),
+          /*
+           * The one picker in here that is genuinely long — every stored
+           * conversation in this directory, growing for as long as the
+           * directory is worked in — so it is the one that is typed at rather
+           * than walked. The rail's keys, on the rail's rows, in the surface
+           * that is open when the rail is not on screen.
+           */
+          filterable: true,
+          onPreview: (item) => {
+            const session = found(item.key);
+            // Pressing Space twice on a row puts the box away, which is the
+            // only way out of it that does not also close the list.
+            if (session !== undefined) setPreview((shown) => (shown?.id === session.id ? null : session));
+          },
+          onRename: (item) => {
+            const session = found(item.key);
+            if (session === undefined) return;
+            setModal({
+              kind: 'prompt',
+              title: 'Name this conversation',
+              initial: session.title,
+              /*
+               * The list is re-read rather than patched, and both ways out do
+               * it: a row still showing the old title after a rename would be
+               * the screen disagreeing with the store, and Esc out of the name
+               * should leave the list exactly where it was found. Waited on
+               * first, because a list re-read before the write landed would
+               * come back with the name that was just replaced.
+               */
+              onSubmit: (name) => {
+                const named = name.trim();
+                if (named.length === 0) {
+                  resumeAgain.current();
+                  return;
+                }
+                setModal({ kind: 'loading', title: `Naming it "${oneLine(named, 40)}"…` });
+                void renameStoredSession(session.id, named).then(() => {
+                  resumeAgain.current();
+                });
+              },
+              onCancel: () => {
+                resumeAgain.current();
+              },
+            });
+          },
+          onSecondary: [
+            {
+              key: 'ctrl+a',
+              label: 'archive',
+              run: (item) => {
+                const session = found(item.key);
+                if (session === undefined) return;
+                setModal(null);
+                setPreview(null);
+                void archiveRailSession(session);
+              },
+            },
+            {
+              key: 'ctrl+p',
+              label: 'pin',
+              run: (item) => {
+                if (found(item.key) !== undefined) togglePinFor(item.key);
+              },
+            },
+          ],
+          onCancel: () => {
+            setPreview(null);
+          },
           onSelect: (item) => {
-            const session = list.find((candidate) => candidate.id === item.key);
+            const session = found(item.key);
             setModal(null);
+            setPreview(null);
             if (session === undefined || session.id === state.sessionId) return;
             void loadSession(session.id, session.title);
           },
@@ -852,8 +1131,11 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         say('error', `Could not list conversations: ${describeError(error)}`);
       }
     },
-    [host, state.settings, state.sessionId, workspace, say, loadSession],
+    [host, state.settings, state.sessionId, workspace, say, loadSession, renameStoredSession, archiveRailSession, togglePinFor],
   );
+  resumeAgain.current = () => {
+    void openResumePicker();
+  };
 
   // `artemis -c` / `--resume <id>`: act once the screen exists.
   const resumedOnLaunch = useRef(false);
@@ -1171,29 +1453,47 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     return parts.join(' · ');
   };
 
-  const openTaskTranscript = useCallback(
-    async (task: BackgroundTask) => {
+  /**
+   * What one delegated agent did, read out of the provider's own store.
+   *
+   * Keyed on the agent rather than on a task, because the two are not always
+   * the same thing. A `Task`/`Agent` call is filed under exactly the id the
+   * task list carries, so for those they coincide; a workflow's agents each
+   * write their own transcript under an id nested in the workflow's progress,
+   * and those are reachable only from the delegated strip's unfolded rows. One
+   * function for both, so `/tasks` and the strip cannot come to disagree about
+   * what opening an agent means.
+   */
+  const openAgentTranscript = useCallback(
+    async (agentId: string, described: string) => {
       const sessionId = state.sessionId;
       if (sessionId === undefined) {
         setNotice('No session to read the agent from yet.');
         return;
       }
-      setModal({ kind: 'loading', title: `Reading what "${oneLine(task.description, 50)}" did…` });
+      setModal({ kind: 'loading', title: `Reading what "${oneLine(described, 50)}" did…` });
       try {
         const events = await host.subagentMessages(
           state.settings.profileId,
           state.settings.providerId,
           sessionId,
-          task.id,
+          agentId,
           state.settings.cwd,
         );
-        setModal({ kind: 'replay', title: oneLine(task.description, 90), events });
+        setModal({ kind: 'replay', title: oneLine(described, 90), events });
       } catch (error) {
         setModal(null);
         say('error', `Could not read that agent's transcript: ${describeError(error)}`);
       }
     },
     [host, state.sessionId, state.settings, say],
+  );
+
+  const openTaskTranscript = useCallback(
+    async (task: BackgroundTask) => {
+      await openAgentTranscript(task.id, task.description);
+    },
+    [openAgentTranscript],
   );
 
   const openTasksPicker = useCallback(() => {
@@ -1532,20 +1832,15 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       showFlash('nothing to pin yet');
       return;
     }
-    const nowPinned = preferences.togglePin(sessionId);
-    setPinTick((tick) => tick + 1);
-    showFlash(nowPinned ? 'pinned' : 'unpinned');
-  }, [preferences, state.sessionId, showFlash]);
+    togglePinFor(sessionId);
+  }, [state.sessionId, showFlash, togglePinFor]);
 
   /**
-   * `/title` — name this conversation.
+   * `/title` — name *this* conversation.
    *
-   * Written into the provider's own store, through the same door the automatic
-   * namer uses and the desktop's rename menu item uses: a typed title and a
-   * generated one are the same fact about a session, and a second store kept
-   * here would be a fact about one installation — invisible to the desktop,
-   * absent on another machine. A provider whose store has no such field says
-   * so and nothing is written; see `Capabilities.renameSession`.
+   * Which one, and the words for having none yet; the writing is
+   * {@link renameStoredSession}'s, because Ctrl+R over the conversation list
+   * does the same thing to a row that is usually not this one.
    */
   const renameConversation = useCallback(
     (name: string) => {
@@ -1558,33 +1853,9 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         showFlash('/title <name> names this conversation');
         return;
       }
-      if (host.capabilitiesFor(state.settings.providerId)?.renameSession !== true) {
-        showFlash('this provider does not let a conversation be renamed');
-        return;
-      }
-      void (async () => {
-        try {
-          const done = await host.renameSession(
-            state.settings.profileId,
-            state.settings.providerId,
-            sessionId,
-            state.settings.cwd,
-            name,
-          );
-          if (!done) {
-            showFlash('this provider does not let a conversation be renamed');
-            return;
-          }
-          showFlash(`named ${oneLine(name, 48)}`);
-          // The rail is where the name is read back from, and it is what
-          // `/export` takes its title and its filename from.
-          await refreshRail();
-        } catch (error) {
-          say('error', `Could not rename this conversation: ${describeError(error)}`);
-        }
-      })();
+      void renameStoredSession(sessionId, name);
     },
-    [host, state.sessionId, state.settings.profileId, state.settings.providerId, state.settings.cwd, showFlash, say, refreshRail],
+    [state.sessionId, showFlash, renameStoredSession],
   );
 
   /* ---------------------------------------------------------------------- */
@@ -2262,11 +2533,51 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   }, [conversation, live]);
 
   /* ---------------------------------------------------------------------- */
+  /* The delegated strip, pointed at                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /** Which row of the strip the cursor is on. The strip clamps it; see below. */
+  const [delegatedSelected, setDelegatedSelected] = useState(0);
+  /** Task ids whose workflow agents are unfolded, which `→` and `←` change. */
+  const [delegatedExpanded, setDelegatedExpanded] = useState<ReadonlySet<string>>(() => new Set());
+  /**
+   * The row under the cursor, as the strip reported it.
+   *
+   * Taken from the strip rather than worked out again here, which is what its
+   * header asks for and the reason it hands one back: the rows are read out of
+   * the tasks on every render and unfolding changes how many there are, so a
+   * second reading in this file would be a second answer to "what does Enter
+   * open" — and the two would part company on the first tick of the clock.
+   */
+  const [delegatedRow, setDelegatedRow] = useState<DelegatedRow | undefined>(undefined);
+  /**
+   * How many rows the strip has, which is all this file needs of them.
+   *
+   * Tab must not stop at a strip with nothing in it and ↑↓ must not walk past
+   * the end, and both are questions about the count. `delegatedRows` is asked,
+   * rather than the tasks counted again, for {@link delegatedRow}'s reason. The
+   * clock it is given is only spent on the text of rows nothing here reads.
+   */
+  const delegatedCount = useMemo(
+    () => delegatedRows(state.tasks, Date.now(), mainWidth, { expanded: delegatedExpanded }).rows.length,
+    [state.tasks, mainWidth, delegatedExpanded],
+  );
+
+  /*
+   * A strip that has emptied is a strip nobody can see, and the cursor in it
+   * answers keys that now have no rows to act on. The focus comes home.
+   */
+  useEffect(() => {
+    if (delegatedCount === 0 && focus === 'delegated') setFocus('composer');
+  }, [delegatedCount, focus]);
+
+  /* ---------------------------------------------------------------------- */
   /* Keys                                                                    */
   /* ---------------------------------------------------------------------- */
 
   const modalOpen = modal !== null || pendingRequest !== undefined;
   const sidebarActive = focus === 'sidebar' && showSidebar && !modalOpen;
+  const delegatedActive = focus === 'delegated' && delegatedCount > 0 && !modalOpen;
   const composerActive = focus === 'composer' && !modalOpen;
 
   /*
@@ -2317,37 +2628,6 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   }, [files, state.settings.cwd]);
 
   /**
-   * Put a conversation away, or take it back out.
-   *
-   * A tag written into the provider's own store — the same one the desktop
-   * writes — so a row archived here is archived there. Nothing is destroyed
-   * and the conversation is still resumable from the archive folder, which is
-   * what makes this the safe half of the pair and why it asks nothing before
-   * doing it.
-   */
-  const archiveRailSession = useCallback(
-    async (session: SessionSummary) => {
-      const archived = isArchived(session);
-      if (host.capabilitiesFor(session.providerId)?.tagSession !== true) {
-        setNotice(`${state.settings.providerLabel} cannot archive a conversation.`);
-        return;
-      }
-      try {
-        const done = await host.archiveSession(session.profileId, session.providerId, session.id, session.cwd, !archived);
-        if (!done) {
-          setNotice('That conversation could not be archived; it may already be gone.');
-          return;
-        }
-        say('info', `${archived ? 'Restored' : 'Archived'} ${oneLine(session.title, 60)}.`);
-        await refreshRail();
-      } catch (error) {
-        say('error', `Could not archive that conversation: ${describeError(error)}`);
-      }
-    },
-    [host, state.settings.providerLabel, say, refreshRail],
-  );
-
-  /**
    * Destroy a conversation, after asking.
    *
    * The transcript file goes and nothing here can bring it back, which is the
@@ -2386,6 +2666,10 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   const chooseRailRow = useCallback(
     (row: RailRow) => {
       setFocus('composer');
+      // The box Space opened is about the row that was under the cursor, and
+      // the cursor has just been acted on. The query is left alone: Esc is what
+      // takes a filter off, and Enter is not Esc.
+      setPreview(null);
       switch (row.kind) {
         case 'new':
           startNew();
@@ -2603,7 +2887,14 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         cycleMode();
         return;
       }
-      if (showSidebar) setFocus((current) => (current === 'composer' ? 'sidebar' : 'composer'));
+      /*
+       * Three stops now, two of which come and go — the rail is dropped on a
+       * narrow terminal and the strip exists only while something is running —
+       * so which ones are there is answered here and which one is next by
+       * `nextFocus`, beside the row of the map that promises it.
+       */
+      setPreview(null);
+      setFocus((current) => nextFocus(current, { sidebar: showSidebar, delegated: delegatedCount > 0 }));
       return;
     }
 
@@ -2614,6 +2905,9 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
      * is the `?` pressed with the focus in the rail.
      */
     if (input === '?' && !composerActive) {
+      // The map is the whole pane; a preview left under it would be a second
+      // box competing for the rows the map is already using.
+      setPreview(null);
       setModal({ kind: 'help' });
       return;
     }
@@ -2639,7 +2933,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
      * not have the keys. Ctrl+End and Ctrl+Home are the composer's own
      * buffer-start and buffer-end, so nothing here answers them.
      */
-    if (!sidebarActive) {
+    if (!sidebarActive && !delegatedActive) {
       const half = Math.max(SCROLL_STEP, Math.floor(scrollExtent.current.viewportLines / 2));
       const bigStep = key.shift || key.ctrl;
       if (key.pageUp || (key.upArrow && (bigStep || !composerActive))) {
@@ -2658,15 +2952,150 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
 
     if (sidebarActive) {
       const row = rail[railIndex];
-      if (key.upArrow || input === 'k') setRailIndex((i) => (i - 1 + rail.length) % Math.max(1, rail.length));
-      else if (key.downArrow || input === 'j') setRailIndex((i) => (i + 1) % Math.max(1, rail.length));
-      else if (key.return) {
+      const session = row?.kind === 'session' ? row.session : undefined;
+      /*
+       * Whether the rail is being typed at, which is what decides who owns five
+       * of its keys. `j`, `k`, `a`, `d` and `p` are movement and actions at a
+       * rail nobody has typed at, and letters of a title the moment somebody
+       * has — there is no third reading, and a rail that kept them as shortcuts
+       * would be a search box that cannot spell "jump", "and" or "api". The
+       * three actions keep working through their Ctrl chords, which are
+       * accepted either way so that nothing learned here has to be unlearned.
+       */
+      const filtering = railQuery.length > 0;
+
+      if (key.escape) {
+        // A query is a thing to undo before it is a thing to leave: the first
+        // Esc puts the whole list back, which is what somebody who mistyped
+        // means by it, and the second leaves the rail.
+        setPreview(null);
+        if (filtering) setRailFilter('');
+        else setFocus('composer');
+        return;
+      }
+      if (key.upArrow || (!filtering && input === 'k')) {
+        setRailIndex((i) => (i - 1 + rail.length) % Math.max(1, rail.length));
+        return;
+      }
+      if (key.downArrow || (!filtering && input === 'j')) {
+        setRailIndex((i) => (i + 1) % Math.max(1, rail.length));
+        return;
+      }
+      if (key.return) {
         if (row !== undefined) chooseRailRow(row);
-      } else if (input === 'a' && row?.kind === 'session') {
-        void archiveRailSession(row.session);
-      } else if (input === 'd' && row?.kind === 'session') {
-        deleteRailSession(row.session);
-      } else if (key.escape) setFocus('composer');
+        return;
+      }
+      if (key.backspace || key.delete) {
+        setRailFilter((current) => current.slice(0, -1));
+        return;
+      }
+      if (key.ctrl || key.meta) {
+        if (session === undefined) return;
+        if (input === 'a') void archiveRailSession(session);
+        else if (input === 'd') deleteRailSession(session);
+        else if (input === 'p') togglePinFor(session.id);
+        return;
+      }
+      if (!filtering && session !== undefined) {
+        if (input === 'a') {
+          void archiveRailSession(session);
+          return;
+        }
+        if (input === 'd') {
+          deleteRailSession(session);
+          return;
+        }
+        if (input === 'p') {
+          togglePinFor(session.id);
+          return;
+        }
+      }
+      /*
+       * Space shows what a conversation is without opening it, and shows it
+       * again to put the box away. Only while nothing is typed: under a query
+       * it is a space between two words, and a preview that cost somebody the
+       * space bar would be a filter that cannot hold a phrase.
+       */
+      if (!filtering && input === ' ') {
+        if (session !== undefined) setPreview((shown) => (shown?.id === session.id ? null : session));
+        return;
+      }
+      /*
+       * Anything left that is a character somebody typed is the query. `/` is
+       * the one exception, and only at a rail nobody has typed at yet: there it
+       * opens an empty query rather than typing itself, so that `/foo` and
+       * `foo` reach the same place and the key the legend advertises does what
+       * the legend says. Inside a query it is an ordinary character, because a
+       * project name is very often `apps/tui`.
+       */
+      if (!filtering && input === '/') {
+        setRailFilter('');
+        return;
+      }
+      if (isTypable(input, key)) setRailFilter((current) => current + input);
+      return;
+    }
+
+    if (delegatedActive) {
+      /*
+       * The strip's keys. Every one of them is a lookup on the row the strip
+       * reported — `openable`, `stoppable`, the task the row belongs to — and
+       * not a second reading of `state.tasks`, which is the arrangement the
+       * strip's header asks for and the reason Enter cannot open something the
+       * row was not offering.
+       */
+      if (key.escape) {
+        setFocus('composer');
+        return;
+      }
+      if (key.upArrow) {
+        setDelegatedSelected((i) => Math.max(0, i - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setDelegatedSelected((i) => Math.min(delegatedCount - 1, i + 1));
+        return;
+      }
+      if (delegatedRow === undefined) return;
+      if (key.return) {
+        // `openable` is the provider's own filing rather than a wish, so a row
+        // that says no is a row with no transcript to open — a backgrounded
+        // shell, or a workflow agent that has not been spawned yet.
+        const agentId = delegatedRow.agentId;
+        if (!delegatedRow.openable || agentId === undefined) {
+          showFlash('nothing was filed for that row');
+          return;
+        }
+        void openAgentTranscript(agentId, [delegatedRow.label, delegatedRow.description].filter((part) => part.length > 0).join(' · '));
+        return;
+      }
+      if (input === 'x') {
+        // Only ever the task: there is no per-agent stop inside a workflow, and
+        // `x` on one agent's row killing the whole workflow is not what anyone
+        // pressing it would have meant.
+        if (!delegatedRow.stoppable) return;
+        showFlash(`stopping ${oneLine(delegatedRow.label, 40)}`);
+        void conversation.stopTask(delegatedRow.taskId).then((outcome) => {
+          if (!outcome.ok) setNotice(outcome.reason);
+        });
+        return;
+      }
+      if (key.rightArrow) {
+        if (!delegatedRow.unfoldable) return;
+        setDelegatedExpanded((current) => new Set([...current, delegatedRow.taskId]));
+        return;
+      }
+      if (key.leftArrow) {
+        // From an agent row too: `←` on one of a workflow's agents folds the
+        // workflow it belongs to, which is the row the cursor came from.
+        setDelegatedExpanded((current) => {
+          if (!current.has(delegatedRow.taskId)) return current;
+          const next = new Set(current);
+          next.delete(delegatedRow.taskId);
+          return next;
+        });
+        return;
+      }
       return;
     }
 
@@ -2759,6 +3188,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
             {...(state.sessionId === undefined ? {} : { activeSessionId: state.sessionId })}
             activity={railActivity}
             pinned={pinned}
+            query={railQuery}
             currentProject={currentProject}
             width={SIDEBAR_WIDTH}
             height={bodyRows}
@@ -2779,7 +3209,24 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
            * thing that answers it. With nothing open — the ordinary case —
            * this is the line above the composer either way.
            */}
-          <DelegatedStrip tasks={state.tasks} columns={mainWidth} />
+          <DelegatedStrip
+            tasks={state.tasks}
+            columns={mainWidth}
+            focused={delegatedActive}
+            selected={delegatedSelected}
+            expanded={delegatedExpanded}
+            /*
+             * The strip clamps the cursor — its rows move on their own as work
+             * settles — and says where it came to rest, so the number held here
+             * and the one drawn cannot disagree. The row comes back with it, so
+             * Enter and `x` are a lookup rather than a second reading of the
+             * tasks.
+             */
+            onSelect={(row, index) => {
+              setDelegatedRow(row);
+              if (index >= 0) setDelegatedSelected(index);
+            }}
+          />
 
           {/*
            * Between what the agent is doing and what it has not read yet: what
@@ -2845,11 +3292,40 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
                 {...(modal.initialKey === undefined ? {} : { initialKey: modal.initialKey })}
                 {...(modal.hint === undefined ? {} : { hint: modal.hint })}
                 onSelect={modal.onSelect}
+                {...(preview === null
+                  ? {}
+                  : { maxRows: Math.max(3, Math.min(PICKER_ROWS_WITH_PREVIEW, bodyRows - PREVIEW_SLOT_ROWS)) })}
+                {...(modal.filterable === true ? { filterable: true } : {})}
+                {...(modal.onPreview === undefined ? {} : { onPreview: modal.onPreview })}
+                {...(modal.onRename === undefined ? {} : { onRename: modal.onRename })}
+                {...(modal.onSecondary === undefined ? {} : { onSecondary: modal.onSecondary })}
                 onCancel={() => {
                   setModal(null);
                   modal.onCancel?.();
                 }}
               />
+            </Box>
+          )}
+          {modal?.kind === 'prompt' && (
+            <Box paddingX={1} flexShrink={0}>
+              <Prompt
+                title={modal.title}
+                initial={modal.initial}
+                placeholder="a name for this conversation"
+                onSubmit={modal.onSubmit}
+                onCancel={modal.onCancel}
+              />
+            </Box>
+          )}
+          {/*
+           * Under whatever opened it. Space in the rail and Space in the
+           * conversation list put the same box in the same place — see the
+           * note on `preview` for why that place is here and not inside the
+           * thirty-two columns of the rail.
+           */}
+          {preview !== null && (
+            <Box paddingX={1} flexShrink={0}>
+              <SessionPreview session={preview} columns={mainWidth - 2} />
             </Box>
           )}
           {modal?.kind === 'help' && (
@@ -2941,7 +3417,11 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
                     hint: `${state.rewindArmed.fork ? 'branching from' : 'rewinding to'} an earlier prompt · Esc cancels`,
                   }
                 : sidebarActive
-                  ? { hint: 'sidebar: ↑↓ Enter · a archive · d delete · Esc back' }
+                  ? railQuery.length > 0
+                    ? // The rail's own legend has the room for three chords and
+                      // no more; this is where the words for them go.
+                      { hint: 'filtering: Ctrl+A archive · Ctrl+D delete · Ctrl+P pin · Esc clears' }
+                    : { hint: 'sidebar: ↑↓ Enter · a archive · d delete · p pin · Space preview · / filter' }
                   : scroll > 0
                     ? { hint: 'scrolled · Esc to follow' }
                     : {})}

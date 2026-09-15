@@ -243,8 +243,16 @@ export function filterItems<K extends string = string>(
   return scored.sort((a, b) => b.score - a.score).map((entry) => entry.match);
 }
 
-/** Whether a keypress is a character somebody typed rather than a key they pressed. */
-function isTypable(input: string, key: Key): boolean {
+/**
+ * Whether a keypress is a character somebody typed rather than a key they
+ * pressed.
+ *
+ * Exported because the rail asks the same question of the same keystrokes —
+ * see `app.tsx`, which is where the rail's keys are answered — and two
+ * readings of "is this typing" would part company on the first control
+ * character one of them forgot.
+ */
+export function isTypable(input: string, key: Key): boolean {
   if (input.length === 0 || key.ctrl || key.meta || key.return || key.tab) return false;
   for (const character of input) {
     const code = character.codePointAt(0) ?? 0;

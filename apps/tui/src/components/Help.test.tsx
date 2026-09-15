@@ -102,7 +102,11 @@ describe('Help', () => {
   it('goes no further than the end of the map', async () => {
     const { lastFrame, stdin } = render(<Help columns={80} rows={12} onClose={() => undefined} />);
     await tick();
-    for (let press = 0; press < 12; press += 1) stdin.write(PAGE_DOWN);
+    // Derived rather than a number, because the map grows: one press per row
+    // and per heading is more than enough to reach the bottom of any map, and a
+    // literal here is a test that fails the next time a group is added.
+    const presses = KEYMAP.reduce((total, group) => total + group.keys.length + 1, 0);
+    for (let press = 0; press < presses; press += 1) stdin.write(PAGE_DOWN);
     await tick();
     const frame = lastFrame() ?? '';
     expect(frame).toContain('/quit');

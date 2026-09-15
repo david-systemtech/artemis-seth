@@ -41,6 +41,15 @@
  *
  * The slash commands come last, built from {@link COMMANDS} rather than
  * retyped, so the overlay is the whole map and not the keyboard half of it.
+ *
+ * ## Where Tab goes
+ *
+ * One key in the map is not a description of behaviour but the behaviour
+ * itself: {@link nextFocus} is the ring Tab walks. It is here rather than in
+ * `app.tsx` for the reason the rest of this file exists — the row that says
+ * "Tab: round the composer, the list and the strip" and the code that makes
+ * that true are one edit apart, so the map cannot go on promising a stop the
+ * ring has dropped.
  */
 
 import { COMMANDS } from './commands.js';
@@ -51,7 +60,49 @@ import { COMMANDS } from './commands.js';
  * `anywhere` is the handful that no component may take: the focus switch, the
  * interrupt, the quit. The rest name whatever has the keyboard at the time.
  */
-export type KeyContext = 'composer' | 'transcript' | 'sidebar' | 'permission' | 'pager' | 'anywhere';
+export type KeyContext =
+  | 'composer'
+  | 'transcript'
+  | 'sidebar'
+  | 'delegated'
+  | 'picker'
+  | 'permission'
+  | 'pager'
+  | 'anywhere';
+
+/** The three places the keyboard can be, in the order Tab walks them. */
+export type Focus = 'composer' | 'sidebar' | 'delegated';
+
+/** Which stops on the ring exist right now. The composer is always one. */
+export interface FocusStops {
+  /** False on a terminal too narrow for the rail, which is then not drawn. */
+  readonly sidebar: boolean;
+  /** False whenever nothing is delegated; the strip is not drawn either. */
+  readonly delegated: boolean;
+}
+
+/**
+ * The next stop after `current`, skipping the ones that are not there.
+ *
+ * A ring rather than a toggle, because there are three stops now and two of
+ * them come and go: the rail disappears on a narrow terminal and the delegated
+ * strip exists only while something is running. Tab must therefore never land
+ * on a surface that is not on the screen — a cursor nobody can see, answering
+ * keys nobody can account for — and must always be able to get back to the
+ * composer, which is the one stop that is always there. Both of those are what
+ * make this worth a function and a test rather than a chain of ternaries at the
+ * keystroke.
+ */
+export function nextFocus(current: Focus, stops: FocusStops): Focus {
+  const ring: Focus[] = ['composer'];
+  if (stops.sidebar) ring.push('sidebar');
+  if (stops.delegated) ring.push('delegated');
+  // A focus whose stop has just gone — the last task settled while the strip
+  // had the keys — is not on the ring, so `indexOf` is -1 and the step lands on
+  // the composer. Tab always leads out of a surface that is no longer there.
+  const at = ring.indexOf(current);
+  return ring[(at + 1) % ring.length] ?? 'composer';
+}
 
 export interface KeyBinding {
   /** The presses that do it. Several here are alternatives, not a chord. */
@@ -80,7 +131,7 @@ const GROUPS: readonly KeyGroup[] = [
     title: 'Anywhere',
     context: 'anywhere',
     keys: [
-      { keys: ['Tab'], does: 'Between the composer and the list' },
+      { keys: ['Tab'], does: 'Round the composer, the list and the strip' },
       { keys: ['Shift+Tab'], does: 'Step the permission mode on' },
       { keys: ['Esc'], does: 'Interrupt; or follow the end again' },
       { keys: ['Esc Esc'], does: 'Go back to an earlier prompt' },
@@ -147,11 +198,47 @@ const GROUPS: readonly KeyGroup[] = [
     title: 'The conversation list',
     context: 'sidebar',
     keys: [
-      { keys: ['↑', '↓', 'k', 'j'], does: 'Move the cursor' },
+      { keys: ['↑', '↓'], does: 'Move the cursor' },
+      { keys: ['k', 'j'], does: 'The same — until a filter is being typed' },
       { keys: ['Enter'], does: 'Open it, or fold the folder' },
+      { keys: ['/'], does: 'Filter the list by what you type' },
+      { keys: ['Backspace'], does: 'Rub a letter off the filter' },
+      { keys: ['Space'], does: 'Show what a conversation is, unopened' },
       { keys: ['a'], does: 'Archive the one under the cursor' },
       { keys: ['d'], does: 'Delete it' },
+      { keys: ['p'], does: 'Pin it to the top of its folder' },
+      { keys: ['Ctrl+A'], does: 'Archive it, while a filter is being typed' },
+      { keys: ['Ctrl+D'], does: 'Delete it, while filtering' },
+      { keys: ['Ctrl+P'], does: 'Pin it, while filtering' },
+      { keys: ['Esc'], does: 'Clear the filter; then back to the composer' },
+    ],
+  },
+  {
+    title: 'Delegated work',
+    context: 'delegated',
+    keys: [
+      { keys: ['Tab'], does: 'Reached after the list, while work is running' },
+      { keys: ['↑', '↓'], does: 'Move down the strip' },
+      { keys: ['Enter'], does: 'Open what that agent did' },
+      { keys: ['x'], does: 'Stop the task under the cursor' },
+      { keys: ['→'], does: "Unfold a workflow's agents" },
+      { keys: ['←'], does: 'Fold them again' },
       { keys: ['Esc'], does: 'Back to the composer' },
+    ],
+  },
+  {
+    title: 'A list to choose from',
+    context: 'picker',
+    keys: [
+      { keys: ['↑', '↓'], does: 'Move the cursor' },
+      { keys: ['k', 'j'], does: 'The same, in a list that is not typed at' },
+      { keys: ['Letters'], does: 'Type to filter a long list' },
+      { keys: ['Enter'], does: 'Choose the row under the cursor' },
+      { keys: ['Space'], does: 'Preview it without opening it' },
+      { keys: ['Ctrl+R'], does: 'Rename the conversation under the cursor' },
+      { keys: ['Ctrl+A'], does: 'Archive it' },
+      { keys: ['Ctrl+P'], does: 'Pin it' },
+      { keys: ['Esc'], does: 'Clear the query; then close the list' },
     ],
   },
   {

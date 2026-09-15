@@ -50,6 +50,12 @@
  * was just typed is the one thing a filter must not do. The query is drawn
  * under the title with what it found, so a rail that has gone quiet says why.
  *
+ * Typing claims the letters, which moves three keys: `a`, `d` and `p` are the
+ * start of somebody's search while a query is on screen, so archive, delete and
+ * pin are their Ctrl chords for as long as one is. The legend under the list
+ * changes with them — the one place a person finds that out is the line that is
+ * already on screen saying what the rail can do.
+ *
  * Pinning is the other half of the same problem: the handful of conversations
  * somebody returns to every day, held at the top of their folder with a `◈`
  * rather than sinking as newer ones arrive. The glyph shares the column with
@@ -389,8 +395,20 @@ export function Sidebar({
         }
       })}
       <Box flexGrow={1} />
+      {/*
+        Two legends, because three of the rail's keys move when it is being
+        typed at: `a`, `d` and `p` are letters somebody is spelling a title
+        with, so archiving, deleting and pinning are reached by their Ctrl
+        chords for as long as a query is on screen. `^A` rather than `Ctrl+A`
+        because the rail is thirty columns wide and that is the terminal's own
+        shorthand for it.
+      */}
       <Text dimColor>
-        {focused ? (filtering ? '↑↓ · Enter · a · d · Esc clears' : '↑↓ · Enter · a · d · / filter · Esc') : 'Tab: conversations'}
+        {focused
+          ? filtering
+            ? '↑↓ · ^A ^D ^P · Esc clears'
+            : '↑↓ Enter · a d p · / filter · Esc'
+          : 'Tab: conversations'}
       </Text>
     </Box>
   );

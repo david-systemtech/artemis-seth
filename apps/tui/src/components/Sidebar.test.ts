@@ -371,6 +371,23 @@ describe('Sidebar', () => {
     expect(draw(rows, { focused: false })).toContain('Tab: conversations');
   });
 
+  /*
+   * The legend is the only place a person finds out that three keys moved. A
+   * rail that went on offering `a` and `d` while a query was on screen would be
+   * offering two keys that now type letters into it.
+   */
+  it('offers the bare letters until a query is typed, and the chords after', () => {
+    const rows = railRows(searchable, ALL_OPEN, identity);
+
+    const idle = draw(rows);
+    expect(idle).toContain('a d p');
+    expect(idle).not.toContain('^A');
+
+    const typing = draw(rows, { query: 'rail' });
+    expect(typing).toContain('^A ^D ^P');
+    expect(typing).not.toContain('a d p');
+  });
+
   it('marks a pinned conversation, and only a pinned one', () => {
     const rows = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { pinned: new Set(['release']) });
     const frame = draw(rows, { pinned: new Set(['release']) });
