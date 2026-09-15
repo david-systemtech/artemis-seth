@@ -72,6 +72,7 @@ import type { PlanUsage } from './usage.js';
 import type { AgentEvent } from './events.js';
 import type { ProfileId } from './ids.js';
 import type { Capabilities, ProviderId, ProviderKind } from './provider.js';
+import type { RoutineDraft, RoutinePatch, RoutineSnapshot } from './routine.js';
 
 /* -------------------------------------------------------------------------- */
 /* Addresses                                                                  */
@@ -741,6 +742,78 @@ export interface ServerSessionDeletedBody {
 export interface ServerSessionTaggedBody {
   readonly object: 'artemis.session.tagged';
   readonly tagged: boolean;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Routines: appointments that fire in the server                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The server's routines, as `GET /api/v0/routines` reports them.
+ * ============================================================================
+ *
+ * A routine that runs *in the server* fires on schedule with every client
+ * closed — which is the point of it, and the difference from a desktop routine
+ * that fires only while the app is open. These five routes are how a client
+ * makes and manages them:
+ *
+ * ```
+ *   GET    /api/v0/routines                 the ones this connection owns
+ *   POST   /api/v0/routines                 create one, owned by this connection
+ *   PATCH  /api/v0/routines/{id}            edit one this connection owns
+ *   DELETE /api/v0/routines/{id}            delete one this connection owns
+ *   POST   /api/v0/routines/{id}/run-now    fire one now, schedule notwithstanding
+ * ```
+ *
+ * ## Scope is the connection's, exactly as it is for sessions
+ *
+ * Every route is scoped by the same `workspaceKey` the session ledger uses: a
+ * token sees, edits and fires exactly the routines whose scope matches its own
+ * pin, and "not yours" answers like "not there" — a token must not be able to
+ * sound out which routines exist. Create stamps the caller's scope and
+ * connection id; the client never sends either.
+ *
+ * ## The directory and the mode are the server's to decide
+ *
+ * A served firing runs in the connection's own workspace and nowhere else, so
+ * a `cwd` on the draft is ignored — a server routine belongs to a connection
+ * with a fixed directory, and one without is refused. And because a server has
+ * nobody in front of it to answer a permission prompt, a firing opens in
+ * `bypassPermissions` unless the routine names a stricter mode; the client is
+ * expected to leave it at the default.
+ */
+
+/** The routine a client sends to create one. `cwd` is ignored — see the header. */
+export interface ServerRoutineCreateRequest {
+  readonly draft: RoutineDraft;
+}
+
+/** The edit a client sends. Absent fields are left alone. */
+export interface ServerRoutineUpdateRequest {
+  readonly patch: RoutinePatch;
+}
+
+/** The body of `GET /api/v0/routines`. */
+export interface ServerRoutinesBody {
+  readonly object: 'artemis.routines';
+  readonly routines: readonly RoutineSnapshot[];
+}
+
+/**
+ * The body of a single-routine route — create, edit, and run-now alike.
+ *
+ * One shape for all three so a client has one thing to read: the routine as it
+ * now stands, next appointment and firing state included.
+ */
+export interface ServerRoutineBody {
+  readonly object: 'artemis.routine';
+  readonly routine: RoutineSnapshot;
+}
+
+/** Body of `DELETE /api/v0/routines/{id}`. False when there was nothing to remove. */
+export interface ServerRoutineDeletedBody {
+  readonly object: 'artemis.routine.deleted';
+  readonly deleted: boolean;
 }
 
 /** One row of `GET /v1/models`, in OpenAI's shape. */

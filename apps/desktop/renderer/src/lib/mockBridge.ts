@@ -33,6 +33,7 @@ import type {
   RunHandle,
   RunSuggestion,
   Routine,
+  RoutineSnapshot,
   RoutinesState,
   SecretConnection,
   SecretConnectionState,
@@ -385,6 +386,8 @@ let mockRemoteAccounts: readonly ServerProfile[] = [
   { ...mockServerProfile('remote-work', 'work'), live: true },
 ];
 let mockSignIn: ServerSignInStatus | null = null;
+/** Routines that pretend to live on a server this profile points at. */
+let mockServerRoutines: readonly RoutineSnapshot[] = [];
 
 /**
  * One poll, one step — the shape the real flow has.
@@ -2480,6 +2483,70 @@ export function createMockBridge(): ArtemisBridge {
       },
     },
 
+    /*
+     * Routines on a remote server. A small in-memory set per session, enough
+     * for the routines pane to show, add and remove server routines in dev
+     * without a real server behind the profile.
+     */
+    serverRoutines: {
+      list: async () => ok({ routines: mockServerRoutines }),
+      create: async ({ draft }) => {
+        const routine: RoutineSnapshot = {
+          id: `server-routine-${String(mockServerRoutines.length + 1)}`,
+          name: draft.name,
+          instructions: draft.instructions,
+          cwd: '/srv/work',
+          profileId: draft.profileId,
+          providerId: draft.providerId,
+          ...(draft.model === undefined ? {} : { model: draft.model }),
+          ...(draft.effort === undefined ? {} : { effort: draft.effort }),
+          ...(draft.permissionMode === undefined ? {} : { permissionMode: draft.permissionMode }),
+          schedule: draft.schedule,
+          paused: draft.paused === true,
+          createdAt: Date.now(),
+          scope: 'dir:/srv/work',
+          connectionId: 'mock-connection',
+          running: false,
+          history: [],
+        };
+        mockServerRoutines = [routine, ...mockServerRoutines];
+        return ok({ routine });
+      },
+      update: async ({ routineId, patch }) => {
+        let updated: RoutineSnapshot | undefined;
+        mockServerRoutines = mockServerRoutines.map((routine) => {
+          if (routine.id !== routineId) return routine;
+          updated = {
+            ...routine,
+            ...(patch.name === undefined ? {} : { name: patch.name }),
+            ...(patch.instructions === undefined ? {} : { instructions: patch.instructions }),
+            ...(patch.model === undefined
+              ? {}
+              : patch.model === ''
+                ? { model: undefined }
+                : { model: patch.model }),
+            ...(patch.schedule === undefined ? {} : { schedule: patch.schedule }),
+            ...(patch.paused === undefined ? {} : { paused: patch.paused }),
+          };
+          return updated;
+        });
+        return updated === undefined
+          ? ({ ok: false, error: { code: 'invalid_request', message: 'No such routine.' } } as never)
+          : ok({ routine: updated });
+      },
+      delete: async ({ routineId }) => {
+        const had = mockServerRoutines.some((routine) => routine.id === routineId);
+        mockServerRoutines = mockServerRoutines.filter((routine) => routine.id !== routineId);
+        return ok({ removed: had });
+      },
+      runNow: async ({ routineId }) => {
+        const routine = mockServerRoutines.find((entry) => entry.id === routineId);
+        return routine === undefined
+          ? ({ ok: false, error: { code: 'invalid_request', message: 'No such routine.' } } as never)
+          : ok({ routine });
+      },
+    },
+
     usagePlan: {
       /*
        * Empty until that profile has actually been fetched.
@@ -2798,7 +2865,10 @@ export function createMockBridge(): ArtemisBridge {
             id: `routine-${mockRoutines.length + 1}`,
             name: draft.name,
             instructions: draft.instructions,
-            cwd: draft.cwd,
+            // A local routine always has a directory; the field only became
+            // optional on the wire for a server routine, which this mock's
+            // local-routines surface never produces.
+            cwd: draft.cwd ?? '',
             profileId: draft.profileId,
             providerId: draft.providerId,
             ...(draft.model === undefined ? {} : { model: draft.model }),

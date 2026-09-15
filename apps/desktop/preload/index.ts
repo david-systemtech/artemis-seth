@@ -117,6 +117,11 @@ import {
   type ServerAccountsUpdateRequest,
   type ServerAccountSignInRequest,
   type ServerAccountSubmitCodeRequest,
+  type ServerRoutinesRequest,
+  type ServerRoutinesCreateRequest,
+  type ServerRoutinesUpdateRequest,
+  type ServerRoutinesDeleteRequest,
+  type ServerRoutinesRunNowRequest,
   type PlanUsagePush,
   type MenuOpenSettings,
   type UpdateState,
@@ -844,6 +849,19 @@ const bridge: ArtemisBridge = Object.freeze({
       invoke(IPC.serverAccountsSubmitCode, request),
     cancelSignIn: (request: ServerAccountSignInRequest) =>
       invoke(IPC.serverAccountsCancelSignIn, request),
+  }),
+
+  /**
+   * Routines on a remote server. The same one-machine-further rule as
+   * `serverAccounts`: an id names which server, and the appointments live and
+   * fire there. Distinct from `routines`, which are this machine's own.
+   */
+  serverRoutines: Object.freeze({
+    list: (request: ServerRoutinesRequest) => invoke(IPC.serverRoutinesList, request),
+    create: (request: ServerRoutinesCreateRequest) => invoke(IPC.serverRoutinesCreate, request),
+    update: (request: ServerRoutinesUpdateRequest) => invoke(IPC.serverRoutinesUpdate, request),
+    delete: (request: ServerRoutinesDeleteRequest) => invoke(IPC.serverRoutinesDelete, request),
+    runNow: (request: ServerRoutinesRunNowRequest) => invoke(IPC.serverRoutinesRunNow, request),
   }),
 
   usagePlan: Object.freeze({

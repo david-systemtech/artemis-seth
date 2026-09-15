@@ -175,6 +175,11 @@ import {
   validateServerAccountsUpdate,
   validateServerAccountSignIn,
   validateServerAccountSubmitCode,
+  validateServerRoutines,
+  validateServerRoutinesCreate,
+  validateServerRoutinesUpdate,
+  validateServerRoutinesDelete,
+  validateServerRoutinesRunNow,
   validateAgentPromptsList,
   validateAgentPromptsSave,
   validateMemoryBankAdd,
@@ -1313,6 +1318,55 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       validate: validateServerAccountSignIn,
       handle: async (request) => ({
         signIn: await engine.require().cancelRemoteSignIn(request.profileId, request.accountId),
+      }),
+    },
+
+    /* ---------------------------------------------------------------- */
+    /* Routines on a remote server                                      */
+    /* ---------------------------------------------------------------- */
+
+    /**
+     * The server-routine channels: the appointments that fire *on the server*,
+     * distinct from `routines:*` (this machine's own). Each is one
+     * authenticated request to the server the profile names, unwrapped by the
+     * engine to the routine or the list the pane renders.
+     */
+    [IPC.serverRoutinesList]: {
+      validate: validateServerRoutines,
+      handle: async (request) => ({
+        routines: await engine.require().remoteRoutines(request.profileId),
+      }),
+    },
+
+    [IPC.serverRoutinesCreate]: {
+      validate: validateServerRoutinesCreate,
+      handle: async (request) => ({
+        routine: await engine.require().createRemoteRoutine(request.profileId, request.draft),
+      }),
+    },
+
+    [IPC.serverRoutinesUpdate]: {
+      validate: validateServerRoutinesUpdate,
+      handle: async (request) => ({
+        routine: await engine
+          .require()
+          .updateRemoteRoutine(request.profileId, request.routineId, request.patch),
+      }),
+    },
+
+    [IPC.serverRoutinesDelete]: {
+      validate: validateServerRoutinesDelete,
+      handle: async (request) => ({
+        removed: (
+          await engine.require().deleteRemoteRoutine(request.profileId, request.routineId)
+        ).removed,
+      }),
+    },
+
+    [IPC.serverRoutinesRunNow]: {
+      validate: validateServerRoutinesRunNow,
+      handle: async (request) => ({
+        routine: await engine.require().runRemoteRoutine(request.profileId, request.routineId),
       }),
     },
 

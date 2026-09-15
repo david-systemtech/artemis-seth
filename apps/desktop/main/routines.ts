@@ -61,6 +61,7 @@ import type {
   RunId,
 } from '@rx-artemis/protocol';
 import {
+  isPermissionMode,
   isProviderId,
   lastFireBetween,
   MAX_ROUTINE_HISTORY,
@@ -340,6 +341,13 @@ export function createRoutineHost(options: RoutineHostOptions): RoutineHost {
         prompt: routine.instructions,
         runId,
         ...(routine.model === undefined ? {} : { model: routine.model }),
+        // Effort and mode reach the run only when the routine set one; a
+        // routine with neither opens exactly as a typed turn would. A
+        // scheduled run's mode is usually `bypassPermissions` (the form's
+        // default), which is what lets a firing nobody is watching get past
+        // its first prompt rather than parking on it.
+        ...(routine.effort === undefined ? {} : { effort: routine.effort }),
+        ...(routine.permissionMode === undefined ? {} : { permissionMode: routine.permissionMode }),
         metadata: { routineId: routine.id, firedAt, ...(catchUp ? { catchUp: true } : {}) },
       });
     } catch (error) {
@@ -497,6 +505,15 @@ export function createRoutineHost(options: RoutineHostOptions): RoutineHost {
             : patch.model === ''
               ? { model: undefined }
               : { model: patch.model }),
+          // Effort clears on the empty string, the same convention `model`
+          // uses; `permissionMode` is a closed set, so it is passed straight
+          // through and `readRoutine` drops it if a caller sent nonsense.
+          ...(patch.effort === undefined
+            ? {}
+            : patch.effort === ''
+              ? { effort: undefined }
+              : { effort: patch.effort }),
+          ...(patch.permissionMode === undefined ? {} : { permissionMode: patch.permissionMode }),
           ...(patch.schedule === undefined ? {} : { schedule: patch.schedule }),
           ...(patch.paused === undefined ? {} : { paused: patch.paused }),
         });
@@ -562,6 +579,22 @@ export function readSchedule(value: unknown): RoutineSchedule | undefined {
     typeof record['at'] === 'string'
   ) {
     schedule = { kind: 'weekly', day: record['day'], at: record['at'] };
+  } else if (
+    // Read exactly the way `weekly` is: an array of day numbers rather than a
+    // single one. The `scheduleProblem` check below is what rejects an empty
+    // list or a repeat, so this only has to establish the shape.
+    kind === 'days' &&
+    Array.isArray(record['days']) &&
+    record['days'].every((day): day is number => typeof day === 'number') &&
+    typeof record['at'] === 'string'
+  ) {
+    schedule = { kind: 'days', days: record['days'], at: record['at'] };
+  } else if (
+    kind === 'monthly' &&
+    typeof record['day'] === 'number' &&
+    typeof record['at'] === 'string'
+  ) {
+    schedule = { kind: 'monthly', day: record['day'], at: record['at'] };
   } else if (kind === 'cron' && typeof record['expression'] === 'string') {
     schedule = { kind: 'cron', expression: record['expression'] };
   }
@@ -647,6 +680,15 @@ function readRoutine(value: unknown): Routine | undefined {
     profileId,
     providerId: providerId as ProviderId,
     ...(asString(record['model']) === undefined ? {} : { model: asString(record['model']) }),
+    // Both joined the record after it shipped, so both are read tolerantly: an
+    // absent effort is the provider's default, and a `permissionMode` that is
+    // not one of the known set is dropped rather than trusted — the engine
+    // would reject a bad one, but a routine file is read on every boot and a
+    // stored typo should not become a boot-time surprise.
+    ...(asString(record['effort']) === undefined ? {} : { effort: asString(record['effort']) }),
+    ...(isPermissionMode(record['permissionMode'])
+      ? { permissionMode: record['permissionMode'] }
+      : {}),
     schedule,
     paused: record['paused'] === true,
     createdAt,

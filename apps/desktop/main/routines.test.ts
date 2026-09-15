@@ -384,3 +384,64 @@ describe('edits', () => {
     expect(removed.routines).toHaveLength(0);
   });
 });
+
+describe('effort, permission mode, and the new schedule kinds', () => {
+  it('passes effort and permission mode to the run when set', async () => {
+    const { host, engine } = await makeHost();
+    await host.start();
+    await host.create({ ...DRAFT, effort: 'high', permissionMode: 'bypassPermissions' });
+
+    await vi.advanceTimersByTimeAsync(31_000);
+
+    expect(engine.started[0]).toMatchObject({
+      effort: 'high',
+      permissionMode: 'bypassPermissions',
+    });
+  });
+
+  it('round-trips effort and permission mode through disk, and clears effort with the empty string', async () => {
+    const first = await makeHost();
+    await first.host.start();
+    const created = await first.host.create({
+      ...DRAFT,
+      effort: 'high',
+      permissionMode: 'acceptEdits',
+    });
+    const id = created.routines[0]?.id as string;
+
+    const reloaded = await makeHost(first.dir);
+    await reloaded.host.start();
+    expect(reloaded.host.state().routines[0]).toMatchObject({
+      effort: 'high',
+      permissionMode: 'acceptEdits',
+    });
+
+    const cleared = await first.host.update(id, { effort: '' });
+    expect(cleared.routines[0]?.effort).toBeUndefined();
+    expect(cleared.routines[0]?.permissionMode).toBe('acceptEdits');
+  });
+
+  it('reads and fires a days-of-week schedule', async () => {
+    // 2026-03-03 is a Tuesday (getDay() === 2); a Tue/Thu schedule fires today.
+    const { host, engine } = await makeHost();
+    await host.start();
+    await host.create({ ...DRAFT, schedule: { kind: 'days', days: [2, 4], at: '09:00' } });
+
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(engine.started).toHaveLength(1);
+  });
+
+  it('reads a monthly schedule back through disk', async () => {
+    const first = await makeHost();
+    await first.host.start();
+    await first.host.create({ ...DRAFT, schedule: { kind: 'monthly', day: 15, at: '09:00' } });
+
+    const reloaded = await makeHost(first.dir);
+    await reloaded.host.start();
+    expect(reloaded.host.state().routines[0]?.schedule).toEqual({
+      kind: 'monthly',
+      day: 15,
+      at: '09:00',
+    });
+  });
+});
