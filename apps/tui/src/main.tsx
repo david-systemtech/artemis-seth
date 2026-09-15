@@ -22,6 +22,7 @@ import { render } from 'ink';
 
 import { App } from './app.js';
 import { artemisDataDir } from './dataDir.js';
+import { Frecency, defaultFrecencyPath } from './fileIndex.js';
 import { launch } from './launch.js';
 import { currentVersion, installRoot, runUpdate } from './update.js';
 import { runPrint } from './print.js';
@@ -145,6 +146,13 @@ async function main(): Promise<number> {
   }
   const { launched } = result;
 
+  /*
+   * Which files `@` offers first, remembered between runs. Only the terminal
+   * has one: `--print` completes nothing, and saving from there would write an
+   * empty file over a real one.
+   */
+  let files: Frecency | undefined;
+
   try {
     if (parsed.print !== undefined) {
       if (parsed.print.trim().length === 0) {
@@ -162,15 +170,19 @@ async function main(): Promise<number> {
       return 2;
     }
 
+    files = new Frecency(defaultFrecencyPath());
+    await files.load();
+
     // The whole terminal, on the alternate screen: what was on it before is
     // restored on exit, and the app draws to the size it is given.
-    const instance = render(<App launched={launched} />, { exitOnCtrlC: false, alternateScreen: true });
+    const instance = render(<App launched={launched} files={files} />, { exitOnCtrlC: false, alternateScreen: true });
     await instance.waitUntilExit();
     return 0;
   } finally {
     await launched.cache.flush();
     await launched.preferences.flush();
     await launched.history.flush();
+    await files?.save();
     await launched.host.dispose();
   }
 }

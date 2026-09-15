@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { render } from 'ink-testing-library';
 
 import type { HistoryScope } from '../history.js';
-import { Composer, type ComposerHandle, type HistoryLookup } from './Composer.js';
+import { Composer, type ComposerHandle, type FileIndex, type HistoryLookup } from './Composer.js';
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 30));
 
@@ -107,7 +107,7 @@ describe('Composer', () => {
     const { lastFrame, stdin } = composer({ onSubmit });
     await tick();
     await press(stdin, 'alpha', CTRL_J, 'beta', ENTER);
-    expect(onSubmit).toHaveBeenCalledWith('alpha\nbeta');
+    expect(onSubmit).toHaveBeenCalledWith('alpha\nbeta', []);
     expect(lastFrame()).toContain(PLACEHOLDER);
     expect(lastFrame()).not.toContain('alpha');
   });
@@ -204,7 +204,7 @@ describe('Composer', () => {
     const one = rowWith(lastFrame(), 'one');
     expect(rowWith(lastFrame(), 'two')).toBe(one + 1);
     await press(stdin, ENTER);
-    expect(onSubmit).toHaveBeenCalledWith('one\ntwo');
+    expect(onSubmit).toHaveBeenCalledWith('one\ntwo', []);
   });
 
   it('clips at eight rows and counts what is out of sight', async () => {
@@ -281,7 +281,7 @@ describe('Composer: the slash menu', () => {
     const { lastFrame, stdin } = composer({ onSubmit });
     await tick();
     await press(stdin, '/mo', DOWN, ENTER);
-    expect(onSubmit).toHaveBeenCalledWith('/mode');
+    expect(onSubmit).toHaveBeenCalledWith('/mode', []);
     expect(lastFrame()).toContain(PLACEHOLDER);
   });
 
@@ -294,7 +294,7 @@ describe('Composer: the slash menu', () => {
     expect(marked(lastFrame())).toHaveLength(1);
     expect(lastFrame()).not.toContain(MENU_HINT);
     await press(stdin, ENTER);
-    expect(onSubmit).toHaveBeenCalledWith('/mdoel');
+    expect(onSubmit).toHaveBeenCalledWith('/mdoel', []);
   });
 
   it('finds a command by an alias and runs it under its real name', async () => {
@@ -306,7 +306,7 @@ describe('Composer: the slash menu', () => {
     expect(quit).toBeGreaterThan(0);
     expect(rowsOf(lastFrame())[quit]).toContain('❯');
     await press(stdin, ENTER);
-    expect(onSubmit).toHaveBeenCalledWith('/quit');
+    expect(onSubmit).toHaveBeenCalledWith('/quit', []);
   });
 
   it('offers a bridged skill by the word someone would look for', async () => {
@@ -322,7 +322,7 @@ describe('Composer: the slash menu', () => {
     expect(lastFrame()).not.toContain('/compact');
     // Fully qualified, which is the only form the provider will answer to.
     await press(stdin, ENTER);
-    expect(onSubmit).toHaveBeenCalledWith('/artemis-skills:code-review');
+    expect(onSubmit).toHaveBeenCalledWith('/artemis-skills:code-review', []);
   });
 
   it('keeps ↑ while the menu is open, and hands it back once it closes', async () => {
@@ -589,7 +589,7 @@ describe('Composer: Ctrl+R', () => {
     const { lastFrame, stdin } = searcher({ onSubmit });
     await tick();
     await press(stdin, CTRL_R, 'build', ENTER);
-    expect(onSubmit).toHaveBeenCalledWith('fix the build');
+    expect(onSubmit).toHaveBeenCalledWith('fix the build', []);
     expect(lastFrame()).not.toContain('reverse-i-search');
     expect(lastFrame()).toContain(PLACEHOLDER);
   });
@@ -648,5 +648,194 @@ describe('Composer: Ctrl+R', () => {
     await press(stdin, 'half typed', CTRL_R);
     expect(lastFrame()).not.toContain('reverse-i-search');
     expect(lastFrame()).toContain('half typed');
+  });
+});
+
+/*
+ * `@` names a file.
+ *
+ * The index here is an array. `fileIndex.ts` is tested where it lives, over a
+ * real directory and against the scorer; what these tests are about is which
+ * keystroke opens the popup, which one inserts, and what travels beside the
+ * message when it goes.
+ */
+const MENTION_HINT = '↑↓ move · Tab/Enter insert';
+
+const COMPOSER_PATH = 'apps/tui/src/components/Composer.tsx';
+const COMPLETIONS_PATH = 'apps/tui/src/components/Completions.tsx';
+
+const PATHS: readonly string[] = ['README.md', 'apps/tui/src/app.tsx', COMPOSER_PATH, COMPLETIONS_PATH];
+
+interface FakeIndex {
+  readonly index: FileIndex;
+  /** The paths `record` was told about, in order. */
+  readonly recorded: readonly string[];
+  /** Hand over the listing, for an index made to answer late. */
+  readonly land: () => void;
+}
+
+/**
+ * An index over an array, which either answers at once or waits to be told to.
+ * `boost` stands in for the frecency file: a number per path, no clock.
+ */
+const fakeIndex = (
+  options: { readonly paths?: readonly string[]; readonly late?: boolean; readonly boost?: Readonly<Record<string, number>> } = {},
+): FakeIndex => {
+  const paths = options.paths ?? PATHS;
+  const recorded: string[] = [];
+  let land = (): void => undefined;
+  const listing =
+    options.late === true
+      ? new Promise<readonly string[]>((resolve) => {
+          land = () => {
+            resolve(paths);
+          };
+        })
+      : Promise.resolve(paths);
+  return {
+    index: {
+      list: () => listing,
+      frecency: {
+        boost: (path: string) => options.boost?.[path] ?? 0,
+        record: (path: string) => {
+          recorded.push(path);
+        },
+      },
+    },
+    recorded,
+    land: () => {
+      land();
+    },
+  };
+};
+
+describe('Composer: naming a file with @', () => {
+  it('offers the paths that match, the best of them highlighted', async () => {
+    const { index } = fakeIndex();
+    const { lastFrame, stdin } = composer({ fileIndex: index });
+    await tick();
+    await press(stdin, 'look at @comp');
+
+    const composerRow = rowWith(lastFrame(), COMPOSER_PATH);
+    const completionsRow = rowWith(lastFrame(), COMPLETIONS_PATH);
+    expect(composerRow).toBeGreaterThan(0);
+    expect(rowsOf(lastFrame())[composerRow]).toContain('❯');
+    expect(completionsRow).toBe(composerRow + 1);
+    expect(rowsOf(lastFrame())[completionsRow]).not.toContain('❯');
+    // The files that have nothing to do with `comp` are not in the list.
+    expect(lastFrame()).not.toContain('README.md');
+    expect(lastFrame()).toContain(MENTION_HINT);
+  });
+
+  it('↓ moves the highlight, and Tab inserts the row it lands on', async () => {
+    const { index, recorded } = fakeIndex();
+    const { lastFrame, stdin } = composer({ fileIndex: index });
+    await tick();
+    await press(stdin, 'look at @comp', DOWN);
+    expect(rowsOf(lastFrame())[rowWith(lastFrame(), COMPLETIONS_PATH)]).toContain('❯');
+
+    await press(stdin, TAB);
+    // Written over the token, with the space that means the next word can
+    // just be typed — and the popup is gone, because there is no token left.
+    expect(lastFrame()).toContain(`look at @${COMPLETIONS_PATH}`);
+    expect(lastFrame()).not.toContain(MENTION_HINT);
+    expect(recorded).toEqual([COMPLETIONS_PATH]);
+  });
+
+  it('Enter inserts rather than sends; the next Enter sends, carrying the path', async () => {
+    const onSubmit = vi.fn();
+    const { index } = fakeIndex();
+    const { lastFrame, stdin } = composer({ onSubmit, fileIndex: index });
+    await tick();
+    await press(stdin, 'read @comp', ENTER);
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(lastFrame()).toContain(`read @${COMPOSER_PATH}`);
+
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith(`read @${COMPOSER_PATH} `, [COMPOSER_PATH]);
+    expect(lastFrame()).toContain(PLACEHOLDER);
+  });
+
+  it('leaves a path nobody has heard of as the words it is', async () => {
+    const onSubmit = vi.fn();
+    const { index } = fakeIndex();
+    const { lastFrame, stdin } = composer({ onSubmit, fileIndex: index });
+    await tick();
+    await press(stdin, 'see @nope/missing.ts');
+    expect(lastFrame()).toContain('no match');
+
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('see @nope/missing.ts', []);
+  });
+
+  it('inserts into the middle of a sentence and leaves the cursor after the path', async () => {
+    const { index } = fakeIndex();
+    const { lastFrame, stdin } = composer({ fileIndex: index });
+    await tick();
+    await press(stdin, 'rewrite @comp for me', LEFT, LEFT, LEFT, LEFT, LEFT, LEFT, LEFT, TAB);
+    expect(lastFrame()).toContain(`rewrite @${COMPOSER_PATH} for me`);
+    // The cursor is where the space left it, which typing proves.
+    await press(stdin, 'X');
+    expect(lastFrame()).toContain(`rewrite @${COMPOSER_PATH} Xfor me`);
+  });
+
+  it('a command word beats it: / at the start wins', async () => {
+    const { index } = fakeIndex();
+    const { lastFrame, stdin } = composer({ fileIndex: index });
+    await tick();
+    await press(stdin, '/mo');
+    expect(lastFrame()).toContain('/model');
+
+    // Still one word beginning with a slash, so the `@` is a character in a
+    // command's name and nothing else.
+    await press(stdin, '@comp');
+    expect(lastFrame()).not.toContain(MENTION_HINT);
+    expect(lastFrame()).not.toContain(COMPOSER_PATH);
+  });
+
+  it('opens once the command word has ended, because then it is arguments', async () => {
+    const { index } = fakeIndex();
+    const { lastFrame, stdin } = composer({ fileIndex: index });
+    await tick();
+    await press(stdin, '/attach @comp');
+    expect(lastFrame()).toContain(COMPOSER_PATH);
+    expect(lastFrame()).toContain(MENTION_HINT);
+  });
+
+  it('says loading… until the listing lands', async () => {
+    const { index, land } = fakeIndex({ late: true });
+    const { lastFrame, stdin } = composer({ fileIndex: index });
+    await tick();
+    await press(stdin, '@comp');
+    expect(lastFrame()).toContain('loading…');
+    expect(lastFrame()).not.toContain(COMPOSER_PATH);
+
+    land();
+    await tick();
+    expect(lastFrame()).not.toContain('loading…');
+    expect(lastFrame()).toContain(COMPOSER_PATH);
+  });
+
+  it('with nothing typed, offers what was picked before and then path order', async () => {
+    const { index } = fakeIndex({ boost: { [COMPLETIONS_PATH]: 40 } });
+    const { lastFrame, stdin } = composer({ fileIndex: index });
+    await tick();
+    await press(stdin, 'about @');
+
+    const picked = rowWith(lastFrame(), COMPLETIONS_PATH);
+    expect(rowsOf(lastFrame())[picked]).toContain('❯');
+    expect(rowWith(lastFrame(), 'README.md')).toBe(picked + 1);
+    expect(rowWith(lastFrame(), 'apps/tui/src/app.tsx')).toBe(picked + 2);
+  });
+
+  it('names what will travel in the row under the box', async () => {
+    const { index } = fakeIndex();
+    const { lastFrame, stdin } = composer({ fileIndex: index, attachments: ['shot.png'] });
+    await tick();
+    await press(stdin, 'read @comp', TAB);
+    const row = rowWith(lastFrame(), '⎘');
+    expect(rowsOf(lastFrame())[row]).toContain('shot.png');
+    expect(rowsOf(lastFrame())[row]).toContain(COMPOSER_PATH);
+    expect(rowsOf(lastFrame())[row]).toContain('goes with the next message');
   });
 });

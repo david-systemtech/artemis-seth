@@ -98,9 +98,44 @@
  * inside one dispatch, before any render, so a flag lowered as the search
  * closes would already read as lowered when the app looks, and the Esc that
  * closed the search would interrupt the turn as well.
+ *
+ * ## `@` names a file
+ *
+ * An `@` after whitespace opens the same kind of popup the slash menu uses,
+ * over the files under the working directory. None of the thinking is here:
+ * `fileIndex.ts` finds the token under the cursor, ranks the paths against
+ * what has been typed into it, and writes the chosen one back over the token.
+ * What this decides is which keystroke means which of those. ↑ and ↓ are the
+ * popup's while it is open, ahead of the text and the history, for the reason
+ * they are the menu's. Tab and Enter both insert — and Enter inserting is the
+ * point: the popup is a word being finished, not a message being sent, so the
+ * send is the *next* Enter. Esc is not bound here either.
+ *
+ * The two popups are never open together. A single word beginning with a slash
+ * is a command being typed, and no command's name has an `@` in it, so the
+ * slash wins by being asked first.
+ *
+ * The list is not this component's to build. It arrives as `fileIndex`, one
+ * object per working directory, and `list()` is called at most once per
+ * object: the first time the text contains an `@` at all. That is the last
+ * moment before an answer is wanted and long after the first keystroke was
+ * drawn, which is what keeps a repository of twenty thousand files out of the
+ * way of someone typing "hello". A different directory is a different object,
+ * and a different object is a fresh listing. Until it lands the popup says
+ * `loading…` rather than lying with an empty list, and a query that matched
+ * nothing says `no match`.
+ *
+ * What is *sent* is the other half. The message keeps its `@path` text, which
+ * is what tells the agent which file was meant where, and the paths travel
+ * beside it as `onSubmit`'s second argument for the app to attach. Only paths
+ * the listing knows travel: an address, an `@media`, a path typed before the
+ * list arrived are all left as the words they already were — and the app
+ * checks each of the rest on disk before reading it, because a listing is a
+ * snapshot and files move. The row under the box names everything that will
+ * go, so what travels is never a guess.
  */
 
-import { useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 
 import { matchCommands } from '../commands.js';
@@ -138,12 +173,18 @@ import {
   wordRight,
   yank,
 } from '../editor.js';
+import { fuzzyMatch, mentionAt, replaceMention, type FileMatch, type FrecencyLike } from '../fileIndex.js';
 import { HistoryCursor, type HistoryMatch, type HistoryScope } from '../history.js';
 import { ACCENT } from '../theme.js';
 import { Completions } from './Completions.js';
 
 /** Lines drawn at once before the box scrolls instead of growing. */
 const MAX_ROWS = 8;
+
+/** Paths offered at once. The popup sits over the conversation; the menu's own window. */
+const MENTION_ROWS = 8;
+
+const MENTION_HINT = '↑↓ move · Tab/Enter insert';
 
 /** Ctrl+_ , which most terminals send as a unit separator and no letter. */
 const UNDO_INPUT = '\u001F';
@@ -171,6 +212,67 @@ function commandWord(usage: string): string {
 export interface HistoryLookup {
   recent(scope: HistoryScope): readonly string[];
   search(query: string, scope: HistoryScope, limit?: number): readonly HistoryMatch[];
+}
+
+/** The two methods of `Frecency` the popup needs: reading an order, writing a pick. */
+export interface MentionMemory extends FrecencyLike {
+  /** This path was just chosen, so it floats next time. */
+  record(path: string): void;
+}
+
+/**
+ * Where `@` looks, and what it remembers.
+ *
+ * The composer neither lists a directory nor opens a file. It is handed one of
+ * these per working directory, asks it for the paths once, and tells it which
+ * one was picked; everything behind the two methods — git, a walk, a file of
+ * counts — is `fileIndex.ts`'s business, and a test hands over an array and a
+ * `record` that does nothing.
+ */
+export interface FileIndex {
+  /** The paths under the working directory, relative to it, forward slashes. */
+  list(): Promise<readonly string[]>;
+  /** What settles a near-tie, and where an accepted path is written down. */
+  readonly frecency: MentionMemory;
+}
+
+/** An `@` that starts a token: at the very start of the text, or after whitespace. */
+const MENTION_TOKEN = /(?:^|\s)@(\S+)/gu;
+
+/**
+ * The `@paths` in `text` that the listing knows, in the order they appear and
+ * once each.
+ *
+ * Filtering against the listing is the point rather than a nicety: it is what
+ * keeps an address, an `@media` and half a typed path as the words they are.
+ */
+function mentionsIn(text: string, known: ReadonlySet<string>): readonly string[] {
+  if (known.size === 0) return [];
+  const found: string[] = [];
+  for (const match of text.matchAll(MENTION_TOKEN)) {
+    const path = match[1];
+    if (path !== undefined && known.has(path) && !found.includes(path)) found.push(path);
+  }
+  return found;
+}
+
+/**
+ * `replaceAll`, with the cursor left somewhere other than the end.
+ *
+ * A path completed in the middle of a sentence wants the cursor just past the
+ * space it added, not past the rest of the line. `editor.ts` keeps its cursor
+ * moves private and its whole-text replacement ends at the end, so the walk
+ * back is made of its own `left`: no second undo entry, and no chance of
+ * landing inside a surrogate pair.
+ */
+function replaceLeavingCursor(state: EditorState, text: string, cursor: number): EditorState {
+  let next = replaceAll(state, text);
+  while (next.cursor > cursor) {
+    const back = left(next);
+    if (back.cursor === next.cursor) break;
+    next = back;
+  }
+  return next;
 }
 
 /** What the app can do to the box from outside a keystroke. */
@@ -210,7 +312,12 @@ interface Search {
 }
 
 export interface ComposerProps {
-  readonly onSubmit: (text: string) => void;
+  /**
+   * What was typed, and the `@paths` in it that name a real file — in order,
+   * once each. The text keeps the mentions; the second argument is what the
+   * app turns into attachments.
+   */
+  readonly onSubmit: (text: string, mentions: readonly string[]) => void;
   /** The agent is mid-turn. Enter steers; the hint says so. */
   readonly live: boolean;
   /** The provider cannot take a message until the turn ends. */
@@ -227,6 +334,8 @@ export interface ComposerProps {
    * the app's to do something with.
    */
   readonly onArrowOverflow?: (direction: 'up' | 'down') => void;
+  /** What `@` completes against. Without it `@` is an ordinary character. */
+  readonly fileIndex?: FileIndex;
   /** What ↑ and Ctrl+R read. Without it neither key does anything new. */
   readonly history?: HistoryLookup;
   /** The slices ↑ prefers and Ctrl+S cycles, best first. */
@@ -249,6 +358,7 @@ export function Composer({
   providerCommands = [],
   isActive = true,
   onArrowOverflow,
+  fileIndex,
   history,
   historyScopes = DEFAULT_SCOPES,
   onTakeBackQueued,
@@ -266,7 +376,8 @@ export function Composer({
 
   // A single word beginning with a slash is a command being typed. Whitespace
   // of any kind ends that: what follows is arguments, or a second line.
-  const menu = value.startsWith('/') && !/\s/u.test(value) ? matchCommands(value, providerCommands) : [];
+  const typingCommand = value.startsWith('/') && !/\s/u.test(value);
+  const menu = typingCommand ? matchCommands(value, providerCommands) : [];
   const selected =
     menu.length === 0
       ? null
@@ -285,6 +396,64 @@ export function Composer({
   const walking = walk !== null && walk.text === value ? walk : null;
 
   const [search, setSearch] = useState<Search | null>(null);
+
+  /*
+   * `@`, and the files it could mean.
+   *
+   * The listing is asked for once per index — the identity of the object is
+   * the directory it lists — and only once the text has an `@` in it at all.
+   * That trigger is the cheapest honest one: it catches a pasted message as
+   * well as a typed `@`, and it costs nothing at all for the messages that
+   * name no file, which is most of them. A listing that fails is an empty one,
+   * because a completion is not worth an error in front of a prompt.
+   */
+  const [listed, setListed] = useState<{ readonly index: FileIndex; readonly paths: readonly string[] } | null>(null);
+  const requested = useRef<FileIndex | null>(null);
+  const couldName = fileIndex !== undefined && value.includes('@');
+  useEffect(() => {
+    if (fileIndex === undefined || !couldName || requested.current === fileIndex) return;
+    requested.current = fileIndex;
+    void fileIndex.list().then(
+      (found) => {
+        setListed({ index: fileIndex, paths: found });
+      },
+      () => {
+        setListed({ index: fileIndex, paths: [] });
+      },
+    );
+  }, [fileIndex, couldName]);
+  // Compared rather than cleared: a new directory arrives as a new index, and
+  // the last one's paths must not answer for it, even for a frame.
+  const paths = listed !== null && listed.index === fileIndex ? listed.paths : null;
+
+  /*
+   * The slash menu wins. The only word the two could both claim is one that
+   * begins with a slash and has an `@` in it, and that word is someone typing
+   * a command. A reverse search owns the whole keyboard, this included.
+   */
+  const mention = fileIndex === undefined || typingCommand || search !== null ? null : mentionAt(value, buffer.cursor);
+  const query = mention === null ? null : mention.query;
+  const suggestions = useMemo<readonly FileMatch[]>(() => {
+    if (fileIndex === undefined || query === null || paths === null) return [];
+    return fuzzyMatch(query, paths, { limit: MENTION_ROWS, frecency: fileIndex.frecency });
+  }, [fileIndex, query, paths]);
+  /*
+   * The highlighted path, on the same terms as `picked`: remembered against
+   * the token it was chosen over, so any edit — which is a new query and a new
+   * list — falls back to the first row rather than pointing somewhere else.
+   */
+  const [pickedPath, setPickedPath] = useState<{ readonly token: string; readonly index: number } | null>(null);
+  const token = mention === null ? '' : `${String(mention.start)} ${mention.query}`;
+  const mentionSelected =
+    suggestions.length === 0
+      ? null
+      : pickedPath !== null && pickedPath.token === token
+        ? Math.max(0, Math.min(pickedPath.index, suggestions.length - 1))
+        : 0;
+  const mentionChoice = mentionSelected === null ? undefined : suggestions[mentionSelected];
+  /** What is in the box that will travel as a file: the row under it says so too. */
+  const known = useMemo(() => new Set(paths ?? []), [paths]);
+  const mentions = useMemo(() => mentionsIn(value, known), [value, known]);
 
   /*
    * Read by the app, on the same keystroke the composer is answering, so it
@@ -317,6 +486,19 @@ export function Composer({
     }),
     [buffer],
   );
+
+  /**
+   * Write the chosen path over the token under the cursor, and remember that
+   * it was chosen. `fileIndex.ts` decides what the text and the cursor become;
+   * the space it leaves after the path is why the next word can just be typed.
+   */
+  const acceptMention = (path: string): void => {
+    if (mention === null) return;
+    const written = replaceMention(value, mention.start, mention.end, `@${path}`);
+    setBuffer((current) => replaceLeavingCursor(current, written.text, written.cursor));
+    fileIndex?.frecency.record(path);
+    setPickedPath(null);
+  };
 
   /** Put `text` in the box, undoably, and hand back the buffer that makes. */
   const put = (text: string): EditorState => {
@@ -415,7 +597,7 @@ export function Composer({
             setBuffer(search.draft);
             return;
           }
-          onSubmit(value);
+          onSubmit(value, mentions);
           setBuffer(clear);
           return;
         }
@@ -464,6 +646,16 @@ export function Composer({
         return;
       }
       if (key.return) {
+        /*
+         * The file popup takes Enter before anything else can: what it means
+         * there is "that one", and the message goes on the Enter after. A
+         * popup that sent instead would attach a file and end the sentence in
+         * the same keystroke, which is not what anyone meant by picking a row.
+         */
+        if (mentionChoice !== undefined) {
+          acceptMention(mentionChoice.path);
+          return;
+        }
         if (endsWithContinuation(buffer)) {
           setBuffer(continueLine);
           return;
@@ -475,12 +667,12 @@ export function Composer({
          * still knows nothing about what any command does.
          */
         if (highlighted !== undefined) {
-          onSubmit(commandWord(highlighted.usage));
+          onSubmit(commandWord(highlighted.usage), []);
           setBuffer(clear);
           return;
         }
         if (value.trim().length === 0 && attachments.length === 0) return;
-        onSubmit(value);
+        onSubmit(value, mentions);
         setBuffer(clear);
         return;
       }
@@ -503,6 +695,13 @@ export function Composer({
       if (key.upArrow || key.downArrow) {
         // A modified arrow is the app's half-screen scroll, never the text's.
         if (key.shift || key.ctrl || key.meta) return;
+        if (mentionSelected !== null) {
+          // The file popup walks for the same reason the menu does, and wraps
+          // for the same reason the picker does.
+          const step = key.upArrow ? -1 : 1;
+          setPickedPath({ token, index: (mentionSelected + step + suggestions.length) % suggestions.length });
+          return;
+        }
         if (selected !== null) {
           // The open menu takes a plain arrow ahead of the text and ahead of
           // the app: the text is one word, so it has no second line to move
@@ -601,6 +800,11 @@ export function Composer({
         }
       }
       if (key.tab) {
+        // The path the popup is on, written over the token it was typed into.
+        if (mentionChoice !== undefined) {
+          acceptMention(mentionChoice.path);
+          return;
+        }
         // Fill in the highlighted row — the canonical name, prefix and all,
         // which is what makes a bridged `/plugin:command` typeable. Through
         // the editor, so one undo gets back the letters that were typed.
@@ -627,6 +831,8 @@ export function Composer({
   const { top, size } = editorWindow(row, rows.length, MAX_ROWS);
   const hiddenBelow = rows.length - top - size;
   const placeholder = locked ? 'working — wait for this turn' : live ? 'steer the agent…' : 'message, or / for commands';
+  /** Everything one row under the box promises: what was attached, and what was named. */
+  const carried = [...attachments, ...mentions];
   const prompt = (
     <Text color={locked ? undefined : ACCENT} dimColor={locked} bold>
       {'❯ '}
@@ -717,10 +923,29 @@ export function Composer({
         }))}
         selected={selected}
       />
-      {attachments.length > 0 && (
+      {/*
+       * The files `@` could mean. `loading…` and `no match` are rows of their
+       * own rather than a list with one apologetic entry in it, because
+       * neither is something Tab should be able to insert.
+       */}
+      {mention !== null &&
+        (paths === null ? (
+          <Text dimColor>{'  loading…'}</Text>
+        ) : suggestions.length === 0 ? (
+          <Text dimColor>{'  no match'}</Text>
+        ) : (
+          <Completions
+            items={suggestions.map((match) => ({ key: match.path, label: match.path, indices: match.indices }))}
+            selected={mentionSelected}
+            maxRows={MENTION_ROWS}
+            hint={MENTION_HINT}
+          />
+        ))}
+      {carried.length > 0 && (
         <Text dimColor>
           {'  ⎘ '}
-          {attachments.join(', ')} · goes with the next message · /attach clear
+          {carried.join(', ')} · goes with the next message
+          {attachments.length > 0 ? ' · /attach clear' : ''}
         </Text>
       )}
       {notice !== undefined && (

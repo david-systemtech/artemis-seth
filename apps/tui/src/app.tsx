@@ -76,12 +76,13 @@ import { CATALOGUE_KEY, commandsKey, modelsKey, usageKey } from './cache.js';
 import { checkForUpdate, currentVersion, installRoot } from './update.js';
 import { COMMANDS, parseCommand, type Command } from './commands.js';
 import { Conversation, type ConversationSettings } from './conversation.js';
+import { listFiles, type Frecency } from './fileIndex.js';
 import type { HistoryScope } from './history.js';
 import type { Launched } from './launch.js';
 import type { ModelListing } from './host.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
 import { ACCENT } from './theme.js';
-import { Composer, type ComposerHandle } from './components/Composer.js';
+import { Composer, type ComposerHandle, type FileIndex } from './components/Composer.js';
 import { DelegatedStrip } from './components/Delegated.js';
 import { Header } from './components/Header.js';
 import { PermissionCard } from './components/PermissionCard.js';
@@ -99,6 +100,12 @@ import { ReplayRows, TranscriptViewport } from './components/Transcript.js';
 
 export interface AppProps {
   readonly launched: Launched;
+  /**
+   * Which files `@` offers first: what was picked before, and how long ago.
+   * Read and written here, loaded and saved by `main.tsx`, and absent from
+   * `--print`, which completes nothing.
+   */
+  readonly files?: Frecency;
 }
 
 interface PickerModal {
@@ -174,7 +181,7 @@ const SCROLL_STEP = 2;
 
 const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-export function App({ launched }: AppProps): React.JSX.Element {
+export function App({ launched, files }: AppProps): React.JSX.Element {
   const { host, descriptors, cache, preferences, history } = launched;
   const { exit } = useApp();
   const { columns, rows } = useTerminalSize();
@@ -1280,7 +1287,7 @@ export function App({ launched }: AppProps): React.JSX.Element {
   );
 
   const submit = useCallback(
-    (text: string) => {
+    (text: string, mentions: readonly string[] = []) => {
       setNotice(undefined);
       const command = parseCommand(text);
       if (command !== null) {
@@ -1305,15 +1312,32 @@ export function App({ launched }: AppProps): React.JSX.Element {
         cwd: state.settings.cwd,
         ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),
       });
-      void conversation.send(text, attachments).then((outcome) => {
+      /*
+       * An `@path` is a file the message is about, so it travels as one — read
+       * with `/attach`'s own reader and sent beside whatever was already
+       * queued. The `@path` stays in the text, because that is what tells the
+       * agent which file was meant where; the attachment is what saves it a
+       * round trip to read it. Anything the reader will not take — a
+       * directory, a path deleted since the index was listed, a kind this
+       * provider cannot accept — is simply not attached, and the words remain
+       * exactly as they were typed.
+       */
+      void (async () => {
+        const read = await Promise.all(mentions.map((path) => readAttachment(path, state.settings.cwd)));
+        const named = read.flatMap((result) => {
+          if (!result.ok) return [];
+          const accepts = result.attachment.kind === 'image' ? state.capabilities.imageInput : state.capabilities.fileInput;
+          return accepts ? [result.attachment] : [];
+        });
+        const outcome = await conversation.send(text, [...attachments, ...named]);
         if (!outcome.ok) {
           setNotice(outcome.reason);
           // Not lost: a refused message keeps its attachments for the retry.
           if (attachments.length > 0) setPendingAttachments(pendingAttachments);
         }
-      });
+      })();
     },
-    [conversation, runCommand, pendingAttachments, history, state.settings.cwd, state.sessionId],
+    [conversation, runCommand, pendingAttachments, history, state.capabilities, state.settings.cwd, state.sessionId],
   );
 
   /* ---------------------------------------------------------------------- */
@@ -1347,6 +1371,30 @@ export function App({ launched }: AppProps): React.JSX.Element {
     ],
     [state.settings.cwd, state.sessionId],
   );
+
+  /**
+   * What `@` completes against: the files under the working directory, and
+   * what was picked before.
+   *
+   * Memoised on the directory, so moving — `/cwd`, or opening a session that
+   * ran somewhere else — hands the composer a different index and the listing
+   * is taken again. The promise is the cache: a second `@` joins the first
+   * listing rather than starting another, and a directory nobody names a file
+   * in is never listed at all, because the composer only asks once there is an
+   * `@` in the box.
+   */
+  const fileIndex = useMemo<FileIndex | undefined>(() => {
+    if (files === undefined) return undefined;
+    const where = state.settings.cwd;
+    let listing: Promise<readonly string[]> | undefined;
+    return {
+      list: () => {
+        listing ??= listFiles(where);
+        return listing;
+      },
+      frecency: files,
+    };
+  }, [files, state.settings.cwd]);
 
   /**
    * Put a conversation away, or take it back out.
@@ -1700,6 +1748,7 @@ export function App({ launched }: AppProps): React.JSX.Element {
               providerCommands={state.slashCommands}
               history={history}
               historyScopes={historyScopes}
+              {...(fileIndex === undefined ? {} : { fileIndex })}
               /*
                * ↑ on an empty box. The composer knows it is empty and the
                * conversation knows whether anything is waiting, so the
