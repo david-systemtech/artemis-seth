@@ -1472,15 +1472,23 @@ export function App({ launched }: AppProps): React.JSX.Element {
      * or Ctrl with an arrow moves half a screen; Esc, when nothing is
      * running, follows the end again. The sidebar owns the arrows while it
      * has focus.
+     *
+     * A *plain* arrow belongs to the composer while the composer has focus: it
+     * moves the cursor through what is being typed, and the presses that run
+     * off its first and last line come back here as `onArrowOverflow` below,
+     * which scrolls exactly as a plain arrow did. A modified arrow and the
+     * page keys are never the composer's, so they still move half a screen
+     * from wherever focus is.
      */
     if (!sidebarActive) {
       const half = Math.max(SCROLL_STEP, Math.floor(scrollExtent.current.viewportLines / 2));
-      if (key.upArrow || key.pageUp) {
-        scrollBy(key.pageUp || key.shift || key.ctrl ? half : SCROLL_STEP);
+      const bigStep = key.shift || key.ctrl;
+      if (key.pageUp || (key.upArrow && (bigStep || !composerActive))) {
+        scrollBy(key.pageUp || bigStep ? half : SCROLL_STEP);
         return;
       }
-      if (key.downArrow || key.pageDown) {
-        scrollBy(-(key.pageDown || key.shift || key.ctrl ? half : SCROLL_STEP));
+      if (key.pageDown || (key.downArrow && (bigStep || !composerActive))) {
+        scrollBy(-(key.pageDown || bigStep ? half : SCROLL_STEP));
         return;
       }
       if (key.end || (key.escape && scroll > 0 && !conversation.isLive)) {
@@ -1605,6 +1613,12 @@ export function App({ launched }: AppProps): React.JSX.Element {
               isActive={composerActive}
               attachments={pendingAttachments.map((entry) => entry.name)}
               providerCommands={state.slashCommands}
+              // An arrow the text had no use for — ↑ on its first line, ↓ on
+              // its last — scrolls the conversation, which is what a plain
+              // arrow has always done here.
+              onArrowOverflow={(direction) => {
+                scrollBy(direction === 'up' ? SCROLL_STEP : -SCROLL_STEP);
+              }}
               {...(notice === undefined ? {} : { notice })}
             />
             <StatusBar
