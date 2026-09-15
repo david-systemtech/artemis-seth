@@ -85,6 +85,7 @@ import { DelegatedStrip } from './components/Delegated.js';
 import { Header } from './components/Header.js';
 import { PermissionCard } from './components/PermissionCard.js';
 import { Picker, type PickerItem } from './components/Picker.js';
+import { QueuedStrip } from './components/QueuedStrip.js';
 import { Sidebar, railRows, type RailRow } from './components/Sidebar.js';
 import { basename } from 'node:path';
 import { homedir } from 'node:os';
@@ -172,7 +173,7 @@ const SCROLL_STEP = 2;
 const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 export function App({ launched }: AppProps): React.JSX.Element {
-  const { host, descriptors, cache, preferences } = launched;
+  const { host, descriptors, cache, preferences, history } = launched;
   const { exit } = useApp();
   const { columns, rows } = useTerminalSize();
 
@@ -1285,6 +1286,21 @@ export function App({ launched }: AppProps): React.JSX.Element {
       const attachments = pendingAttachments.map((entry) => entry.attachment);
       setPendingAttachments([]);
       setScroll(0);
+      /*
+       * Remembered here and not in `Conversation`, because what is remembered
+       * is what a person typed: this is every submission that leaves the
+       * composer as a message or a steer, and none of the slash commands the
+       * terminal answers itself — those returned above, and `/model` is not a
+       * prompt anybody wants Up to hand back. It is written down before the
+       * provider is asked, so a message the run refuses is still one keystroke
+       * from being retyped. Blank text and an immediate repeat are dropped by
+       * `history.ts`, which is where that rule belongs.
+       */
+      history.append({
+        text,
+        cwd: state.settings.cwd,
+        ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),
+      });
       void conversation.send(text, attachments).then((outcome) => {
         if (!outcome.ok) {
           setNotice(outcome.reason);
@@ -1293,7 +1309,7 @@ export function App({ launched }: AppProps): React.JSX.Element {
         }
       });
     },
-    [conversation, runCommand, pendingAttachments],
+    [conversation, runCommand, pendingAttachments, history, state.settings.cwd, state.sessionId],
   );
 
   /* ---------------------------------------------------------------------- */
@@ -1479,6 +1495,13 @@ export function App({ launched }: AppProps): React.JSX.Element {
      * which scrolls exactly as a plain arrow did. A modified arrow and the
      * page keys are never the composer's, so they still move half a screen
      * from wherever focus is.
+     *
+     * End is the same division: the composer takes it to the end of the line
+     * while it has focus — two owners for one key is how the cursor ended up
+     * jumping and the transcript snapping to the bottom on a single press —
+     * and it follows the end of the conversation only when the composer does
+     * not have the keys. Ctrl+End and Ctrl+Home are the composer's own
+     * buffer-start and buffer-end, so nothing here answers them.
      */
     if (!sidebarActive) {
       const half = Math.max(SCROLL_STEP, Math.floor(scrollExtent.current.viewportLines / 2));
@@ -1491,7 +1514,7 @@ export function App({ launched }: AppProps): React.JSX.Element {
         scrollBy(-(key.pageDown || bigStep ? half : SCROLL_STEP));
         return;
       }
-      if (key.end || (key.escape && scroll > 0 && !conversation.isLive)) {
+      if ((key.end && !composerActive) || (key.escape && scroll > 0 && !conversation.isLive)) {
         setScroll(0);
         return;
       }
@@ -1554,6 +1577,16 @@ export function App({ launched }: AppProps): React.JSX.Element {
            * this is the line above the composer either way.
            */}
           <DelegatedStrip tasks={state.tasks} columns={mainWidth} />
+
+          {/*
+           * Under the delegated strip, for the same reason and in the order
+           * the two answer: what the agent is doing, then what it has not read
+           * yet. Both are given the conversation's width rather than the
+           * terminal's — the rail is not theirs to draw over — and both
+           * disappear entirely when there is nothing to say, so a conversation
+           * that never steers is laid out as it always was.
+           */}
+          <QueuedStrip messages={state.queuedMessages} columns={mainWidth} />
 
           {pendingRequest !== undefined && modal === null && (
             <Box paddingX={1} flexShrink={0}>

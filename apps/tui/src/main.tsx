@@ -170,6 +170,7 @@ async function main(): Promise<number> {
   } finally {
     await launched.cache.flush();
     await launched.preferences.flush();
+    await launched.history.flush();
     await launched.host.dispose();
   }
 }
