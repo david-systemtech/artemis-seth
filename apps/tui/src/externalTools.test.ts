@@ -370,7 +370,9 @@ describe('isOnPath', () => {
     expect(isOnPath('bat', { PATH: bin }, 'linux')).toBe(false);
   });
 
-  it('does not count a file nobody can run', () => {
+  // Windows has no execute bit: `accessSync(X_OK)` there is `F_OK`, so the
+  // question has no answer on that host.
+  it.skipIf(process.platform === 'win32')('does not count a file nobody can run', () => {
     expect(isOnPath('notes.txt', { PATH: bin }, 'linux')).toBe(false);
   });
 

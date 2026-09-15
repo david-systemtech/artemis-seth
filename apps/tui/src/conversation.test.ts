@@ -1,3 +1,5 @@
+import { resolve } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 import type {
   AgentEvent,
@@ -1278,27 +1280,38 @@ describe('going back to an earlier prompt', () => {
  * a real one.
  */
 describe('Conversation: the change ledger', () => {
-  const disk = (): { readonly files: Map<string, string>; readonly deps: Partial<ChangeLedgerDeps> } => {
-    const files = new Map<string, string>();
+  /**
+   * A disk in a map, keyed by resolved path on both sides, so `/repo/a.ts`
+   * written by a test and `D:\\repo\\a.ts` read by the ledger on Windows are
+   * the same file.
+   */
+  const disk = (): { readonly files: { set(path: string, text: string): void; get(path: string): string | undefined }; readonly deps: Partial<ChangeLedgerDeps> } => {
+    const store = new Map<string, string>();
+    const files = {
+      set: (path: string, text: string): void => {
+        store.set(resolve(path), text);
+      },
+      get: (path: string): string | undefined => store.get(resolve(path)),
+    };
     const missing = (path: string): Error => Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
     return {
       files,
       deps: {
         readFile: async (path) => {
-          const text = files.get(path);
+          const text = store.get(resolve(path));
           if (text === undefined) throw missing(path);
           return text;
         },
         writeFile: async (path, text) => {
-          files.set(path, text);
+          store.set(resolve(path), text);
         },
         stat: async (path) => {
-          const text = files.get(path);
+          const text = store.get(resolve(path));
           if (text === undefined) throw missing(path);
           return { size: Buffer.byteLength(text, 'utf8') };
         },
         rm: async (path) => {
-          files.delete(path);
+          store.delete(resolve(path));
         },
         now: () => 0,
       },
@@ -1367,7 +1380,7 @@ describe('Conversation: the change ledger', () => {
     await call(driver, c, edit('t1', 'a.ts', 'one', 'two'), () => files.set('/repo/a.ts', 'two\n'));
 
     // Relative to the conversation's own cwd, which is the ledger's.
-    expect(c.changes.files()).toMatchObject([{ label: 'a.ts', path: '/repo/a.ts', edits: 1 }]);
+    expect(c.changes.files()).toMatchObject([{ label: 'a.ts', path: resolve('/repo/a.ts'), edits: 1 }]);
     expect(c.getState().filesChanged).toEqual({ files: 1, added: 1, removed: 1 });
     // And the bar was told: the fold publishes, so a summary that lands a disk
     // read after the event still reaches the screen.
@@ -1446,7 +1459,7 @@ describe('Conversation: the change ledger', () => {
     await call(driver, c, edit('t7', 'b.ts', 'old', 'new'), () => files.set('/elsewhere/b.ts', 'new\n'));
     // Resolved and labelled against the directory it is actually working in;
     // a path recorded against the old root would name a different file.
-    expect(c.changes.files()).toMatchObject([{ label: 'b.ts', path: '/elsewhere/b.ts' }]);
+    expect(c.changes.files()).toMatchObject([{ label: 'b.ts', path: resolve('/elsewhere/b.ts') }]);
   });
 
   it('recomputes the summary when a change is taken back', async () => {

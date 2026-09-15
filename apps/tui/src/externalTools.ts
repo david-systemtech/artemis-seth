@@ -67,7 +67,7 @@
 
 import { spawn as spawnProcess } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
-import { basename, delimiter, extname, join } from 'node:path';
+import { basename, extname, join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 
 import { splitCommand } from './externalEditor.js';
@@ -136,7 +136,9 @@ const DEFAULT_PATHEXT = '.COM;.EXE;.BAT;.CMD';
 export function isOnPath(command: string, env: NodeJS.ProcessEnv = process.env, platform: string = process.platform): boolean {
   const windows = platform === 'win32';
   const raw = env['PATH'] ?? env['Path'] ?? '';
-  const directories = raw.split(windows ? ';' : delimiter).filter((entry) => entry.length > 0);
+  // The separator follows the platform asked about, not the host's: a test
+  // on a Windows host asking about Linux must split on the colon.
+  const directories = raw.split(windows ? ';' : ':').filter((entry) => entry.length > 0);
   const extensions = windows && extname(command).length === 0 ? (env['PATHEXT'] ?? DEFAULT_PATHEXT).split(';').filter((entry) => entry.length > 0) : [''];
   for (const directory of directories) {
     for (const extension of extensions) {

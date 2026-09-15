@@ -26,7 +26,7 @@
 
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
@@ -66,7 +66,11 @@ async function tree(): Promise<string> {
   await mkdir(join(root, 'build', 'nested', 'deep'), { recursive: true });
   await mkdir(join(root, 'src'), { recursive: true });
   await mkdir(join(root, '.cache'), { recursive: true });
-  for (const path of ['build/a.js', 'build/b.js', 'build/nested/c.js', 'build/nested/deep/d.js', 'src/a.ts', 'src/b.ts', 'keep.txt', '.dotfile', '*']) {
+  // Windows cannot name a file `*`, so the tree has no such file there and the
+  // one test that needs it is skipped on that platform.
+  const names = ['build/a.js', 'build/b.js', 'build/nested/c.js', 'build/nested/deep/d.js', 'src/a.ts', 'src/b.ts', 'keep.txt', '.dotfile'];
+  if (process.platform !== 'win32') names.push('*');
+  for (const path of names) {
     await writeFile(join(root, path), 'x');
   }
   await writeFile(join(root, 'log.txt'), 'hello world');
@@ -102,12 +106,14 @@ function fakeDisk(directories: ReadonlyMap<string, readonly DirEntry[]>): BlastR
     execFile: async (file) => {
       throw new Error(`previewing rm must not run ${file}`);
     },
+    // Keys are resolved on both sides, so `/w` and `\\w` and `D:\\w` are one
+    // directory whatever the host's separator and drive letter make of them.
     readdir: async (path) => {
-      const entries = directories.get(path);
+      const entries = directories.get(resolve(path));
       if (entries === undefined) throw new Error(`not a directory: ${path}`);
       return entries;
     },
-    stat: async (path) => ({ size: 0, directory: directories.has(path) }),
+    stat: async (path) => ({ size: 0, directory: directories.has(resolve(path)) }),
     timeoutMs: BLAST_TIMEOUT_MS,
   };
 }
@@ -281,7 +287,7 @@ describe('previewing rm against a directory', () => {
     expect(await only('rm src/?.ts', root)).toMatchObject({ summary: '2 files' });
   });
 
-  it('leaves the dotfiles out of a bare star, and reads a quoted one as a filename', async () => {
+  it.skipIf(process.platform === 'win32')('leaves the dotfiles out of a bare star, and reads a quoted one as a filename', async () => {
     const root = await tree();
     const star = await only('rm -rf *', root);
     expect(star.summary).toBe('4 files and 2 directories (6 files inside)');
@@ -311,8 +317,8 @@ describe('previewing rm against a directory', () => {
 
   it('stops counting at the cap and says the count is a floor', async () => {
     const directories = new Map<string, readonly DirEntry[]>([
-      ['/w', [{ name: 'big', directory: true }]],
-      ['/w/big', Array.from({ length: MAX_ENTRIES + 500 }, (_, index) => ({ name: `f${String(index)}.txt`, directory: false }))],
+      [resolve('/w'), [{ name: 'big', directory: true }]],
+      [resolve('/w', 'big'), Array.from({ length: MAX_ENTRIES + 500 }, (_, index) => ({ name: `f${String(index)}.txt`, directory: false }))],
     ]);
     const preview = await only('rm -rf big', '/w', fakeDisk(directories));
     expect(preview.summary).toBe(`1 directory (${String(MAX_ENTRIES)}+ files inside)`);

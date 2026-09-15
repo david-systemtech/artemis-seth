@@ -8,6 +8,8 @@
  * the wrapping is the part that would quietly push a box wider than the rail.
  */
 
+import { join, resolve, sep } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 import { render } from 'ink-testing-library';
 import type { ProfileId, SessionId, SessionSummary } from '@rx-artemis/protocol';
@@ -25,13 +27,16 @@ function session(over: Partial<SessionSummary> & { id: string; cwd: string; upda
   } as SessionSummary;
 }
 
-const HOME = '/home/ada';
+// Built with the host's own separator and drive, so the shortening the test
+// asserts is the one the host would draw.
+const HOME = resolve('/home/ada');
+const SHORT = `~${sep}code${sep}api`;
 const minute = 60_000;
 
 const full = session({
   id: 's1',
   title: 'Rail filtering',
-  cwd: '/home/ada/code/api',
+  cwd: join(HOME, 'code', 'api'),
   updatedAt: Date.now() - minute,
   gitBranch: 'tui/overhaul',
   model: 'opus',
@@ -47,7 +52,7 @@ describe('previewLines', () => {
 
     expect(lines[0]).toEqual({ kind: 'title', text: 'Rail filtering' });
     expect(lines[1]?.text).toBe('1m ago · tui/overhaul · opus · 42 messages');
-    expect(texts(lines)).toContain('~/code/api');
+    expect(texts(lines)).toContain(SHORT);
   });
 
   it('leaves out what the provider never recorded, rather than printing a gap', () => {
@@ -110,7 +115,7 @@ describe('SessionPreview', () => {
 
     expect(frame).toContain('Rail filtering');
     expect(frame).toContain('tui/overhaul');
-    expect(frame).toContain('~/code/api');
+    expect(frame).toContain(SHORT);
     expect(frame).toContain('first prompt');
     expect(frame).toContain('Make the rail searchable');
   });
