@@ -485,9 +485,16 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
         </Block>
       );
     }
-    case 'command':
+    case 'command': {
+      /*
+       * `!git status` is not a slash command, and drawing it with a slash said
+       * it was — a row reading `/ git status` names a command the app does not
+       * have. The shell's own prompt character says where it ran, and the
+       * colour keeps it from reading as one more dim machinery line.
+       */
+      const shell = item.source === 'shell';
       return (
-        <Block marker="/" dim>
+        <Block marker={shell ? '$' : '/'} color={shell ? 'cyan' : undefined} dim={!shell}>
           <Text dimColor>
             {item.name}
             {item.args !== undefined ? ` ${item.args}` : ''}
@@ -499,6 +506,7 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
           )}
         </Block>
       );
+    }
     case 'run-end': {
       const tokens = totalInputTokens(item.usage?.tokens);
       const parts = [

@@ -312,7 +312,11 @@ function itemBlocks(item: TranscriptItem, withThinking: boolean, withOutput: boo
 
     case 'command': {
       const args = item.args === undefined || item.args.length === 0 ? '' : ` ${item.args}`;
-      const blocks: Block[] = [{ text: `- / ${item.name}${args}${item.failed === true ? ' — failed' : ''}` }];
+      // The shell's prompt character for a `!` line: exported as `/ git status`
+      // it reads as a slash command, and the document is read by people who
+      // would go looking for one.
+      const mark = item.source === 'shell' ? '$' : '/';
+      const blocks: Block[] = [{ text: `- ${mark} ${item.name}${args}${item.failed === true ? ' — failed' : ''}` }];
       if (withOutput && item.output !== undefined && item.output.trim().length > 0) {
         blocks.push({ text: fence(cap(item.output.split('\n')).join('\n')) });
       }

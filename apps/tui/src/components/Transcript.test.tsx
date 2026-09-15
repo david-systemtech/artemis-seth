@@ -326,3 +326,34 @@ describe('the width a row is drawn in', () => {
     expect(lastFrame() ?? '').toContain('+ const a = 1;');
   });
 });
+
+/**
+ * A `!` line ran in the shell, and the row says which.
+ *
+ * Every command row was drawn with a slash, so `!git status` came back as
+ * `/ git status` — a slash command the app has never had, sitting in the
+ * transcript next to the ones it does.
+ */
+describe('where a command ran', () => {
+  const markerOf = (frame: string, text: string): string | undefined =>
+    frame
+      .split('\n')
+      .find((line) => line.includes(text))
+      ?.trimStart()
+      .slice(0, 1);
+
+  it('gives the shell the prompt character and leaves the slash to slash commands', async () => {
+    const events = stream(
+      { type: 'command.run', command: { name: 'model', args: 'sonnet' } },
+      { type: 'command.run', source: 'shell', command: { name: 'git', args: 'status', output: 'nothing to commit' } },
+    );
+    const { lastFrame } = render(<ReplayRows events={events} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(markerOf(frame, 'git status')).toBe('$');
+    expect(markerOf(frame, 'model sonnet')).toBe('/');
+    // The output is drawn the same either way.
+    expect(frame).toContain('nothing to commit');
+  });
+});

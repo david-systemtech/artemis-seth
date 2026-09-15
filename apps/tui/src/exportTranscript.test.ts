@@ -244,12 +244,16 @@ describe('transcriptToMarkdown', () => {
       },
       { type: 'permission.resolved', requestId: 'r1', outcome: 'allowed' },
       { type: 'command.run', command: { name: 'model', args: 'sonnet', output: 'Model set to sonnet.' } },
+      { type: 'command.run', source: 'shell', command: { name: 'git', args: 'status' } },
       { type: 'run.end', reason: 'interrupted', durationMs: 2_000 },
     );
     const doc = transcriptToMarkdown(model);
 
     expect(doc).toContain('- ⚿ Bash — allowed');
     expect(doc).toContain('- / model sonnet');
+    // A `!` line ran in the shell; exported with a slash it reads as a command
+    // the app has, and the reader goes looking for one.
+    expect(doc).toContain('- $ git status');
     expect(doc).toContain(['```', 'Model set to sonnet.', '```'].join('\n'));
     expect(doc).toContain('_Interrupted · 2.0s_');
   });
