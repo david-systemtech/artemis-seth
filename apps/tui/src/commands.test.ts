@@ -98,12 +98,13 @@ describe('matchCommands', () => {
 
   it('ranks a whole name first, then an alias, then the provider', () => {
     const matched = matchCommands('/c', providers);
-    // `copy` and `cwd` by name, in the order they are declared; `continue`,
-    // `changes` and `clear` are aliases, again in the order the commands they
-    // mean are declared; `compact` is the provider's own, and `code-review`
-    // only matched a word inside its name.
+    // `copy`, `check` and `cwd` by name, in the order they are declared;
+    // `continue`, `changes` and `clear` are aliases, again in the order the
+    // commands they mean are declared; `compact` is the provider's own, and
+    // `code-review` only matched a word inside its name.
     expect(usages(matched)).toEqual([
       '/copy',
+      '/check [command|off|now]',
       '/cwd',
       '/resume',
       '/diff',
@@ -111,7 +112,7 @@ describe('matchCommands', () => {
       '/compact',
       '/artemis-skills:code-review',
     ]);
-    expect(matched.map((match) => match.rank)).toEqual([0, 0, 1, 1, 1, 3, 5]);
+    expect(matched.map((match) => match.rank)).toEqual([0, 0, 0, 1, 1, 1, 3, 5]);
   });
 
   it('matches a word inside a name, which is how a bridged skill is reachable', () => {
@@ -275,6 +276,47 @@ describe('the turn ledger, the card of asks, and the snippets', () => {
     expect(spec?.usage).toBe('/snip [name] [words]');
     expect(spec?.summary).toContain('save');
     expect(spec?.summary).toContain('--examples');
+  });
+});
+
+/*
+ * `/check`, whose three words are not subcommands to the parser.
+ *
+ * Everything after the name is one string, exactly as `/snip`'s is, and for a
+ * sharper reason: a check command is a shell line. `pnpm lint && pnpm test` has
+ * to arrive with its `&&`, and a parser that split on whitespace or recognised
+ * `off` as a token would be a parser deciding which shell lines are allowed.
+ */
+describe('/check', () => {
+  it('parses, and answers to the plural as well', () => {
+    expect(parseCommand('/check')).toEqual({ name: 'check', args: '' });
+    expect(parseCommand('/checks')).toEqual({ name: 'check', args: '' });
+    expect(parseCommand('/checks off')).toEqual({ name: 'check', args: 'off' });
+  });
+
+  it('hands the whole line over, shell operators and all', () => {
+    expect(parseCommand('/check pnpm lint && pnpm -w test')).toEqual({
+      name: 'check',
+      args: 'pnpm lint && pnpm -w test',
+    });
+    // The case of a command is the shell's business, not the parser's; only the
+    // word after the slash is folded.
+    expect(parseCommand('/CHECK Make Test')).toEqual({ name: 'check', args: 'Make Test' });
+    expect(parseCommand('/check now')).toEqual({ name: 'check', args: 'now' });
+  });
+
+  it('says in the menu that the bare command is the readout', () => {
+    const spec = COMMANDS.find((candidate) => candidate.name === 'check');
+    expect(spec?.usage).toBe('/check [command|off|now]');
+    expect(spec?.summary).toContain('after the agent edits');
+    expect(completeCommand('/chec').map((command) => command.name)).toEqual(['check']);
+  });
+
+  it('leaves the neighbours it starts like alone', () => {
+    // `/changes` is `/diff`'s alias and has to stay that way, and a provider's
+    // `/checkpoint` is the provider's.
+    expect(parseCommand('/changes')?.name).toBe('diff');
+    expect(parseCommand('/checkpoint')).toBeNull();
   });
 });
 

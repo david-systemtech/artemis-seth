@@ -30,6 +30,7 @@ export type CommandName =
   | 'export'
   | 'diff'
   | 'undo'
+  | 'check'
   | 'pin'
   | 'title'
   | 'asks'
@@ -66,6 +67,18 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: 'export', usage: '/export [file]', summary: 'Write this conversation to a markdown file' },
   { name: 'diff', usage: '/diff', summary: "What this conversation changed, and the working tree's diff" },
   { name: 'undo', usage: '/undo', summary: 'Take back the last file change the agent made' },
+  /*
+   * Beside `/diff` and `/undo` because it is the third command about the files
+   * a turn touched. The bracket says the same thing `/snip`'s does — the bare
+   * command is the readout, and the three words that are not a command follow
+   * it — because a usage that listed `off` and `now` as rows of their own would
+   * be three rows in the menu for one thing.
+   */
+  {
+    name: 'check',
+    usage: '/check [command|off|now]',
+    summary: "Run this project's own lint or tests after the agent edits",
+  },
   { name: 'pin', usage: '/pin', summary: 'Keep this conversation at the top of its folder' },
   { name: 'title', usage: '/title <name>', summary: 'Name this conversation' },
   { name: 'asks', usage: '/asks', summary: 'Every conversation waiting on a permission, answerable in one list' },
@@ -117,6 +130,8 @@ const ALIASES: Readonly<Record<string, CommandName>> = {
   revert: 'undo',
   rename: 'title',
   name: 'title',
+  // The plural, which is what the thing is called: nobody runs one check.
+  checks: 'check',
   // The three that landed with the ledger of turns, the card of asks, and the
   // snippets: the plural, the noun, and the word for what the list is.
   waiting: 'asks',

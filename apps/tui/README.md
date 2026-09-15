@@ -43,14 +43,16 @@ quit · `Ctrl+O` unfold the whole transcript · `Ctrl+T` show or hide the
 checklist · `Ctrl+]` go to the next conversation that needs you · `Alt+H` hand
 this conversation to another account · `?` open the key map.
 
-**Writing a message.** `Enter` send, steer a turn, or run the highlighted
-row · `Shift+Enter` / `Ctrl+J` a newline · a trailing `\` keeps the line open ·
+**Writing a message.** `Enter` send, steer a turn, run the highlighted row, or —
+on an empty box with a failed check on offer — send that failure to the agent ·
+`Shift+Enter` / `Ctrl+J` a newline · a trailing `\` keeps the line open ·
 `↑` / `↓` the text, then the queue, then history · `/` a command and its menu ·
 `@` a file and the paths that match · `;;` a saved snippet and the ones whose
 name matches · `Tab` fill in the highlighted row, or step to the next slot a
 snippet left empty, `Shift+Tab` back to the one before · `!` run a shell command
-(`!!` sends the output to the agent) · `Ctrl+V` paste an image, or the text on
-the clipboard · `Ctrl+G` edit the draft in `$EDITOR`.
+(`!!` sends the output to the agent) · `1`–`4` on an empty box take the
+numbered follow-up the last answer offered · `Ctrl+V` paste an image, or the
+text on the clipboard · `Ctrl+G` edit the draft in `$EDITOR`.
 
 **Moving and editing.** `Ctrl+A` / `Home` and `Ctrl+E` / `End` the line's
 ends · `Ctrl+Home` / `Ctrl+End` the buffer's · `Alt+B` / `Alt+F` a word back
@@ -138,6 +140,7 @@ turns its row amber and says how long it has been quiet.
 | `/export [file]` | Write this conversation to a markdown file |
 | `/diff` | What this conversation changed, and the working tree's diff |
 | `/undo` | Take back the last file change the agent made |
+| `/check [command\|off\|now]` | Run this project's own lint or tests after the agent edits |
 | `/pin` | Keep this conversation at the top of its folder |
 | `/title <name>` | Name this conversation |
 | `/asks` | Every conversation waiting on a permission, answerable in one list |
@@ -164,6 +167,22 @@ and the cursor lands in the first hole still empty with `Tab` and `Shift+Tab`
 walking the rest. `/snip save <name> <the template>` writes one — the name is
 the first word and everything after it is the body, line breaks and all — and
 `/snip --examples` copies in three to edit, since nothing ships with any.
+
+`/check pnpm -w test` sets what this folder runs after any turn that finished and
+edited a file — per directory, remembered between launches, and taken as typed so
+`pnpm lint && pnpm -w test` works. The command runs in the background with two
+minutes to answer, leaves the same `$` row in the transcript that `!` leaves, and
+says on the status line whether it passed. It never sends anything on its own: a
+failure is *offered*, and `Enter` on an empty box is what hands the output to the
+agent. The same failure twice in a row is offered once. `/check` alone says what
+is set, `/check off` clears it, and `/check now` runs it whatever the last turn
+did.
+
+When the agent offers follow-up work, its suggestions are numbered chips under
+the answer, and `1`–`4` put the numbered one in the composer and ask where to
+run it: here, or in a new conversation beside this one. A worktree and a server
+are listed and refused, with the reason — the desktop starts those; the terminal
+does not yet.
 
 ## From a script
 

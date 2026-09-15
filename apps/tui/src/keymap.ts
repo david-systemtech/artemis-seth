@@ -193,7 +193,14 @@ const GROUPS: readonly KeyGroup[] = [
     title: 'Writing a message',
     context: 'composer',
     keys: [
-      { keys: ['Enter'], does: 'Send it, steer a turn, run a row' },
+      /*
+       * The fourth thing Enter does at the box, and the one that needs saying:
+       * with a failed check on offer and nothing typed, it sends that failure
+       * to the agent. One row rather than two, because the rule here is one
+       * key one row per context, and because they are never true at once —
+       * with words in the box Enter sends the words.
+       */
+      { keys: ['Enter'], does: 'Send it, steer a turn, run a row, send a failed check' },
       { keys: ['Shift+Enter', 'Ctrl+J'], does: 'A newline instead of sending' },
       { keys: ['\\ Enter'], does: 'A backslash keeps the line open' },
       { keys: ['↑', '↓'], does: 'The text, then the queue, then history' },
@@ -220,6 +227,14 @@ const GROUPS: readonly KeyGroup[] = [
       { keys: ['!'], does: 'Run a shell command; !! sends the output' },
       { keys: ['Ctrl+V'], does: 'Paste an image, or the text there' },
       { keys: ['Ctrl+G'], does: 'Edit the draft in $EDITOR' },
+      /*
+       * The chips under an answer wear these numbers, and this is the other
+       * half of that: a number drawn on a chip has to name a key, or it is
+       * decoration. Only while the box is empty and only on the newest answer's
+       * offers — see `suggestions.ts` — so the digits are ordinary characters
+       * the rest of the time.
+       */
+      { keys: ['1–4'], does: 'Take one of the follow-ups the agent offered' },
     ],
   },
   {

@@ -141,6 +141,29 @@ describe('KEYMAP: the keys the terminal grew', () => {
     expect(inContext('anywhere').get('Shift+Tab')).toContain('permission mode');
   });
 
+  /*
+   * The digits are the whole of how a follow-up is taken, and the only surface
+   * that could teach them is a chip — which is drawn under an answer that has
+   * scrolled off by the time somebody wonders what the number was for. So the
+   * map is where the key lives, next to the other things an empty box answers.
+   */
+  it('writes down the digits that take a follow-up the agent offered', () => {
+    const composer = inContext('composer');
+    expect(composer.get('1–4')).toContain('follow-ups');
+  });
+
+  /*
+   * Enter's fourth reading. The rule here is one key, one row, per context, so
+   * the check that matters is that the row grew rather than that a second one
+   * appeared — a second row would have been caught by the clash test anyway,
+   * which is the point of having both.
+   */
+  it('folds the failed check into the row Enter already had', () => {
+    const does = inContext('composer').get('Enter') ?? '';
+    expect(does).toContain('Send it');
+    expect(does).toContain('check');
+  });
+
   it('gives a key that does two things one row that says both', () => {
     // Two rows for one key in one context is what the clash test forbids, and
     // rightly — but Ctrl+S really does two things, and a row naming only one

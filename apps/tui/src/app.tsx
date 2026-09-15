@@ -216,6 +216,7 @@ import { isArchived } from '@rx-artemis/protocol';
 import { browseRowLabel, browseRows, browseStart, recentDirectories, shortenPath } from './directories.js';
 import { needsYou, prunePool, railActivityFor, type Needing } from './pool.js';
 
+import { AfterEdit, AFTER_EDIT_TIMEOUT_MS, type AfterEditResult } from './afterEdit.js';
 import { attachmentFromBytes, readAttachment } from './attachments.js';
 import { awayRecap, noticeFor, titleStateOf, type RecapSubject, type RunEnded } from './attention.js';
 import { CATALOGUE_KEY, commandsKey, modelsKey, usageKey } from './cache.js';
@@ -256,6 +257,7 @@ import {
   type RowVerbKind,
 } from './rowVerbs.js';
 import { runShell } from './shell.js';
+import { suggestionsOf, SUGGESTION_DIGITS, type Suggestion } from './suggestions.js';
 import { timelineLines, timelineSummary, turnsOf } from './timeline.js';
 import { AttentionTimer, notify, progressState, setTitle, titleFor } from './terminal.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
@@ -770,6 +772,12 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       // left, and mean nothing in the one arriving.
       setCursorId(null);
       setExpanded(new Set());
+      // The same is true of a failed check: it is about the edits of a turn in
+      // the conversation being left, and Enter here now means what it means in
+      // the one arriving. What the checks *remember* is not cleared — that is
+      // "the same failure twice in a row", which is about the person and not
+      // about which transcript is on the screen.
+      setCheckOffer(null);
       const arrivingSession = next.getState().sessionId;
       composerRef.current?.setText(
         drafts.current.get(next) ?? (arrivingSession === undefined ? undefined : preferences.draftFor(arrivingSession)) ?? '',
@@ -877,6 +885,31 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
    */
   const bypassConfirmed = useRef(false);
 
+  /*
+   * The project's own checks, and the one failure that is on offer.
+   * ------------------------------------------------------------------------
+   *
+   * `afterEdit.ts` decides everything about *what is true* — whether a turn is
+   * one to check after, how long a command may run, what the agent is told, and
+   * whether a failure has been seen before. What is here is the three things it
+   * deliberately leaves out: which row the transcript gets, what the status line
+   * says, and which key sends the failure on.
+   *
+   * One instance for the process, in a ref like `attention` and for the same
+   * reason: the only thing it remembers is the last failure it offered, and that
+   * is a fact about the person sitting here rather than about a conversation.
+   *
+   * The offer is state and not a ref, because the status line's own words are
+   * what advertise the key — so a frame that has an offer and a frame that does
+   * not are two different frames. It is cleared in four places, each of which is
+   * a moment the failure has stopped being the thing in front of you: the next
+   * submission, an Esc, the start of another turn, and a switch to another
+   * conversation.
+   */
+  const checks = useRef<AfterEdit | null>(null);
+  checks.current ??= new AfterEdit();
+  const [checkOffer, setCheckOffer] = useState<AfterEditResult | null>(null);
+
   const pendingRequest = state.pendingPermissions[0];
   const workspace = basename(state.settings.cwd) || state.settings.cwd;
   const live = state.status !== 'idle';
@@ -911,6 +944,20 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   // person where they were.
   useEffect(() => {
     if (live) setScroll(0);
+  }, [live]);
+
+  /*
+   * A turn starting takes the failed check off the table.
+   *
+   * Whatever the agent has been asked to do next, it is not "here is what your
+   * last edits broke" — and Enter is the key that sends that, so leaving the
+   * offer up through a turn would leave one keystroke pointing at something
+   * stale. Watched on the status rather than on an event because there is no
+   * `run.start`: a run announces its end and nothing else, and a turn beginning
+   * is exactly this flag turning over.
+   */
+  useEffect(() => {
+    if (live) setCheckOffer(null);
   }, [live]);
 
   /* ---------------------------------------------------------------------- */
@@ -2107,6 +2154,118 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   );
 
   /**
+   * Run this directory's checks, and put what happened where it can be acted on.
+   *
+   * Three surfaces for one command, each answering a different question, which is
+   * why `afterEdit.ts` hands back a result and draws none of it.
+   *
+   *  - **The flash** answers "is something still running", so it stays up for as
+   *    long as the checks may. `AfterEdit` kills them at two minutes and says so;
+   *    a flash that expired first would leave the terminal looking idle while a
+   *    test suite was still going, which is the reading that gets a feature
+   *    switched off.
+   *  - **The row** answers "what did it say", and it is a `$` row rather than a
+   *    `/` one because that is what it is: a shell command this process ran, with
+   *    no model asked and nothing sampled. The ending line goes back on the end
+   *    of the output — `AfterEdit` lifted it out for the flash's sake, and the
+   *    row is meant to hold what the compiler wrote *and* how it finished.
+   *  - **The offer** answers "is this worth interrupting somebody for", and that
+   *    is `isNewFailure`'s to decide. It is asked of every result and not only of
+   *    the failures, because a pass is what ends a run of identical ones and that
+   *    is recorded there.
+   *
+   * The transcript is captured rather than looked up, so a check that outlives a
+   * switch still files its row in the conversation whose turn it was. The offer
+   * is the one thing held back in that case: Enter would send it wherever the
+   * person went instead.
+   */
+  const runChecks = useCallback(
+    async (command: string, cwd: string): Promise<void> => {
+      const engine = checks.current;
+      if (engine === null) return;
+      const owner = conversation;
+      showFlash(`checks: ${oneLine(command, 48)}`, AFTER_EDIT_TIMEOUT_MS);
+      const result = await engine.run(command, cwd);
+      // Split the way `runShellLine` splits a typed line: the first word is the
+      // name the row draws, the rest are its arguments.
+      const cut = command.search(/\s/u);
+      const args = cut === -1 ? undefined : command.slice(cut).trim();
+      const said = [result.output, result.exitLine ?? ''].filter((part) => part.length > 0).join('\n');
+      transcript.apply({
+        type: 'command.run',
+        // Not the provider's numbering, for {@link SHELL_RUN_ID}'s reason.
+        runId: SHELL_RUN_ID,
+        seq: 0,
+        ts: Date.now(),
+        command: {
+          name: cut === -1 ? command : command.slice(0, cut),
+          ...(args === undefined || args.length === 0 ? {} : { args }),
+          ...(said.length === 0 ? {} : { output: said }),
+          ...(result.ok ? {} : { failed: true }),
+        },
+        source: 'shell',
+      });
+      // A failure's summary names the key that sends it, and a key advertised
+      // for two seconds is not advertised; a pass has nothing to act on and
+      // keeps the ordinary window.
+      showFlash(engine.summarize(result), result.ok ? undefined : RECAP_FLASH_MS);
+      const worthOffering = engine.isNewFailure(result);
+      if (result.ok) setCheckOffer(null);
+      // Not cleared when the failure is a repeat: either it is the offer that is
+      // already standing, or it is one somebody has already sent, and both are
+      // cases where the right number of offers is the number there is now.
+      else if (worthOffering && conversationRef.current === owner) setCheckOffer(result);
+    },
+    [conversation, showFlash, transcript],
+  );
+
+  /*
+   * The turn that has just ended, and whether it is one to check after.
+   *
+   * A listener of its own rather than a line in either of the two further down:
+   * the failed-run one is about a light on the taskbar and the pooled one is
+   * about every conversation at once, while this is about the one on the screen
+   * and has to wait on a disk read before it can answer at all.
+   *
+   * Filtered to this conversation's *own* run, the way the pooled listener is: a
+   * conversation forwards its siblings' events too, and a delegated agent
+   * finishing is not the end of anybody's turn.
+   *
+   * The ledger is waited on first. It is fed from a handler that cannot wait for
+   * a read, so the count this is decided on would otherwise be missing the very
+   * last edit of the turn — the one most likely to be what broke something. What
+   * comes back is read off the live state and not off the render's snapshot,
+   * which is a frame old by then.
+   */
+  useEffect(() => {
+    let ownRun = conversation.getState().runId;
+    return conversation.subscribeEvents((event) => {
+      ownRun = conversation.getState().runId ?? ownRun;
+      if (event.type !== 'run.end' || event.runId !== ownRun) return;
+      // Asked here as well as in `shouldRun`, which would answer the same: the
+      // ledger read below is a wait, and there is nothing to learn from it about
+      // a turn whose reason has already ruled it out.
+      if (event.reason !== 'completed') return;
+      void (async () => {
+        await conversation.changesSettled();
+        const settled = conversation.getState();
+        // This conversation's directory, which is fixed for as long as it exists
+        // — a `/cwd` is a new conversation and not this one moved — so reading it
+        // here keeps `state` out of this effect's dependencies and out of its
+        // resubscriptions.
+        const cwd = settled.settings.cwd;
+        const command = preferences.afterEditFor(cwd);
+        const engine = checks.current;
+        // A narrowing, not a decision: whether nothing being set is a reason not
+        // to run is one of the three things `shouldRun` answers.
+        if (engine === null || command === undefined) return;
+        if (!engine.shouldRun({ editedFiles: settled.filesChanged?.files ?? 0, reason: event.reason, command })) return;
+        await runChecks(command, cwd);
+      })();
+    });
+  }, [conversation, preferences, runChecks]);
+
+  /**
    * Put text on the clipboard and say which of the two routes it took.
    *
    * "Copied" and "sent to the terminal" are different promises and the flash
@@ -2777,6 +2936,62 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
    */
   const handOffAgain = useRef<() => void>(() => undefined);
 
+  /**
+   * `/check` — read back this folder's checks, set them, switch them off, or run
+   * them now.
+   *
+   * Per directory and not per conversation, because it is a fact about a project:
+   * `pnpm -w test` is the answer for this checkout however many conversations are
+   * open in it, and somebody who set it last week is owed it today. The store is
+   * `preferences.ts`, keyed by the resolved path.
+   *
+   * The command is taken exactly as it was typed, pipes and `&&` and all: it goes
+   * to a shell, so anything a shell understands is a legal answer and a terminal
+   * that tried to validate it would only be wrong about somebody's `just`
+   * recipe.
+   *
+   * Everything but the bare readout forgets the last failure first. All three are
+   * moments where "the same failure twice in a row" has stopped being true
+   * without a check having passed — the command changed, it was switched off, or
+   * it was asked for by hand — and asking by hand is asking for the answer, not
+   * for silence because the answer has not changed since last time.
+   */
+  const runCheckCommand = useCallback(
+    (args: string) => {
+      const cwd = state.settings.cwd;
+      const engine = checks.current;
+      if (args.length === 0) {
+        const current = preferences.afterEditFor(cwd);
+        setNotice(current === undefined ? 'no check set for this folder' : `checks after edits: ${current}`);
+        return;
+      }
+      if (args === 'off') {
+        preferences.setAfterEdit(cwd, undefined);
+        engine?.forget();
+        // The offer is about a check that no longer runs here.
+        setCheckOffer(null);
+        showFlash('no checks after edits');
+        return;
+      }
+      if (args === 'now') {
+        const current = preferences.afterEditFor(cwd);
+        engine?.forget();
+        if (current === undefined) {
+          setNotice('no check set for this folder · /check <command> sets one');
+          return;
+        }
+        // Regardless of `shouldRun`, which is the rule for what is worth doing
+        // unasked. This was asked for, so an untouched turn is not a reason.
+        void runChecks(current, cwd);
+        return;
+      }
+      preferences.setAfterEdit(cwd, args);
+      engine?.forget();
+      showFlash(`checks after edits: ${args}`);
+    },
+    [state.settings.cwd, preferences, showFlash, runChecks],
+  );
+
   const runCommand = useCallback(
     (command: Command) => {
       switch (command.name) {
@@ -2799,7 +3014,13 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
           return;
         }
         case 'cwd':
+          // Another folder is another project with checks of its own, so what
+          // failed last is no longer a thing that could fail again in a row.
+          checks.current?.forget();
           openDirectoryPicker();
+          return;
+        case 'check':
+          runCheckCommand(command.args);
           return;
         case 'quit':
           exit();
@@ -2912,6 +3133,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       openAsksCard,
       openTimelinePicker,
       runSnip,
+      runCheckCommand,
       confirm,
       applyMode,
     ],
@@ -2920,6 +3142,14 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   const submit = useCallback(
     (text: string, mentions: readonly string[] = [], images: readonly PastedImage[] = []) => {
       setNotice(undefined);
+      /*
+       * Whatever is being sent, the failed check is no longer the thing Enter
+       * means — including when it is the hand-over itself, which is sent once
+       * and would otherwise be one keystroke from being sent twice. Cleared here
+       * rather than at the key so that every door into the composer's Enter goes
+       * through one line: a message, a steer, a slash command, a snippet.
+       */
+      setCheckOffer(null);
       const command = parseCommand(text);
       if (command !== null) {
         runCommand(command);
@@ -4165,6 +4395,102 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     });
   }, [conversation, openPicker, showFlash]);
 
+  /* ---------------------------------------------------------------------- */
+  /* The follow-ups the agent offered                                        */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * What is on offer, and whether the digits are bound to it.
+   *
+   * Read out of the transcript on every change to its list rather than kept
+   * anywhere. `suggestions.ts` stores nothing, files nothing and is told nothing
+   * — an offer *is* the tool call that made it — which is why a reopened
+   * conversation's chips come back without a line of code to restore them, and
+   * why this is a memo over the id list rather than a subscription of its own.
+   *
+   * One boolean for the keys and for the chips both. The number a reader sees and
+   * the digit the app binds are meant to be one calculation; two booleans would
+   * be two, and a chip advertising a key the app had quietly stood down is the
+   * single bug this feature can have. A running turn takes them away because the
+   * offers belong to the answer above the prompt that has just replaced them, and
+   * a modal because a digit in a list is a filter.
+   */
+  const items = useSyncExternalStore(transcript.subscribeList, transcript.getListSnapshot);
+  // `items` is the trigger and not the argument: the list changing is what makes
+  // the answer stale, and `suggestionsOf` reads the model itself.
+  const offers = useMemo(() => suggestionsOf(transcript), [transcript, items]);
+  const digitsBound = offers.length > 0 && !conversation.isLive && modal === null;
+
+  /**
+   * Take one: the prompt goes in the box, and a list asks where to run it.
+   *
+   * The prompt is in the composer before the list opens, which is what makes
+   * `here` a row with nothing left to do and Esc lossless — whatever is chosen,
+   * or nothing is, the words are where they can be read, edited and sent. A digit
+   * never sends: an offer the agent made is still a message the person sends.
+   *
+   * Two of the four rows are shown and refused, which is this codebase's rule for
+   * a target that exists and cannot be reached from here — the desktop splits a
+   * worktree and opens a server column, the terminal does not yet — because a row
+   * that was hidden instead would read as a thing Artemis cannot do. Each says
+   * which of the two it is, since "not set up" is something the reader can fix
+   * and "not built here" is not.
+   */
+  const takeSuggestion = useCallback(
+    (offer: Suggestion) => {
+      composerRef.current?.setText(offer.prompt);
+      setFocus('composer');
+      const settings = state.settings;
+      void (async () => {
+        // Asked rather than taken from `projectRoots`, which folds a directory
+        // that is in no repository onto itself and so cannot tell "no
+        // repository" from "its own root".
+        const described = await describeWorkspace(settings.cwd).catch(() => undefined);
+        // A server is an `artemis` account and nothing else: the terminal keeps
+        // no address of its own, and an account is what the desktop reads for the
+        // same row. `accounts` is already the enabled ones.
+        const hasServer = accounts.some((account) => account.providerId === 'artemis');
+        openPicker({
+          title: 'Run it',
+          items: [
+            { key: 'here', label: 'here', detail: 'the prompt is in the box, to send or to edit' },
+            { key: 'session', label: 'in a new conversation', detail: 'beside this one, in the same folder' },
+            {
+              key: 'worktree',
+              label: 'in a worktree',
+              disabled: true,
+              reason:
+                described?.repoRoot === undefined ? 'not in a git repository' : 'the terminal cannot open a worktree yet',
+            },
+            {
+              key: 'server',
+              label: 'on a server',
+              disabled: true,
+              reason: hasServer ? 'the terminal cannot open one there yet' : 'no server configured',
+            },
+          ],
+          hint: PICKER_KEYS,
+          onSelect: (item) => {
+            setModal(null);
+            if (item.key !== 'session') return;
+            /*
+             * The shape `startFreshOn` uses, less the briefing: a conversation of
+             * its own, switched to, and the prompt sent on it rather than left in
+             * the box. Sent on `next` and not through `submit`, because `submit`
+             * is about whatever is on the screen and on this frame that is still
+             * the conversation being left — which keeps the prompt as its draft,
+             * where it was typed and where going back finds it again.
+             */
+            const next = makeConversation(settings);
+            switchTo(next);
+            void next.send(offer.prompt);
+          },
+        });
+      })();
+    },
+    [state.settings, accounts, openPicker, makeConversation, switchTo],
+  );
+
   useInput((input, key) => {
     /*
      * Somebody is here. Every press pushes both bells back out to their full
@@ -4333,6 +4659,62 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       // box competing for the rows the map is already using.
       setPreview(null);
       setModal({ kind: 'help' });
+      return;
+    }
+
+    /*
+     * 1–4 take one of the follow-ups the agent offered.
+     *
+     * Guarded on the same boolean the chips are numbered from, so a digit cannot
+     * come to mean a different task from the one whose number is drawn on the
+     * screen — and only from an empty box, because the rest of the time these are
+     * four ordinary characters somebody is typing into a message.
+     *
+     * The composer will already have put the digit in the box by the time this
+     * runs: Ink gives the press to both handlers, the child's first, and there is
+     * no way to stand one of them down. `setText` replaces the whole buffer
+     * through the editor's own undo, so the digit goes and the prompt arrives on
+     * one keystroke that is still one Ctrl+_ from being taken back.
+     */
+    if (
+      digitsBound &&
+      composerActive &&
+      // A chorded digit is somebody else's key — nothing here claims one, and a
+      // Ctrl+1 that started a task would be a binding the map does not promise.
+      !key.ctrl &&
+      !key.meta &&
+      composerRef.current?.isCapturing() !== true &&
+      composerRef.current?.getText() === ''
+    ) {
+      const chosen = offers.find((offer) => offer.index <= SUGGESTION_DIGITS && String(offer.index) === input);
+      if (chosen !== undefined) {
+        takeSuggestion(chosen);
+        return;
+      }
+    }
+
+    /*
+     * Enter sends a failed check to the agent.
+     *
+     * One owner for the key and not two: the composer answers Enter whenever
+     * there is anything to send and declines on an empty box with nothing
+     * queued, so the press only gets this far when there is nothing else it
+     * could have meant. An attachment waiting counts as something to send —
+     * Enter is how it goes — so the offer waits its turn.
+     *
+     * `submit` is what clears it, along with every other way of sending
+     * something; see the line at the top of it.
+     */
+    if (
+      key.return &&
+      composerActive &&
+      checkOffer !== null &&
+      pendingAttachments.length === 0 &&
+      composerRef.current?.isCapturing() !== true &&
+      composerRef.current?.getText() === ''
+    ) {
+      const engine = checks.current;
+      if (engine !== null) submit(engine.handOff(checkOffer));
       return;
     }
 
@@ -4618,6 +5000,24 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     }
 
     if (!key.escape) return;
+
+    /*
+     * An Esc that has got this far puts the failed check away as well.
+     *
+     * Esc is this terminal's word for "not that", and of everything it already
+     * means the offer is the one thing no other key can decline. It rides along
+     * rather than claiming the press, because whatever this Esc is about to do —
+     * interrupt the turn, arm the second Esc — is still true on the same
+     * keystroke, and an offer that had to be dismissed before the turn could be
+     * interrupted would be a key somebody pressed twice for one thing.
+     *
+     * Here and not at the top of the handler, so the Escs that belong to another
+     * surface leave it alone: closing a search, leaving the rail, or following
+     * the end of a conversation that was scrolled back are none of them an answer
+     * to what the checks found.
+     */
+    setCheckOffer(null);
+
     if (conversation.isLive) {
       void conversation.interrupt();
       return;
@@ -4748,6 +5148,13 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
              * size, which is what most terminals will go on getting.
              */
             imageProtocol={imageProtocol()}
+            /*
+             * Whether the chips under an answer wear their numbers. The same
+             * boolean the keys are guarded on, for the reason it is computed
+             * once: a number on a chip is a promise about a key, and the two
+             * must not be able to disagree. See `suggestions.ts`.
+             */
+            suggestionDigits={digitsBound}
           />
 
           {/*
