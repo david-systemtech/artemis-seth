@@ -20,6 +20,15 @@
  * same keystroke. Esc, Ctrl+C and the scrolling arrows are handled globally
  * only when no modal owns them.
  *
+ * Three of the composer's keys need something only this file has, so they
+ * arrive as props and the composer stays a box of text. Ctrl+G hands the whole
+ * terminal to `$EDITOR` and takes it back, which is Ink's instance and nobody
+ * else's — see `editExternally`. `!` turns the box into a shell prompt and its
+ * lines are run by `shell.ts`, landing either as a command row in the
+ * transcript or, for `!!`, as a message the agent is asked about. Ctrl+V's
+ * images come back through `onSubmit`'s third argument and become attachments
+ * beside the `@paths`.
+ *
  * Slash commands are parsed before anything is sent. The switchers and
  * viewers are pickers over data the host already knows how to fetch:
  *
@@ -71,18 +80,20 @@ import { isArchived } from '@rx-artemis/protocol';
 import { browseRowLabel, browseRows, browseStart, recentDirectories, shortenPath } from './directories.js';
 import { prunePool, railActivityFor } from './pool.js';
 
-import { readAttachment } from './attachments.js';
+import { attachmentFromBytes, readAttachment } from './attachments.js';
 import { CATALOGUE_KEY, commandsKey, modelsKey, usageKey } from './cache.js';
 import { checkForUpdate, currentVersion, installRoot } from './update.js';
 import { COMMANDS, parseCommand, type Command } from './commands.js';
 import { Conversation, type ConversationSettings } from './conversation.js';
+import { editInExternalEditor, type ExternalEditResult } from './externalEditor.js';
 import { listFiles, type Frecency } from './fileIndex.js';
 import type { HistoryScope } from './history.js';
 import type { Launched } from './launch.js';
 import type { ModelListing } from './host.js';
+import { runShell } from './shell.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
 import { ACCENT } from './theme.js';
-import { Composer, type ComposerHandle, type FileIndex } from './components/Composer.js';
+import { Composer, type ComposerHandle, type FileIndex, type PastedImage } from './components/Composer.js';
 import { DelegatedStrip } from './components/Delegated.js';
 import { Header } from './components/Header.js';
 import { PermissionCard } from './components/PermissionCard.js';
@@ -178,12 +189,20 @@ const SIDEBAR_WIDTH = 32;
 const TALL_HEADER_MIN_ROWS = 24;
 /** Lines one arrow press scrolls — a wheel tick arrives as a few of these. */
 const SCROLL_STEP = 2;
+/**
+ * The run a `!` command's transcript row belongs to: none of them.
+ *
+ * `apply` counts sequence numbers per run to notice events dropped in transit.
+ * A row written here has nothing to do with the provider's stream, so it gets a
+ * run of its own and never disturbs that count.
+ */
+const SHELL_RUN_ID = 'local-shell';
 
 const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 export function App({ launched, files }: AppProps): React.JSX.Element {
   const { host, descriptors, cache, preferences, history } = launched;
-  const { exit } = useApp();
+  const { exit, suspendTerminal } = useApp();
   const { columns, rows } = useTerminalSize();
 
   /**
@@ -1287,16 +1306,36 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   );
 
   const submit = useCallback(
-    (text: string, mentions: readonly string[] = []) => {
+    (text: string, mentions: readonly string[] = [], images: readonly PastedImage[] = []) => {
       setNotice(undefined);
       const command = parseCommand(text);
       if (command !== null) {
         runCommand(command);
         return;
       }
-      const attachments = pendingAttachments.map((entry) => entry.attachment);
+      /*
+       * An image pasted into the box with Ctrl+V. There is no file for it —
+       * the bytes came off the clipboard — so `attachments.ts` builds the same
+       * `Attachment` from what is in hand. A provider that cannot take images
+       * gets none, and says so rather than dropping one silently; the `[Image
+       * #1]` left in the text is still where it was meant.
+       */
+      const pasted = state.capabilities.imageInput
+        ? images.flatMap((image) => {
+            const attachment = attachmentFromBytes(image.name, image.mediaType, image.bytes);
+            return attachment === null ? [] : [attachment];
+          })
+        : [];
+      const attachments = [...pendingAttachments.map((entry) => entry.attachment), ...pasted];
       setPendingAttachments([]);
       setScroll(0);
+      if (pasted.length < images.length) {
+        setNotice(
+          state.capabilities.imageInput
+            ? 'A pasted image was too large to send.'
+            : `${state.settings.providerLabel} cannot take images.`,
+        );
+      }
       /*
        * Remembered here and not in `Conversation`, because what is remembered
        * is what a person typed: this is every submission that leaves the
@@ -1337,7 +1376,114 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         }
       })();
     },
-    [conversation, runCommand, pendingAttachments, history, state.capabilities, state.settings.cwd, state.sessionId],
+    [
+      conversation,
+      runCommand,
+      pendingAttachments,
+      history,
+      state.capabilities,
+      state.settings.cwd,
+      state.settings.providerLabel,
+      state.sessionId,
+    ],
+  );
+
+  /* ---------------------------------------------------------------------- */
+  /* The terminal, lent out                                                  */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Hand the whole terminal to `$EDITOR`, and take it back.
+   *
+   * Two programs cannot own one terminal: `vim` wants the alternate screen,
+   * raw mode and standard input, and Ink is holding all three. Ink 7 knows
+   * this and does the entire dance behind `useApp().suspendTerminal` — it
+   * flushes whatever render is pending, erases its own frame, turns off the
+   * kitty protocol it may have negotiated, writes `\x1b[?1049l` to leave the
+   * alternate screen, and drops raw mode and bracketed paste; on the way back
+   * it re-enters the alternate screen, re-enables the protocol, retakes raw
+   * mode, throws away the frame it diffs against and forces a full redraw. Ink
+   * restores all of it even when the callback throws, which is the reason to
+   * use it rather than to write the escapes out here: a half-suspended
+   * terminal is a dead prompt, and there is no key left to fix it with.
+   *
+   * What it cannot do is prove anything about a real terminal from a test —
+   * the whole sequence is writes to a TTY and reads from one. See the report:
+   * the escape sequences and the order are Ink's, verified by reading it; what
+   * `$EDITOR` looks like on the way in and out has to be tried by hand.
+   */
+  const editExternally = useCallback(
+    async (text: string): Promise<string | undefined> => {
+      let result: ExternalEditResult | undefined;
+      try {
+        await suspendTerminal(async () => {
+          result = await editInExternalEditor(text);
+        });
+      } catch (error) {
+        setNotice(`Could not hand over the terminal: ${describeError(error)}`);
+        return undefined;
+      }
+      if (result === undefined) return undefined;
+      if (!result.ok) {
+        setNotice(`Could not edit the message: ${result.reason}`);
+        return undefined;
+      }
+      return result.text;
+    },
+    [suspendTerminal],
+  );
+
+  /**
+   * A line typed at the composer's `$`.
+   *
+   * The rules of running it are `shell.ts`'s; what is here is the two things
+   * that can be done with the answer. `!cmd` puts it in the transcript as a
+   * command row — the same row a provider's own slash command gets, because
+   * this is the same kind of thing: the host did it, and no model was asked.
+   * `!!cmd` hands it to the agent as a message instead, fenced, with the
+   * command named above it, which is the short way to ask "why does this say
+   * that" about something that just happened.
+   *
+   * The line is written to the prompt history with its `!` in front, which is
+   * the whole of what makes ↑ at the `$` a shell history: one file, and a
+   * prefix that says which list an entry belongs to.
+   */
+  const runShellLine = useCallback(
+    (command: string, options: { readonly send: boolean }) => {
+      const cwd = state.settings.cwd;
+      history.append({
+        text: `!${options.send ? '!' : ''}${command}`,
+        cwd,
+        ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),
+      });
+      setFlash(`running: ${oneLine(command, 48)}`);
+      setScroll(0);
+      void (async () => {
+        const result = await runShell(command, cwd);
+        setFlash(undefined);
+        if (options.send) {
+          submit(`Ran \`${command}\`:\n\`\`\`\n${result.output}\n\`\`\``);
+          return;
+        }
+        const cut = command.search(/\s/u);
+        const args = cut === -1 ? undefined : command.slice(cut).trim();
+        transcript.apply({
+          type: 'command.run',
+          // Not a run: the seq counter belongs to the provider's stream, and a
+          // run id of its own is what keeps this out of that numbering.
+          runId: SHELL_RUN_ID,
+          seq: 0,
+          ts: Date.now(),
+          command: {
+            name: cut === -1 ? command : command.slice(0, cut),
+            ...(args === undefined || args.length === 0 ? {} : { args }),
+            ...(result.output.length === 0 ? {} : { output: result.output }),
+            ...(result.failed ? { failed: true } : {}),
+          },
+        });
+      })();
+    },
+    [history, state.settings.cwd, state.sessionId, submit, transcript],
   );
 
   /* ---------------------------------------------------------------------- */
@@ -1765,6 +1911,11 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
               onArrowOverflow={(direction) => {
                 scrollBy(direction === 'up' ? SCROLL_STEP : -SCROLL_STEP);
               }}
+              // Ctrl+G and `!`. Both leave the composer knowing nothing about
+              // a terminal or a child process: one is a promise of text, the
+              // other a command and a flag.
+              onExternalEdit={editExternally}
+              onShell={runShellLine}
               {...(notice === undefined ? {} : { notice })}
             />
             <StatusBar

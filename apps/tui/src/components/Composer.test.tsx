@@ -3,7 +3,14 @@ import { describe, expect, it, vi } from 'vitest';
 import { render } from 'ink-testing-library';
 
 import type { HistoryScope } from '../history.js';
-import { Composer, type ComposerHandle, type FileIndex, type HistoryLookup } from './Composer.js';
+import {
+  Composer,
+  type ComposerClipboard,
+  type ComposerHandle,
+  type FileIndex,
+  type HistoryLookup,
+  type PastedImage,
+} from './Composer.js';
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 30));
 
@@ -837,5 +844,366 @@ describe('Composer: naming a file with @', () => {
     expect(rowsOf(lastFrame())[row]).toContain('shot.png');
     expect(rowsOf(lastFrame())[row]).toContain(COMPOSER_PATH);
     expect(rowsOf(lastFrame())[row]).toContain('goes with the next message');
+  });
+});
+
+/*
+ * The last of the box: what a paste turns into, what the clipboard puts in it,
+ * where Ctrl+G sends it, what Ctrl+S sets aside, and the shell behind `!`.
+ *
+ * Every outside thing is a fake — a clipboard that is two functions, an editor
+ * that is a promise, a shell that is a spy — so nothing is spawned, nothing is
+ * read off a real desktop, and each test is about which keystroke means what.
+ */
+const CTRL_V = '\u0016';
+const CTRL_G = '\u0007';
+
+/** What a terminal with bracketed paste sends around pasted text. */
+const pasted = (text: string): string => `\u001B[200~${text}\u001B[201~`;
+
+const LONG_PASTE = Array.from({ length: 12 }, (_, i) => `line ${String(i + 1)}`).join('\n');
+
+/** PNG bytes only by their signature, which is all `readClipboardImage` promises. */
+const PNG = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02);
+
+const fakeClipboard = (contents: { readonly image?: Uint8Array; readonly text?: string }): ComposerClipboard => ({
+  readImage: () =>
+    Promise.resolve(contents.image === undefined ? null : ({ bytes: contents.image, mediaType: 'image/png' } as const)),
+  readText: () => Promise.resolve(contents.text ?? null),
+});
+
+describe('Composer: a big paste is a chip', () => {
+  it('stands in for a long paste, and sends what it stood for', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, 'look at ', pasted(LONG_PASTE));
+
+    expect(lastFrame()).toContain('[Pasted #1 · 12 lines]');
+    expect(lastFrame()).not.toContain('line 7');
+
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith(`look at ${LONG_PASTE}`, []);
+  });
+
+  it('leaves a short paste as the words it is', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, pasted('one\ntwo'));
+    expect(lastFrame()).toContain('one');
+    expect(lastFrame()).not.toContain('Pasted #');
+
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('one\ntwo', []);
+  });
+
+  it('a very long single line is a chip too', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, pasted('x'.repeat(900)));
+    expect(lastFrame()).toContain('[Pasted #1 · 1 line]');
+  });
+
+  it('numbers them up, and expands every one on send', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, pasted(LONG_PASTE), ' and ', pasted('a\nb\nc\nd\ne'));
+
+    expect(lastFrame()).toContain('[Pasted #1 · 12 lines]');
+    expect(lastFrame()).toContain('[Pasted #2 · 5 lines]');
+
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith(`${LONG_PASTE} and a\nb\nc\nd\ne`, []);
+  });
+
+  it('Backspace takes a chip whole, and the letter before it on the next press', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, 'see', pasted(LONG_PASTE));
+    expect(lastFrame()).toContain('[Pasted #1');
+
+    await press(stdin, BACKSPACE);
+    expect(lastFrame()).not.toContain('Pasted #');
+    expect(lastFrame()).toContain('see');
+
+    await press(stdin, BACKSPACE);
+    expect(lastFrame()).toContain('se');
+    expect(lastFrame()).not.toContain('see');
+  });
+
+  it('a chip rubbed out does not travel, and the next one takes a fresh number', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, pasted(LONG_PASTE), BACKSPACE, 'never mind: ', pasted('a\nb\nc\nd'));
+
+    expect(lastFrame()).toContain('[Pasted #2 · 4 lines]');
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('never mind: a\nb\nc\nd', []);
+  });
+
+  it('starts again at one once the message has gone', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, pasted(LONG_PASTE), ENTER);
+    await press(stdin, pasted(LONG_PASTE));
+    expect(lastFrame()).toContain('[Pasted #1');
+  });
+
+  it('a terminal that did not say it was a paste still just types it', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, LONG_PASTE);
+    expect(lastFrame()).not.toContain('Pasted #');
+    expect(lastFrame()).toContain('line 12');
+  });
+});
+
+describe('Composer: Ctrl+V', () => {
+  it('puts an image chip in the text and hands the image over on send', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit, clipboard: fakeClipboard({ image: PNG }) });
+    await tick();
+    await press(stdin, 'what is wrong with ', CTRL_V);
+    await tick();
+
+    expect(lastFrame()).toContain('[Image #1]');
+
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith(
+      'what is wrong with [Image #1]',
+      [],
+      [{ name: 'clipboard-1.png', mediaType: 'image/png', bytes: PNG }],
+    );
+  });
+
+  it('numbers a second image up and sends both', async () => {
+    const onSubmit = vi.fn<(text: string, mentions: readonly string[], images?: readonly PastedImage[]) => void>();
+    const { lastFrame, stdin } = composer({ onSubmit, clipboard: fakeClipboard({ image: PNG }) });
+    await tick();
+    await press(stdin, CTRL_V);
+    await tick();
+    await press(stdin, ' then ', CTRL_V);
+    await tick();
+    expect(lastFrame()).toContain('[Image #1]');
+    expect(lastFrame()).toContain('[Image #2]');
+
+    await press(stdin, ENTER);
+    expect(onSubmit.mock.calls[0]?.[2]?.map((image) => image.name)).toEqual(['clipboard-1.png', 'clipboard-2.png']);
+  });
+
+  it('an image chip rubbed out does not travel', async () => {
+    const onSubmit = vi.fn();
+    const { stdin } = composer({ onSubmit, clipboard: fakeClipboard({ image: PNG }) });
+    await tick();
+    await press(stdin, CTRL_V);
+    await tick();
+    await press(stdin, BACKSPACE, 'never mind', ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('never mind', []);
+  });
+
+  it('falls back to the text on the clipboard, chip and all', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit, clipboard: fakeClipboard({ text: LONG_PASTE }) });
+    await tick();
+    await press(stdin, CTRL_V);
+    await tick();
+    expect(lastFrame()).toContain('[Pasted #1 · 12 lines]');
+
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith(LONG_PASTE, []);
+  });
+
+  it('short text off the clipboard is just typed', async () => {
+    const { lastFrame, stdin } = composer({ clipboard: fakeClipboard({ text: 'git bisect' }) });
+    await tick();
+    await press(stdin, CTRL_V);
+    await tick();
+    expect(lastFrame()).toContain('git bisect');
+  });
+
+  it('says so when there is nothing on it', async () => {
+    const { lastFrame, stdin } = composer({ clipboard: fakeClipboard({}) });
+    await tick();
+    await press(stdin, CTRL_V);
+    await tick();
+    expect(lastFrame()).toContain('no image on the clipboard');
+  });
+});
+
+describe('Composer: Ctrl+G', () => {
+  it('sends the draft out and takes the edited text back', async () => {
+    const onExternalEdit = vi.fn<(text: string) => Promise<string | undefined>>(() =>
+      Promise.resolve('what the editor saved'),
+    );
+    const { lastFrame, stdin } = composer({ onExternalEdit });
+    await tick();
+    await press(stdin, 'half a thought', CTRL_G);
+    await tick();
+
+    expect(onExternalEdit).toHaveBeenCalledWith('half a thought');
+    expect(lastFrame()).toContain('what the editor saved');
+    expect(lastFrame()).not.toContain('half a thought');
+  });
+
+  it('is how the content of a chip is read: it goes out expanded', async () => {
+    const onExternalEdit = vi.fn<(text: string) => Promise<string | undefined>>((text) => Promise.resolve(text));
+    const { lastFrame, stdin } = composer({ onExternalEdit });
+    await tick();
+    await press(stdin, pasted(LONG_PASTE), CTRL_G);
+    await tick();
+
+    expect(onExternalEdit).toHaveBeenCalledWith(LONG_PASTE);
+    // And what came back is the text itself, so there is no chip left over.
+    expect(lastFrame()).not.toContain('Pasted #');
+    expect(lastFrame()).toContain('line 12');
+  });
+
+  it('an abandoned edit leaves the draft alone', async () => {
+    const onExternalEdit = vi.fn<(text: string) => Promise<string | undefined>>(() => Promise.resolve(undefined));
+    const { lastFrame, stdin } = composer({ onExternalEdit });
+    await tick();
+    await press(stdin, 'still here', CTRL_G);
+    await tick();
+    expect(lastFrame()).toContain('still here');
+  });
+});
+
+describe('Composer: Ctrl+S sets a draft aside', () => {
+  it('stashes what is typed and gives it back, cursor and all', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, 'the other thing', LEFT, LEFT, LEFT, LEFT, LEFT, CTRL_S);
+
+    expect(lastFrame()).toContain(PLACEHOLDER);
+    expect(lastFrame()).toContain('stashed · Ctrl+S restores');
+
+    await press(stdin, CTRL_S);
+    expect(lastFrame()).toContain('the other thing');
+    // The cursor came back where it was, which typing proves.
+    await press(stdin, 'X');
+    expect(lastFrame()).toContain('the other Xthing');
+  });
+
+  it('does nothing on an empty box with nothing set aside', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, CTRL_S);
+    expect(lastFrame()).toContain(PLACEHOLDER);
+  });
+
+  it('a message typed and sent in between is not what comes back', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, 'set this aside', CTRL_S, 'something urgent', ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('something urgent', []);
+
+    await press(stdin, CTRL_S);
+    expect(lastFrame()).toContain('set this aside');
+  });
+});
+
+describe('Composer: ! is a shell', () => {
+  it('turns the box into a prompt, and Enter runs the line', async () => {
+    const onShell = vi.fn();
+    const { lastFrame, stdin } = composer({ onShell });
+    await tick();
+    await press(stdin, '!');
+
+    expect(lastFrame()).toContain('shell command · Esc leaves');
+    // The `!` was the key that opened the prompt, not a character in it.
+    const glyph = rowWith(lastFrame(), '$');
+    expect(glyph).toBeGreaterThanOrEqual(0);
+    expect(rowsOf(lastFrame())[glyph]).not.toContain('!');
+
+    await press(stdin, 'git status', ENTER);
+    expect(onShell).toHaveBeenCalledWith('git status', { send: false });
+    // The prompt stays: a shell is a place you run more than one thing.
+    expect(lastFrame()).toContain('shell command · Esc leaves');
+  });
+
+  it('a second ! sends the output to the agent', async () => {
+    const onShell = vi.fn();
+    const { stdin } = composer({ onShell });
+    await tick();
+    await press(stdin, '!', '!pnpm test', ENTER);
+    expect(onShell).toHaveBeenCalledWith('pnpm test', { send: true });
+  });
+
+  it('never runs anything through onSubmit', async () => {
+    const onSubmit = vi.fn();
+    const onShell = vi.fn();
+    const { stdin } = composer({ onSubmit, onShell });
+    await tick();
+    await press(stdin, '!', 'ls', ENTER);
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onShell).toHaveBeenCalledTimes(1);
+  });
+
+  it('Esc leaves it, and Backspace on an empty line does too', async () => {
+    const onShell = vi.fn();
+    const { lastFrame, stdin } = composer({ onShell });
+    await tick();
+    await press(stdin, '!');
+    await pressEscape(stdin);
+    expect(lastFrame()).toContain(PLACEHOLDER);
+    expect(lastFrame()).not.toContain('shell command');
+
+    await press(stdin, '!', 'ls', BACKSPACE, BACKSPACE);
+    expect(lastFrame()).toContain('shell command · Esc leaves');
+    await press(stdin, BACKSPACE);
+    expect(lastFrame()).toContain(PLACEHOLDER);
+  });
+
+  it('owns Esc only while the line is empty, so a turn can still be interrupted', async () => {
+    const ref = createRef<ComposerHandle>();
+    const { stdin } = composer({ onShell: vi.fn(), ref });
+    await tick();
+    await press(stdin, '!');
+    expect(ref.current?.isCapturing()).toBe(true);
+
+    await press(stdin, 'sleep 90');
+    expect(ref.current?.isCapturing()).toBe(false);
+  });
+
+  it('a slash is a path at the prompt, not a command', async () => {
+    const { lastFrame, stdin } = composer({ onShell: vi.fn() });
+    await tick();
+    await press(stdin, '!', '/usr/bin/env');
+    expect(lastFrame()).toContain('/usr/bin/env');
+    expect(lastFrame()).not.toContain('/model');
+  });
+
+  it('↑ at the prompt recalls shell lines, and ↑ in the box recalls the rest', async () => {
+    const history = fakeHistory({ all: ['!git status', 'write the release notes'] });
+    const { lastFrame, stdin } = composer({ onShell: vi.fn(), history });
+    await tick();
+
+    await press(stdin, UP);
+    expect(lastFrame()).toContain('write the release notes');
+    expect(lastFrame()).not.toContain('git status');
+
+    await press(stdin, CTRL_U, '!', UP);
+    expect(lastFrame()).toContain('git status');
+    expect(lastFrame()).not.toContain('release notes');
+  });
+
+  it('will not run an empty line', async () => {
+    const onShell = vi.fn();
+    const { stdin } = composer({ onShell });
+    await tick();
+    await press(stdin, '!', ENTER, '   ', ENTER);
+    expect(onShell).not.toHaveBeenCalled();
+  });
+
+  it('with nothing to run it in, ! is a character like any other', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, '!');
+    expect(lastFrame()).toContain('!');
+    expect(lastFrame()).not.toContain('shell command');
   });
 });
