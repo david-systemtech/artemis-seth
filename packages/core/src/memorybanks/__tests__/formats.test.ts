@@ -118,6 +118,12 @@ describe('checkEntry against the cerebro schema', () => {
     );
   });
 
+  it('accepts a CRLF file, as the CLI does in practice on a Windows checkout', () => {
+    const checked = checkEntry(parseFrontmatter(memory('crlf').replace(/\n/g, '\r\n')), 'crlf', CEREBRO_SCHEMA);
+    expect(checked.problems).toEqual([]);
+    expect(checked.body).toBe('A durable fact.');
+  });
+
   it('warns when a feedback memory lacks Why and How', () => {
     const text = '---\nname: fb\ndescription: x\nmetadata:\n  type: feedback\n---\n\nJust a note.\n';
     expect(checkEntry(parseFrontmatter(text), 'fb', CEREBRO_SCHEMA).warnings[0]).toContain('**Why:**');

@@ -21,8 +21,14 @@ import { CEREBRO_SCHEMA, type BankSchemaSpec } from './schema.js';
 
 export const BANK_MANIFEST_FILE = 'BANK.md';
 
-/** What a project's memory file carries of one bank by default: about a screen. */
-export const DEFAULT_INDEX_BUDGET: IndexBudget = { lines: 80, bytes: 12_000 };
+/**
+ * What a project's memory file carries of one bank when nothing says
+ * otherwise. Claude Code loads the first 200 lines or 25 KB of that file and
+ * drops the rest, so this is most of that allowance: a machine with one bank
+ * keeps nearly all of its index, and a host with several divides the
+ * allowance between them (see `installBankEverywhere`'s `budget`).
+ */
+export const DEFAULT_INDEX_BUDGET: IndexBudget = { lines: 150, bytes: 20_000 };
 
 export interface BankManifest {
   readonly name: string;

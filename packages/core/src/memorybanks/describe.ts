@@ -16,13 +16,17 @@ import type { MemoryBankPromptInfo } from '@rx-artemis/protocol';
 import { bankHome, projectKey, renderIndexBlock } from './bankIndex.js';
 import { readBankAt } from './formats.js';
 import { sourceStamp } from './install.js';
-import { installableEntries, type Bank } from './model.js';
+import { installableEntries, type Bank, type IndexBudget } from './model.js';
 import { embeddedCli } from './registry.js';
 import { scopeCoversProfile, type BankRecord, type BankRegistryV2 } from './registryV2.js';
 
 export interface RunBanksOptions {
   readonly registry: BankRegistryV2;
-  /** The run's profile. Absent means every bank, whatever its scope. */
+  /**
+   * The run's profile. Absent means a run that names no account, which only
+   * the banks attached to every profile reach — a bank attached to a chosen
+   * set is never described to a run that cannot say it is one of them.
+   */
   readonly profileId?: string;
 }
 
@@ -42,6 +46,11 @@ export interface DescribeRunBanksOptions extends RunBanksOptions {
   readonly fallbackCli?: string | null;
   /** ISO date for the index's managed line. Defaults to today. */
   readonly today?: string;
+  /**
+   * The index budget for each bank, when the host shares one allowance
+   * between the banks a run carries. Absent means each bank's own.
+   */
+  readonly budget?: IndexBudget;
 }
 
 function describeOne(record: BankRecord, bank: Bank, isDefault: boolean, options: DescribeRunBanksOptions): MemoryBankPromptInfo {
@@ -54,7 +63,7 @@ function describeOne(record: BankRecord, bank: Bank, isDefault: boolean, options
     repo: bank.root,
     source: sourceStamp(bank.root),
     today: options.today ?? new Date().toISOString().slice(0, 10),
-    budget: bank.indexBudget,
+    budget: options.budget ?? bank.indexBudget,
   });
   const instructions = record.role === 'readonly' ? undefined : (bank.instructions ?? undefined);
   const legacyLayout = bank.format === 'legacy-projects' ? 'projects' : bank.format === 'legacy-flat' ? 'flat' : undefined;

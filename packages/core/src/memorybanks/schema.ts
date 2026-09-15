@@ -37,7 +37,17 @@ export interface BankSchemaSpec {
   readonly strictKeys: boolean;
   /** Top-level keys allowed under `strictKeys`. */
   readonly knownKeys: readonly string[];
-  /** A CRLF file is a problem rather than a fact. The CLI's rule; off for a manifest bank. */
+  /**
+   * A CRLF file is a problem rather than a fact.
+   *
+   * Off for the `cerebro` schema, although the CLI has such a rule: Python's
+   * text mode normalises line endings on read, so the CLI never meets a
+   * carriage return in a file on disk and the rule only ever fires on text
+   * handed to it some other way. A Windows checkout with `core.autocrlf` has
+   * CRLF in every file, and refusing those would refuse every bank on every
+   * Windows machine that the CLI happily installs from. A manifest bank may
+   * switch it on to insist.
+   */
   readonly rejectCrlf: boolean;
 }
 
@@ -54,7 +64,7 @@ export const CEREBRO_SCHEMA: BankSchemaSpec = {
   nameMatchesFile: true,
   strictKeys: true,
   knownKeys: ['name', 'description', 'metadata'],
-  rejectCrlf: true,
+  rejectCrlf: false,
 };
 
 /** Read a dotted key out of a mapping. */
