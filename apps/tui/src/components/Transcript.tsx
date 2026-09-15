@@ -1274,7 +1274,7 @@ export function TranscriptViewport({
    */
   const reported = useRef<string | null>(null);
   useEffect(() => {
-    const key = shown.join(' ');
+    const key = shown.join('\0');
     if (reported.current === key) return;
     reported.current = key;
     onCursorRows?.(shown);
