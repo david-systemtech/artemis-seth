@@ -9,7 +9,7 @@ import { render } from 'ink-testing-library';
 import { SUGGESTED_TASK_TOOL, type AgentEvent, type RunId } from '@rx-artemis/protocol';
 import { TranscriptModel, syncScheduler } from '@rx-artemis/transcript';
 
-import { ReplayRows, TOOL_STUCK_MS, TranscriptViewport } from './Transcript.js';
+import { ReplayRows, TOOL_STUCK_MS, TranscriptViewport, inOrderOfStart, offsetShowing } from './Transcript.js';
 
 /** Envelope filler; timestamps rise with position, which is what the order rests on. */
 function stream(...drafts: Array<Omit<AgentEvent, 'runId' | 'seq' | 'ts'>>): AgentEvent[] {
@@ -469,5 +469,159 @@ describe('a call that has gone quiet', () => {
     // not existed since.
     expect(frame).toContain('Bash(pnpm build)');
     expect(frame).not.toContain('no output for');
+  });
+});
+
+/**
+ * A cursor over the rows.
+ *
+ * The transcript was the one surface in the terminal a person could read and
+ * not touch. The cursor is what gives a row an identity the keys can act on,
+ * and these are the three things it has to get right: it marks one row, it
+ * tells the app which rows it drew and in what order, and a row it has been
+ * asked to unfold unfolds without taking the conversation with it.
+ */
+describe('a cursor over the rows', () => {
+  const lineWith = (frame: string, text: string): string =>
+    frame.split('\n').find((candidate) => candidate.includes(text)) ?? '';
+
+  it('marks the row it is on, and leaves every other row where it was', async () => {
+    const transcript = model(
+      stream(
+        { type: 'text.complete', messageId: 'u1', role: 'user', text: 'Count to three.' },
+        { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'One, two, three.' },
+      ),
+    );
+    const ids = inOrderOfStart(transcript.getRowsSnapshot(), transcript);
+    const { lastFrame, unmount } = render(
+      <TranscriptViewport transcript={transcript} live={false} offset={0} cursor={ids[1] ?? null} />,
+    );
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    const marked = lineWith(frame, 'One, two, three.');
+    const rest = lineWith(frame, 'Count to three.');
+    expect(marked.trimStart().startsWith('❯')).toBe(true);
+    expect(rest).not.toContain('❯');
+
+    // The column is held open on every row, so arriving on one does not shove
+    // its text sideways: both markers sit at the same column either way.
+    expect(rest.indexOf('▌')).toBe(marked.indexOf('●'));
+  });
+
+  it('reserves nothing at all when it has not been given a cursor', async () => {
+    const transcript = model(stream({ type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'On it.' }));
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={transcript} live={false} offset={0} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    expect(lineWith(frame, 'On it.').trimStart().startsWith('●')).toBe(true);
+  });
+
+  it('reports the rows it drew, in the order they are on the screen', async () => {
+    const transcript = model(
+      stream(
+        { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'Looking around.' },
+        { type: 'tool.start', toolCallId: 'c1', name: 'Bash', input: { command: 'ls' } },
+        { type: 'tool.end', toolCallId: 'c1', status: 'ok', resultText: 'README.md' },
+        { type: 'text.delta', messageId: 'm2', blockIndex: 0, text: 'Still going.' },
+      ),
+    );
+    const seen: string[][] = [];
+    const { unmount } = render(
+      <TranscriptViewport
+        transcript={transcript}
+        live={false}
+        offset={0}
+        cursor={null}
+        onCursorRows={(ids) => seen.push([...ids])}
+      />,
+    );
+    await tick();
+    unmount();
+
+    // Once for the list, not once per render: `shown` is a fresh array on every
+    // token that arrives, and an app told a hundred times a second that nothing
+    // has changed would step its cursor over nothing else.
+    expect(seen).toHaveLength(1);
+
+    // Screen order, which is not the model's: the model parks a run's calls at
+    // the foot of the run and the screen puts the count where the first call
+    // was made.
+    const rows = transcript.getRowsSnapshot();
+    expect(seen[0]).toEqual(inOrderOfStart(rows, transcript));
+    expect(seen[0]).not.toEqual([...rows]);
+  });
+
+  it('unfolds the row it is asked to and leaves the others cut', async () => {
+    const offer = (id: string, title: string, lines: readonly string[]): Array<Omit<AgentEvent, 'runId' | 'seq' | 'ts'>> => [
+      { type: 'tool.start', toolCallId: id, name: SUGGESTED_TASK_TOOL, input: { title } },
+      { type: 'tool.end', toolCallId: id, status: 'ok', resultText: lines.join('\n') },
+    ];
+    const alpha = ['alpha1', 'alpha2', 'alpha3', 'alpha4', 'alpha5', 'alpha6'];
+    const beta = ['beta1', 'beta2', 'beta3', 'beta4', 'beta5', 'beta6'];
+    const transcript = model(stream(...offer('s1', 'First', alpha), ...offer('s2', 'Second', beta)));
+    const ids = inOrderOfStart(transcript.getRowsSnapshot(), transcript);
+    const { lastFrame, unmount } = render(
+      <TranscriptViewport
+        transcript={transcript}
+        live={false}
+        offset={0}
+        cursor={ids[0] ?? null}
+        expandedRows={new Set(ids.slice(0, 1))}
+      />,
+    );
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    // The row asked about is whole.
+    for (const line of alpha) expect(frame).toContain(line);
+    // Its neighbour is still a preview: head, count, tail.
+    expect(frame).toContain('beta1');
+    expect(frame).toContain('beta6');
+    expect(frame).not.toContain('beta3');
+    expect(frame.split('… +3 lines').length - 1).toBe(1);
+  });
+});
+
+/**
+ * The arithmetic that keeps the cursor row on the screen.
+ *
+ * Scrolling is by line and the cursor is by row, so moving onto a row the clip
+ * has cut off means working out which offset would show it. Tested directly:
+ * the numbers are the whole of it, and a mounted terminal in a test has no
+ * fixed height and therefore never clips anything.
+ */
+describe('the offset that shows a row', () => {
+  // A hundred lines of content in a twenty-line pane: at offset 0 the visible
+  // band is the last twenty lines, 80 to 100.
+  const measured = { content: 100, viewport: 20 };
+
+  it('is nothing at all when the row is already on the screen', () => {
+    expect(offsetShowing({ id: 'r', top: 90, height: 3 }, measured, 0)).toBeNull();
+  });
+
+  it('brings a row above the band down by its head', () => {
+    // 100 − 20 − 50: the row's first line becomes the first line shown.
+    expect(offsetShowing({ id: 'r', top: 50, height: 3 }, measured, 0)).toBe(30);
+  });
+
+  it('brings a row below the band up by its foot', () => {
+    // Scrolled back to the band 40–60, with the row at 70–73 below it.
+    expect(offsetShowing({ id: 'r', top: 70, height: 3 }, measured, 40)).toBe(27);
+  });
+
+  it('shows the head of a row that is taller than the screen, and settles there', () => {
+    const tall = { id: 'r', top: 50, height: 40 };
+    const head = offsetShowing(tall, measured, 0);
+    expect(head).toBe(30);
+
+    // And asks for the same offset again once it is there, rather than
+    // chasing the foot it can never show — which is what stops the two
+    // corrections taking turns to undo one another.
+    expect(offsetShowing(tall, measured, 30)).toBe(30);
   });
 });

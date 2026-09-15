@@ -40,7 +40,32 @@
  *
  * Collapsed is unchanged but for one thing: a cut result now shows its head
  * *and* its tail. The end of a command's output is where the error is, and
- * three lines from the top of a stack trace is three lines of nothing.
+ * three lines from the top of a stack trace is three lines of nothing. How
+ * much a preview keeps is in `rowVerbs.ts`, next to the verb that reveals the
+ * rest, so that the two cannot come to disagree about whether there is a rest.
+ *
+ * ## A cursor over the rows
+ *
+ * The viewport takes a `cursor` — a row id — and the row it names draws a `❯`
+ * in a one-column gutter to the left of its marker, with the marker itself in
+ * the accent. The column is *reserved on every row* whenever the prop is
+ * passed at all, `null` included, so that arriving in the transcript and
+ * leaving it again does not shift the whole conversation one column sideways
+ * and redraw it.
+ *
+ * Two things come with it. `onCursorRows` reports the ids currently drawn, in
+ * the order they are drawn, because the app is what steps the cursor and only
+ * this component knows which rows exist and in what order — and it fires when
+ * that list changes rather than on every render, since the list is a new array
+ * each time and the app would otherwise be told a hundred times a second that
+ * nothing had happened. `expandedRows` unfolds named rows in an otherwise
+ * collapsed viewport, which is what `Enter` on the cursor toggles: the whole
+ * conversation unfolding because one row was asked about is the pager's job,
+ * not this one's.
+ *
+ * The viewport keeps the cursor row in view by adjusting its own line offset
+ * when the row is clipped — see {@link TranscriptViewport}, which also says
+ * what happens to a row that is taller than the screen.
  *
  * The rows are drawn in the shape of the provider CLIs' own transcripts — a
  * marker in the gutter, content hanging under it, results on a connector —
@@ -76,6 +101,7 @@ import { useNow } from '../hooks/useNow.js';
 import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import { renderDiff } from '../render/diff.js';
 import { renderMarkdownLines } from '../render/markdown.js';
+import { EDIT_LINES, RESULT_HEAD, RESULT_TAIL, WRITE_LINES, resultPreviewLines } from '../rowVerbs.js';
 
 /* -------------------------------------------------------------------------- */
 /* Settling                                                                   */
@@ -169,6 +195,21 @@ export interface RowView {
    * the figure.
    */
   readonly planDeltaFor?: (runEnd: { readonly ts: number }) => readonly PlanDelta[] | undefined;
+  /**
+   * Keep a column to the left of the marker for the cursor.
+   *
+   * On every row at once or on none of them, and true whenever the viewport
+   * has been given a cursor at all — including a cursor of `null`. A gutter
+   * that appeared only under the row being pointed at would move that row's
+   * text one column right of every other row's, which reads as the row
+   * jittering as the cursor passes over it.
+   */
+  readonly gutter?: boolean;
+  /**
+   * This row is the one under the cursor: it draws the `❯` in the gutter and
+   * its marker in the accent. Set by the viewport on exactly one row.
+   */
+  readonly cursor?: boolean;
 }
 
 const COLLAPSED: RowView = {};
@@ -229,6 +270,9 @@ function clock(ts: number): string {
  * keep their size; the viewport clips.
  */
 
+/** What the row under the cursor wears, one column left of its marker. */
+const CURSOR_MARKER = '❯';
+
 /** A marker in the gutter and content that wraps under itself. */
 function Block({
   marker,
@@ -236,6 +280,7 @@ function Block({
   dim,
   spaced = true,
   right,
+  view = COLLAPSED,
   children,
 }: {
   readonly marker: string;
@@ -249,12 +294,32 @@ function Block({
    * column rather than part of it so that it never joins the wrap.
    */
   readonly right?: string;
+  /**
+   * The surface, for the two fields a block draws itself from: whether the
+   * cursor's column is reserved, and whether this block is the one under it.
+   * The rest of the view is the rows' business rather than the frame's.
+   */
+  readonly view?: RowView;
   readonly children: React.ReactNode;
 }): React.JSX.Element {
+  const under = view.cursor === true;
   return (
     <Box flexDirection="row" marginTop={spaced ? 1 : 0} flexShrink={0}>
+      {view.gutter === true && (
+        <Box width={1} flexShrink={0}>
+          {/* A space, not an empty Text: the column has to be held open on the
+              rows the cursor is not on, or they would all shift when it is. */}
+          <Text color={ACCENT} bold>
+            {under ? CURSOR_MARKER : ' '}
+          </Text>
+        </Box>
+      )}
       <Box width={2} flexShrink={0}>
-        <Text color={color} dimColor={dim}>
+        {/* Under the cursor the marker takes the accent, whatever it meant
+            before. A row's colour is its status and the cursor is somewhere
+            else entirely, so one of the two has to give way for the press of
+            a key; the status is still on the row, in its words. */}
+        <Text color={under ? ACCENT : color} dimColor={under ? false : dim}>
           {marker}
         </Text>
       </Box>
@@ -306,30 +371,16 @@ const TOOL_MARK: Record<string, { color?: string; dim?: boolean }> = {
 /** What a call that has gone quiet wears instead. Amber, not red: nothing has failed yet. */
 const STUCK_MARK: { color?: string; dim?: boolean } = { color: 'yellow' };
 
-/**
- * How much of what a call returned is shown, and how it is split.
- *
- * Three lines, as before, but head *and* tail rather than head alone. The head
- * says which call this was; the tail is where the error is — a build that
- * fails prints two hundred lines and the one that matters is the last of them
- * — so a preview that is all head is a preview of the half nobody needs. The
- * count between them says how much is missing and which key shows it.
- */
-const RESULT_HEAD = 2;
-const RESULT_TAIL = 1;
 /*
+ * How much of a result and how much of a diff a collapsed row shows —
+ * `RESULT_HEAD`, `RESULT_TAIL`, `EDIT_LINES`, `WRITE_LINES` — is in
+ * `rowVerbs.ts`, imported above. It lives there because `Enter unfold` is
+ * offered on exactly the rows these numbers hold something back from.
+ *
  * What a call returned is a preview, and a preview is one line per line: a
  * diff row or a result line longer than the screen is cut, not wrapped,
  * because a wrapped line of code reads as two lines of code.
  */
-
-/**
- * How much of a diff is shown. An edit is usually small and the change is
- * the point, so most of it fits; a whole written file is content rather than
- * change, and a screenful of `+` lines says nothing a count does not.
- */
-const EDIT_LINES = 20;
-const WRITE_LINES = 6;
 
 /**
  * How long a running call may say nothing before the row starts to worry.
@@ -365,10 +416,7 @@ function ToolRow({
   const mark = stuck ? STUCK_MARK : TOOL_MARK[item.status] ?? TOOL_MARK['ok'];
   const summary = summarizeToolInput(item.input);
   const edit = detectFileEdit(item.name, item.input);
-  const resultLines =
-    edit === null && item.status === 'ok' && item.resultText !== undefined
-      ? item.resultText.split('\n').filter((line) => line.trim().length > 0)
-      : [];
+  const resultLines = resultPreviewLines(item, edit);
   /*
    * Head, count, tail — or, unfolded, the whole of it and no count.
    *
@@ -382,7 +430,7 @@ function ToolRow({
   const tail = cut ? resultLines.slice(-RESULT_TAIL) : [];
   const hidden = cut ? resultLines.length - RESULT_HEAD - RESULT_TAIL : 0;
   return (
-    <Block marker={TOOL_MARKER} color={mark?.color} dim={mark?.dim}>
+    <Block marker={TOOL_MARKER} color={mark?.color} dim={mark?.dim} view={view}>
       <Text color={stuck ? 'yellow' : undefined}>
         {item.title !== undefined ? (
           <Text bold>{oneLine(item.title, 160)}</Text>
@@ -459,7 +507,7 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
   switch (item.kind) {
     case 'user':
       return (
-        <Block marker="▌" color={ACCENT} right={stamp}>
+        <Block marker="▌" color={ACCENT} right={stamp} view={view}>
           <Text bold dimColor={item.pending}>
             {item.text}
           </Text>
@@ -468,7 +516,7 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
     case 'assistant':
       if (item.text.length === 0) return null;
       return (
-        <Block marker={SPEECH_MARKER} right={stamp}>
+        <Block marker={SPEECH_MARKER} right={stamp} view={view}>
           {renderMarkdownLines(item.text).map((line, i) =>
             line.hang === 0 ? (
               // An empty Text has no height; a blank line needs one space to be a line.
@@ -490,7 +538,7 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
       );
     case 'thinking':
       return (
-        <Block marker="∴" dim spaced>
+        <Block marker="∴" dim spaced view={view}>
           {/*
            * Whole, and in the paragraphs it was written in. It used to be
            * `oneLine(text, 200)`, which flattened the reasoning into a single
@@ -515,7 +563,7 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
       const note = item.note;
       const wholeNote = view.expanded === true && note !== undefined && note.length > 0;
       return (
-        <Block marker="⚿" dim spaced={false}>
+        <Block marker="⚿" dim spaced={false} view={view}>
           <Text dimColor>
             {item.request.toolName} — {item.state}
             {note !== undefined && !wholeNote ? `: ${oneLine(note, 120)}` : ''}
@@ -532,7 +580,7 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
     case 'notice': {
       const color = item.level === 'error' ? 'red' : item.level === 'warn' ? 'yellow' : undefined;
       return (
-        <Block marker={item.level === 'error' ? '✗' : item.level === 'warn' ? '!' : 'ℹ'} color={color} dim={item.level === 'info'}>
+        <Block marker={item.level === 'error' ? '✗' : item.level === 'warn' ? '!' : 'ℹ'} color={color} dim={item.level === 'info'} view={view}>
           <Text color={color} dimColor={item.level === 'info'}>
             {item.text}
           </Text>
@@ -553,7 +601,7 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
        */
       const shell = item.source === 'shell';
       return (
-        <Block marker={shell ? '$' : '/'} color={shell ? 'cyan' : undefined} dim={!shell}>
+        <Block marker={shell ? '$' : '/'} color={shell ? 'cyan' : undefined} dim={!shell} view={view}>
           <Text dimColor>
             {item.name}
             {item.args !== undefined ? ` ${item.args}` : ''}
@@ -591,13 +639,13 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
          * two are indistinguishable unless one of them says so.
          */
         return (
-          <Block marker="" dim spaced={false}>
+          <Block marker="" dim spaced={false} view={view}>
             <Text dimColor>{[...(item.silent ? ['no reply'] : []), ...parts, ...plan].join(' · ')}</Text>
           </Block>
         );
       }
       return (
-        <Block marker="✗" color={item.reason === 'error' ? 'red' : 'yellow'} spaced={false}>
+        <Block marker="✗" color={item.reason === 'error' ? 'red' : 'yellow'} spaced={false} view={view}>
           <Text color={item.reason === 'error' ? 'red' : 'yellow'}>
             {item.reason === 'interrupted' ? 'Interrupted' : item.reason.replace(/_/g, ' ')}
             {parts.length > 0 ? ` · ${parts.join(' · ')}` : ''}
@@ -648,15 +696,24 @@ function GroupRow({
     counts[category] = (counts[category] ?? 0) + 1;
   }
   const summary = describeActivity(counts);
+  /*
+   * A group is several blocks and one row, so the cursor marks its first block
+   * and no other — a caret down the side of every call in a run would say the
+   * cursor was on all of them. That is the summary when there is one, and the
+   * first call still standing when there is not: a run whose every call is
+   * running has nothing folded yet and so no count to head it with.
+   */
+  const heading = summary.length > 0;
+  const memberView = view.cursor === true ? { ...view, cursor: false } : view;
   return (
     <Box flexDirection="column" flexShrink={0}>
-      {summary.length > 0 && (
-        <Block marker={TOOL_MARKER} color={expanded ? undefined : 'green'} dim={expanded}>
+      {heading && (
+        <Block marker={TOOL_MARKER} color={expanded ? undefined : 'green'} dim={expanded} view={view}>
           <Text dimColor={expanded}>{summary}</Text>
         </Block>
       )}
-      {shown.map((call) => (
-        <ToolRow key={call.id} item={call} view={view} />
+      {shown.map((call, index) => (
+        <ToolRow key={call.id} item={call} view={!heading && index === 0 ? view : memberView} />
       ))}
     </Box>
   );
@@ -759,6 +816,86 @@ export interface TranscriptViewportProps {
    * `Conversation.planDeltaForRow`. See {@link RowView.planDeltaFor}.
    */
   readonly planDeltaFor?: RowView['planDeltaFor'];
+  /**
+   * The row the cursor is on, by id. `null` for a cursor that exists but is
+   * nowhere yet; leave it off entirely and there is no cursor at all.
+   *
+   * The difference matters to the layout and not only to the drawing: the
+   * gutter the caret goes in is reserved as soon as the prop is *present*, so
+   * an app that passes `null` while the focus is elsewhere gets a transcript
+   * that does not shift sideways when the focus arrives.
+   */
+  readonly cursor?: string | null;
+  /**
+   * The ids currently drawn, in the order they appear on screen, reported
+   * whenever that list changes.
+   *
+   * The cursor is the app's state — it is the app that reads the keys — and
+   * the app cannot know which rows exist: the model's list is ordered by when
+   * a row was *filed* and holds far more than the window draws. So the list
+   * comes from here, already ordered and already windowed, and stepping the
+   * cursor is an index into it.
+   */
+  readonly onCursorRows?: (ids: readonly string[]) => void;
+  /**
+   * Rows to draw unfolded even though the viewport is not.
+   *
+   * What `Enter` on the cursor toggles. A set rather than one id because a
+   * reader unfolding a diff to compare it with the one three rows down should
+   * not have the first close behind them.
+   */
+  readonly expandedRows?: ReadonlySet<string>;
+}
+
+/** Where the cursor row sits in the content column, in lines from its top. */
+export interface CursorBox {
+  readonly id: string;
+  readonly top: number;
+  readonly height: number;
+}
+
+function sameBox(a: CursorBox | null, b: CursorBox | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.id === b.id && a.top === b.top && a.height === b.height;
+}
+
+/**
+ * Where the cursor row is, asked of the layout Ink has just done.
+ *
+ * `measureElement` gives a height and no position, so the top comes from the
+ * node's own layout, which is relative to the parent — and the parent is the
+ * content column, which is the coordinate system the offset is in. Null
+ * whenever there is no cursor or the row it names is not on the screen: both
+ * are ordinary, and both mean there is nothing to scroll to.
+ */
+function measureCursorRow(node: DOMElement | null, id: string | null): CursorBox | null {
+  if (node === null || id === null) return null;
+  const layout = node.yogaNode;
+  if (layout === undefined) return null;
+  return { id, top: layout.getComputedTop(), height: measureElement(node).height };
+}
+
+/**
+ * The offset that would show this row, or null if it is already shown.
+ *
+ * The visible band is the last `viewport` lines of the content once the offset
+ * has pushed `offset` lines of it below the clip. A row below that band is
+ * brought up by its foot, a row above it by its head — and a row too tall to
+ * fit is shown by its head as well, which is also what stops the two
+ * corrections from taking turns to undo one another for ever.
+ */
+export function offsetShowing(
+  box: CursorBox,
+  measured: { readonly content: number; readonly viewport: number },
+  offset: number,
+): number | null {
+  const bottom = measured.content - offset;
+  const top = bottom - measured.viewport;
+  const below = box.top + box.height > bottom;
+  const above = box.top < top;
+  if (!below && !above) return null;
+  if (above || box.height >= measured.viewport) return measured.content - measured.viewport - box.top;
+  return measured.content - box.top - box.height;
 }
 
 /**
@@ -779,6 +916,21 @@ export interface TranscriptViewportProps {
  * margin, the clip does the rest, and the column's measured height says how
  * far up there is to go. Rows beyond the rendered window are brought in as
  * the offset approaches the top of what is drawn.
+ *
+ * ## Keeping the cursor in view
+ *
+ * The app owns the cursor but not the layout, so the scrolling that follows it
+ * happens here: when the cursor lands on a row the clip has cut off, the
+ * viewport takes the offset over from the app and holds it until the app
+ * scrolls of its own accord or the cursor is put away. Only on a *move*, never
+ * continuously, or PgUp with a cursor set would snap straight back to the row
+ * it was on and scrolling would be impossible.
+ *
+ * A row taller than the screen cannot be shown whole, and the choice is its
+ * head: the head carries the marker, the caret and the line naming what the
+ * row is, and a person who cannot see which row the cursor is on cannot use
+ * the keys that act on it. The foot of such a row is reached with the ordinary
+ * scroll keys, or with Ctrl+O, which is the view that exists for exactly this.
  */
 export function TranscriptViewport({
   transcript,
@@ -788,19 +940,55 @@ export function TranscriptViewport({
   columns,
   expanded,
   planDeltaFor,
+  cursor,
+  onCursorRows,
+  expandedRows,
 }: TranscriptViewportProps): React.JSX.Element {
   const rows = useSyncExternalStore(transcript.subscribeList, transcript.getRowsSnapshot);
   const terminal = useTerminalSize();
+  // The caret's column comes out of the content's, not out of the padding: a
+  // row that measured itself a column wider than it is drawn would decide it
+  // has room for a diff gutter that then overflows.
+  const gutter = cursor !== undefined;
   const view = useMemo<RowView>(
-    () => ({ expanded: expanded === true, live, columns: rowContentColumns(columns ?? terminal.columns), planDeltaFor }),
-    [expanded, live, columns, terminal.columns, planDeltaFor],
+    () => ({
+      expanded: expanded === true,
+      live,
+      columns: rowContentColumns((columns ?? terminal.columns) - (gutter ? 1 : 0)),
+      planDeltaFor,
+      gutter,
+    }),
+    [expanded, live, columns, terminal.columns, planDeltaFor, gutter],
   );
+  /*
+   * Four views for a viewport, not one per row: a row is either under the
+   * cursor or not and either unfolded or not, so there are four objects to
+   * hand out however many rows are on the screen. Rebuilding them per row
+   * would hand every row a new object on every token that arrives.
+   */
+  const viewFor = useMemo(() => {
+    const unfolded: RowView = view.expanded === true ? view : { ...view, expanded: true };
+    const marked: RowView = { ...view, cursor: true };
+    const markedUnfolded: RowView = { ...unfolded, cursor: true };
+    return (id: string): RowView => {
+      const open = expandedRows?.has(id) === true;
+      if (id === cursor) return open ? markedUnfolded : marked;
+      return open ? unfolded : view;
+    };
+  }, [view, cursor, expandedRows]);
+
   const [windowRows, setWindowRows] = useState(WINDOW_ROWS);
   const viewportRef = useRef<DOMElement>(null);
   const contentRef = useRef<DOMElement>(null);
+  const cursorRef = useRef<DOMElement>(null);
   const [measured, setMeasured] = useState({ content: 0, viewport: 0 });
+  const [cursorBox, setCursorBox] = useState<CursorBox | null>(null);
+  const [revealOffset, setRevealOffset] = useState<number | null>(null);
 
-  const following = offset === 0;
+  // The offset actually in force. The app's, until the cursor moves onto a row
+  // that is not on the screen; then this component's, until the app scrolls.
+  const effective = revealOffset ?? offset;
+  const following = effective === 0;
   const start = Math.max(0, rows.length - (following ? WINDOW_ROWS : windowRows));
   const shown = inOrderOfStart(rows.slice(start), transcript);
 
@@ -810,11 +998,58 @@ export function TranscriptViewport({
     const content = contentRef.current === null ? 0 : measureElement(contentRef.current).height;
     const viewport = viewportRef.current === null ? 0 : measureElement(viewportRef.current).height;
     setMeasured((current) => (current.content === content && current.viewport === viewport ? current : { content, viewport }));
+    setCursorBox((current) => {
+      const next = measureCursorRow(cursorRef.current, cursor ?? null);
+      return sameBox(current, next) ? current : next;
+    });
+  });
+
+  /*
+   * The ids on the screen, reported once per change of the list rather than
+   * once per render. `shown` is a fresh array every time — it is a map over a
+   * slice — so an effect keyed on it would fire on every token that arrives,
+   * and the app would re-run whatever it does with a list it has already seen.
+   */
+  const reported = useRef<string | null>(null);
+  useEffect(() => {
+    const key = shown.join(' ');
+    if (reported.current === key) return;
+    reported.current = key;
+    onCursorRows?.(shown);
   });
 
   const maxOffset = Math.max(0, measured.content - measured.viewport);
-  const clamped = Math.min(offset, maxOffset);
+  const clamped = Math.min(effective, maxOffset);
   const nearTop = measured.content - measured.viewport - clamped < measured.viewport;
+
+  /*
+   * A cursor that has just moved is brought into view; one that has not is
+   * left where it is, however the conversation grows around it. `owed` is the
+   * row still waiting for that, and it is cleared whether or not the row
+   * turned out to need scrolling to — the question is asked once per move.
+   */
+  const owed = useRef<string | null>(null);
+  useEffect(() => {
+    owed.current = cursor ?? null;
+  }, [cursor]);
+
+  // The app scrolling is the app taking the offset back, and a cursor put away
+  // takes the conversation back to wherever the app had it.
+  useEffect(() => {
+    setRevealOffset(null);
+  }, [offset]);
+  useEffect(() => {
+    if (cursor === undefined || cursor === null) setRevealOffset(null);
+  }, [cursor]);
+
+  useEffect(() => {
+    if (cursorBox === null || cursorBox.id !== cursor || owed.current !== cursor) return;
+    if (measured.viewport === 0) return;
+    owed.current = null;
+    const wanted = offsetShowing(cursorBox, measured, clamped);
+    if (wanted === null) return;
+    setRevealOffset(Math.max(0, Math.min(wanted, maxOffset)));
+  }, [cursorBox, cursor, measured, clamped, maxOffset]);
 
   useEffect(() => {
     onExtent?.({ maxOffset, viewportLines: measured.viewport });
@@ -866,8 +1101,13 @@ export function TranscriptViewport({
             </Box>
           )}
           {shown.map((id) => (
-            <Box key={id} flexDirection="column" flexShrink={0}>
-              <LiveRow id={id} transcript={transcript} view={view} />
+            <Box
+              key={id}
+              ref={id === cursor ? cursorRef : undefined}
+              flexDirection="column"
+              flexShrink={0}
+            >
+              <LiveRow id={id} transcript={transcript} view={viewFor(id)} />
             </Box>
           ))}
         </Box>
