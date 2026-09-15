@@ -3,7 +3,8 @@ import { render } from 'ink-testing-library';
 
 import type { PermissionDecision, PermissionRequest } from '@rx-artemis/protocol';
 
-import { DEFAULT_DENIAL, PermissionCard } from './PermissionCard.js';
+import type { Preview } from '../blastRadius.js';
+import { DEFAULT_DENIAL, PermissionCard, type BlastPreview } from './PermissionCard.js';
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 30));
 
@@ -309,5 +310,128 @@ describe('PermissionCard', () => {
       behavior: 'deny',
       message: 'Keep planning; keep the loader, change the cache',
     });
+  });
+});
+
+/*
+ * The blast radius, with the disk stood in for.
+ * ---------------------------------------------------------------------------
+ *
+ * Every test here passes its own `preview`, so nothing below reads a directory
+ * or starts a `git`: the card's job is to ask at the right moment, draw what
+ * came back, and stay answerable the whole time, and all three are visible
+ * without the real one. `previewBlastRadius` has its own tests for what it
+ * finds; these are about when the card asks and what it does with the answer.
+ */
+
+/** A promise the test resolves by hand, so "still running" is a state it can hold. */
+const deferred = <T,>(): { readonly promise: Promise<T>; readonly settle: (value: T) => void } => {
+  let settle!: (value: T) => void;
+  const promise = new Promise<T>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, settle };
+};
+
+const CHECKING = 'checking what this would touch…';
+
+describe('PermissionCard blast radius', () => {
+  it('says it is checking, then says what the command would touch', async () => {
+    const gate = deferred<readonly Preview[]>();
+    const preview = vi.fn<BlastPreview>(() => gate.promise);
+    const { lastFrame } = render(
+      <PermissionCard request={base} onDecision={spy()} cwd="/repo" preview={preview} />,
+    );
+    await tick();
+
+    // The card is up and the question is out; neither waited for the other.
+    expect(lastFrame()).toContain(CHECKING);
+    expect(lastFrame()).toContain('❯ Deny');
+    expect(preview).toHaveBeenCalledTimes(1);
+    expect(preview.mock.calls[0]?.[1]).toBe('/repo');
+    expect(preview.mock.calls[0]?.[0]?.[0]?.kind).toBe('rm');
+    expect(preview.mock.calls[0]?.[0]?.[0]?.targets).toEqual(['build']);
+
+    gate.settle([
+      { kind: 'rm', summary: '1 directory (412 files inside)', lines: ['build/'], count: 1 },
+    ]);
+    await tick();
+    expect(lastFrame()).not.toContain(CHECKING);
+    expect(lastFrame()).toContain('⚠ 1 directory (412 files inside)');
+    expect(lastFrame()).toContain('build/');
+  });
+
+  it('a command with no destructive verb in it draws no block, and the disk is never asked', async () => {
+    const preview = vi.fn<BlastPreview>(async () => []);
+    const request: PermissionRequest = {
+      ...base,
+      input: { command: 'ls -la src' },
+      title: 'Run ls -la src',
+    };
+    const { lastFrame } = render(<PermissionCard request={request} onDecision={spy()} preview={preview} />);
+    await tick();
+    expect(lastFrame()).toContain('Run ls -la src');
+    expect(lastFrame()).not.toContain(CHECKING);
+    expect(lastFrame()).not.toContain('⚠');
+    expect(preview).not.toHaveBeenCalled();
+  });
+
+  it('a preview with nothing to say leaves nothing behind, not an empty heading', async () => {
+    // A `>` onto a file that is not there creates rather than destroys, so the
+    // recogniser reports it and the preview drops it again.
+    const preview = vi.fn<BlastPreview>(async () => []);
+    const request: PermissionRequest = {
+      ...base,
+      input: { command: 'echo hi > out.txt' },
+      title: 'Run echo hi > out.txt',
+    };
+    const { lastFrame } = render(<PermissionCard request={request} onDecision={spy()} preview={preview} />);
+    await tick();
+    expect(preview).toHaveBeenCalledTimes(1);
+    expect(lastFrame()).not.toContain(CHECKING);
+    expect(lastFrame()).not.toContain('⚠');
+  });
+
+  it('the block is clipped to the columns the card was given', async () => {
+    const preview = vi.fn<BlastPreview>(async () => [
+      { kind: 'rm', summary: 'abcdefghijklmnopqrstuvwxyz', lines: [] },
+    ]);
+    const { lastFrame } = render(
+      <PermissionCard request={base} onDecision={spy()} columns={20} preview={preview} />,
+    );
+    await tick();
+    // Twenty columns less the borders, the padding and a little slack.
+    expect(lastFrame()).toContain('⚠ abcdefghijk…');
+  });
+
+  it('the picker still answers Deny while the preview is pending', async () => {
+    const gate = deferred<readonly Preview[]>();
+    const onDecision = spy();
+    const { lastFrame, stdin } = render(
+      <PermissionCard request={base} onDecision={onDecision} preview={() => gate.promise} />,
+    );
+    await tick();
+    expect(lastFrame()).toContain(CHECKING);
+
+    await press(stdin, ENTER);
+    expect(onDecision).toHaveBeenCalledWith({ behavior: 'deny', message: DEFAULT_DENIAL });
+  });
+
+  it('a preview that lands after the card has been answered is dropped, and throws nothing', async () => {
+    const gate = deferred<readonly Preview[]>();
+    const onDecision = spy();
+    const { stdin, unmount } = render(
+      <PermissionCard request={base} onDecision={onDecision} preview={() => gate.promise} />,
+    );
+    await tick();
+    await press(stdin, ENTER);
+    expect(onDecision).toHaveBeenCalledTimes(1);
+
+    // Answered, and the card taken down with it. The preview is still running.
+    unmount();
+    gate.settle([{ kind: 'rm', summary: 'too late to matter', lines: [] }]);
+    await expect(gate.promise).resolves.toHaveLength(1);
+    await tick();
+    expect(onDecision).toHaveBeenCalledTimes(1);
   });
 });

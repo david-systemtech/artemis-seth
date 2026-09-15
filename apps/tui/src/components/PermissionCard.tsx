@@ -44,6 +44,24 @@
  * and Enter on the row is what sends it. A suggestion with no `ruleContent` is
  * a bare tool name and has nothing to edit, so `e` does nothing there.
  *
+ * ## What the command would touch
+ *
+ * `rm -rf build/*` asks a question the card cannot answer out of its own text:
+ * how many files is that, and are any of them mine? So for a shell command the
+ * card asks the disk instead — `blastRadius` expands the globs itself, runs
+ * `git clean` with `-n`, counts the commits a force-push would drop — and draws
+ * the answer as yellow `⚠` lines between the arguments and the choices. Every
+ * one of those lines is a `readdir` or the command's own dry run, never a guess
+ * about a filesystem nobody read.
+ *
+ * The preview is I/O and the card is a question with a person waiting on it, so
+ * it gates nothing. The card draws and the picker answers the moment it appears;
+ * the block turns up late, or shows one dim line while it is being worked out,
+ * or never turns up at all. A command with nothing destructive in it gets no
+ * block and no `checking` line, and neither does a preview that came back with
+ * nothing to say — a `>` onto a file that is not there destroys nothing, and a
+ * warning about it is a warning people learn to press Enter through.
+ *
  * ## The one place Esc does not deny
  *
  * While a line is open the card is a box someone is typing in, and Esc closes
@@ -53,7 +71,7 @@
  * denial and that has to stay true where it is claimed.
  */
 
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 
 import type {
@@ -65,8 +83,15 @@ import type {
   Question,
   QuestionAnswer,
 } from '@rx-artemis/protocol';
-import { detectFileEdit, formatJson, oneLine, summarizeToolInput } from '@rx-artemis/transcript';
+import { classifyTool, detectFileEdit, formatJson, oneLine, summarizeToolInput } from '@rx-artemis/transcript';
 
+import {
+  blastRadiusLines,
+  destructiveParts,
+  previewBlastRadius,
+  type Destructive,
+  type Preview,
+} from '../blastRadius.js';
 import {
   backspace,
   cellAt,
@@ -93,6 +118,20 @@ import { Picker, type PickerItem } from './Picker.js';
 
 export const DEFAULT_DENIAL = 'The user declined this action.';
 
+/**
+ * How the card finds out what a command would touch.
+ *
+ * A function rather than the module itself, because {@link previewBlastRadius}
+ * reads directories and starts `git` processes, and a component test that did
+ * that would be a test whose result depends on the machine it runs on. The card
+ * hands over the parts and the directory and takes back lines; everything about
+ * how they were found is on the other side of this type.
+ */
+export type BlastPreview = (parts: readonly Destructive[], cwd: string) => Promise<readonly Preview[]>;
+
+/** How much narrower than the terminal the block is: two borders, two pads, and slack. */
+const BLAST_CHROME = 6;
+
 export interface PermissionCardProps {
   readonly request: PermissionRequest;
   /**
@@ -105,6 +144,16 @@ export interface PermissionCardProps {
    */
   readonly onDecision: (decision: PermissionDecision, followUp?: string) => void;
   readonly isActive?: boolean;
+  /**
+   * Where a relative path in the command would land. The conversation's working
+   * directory, which is not this process's once `/cwd` has been used — the
+   * default is only the fallback for a caller that has not got one to hand.
+   */
+  readonly cwd?: string;
+  /** The columns the card has. The blast block is clipped to fit inside them. */
+  readonly columns?: number;
+  /** Injectable so a test can answer without reading a disk. */
+  readonly preview?: BlastPreview;
 }
 
 export function PermissionCard(props: PermissionCardProps): React.JSX.Element {
@@ -266,6 +315,31 @@ function Field({ placeholder, state, onChange, onSubmit, onClose, onAbandon, isA
 /* Approval                                                                   */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The shell command an approval is asking to run, or null when it is not one.
+ *
+ * Either half is enough to call a request Bash-like. `classifyTool` knows a
+ * shell tool by name whatever the provider called it — `Bash`, `shell`,
+ * `run_command` all land on `command` — and a tool this app has never heard of
+ * still names its argument `command`, which is the miss that would matter: an
+ * `rm -rf` is no less destructive for arriving under an unfamiliar name. In
+ * practice the second test is the one that finds anything, because the line
+ * itself lives in `input.command` either way; the first is what says a string
+ * found there is meant to be read as shell.
+ *
+ * Only a string counts. An argv array joined by spaces is a *different* command
+ * from the array — `['rm', 'my file']` would come back as two paths — and a
+ * preview of the wrong command is worse than no preview at all. Where the
+ * string is not a shell line, nothing is lost: `destructiveParts` recognises a
+ * short list of verbs and finds none of them in `{"command": "click"}`.
+ */
+function commandOf(request: PermissionRequest): string | null {
+  const raw = request.input['command'];
+  const bashLike = classifyTool(request.toolName) === 'command' || 'command' in request.input;
+  if (!bashLike || typeof raw !== 'string' || raw.trim().length === 0) return null;
+  return raw;
+}
+
 /** A rule as it is written down: `Bash(rm:*)`, or a bare tool name. */
 const formatRule = (rule: PermissionRule): string =>
   rule.ruleContent !== undefined ? `${rule.toolName}(${rule.ruleContent})` : rule.toolName;
@@ -349,7 +423,14 @@ type OpenField =
   | { readonly kind: 'comment'; readonly row: 'deny' | 'allow'; readonly editor: EditorState }
   | { readonly kind: 'rule'; readonly index: number; readonly editor: EditorState };
 
-function ApprovalCard({ request, onDecision, isActive = true }: PermissionCardProps): React.JSX.Element {
+function ApprovalCard({
+  request,
+  onDecision,
+  isActive = true,
+  cwd = process.cwd(),
+  columns = 80,
+  preview = previewBlastRadius,
+}: PermissionCardProps): React.JSX.Element {
   const title = request.title ?? `${request.toolName} ${summarizeToolInput(request.input)}`.trim();
   const edit = detectFileEdit(request.toolName, request.input);
   const body = edit === null ? formatJson(request.input).split('\n').slice(0, 14) : renderDiff(edit, 30);
@@ -371,6 +452,61 @@ function ApprovalCard({ request, onDecision, isActive = true }: PermissionCardPr
   const [comments, setComments] = useState<{ readonly deny: string; readonly allow: string }>({ deny: '', allow: '' });
   /** Suggestions the user changed, by their position in `suggestions`. */
   const [edits, setEdits] = useState<ReadonlyMap<number, PermissionRuleUpdate>>(new Map());
+
+  /*
+   * What this command would touch.
+   *
+   * The recogniser is pure and runs in render, so a card for a command with no
+   * destructive verb in it costs a string scan and draws nothing. The previews
+   * start empty and an effect fills them in, which is the whole arrangement:
+   * `previewBlastRadius` reads directories and may wait five seconds on a
+   * `git`, and a card that waited with it would be an approval nobody could
+   * answer for five seconds. Nothing below reads `checking` or `previews` — the
+   * picker is mounted and live from the first frame either way.
+   *
+   * Keyed on the request id, because a new request is a new question and the
+   * previous answer must not be left sitting under it.
+   */
+  const parts = useMemo(() => {
+    const command = commandOf(request);
+    return command === null ? [] : destructiveParts(command);
+  }, [request]);
+  const [previews, setPreviews] = useState<readonly Preview[]>([]);
+  const [checking, setChecking] = useState(() => parts.length > 0);
+
+  useEffect(() => {
+    /*
+     * The card can be answered while this is in flight, and then it is gone —
+     * so the late arrival is dropped rather than set on a component that is no
+     * longer mounted. `previewBlastRadius` does not reject, but an injected one
+     * might, and an unhandled rejection over an otherwise healthy card is not a
+     * trade worth making: a preview that failed is simply no preview.
+     */
+    let live = true;
+    setPreviews([]);
+    setChecking(parts.length > 0);
+    if (parts.length > 0) {
+      void preview(parts, cwd).then(
+        (found) => {
+          if (!live) return;
+          setPreviews(found);
+          setChecking(false);
+        },
+        () => {
+          if (live) setChecking(false);
+        },
+      );
+    }
+    return () => {
+      live = false;
+    };
+    // The id alone, deliberately: the parts and the directory are read off the
+    // request, and re-running this because a parent re-rendered with an equal
+    // `preview` would restart the I/O and blink the block off and on again.
+  }, [request.id]);
+
+  /** Already clipped to the card's width, and already `⚠`-headed; empty when there is nothing to say. */
+  const warnings = blastRadiusLines(previews, columns - BLAST_CHROME);
 
   /** The suggestion as it now stands: edited if it was, the provider's if not. */
   const ruleAt = (index: number): PermissionRuleUpdate | undefined => edits.get(index) ?? suggestions[index];
@@ -536,6 +672,23 @@ function ApprovalCard({ request, onDecision, isActive = true }: PermissionCardPr
           </Text>
         ))}
       </Box>
+      {/*
+       * Under the arguments and above the choices, which is the order someone
+       * reads the card in: this is what the command *means*, and it belongs
+       * between the text of it and the answer to it. No heading — every line
+       * out of `blastRadiusLines` already opens with a `⚠`, and a title over
+       * one line of warning is a line of chrome over a line of fact.
+       */}
+      {(checking || warnings.length > 0) && (
+        <Box flexDirection="column" marginBottom={1}>
+          {checking && <Text dimColor>checking what this would touch…</Text>}
+          {warnings.map((line, i) => (
+            <Text key={i} color="yellow">
+              {line}
+            </Text>
+          ))}
+        </Box>
+      )}
       <Picker
         title=""
         items={items}
