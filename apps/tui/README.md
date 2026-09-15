@@ -39,7 +39,7 @@ an empty composer opens the full key map; what follows is the same map.
 step the permission mode on · `Esc` interrupt, or follow the end again ·
 `Esc Esc` go back to an earlier prompt · `Ctrl+C` interrupt, again to quit ·
 `Ctrl+O` unfold the whole transcript · `Ctrl+T` show or hide the checklist ·
-`?` open the key map.
+`Ctrl+]` go to the next conversation that needs you · `?` open the key map.
 
 **Writing a message.** `Enter` send, steer a turn, or run the highlighted
 row · `Shift+Enter` / `Ctrl+J` a newline · a trailing `\` keeps the line open ·
@@ -85,6 +85,19 @@ several options. The cursor opens on Deny and a bare Enter never authorises.
 turn · `/` search, `n` / `N` between matches · `v` open in your editor · `q`
 close.
 
+## Several conversations at once
+
+Conversations you switch away from keep working. The status line counts
+the ones that need you, in yellow; `Ctrl+]` steps to the next one — first
+those stopped on a permission, then those whose turn finished since you
+last looked. Come back after a few minutes away and the first key shows
+one line saying what finished, with its time and cost, and what is waiting.
+
+Under each finished turn the row says what it cost the plan as well as in
+tokens and dollars: `2.1% of 5hr · 0.4% of week`, for the windows that
+moved while it ran. A tool that has run three minutes with nothing back
+turns its row amber and says how long it has been quiet.
+
 ## Commands
 
 | command | what it does |
@@ -110,6 +123,19 @@ close.
 A `/command` the terminal does not know is sent to the agent as typed, so the
 provider's own commands and your skills stay reachable; the menu offers them
 by the word after the colon.
+
+## From a script
+
+```
+artemis ls                      the stored conversations here: id, updated, branch, title
+artemis ls --all --json         every directory, one JSON object per line
+artemis -p "…" --output-format json          one document at the end
+artemis -p "…" --output-format stream-json   every event as it arrives, then the document
+```
+
+A paste of more than three lines becomes a chip that says what it is —
+`[Pasted #1 · 84 lines · Node stack trace from app.tsx:1442]` — and goes out
+fenced with its language when it is code, a diff, JSON or a log.
 
 ## What it remembers, and where
 
