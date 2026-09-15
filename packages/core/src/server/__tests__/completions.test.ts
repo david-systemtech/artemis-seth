@@ -627,6 +627,26 @@ describe('what gets sent to the provider', () => {
     await drain(source, turn({ extensions: { sessionId: 'sess-3' } }));
     expect(source.started[0]?.input).toMatchObject({ resumeSessionId: 'sess-3' });
   });
+
+  it('carries a fork and a rewind anchor beside the session', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed' }]);
+    await drain(
+      source,
+      turn({ extensions: { sessionId: 'sess-3', forkSession: true, rewindToMessageId: 'msg-7' } }),
+    );
+    expect(source.started[0]?.input).toMatchObject({
+      resumeSessionId: 'sess-3',
+      forkSession: true,
+      rewindToMessageId: 'msg-7',
+    });
+  });
+
+  it('sends neither when neither was asked for', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed' }]);
+    await drain(source, turn({ extensions: { sessionId: 'sess-3' } }));
+    expect(source.started[0]?.input).not.toHaveProperty('forkSession');
+    expect(source.started[0]?.input).not.toHaveProperty('rewindToMessageId');
+  });
 });
 
 describe('promptFromMessages', () => {

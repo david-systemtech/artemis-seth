@@ -725,3 +725,186 @@ describe('correcting the ledger in place', () => {
     ]);
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* Forking and rewinding over the wire                                        */
+/* -------------------------------------------------------------------------- */
+
+/** An account whose provider can fork and rewind, unlike prof-a's bare one. */
+const PROF_C: ServerProfile = {
+  id: 'prof-c' as ServerProfile['id'],
+  slug: 'branchy',
+  label: 'Branchy',
+  provider: { id: 'claude', label: 'Claude', kind: 'hosted' },
+  available: true,
+  disabled: false,
+  live: true,
+  capabilities: { ...NO_CAPABILITIES, forkSession: true, rewind: true },
+  models: [
+    {
+      route: 'branchy/opus',
+      id: 'opus',
+      label: 'Opus 5',
+      note: 'Can branch.',
+      profileId: 'prof-c' as ServerProfile['id'],
+      profileSlug: 'branchy',
+      profileLabel: 'Branchy',
+      providerId: 'claude',
+      thinkingLevels: [],
+      adaptiveThinking: false,
+      fastMode: false,
+      ultracode: false,
+    },
+  ],
+};
+
+const withBranchy: Catalogue = {
+  read: async () => [...PROFILES, PROF_C],
+  invalidate: () => undefined,
+};
+
+/** prof-c's store holds sess-9 in the pinned directory; prof-a's store is as above. */
+const storeOfC: SessionSource = {
+  list: async (query) =>
+    query.profileId === 'prof-c' && query.cwd === '/work/repo'
+      ? {
+          sessions: [
+            {
+              id: 'sess-9' as never,
+              providerId: 'claude' as never,
+              profileId: 'prof-c' as never,
+              cwd: '/work/repo',
+              title: 'Branchable',
+              updatedAt: 9,
+            },
+          ],
+          hasMore: false,
+        }
+      : sessionSource.list(query),
+  messages: sessionSource.messages,
+};
+
+/** A run source that ends at once with the session it is told, recording what it was asked. */
+function scriptedRuns(sessionId: string) {
+  const listeners = new Set<(event: AgentEvent) => void>();
+  const started: Record<string, unknown>[] = [];
+  return {
+    started,
+    startRun: async (input: Record<string, unknown>) => {
+      const { profileId, model, resumeSessionId, forkSession, rewindToMessageId } = input;
+      started.push({
+        profileId,
+        model,
+        ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
+        ...(forkSession === undefined ? {} : { forkSession }),
+        ...(rewindToMessageId === undefined ? {} : { rewindToMessageId }),
+      });
+      queueMicrotask(() => {
+        for (const listener of listeners) {
+          listener({
+            type: 'text.complete',
+            runId: 'run-1',
+            seq: 0,
+            ts: 0,
+            messageId: 'm1',
+            role: 'assistant',
+            text: 'branched',
+          } as unknown as AgentEvent);
+          listener({
+            type: 'run.end',
+            runId: 'run-1',
+            seq: 1,
+            ts: 0,
+            reason: 'completed',
+            sessionId,
+          } as unknown as AgentEvent);
+        }
+      });
+      return {
+        runId: 'run-1',
+        providerId: input['providerId'],
+        profileId,
+        cwd: input['cwd'],
+        status: 'working',
+        capabilities: NO_CAPABILITIES,
+        startedAt: 0,
+      } as never;
+    },
+    subscribe: (listener: (event: AgentEvent) => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    interrupt: async () => undefined,
+    respondToPermission: async () => undefined,
+    disposeRun: async () => undefined,
+  };
+}
+
+describe('forking and rewinding over the wire', () => {
+  const workspaces = {
+    resolve: async () => ({ path: '/work/repo', ephemeral: false }),
+  } as never;
+
+  function chatWith(route: string, artemis: Record<string, unknown>) {
+    return {
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { host: '127.0.0.1:6472', authorization: `Bearer ${TOKEN_A}` },
+      body: {
+        model: route,
+        messages: [{ role: 'user', content: 'again, differently' }],
+        artemis,
+      },
+    };
+  }
+
+  it('refuses a fork on an account whose provider cannot fork', async () => {
+    const { ledger } = await freshLedger();
+    seedOwnership(ledger);
+    const runs = scriptedRuns('sess-1');
+    const reply = await handleServerRequest(
+      chatWith('work-max/opus', { sessionId: 'sess-1', forkSession: true }),
+      context(ledger, { catalogue: withBranchy, sessions: storeOfC, runs: runs as never, workspaces }),
+    );
+    expect(reply.status).toBe(400);
+    expect(JSON.stringify(reply.body)).toContain('cannot fork');
+    // Refused before anything was spent.
+    expect(runs.started).toEqual([]);
+  });
+
+  it('refuses a rewind with no conversation to cut', async () => {
+    const { ledger } = await freshLedger();
+    const runs = scriptedRuns('sess-new');
+    const reply = await handleServerRequest(
+      chatWith('branchy/opus', { rewindToMessageId: 'msg-7' }),
+      context(ledger, { catalogue: withBranchy, sessions: storeOfC, runs: runs as never, workspaces }),
+    );
+    expect(reply.status).toBe(400);
+    expect(JSON.stringify(reply.body)).toContain('artemis.sessionId');
+    expect(runs.started).toEqual([]);
+  });
+
+  it('passes a fork and a rewind anchor to the run on a capable account', async () => {
+    const { ledger } = await freshLedger();
+    recordAs(ledger, 'sess-9', 'prof-c');
+    const runs = scriptedRuns('sess-9-branch');
+    const reply = await handleServerRequest(
+      chatWith('branchy/opus', { sessionId: 'sess-9', forkSession: true, rewindToMessageId: 'msg-7' }),
+      context(ledger, { catalogue: withBranchy, sessions: storeOfC, runs: runs as never, workspaces }),
+    );
+    expect(reply.status).toBe(200);
+    expect(runs.started).toEqual([
+      {
+        profileId: 'prof-c',
+        model: 'opus',
+        resumeSessionId: 'sess-9',
+        forkSession: true,
+        rewindToMessageId: 'msg-7',
+      },
+    ]);
+    // The branch the run announced is this connection's now, like any
+    // conversation it starts — listable and resumable by the same token.
+    expect(ledger.get('sess-9-branch')?.profileId).toBe('prof-c');
+    expect(ledger.get('sess-9')?.profileId).toBe('prof-c');
+  });
+});

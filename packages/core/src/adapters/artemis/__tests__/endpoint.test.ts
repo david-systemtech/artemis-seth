@@ -592,14 +592,18 @@ describe('what a run refuses up front', () => {
     expect(run).toBeDefined();
   });
 
-  it('fork and rewind, which the wire cannot carry yet', async () => {
-    await expect(
-      adapter.createRun({
-        ...base,
-        resumeSessionId: 'sess-abc',
-        forkSession: true,
-      } as unknown as ResolvedRunInput),
-    ).rejects.toMatchObject({ agentError: { code: 'invalid_request' } });
+  it('no longer refuses a fork or a rewind: the wire carries both now', async () => {
+    // Both ride the completions request as `artemis.forkSession` and
+    // `artemis.rewindToMessageId`; a server whose account cannot honour one
+    // refuses the request outright, which is the honest failure. The run
+    // must accept them here.
+    const run = await adapter.createRun({
+      ...base,
+      resumeSessionId: 'sess-abc',
+      forkSession: true,
+      rewindToMessageId: 'msg-7',
+    } as unknown as ResolvedRunInput);
+    expect(run).toBeDefined();
   });
 
   it('a replacing system prompt, which would displace the serving preset', async () => {
@@ -1431,5 +1435,181 @@ describe('listing served conversations', () => {
     });
     expect(page?.sessions[1]).toMatchObject({ id: 'sess-2', accountSlug: 'work-max' });
     expect(page?.sessions[1]).not.toHaveProperty('accountId');
+  });
+});
+
+/**
+ * Reshaping a served conversation, and reading a queued message now.
+ *
+ * A fork and a rewind cross the wire as `artemis.forkSession` and
+ * `artemis.rewindToMessageId`, beside the session id they act on. What these
+ * pin, beyond the body: a fork's session is the *branch* the server announces,
+ * never the original it was told to branch from — announcing that first would
+ * name the branch after its parent and send every later prompt back to it.
+ *
+ * "Read it now" is an interrupt with something queued behind the turn. The
+ * server keeps the queued message across the interrupt and opens the next
+ * turn on it, on the same stream; the adapter used to abort that stream the
+ * moment the interrupt was acknowledged, which ended the conversation on this
+ * side a second after the click while the server went on answering a message
+ * nobody was listening for.
+ */
+describe('forking, rewinding and reading a queued message now', () => {
+  const base = {
+    runId: 'run-fr' as RunId,
+    providerId: 'artemis' as const,
+    profileId: 'profile-1',
+    cwd: process.cwd(),
+    prompt: 'again, differently',
+    model: 'work/opus',
+  };
+
+  function branchStream(response: ServerResponse, sessionId: string): void {
+    response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+    response.write(sse(chunk({ role: 'assistant' })));
+    response.write(sse(chunk({}, { artemis: { sessionId } })));
+    response.write(sse(chunk({ content: 'from here on' })));
+    response.write(
+      sse(chunk({}, { finish_reason: 'stop', artemis: { sessionId, endReason: 'completed' } })),
+    );
+    response.write(sse('[DONE]'));
+    response.end();
+  }
+
+  it('sends the fork beside the session and adopts the branch the server announces', async () => {
+    const { origin, seen } = await serve((_request, response) => branchStream(response, 'branch-1'));
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      resumeSessionId: 'orig-1',
+      forkSession: true,
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+    const events: AgentEvent[] = [];
+    for await (const event of run.events) events.push(event);
+
+    const body = seen[0]?.body as { artemis: Record<string, unknown> };
+    expect(body.artemis).toMatchObject({ sessionId: 'orig-1', forkSession: true });
+    expect(body.artemis).not.toHaveProperty('rewindToMessageId');
+
+    const announced = events.filter((event) => event.type === 'session.started');
+    expect(announced).toHaveLength(1);
+    expect(announced[0]).toMatchObject({ sessionId: 'branch-1', resumedFrom: 'orig-1' });
+    expect(run.sessionId).toBe('branch-1');
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', sessionId: 'branch-1' });
+  });
+
+  it('sends the rewind anchor and keeps the session it cuts', async () => {
+    const { origin, seen } = await serve((_request, response) => branchStream(response, 'orig-1'));
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      resumeSessionId: 'orig-1',
+      rewindToMessageId: 'msg-7',
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+    const events: AgentEvent[] = [];
+    for await (const event of run.events) events.push(event);
+
+    const body = seen[0]?.body as { artemis: Record<string, unknown> };
+    expect(body.artemis).toMatchObject({ sessionId: 'orig-1', rewindToMessageId: 'msg-7' });
+    expect(body.artemis).not.toHaveProperty('forkSession');
+    // A rewind stays in its conversation, so the session is known before the
+    // first byte, exactly as for any other resume.
+    expect(events[0]).toMatchObject({ type: 'session.started', sessionId: 'orig-1' });
+  });
+
+  it('keeps the stream open when the server still holds a queued message', async () => {
+    let held: ServerResponse | undefined;
+    const { origin } = await serve((request, response) => {
+      if (request.url === '/v1/chat/completions') {
+        held = response;
+        response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        response.write(sse(chunk({ role: 'assistant' })));
+        response.write(sse(chunk({}, { artemis: { runId: 'srv-q' } })));
+        response.write(sse(chunk({ content: 'first turn…' })));
+        return; // holds: the test steers, then asks for the message to be read now
+      }
+      if (request.url === '/api/v0/runs/srv-q/messages') {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ runId: 'srv-q', deliveredImmediately: false }));
+        return;
+      }
+      if (request.url === '/api/v0/runs/srv-q/interrupt') {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ runId: 'srv-q', stillQueued: ['srv-m1'] }));
+        // The provider over there takes the queued message up, and the next
+        // turn arrives on the stream it already has.
+        held?.write(sse(chunk({ content: ' second turn' })));
+        held?.write(sse(chunk({}, { finish_reason: 'stop', artemis: { endReason: 'completed' } })));
+        held?.write(sse('[DONE]'));
+        held?.end();
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      runId: 'run-q' as RunId,
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+
+    const events: AgentEvent[] = [];
+    let outcome: { readonly stillQueued: readonly string[] } | undefined;
+    for await (const event of run.events) {
+      events.push(event);
+      if (event.type === 'text.delta' && outcome === undefined) {
+        await run.send('read this next', undefined, 'local-m1' as never);
+        outcome = await run.interrupt();
+      }
+    }
+
+    // Named in this side's ids: the one steer that had not been delivered.
+    expect(outcome?.stillQueued).toEqual(['local-m1']);
+    // The conversation went on rather than ending at the click.
+    expect(events.some((event) => event.type === 'text.delta' && event.text === ' second turn')).toBe(
+      true,
+    );
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+  });
+
+  it('still stops outright when nothing is queued', async () => {
+    const { origin, seen } = await serve((request, response) => {
+      if (request.url === '/v1/chat/completions') {
+        response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        response.write(sse(chunk({ role: 'assistant' })));
+        response.write(sse(chunk({}, { artemis: { runId: 'srv-s' } })));
+        response.write(sse(chunk({ content: 'working…' })));
+        return; // holds forever; the stop is the only exit
+      }
+      if (request.url === '/api/v0/runs/srv-s/interrupt') {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ runId: 'srv-s', stillQueued: [] }));
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      runId: 'run-s' as RunId,
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+
+    const events: AgentEvent[] = [];
+    for await (const event of run.events) {
+      events.push(event);
+      if (event.type === 'text.delta') void run.interrupt();
+    }
+
+    expect(seen.some((row) => row.url === '/api/v0/runs/srv-s/interrupt')).toBe(true);
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'interrupted' });
   });
 });

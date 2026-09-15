@@ -138,6 +138,15 @@ export interface RunSource {
     readonly fastMode?: boolean;
     readonly ultracode?: boolean;
     readonly resumeSessionId?: string;
+    /**
+     * Branch from `resumeSessionId` into a new session, leaving the original
+     * whole; and truncate the resumed conversation at a stored message before
+     * continuing. Both are the caller's own conversation being reshaped, so
+     * they belong to the caller exactly as the session id does; the serving
+     * provider's own capability flags say whether it can honour them.
+     */
+    readonly forkSession?: boolean;
+    readonly rewindToMessageId?: string;
     readonly permissionMode?: string;
     /** Standing instructions to append to the provider's preset. Append-only. */
     readonly systemPrompt?: string;
@@ -834,6 +843,14 @@ export async function* runTurn(
         ...(turn.extensions.sessionId === undefined
           ? {}
           : { resumeSessionId: turn.extensions.sessionId }),
+        // Only meaningful beside a session id, which the route has already
+        // required of them.
+        ...(turn.extensions.forkSession === undefined
+          ? {}
+          : { forkSession: turn.extensions.forkSession }),
+        ...(turn.extensions.rewindToMessageId === undefined
+          ? {}
+          : { rewindToMessageId: turn.extensions.rewindToMessageId }),
         ...(turn.extensions.permissionMode === undefined
           ? {}
           : { permissionMode: turn.extensions.permissionMode }),
