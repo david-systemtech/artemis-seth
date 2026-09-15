@@ -1,6 +1,16 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.14.0
+
+Sessions gather into groups you make, routines run on a schedule — on a server or on this machine — and a question the agent asks waits for you.
+
+**Sessions can be gathered into groups of your own.** The sidebar files every past conversation under the project directory it ran in, which is the right default and the wrong only option: every conversation held on an Artemis Server shares one working directory, so a server's whole history landed under a single heading with no way to tell a week of unrelated work apart. Now you can make a named group and drag any session into it — from a project heading or from the server's one folder — move it between groups, or drag it back out to its project. Groups sit between Pinned and the project headings, keep the order you made them in, and fold like a project does. Pinned and Archived still take precedence: a grouped session you also pin shows under Pinned. Right-click a session for "Move to group", right-click a group heading to rename or delete it (deleting a group returns its sessions to their projects — nothing is destroyed), or drag. The grouping lives in this machine's preferences beside your pins.
+
+**Routines: a saved prompt with an appointment, running on a server or on this machine.** Set one up in Settings → Routines: name it, choose where it runs — **Local** (this machine, while the app is open) or a **Server** (which fires the appointment in the server itself, so it runs on schedule with every window closed) — pick the account and model and reasoning effort, choose a schedule (hourly, daily, weekdays, particular days of the week, weekly, monthly, or a cron expression), and write the prompt it sends each time. A routine fires with nobody in front of it, so by default it runs unattended in bypass-permissions mode — the one mode that never stops to ask; a local routine can be given a stricter mode that pauses on a prompt for you to answer. Each firing is an ordinary run with a real transcript and history, tagged so its firings can be found again. A server routine is scoped to the connection that made it — a token sees and fires only its own — and runs in that connection's own workspace. A missed appointment (the machine asleep, the server down) fires once on the next wake, and older misses are let go.
+
+**A question the agent asks waits for the person it was asked of.** A conversation held with an Artemis Server that stopped to ask a question — an interactive question, or a tool approval — used to have it answered on your behalf after fifteen minutes, with a standing "no one is present" denial, whenever a window was open and nobody had clicked. If you had stepped away meaning to come back, you returned to a conversation that had answered its own question and stopped. A question now waits until you answer it or the run itself ends, and the app raises a notification when an agent stops to ask and no Artemis window is focused, so the wait is something you are told about rather than something you discover.
+
 ## What's new in 2.13.2
 
 Conversations held with an Artemis server stop losing their place — and stop disappearing.
