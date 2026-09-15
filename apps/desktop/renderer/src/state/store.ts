@@ -121,7 +121,12 @@ import { detectArtifact, type Artifact } from '../lib/artifact';
 import { detectFileEdit } from '@rx-artemis/transcript';
 import { isAbsolutePath, lastSegment } from '../lib/paths';
 import { newId } from '../lib/id';
-import { entriesFiling, sessionKey } from '../lib/sessionGroups';
+import {
+  entriesFiling,
+  sessionKey,
+  type CustomGroup,
+  type GroupMembership,
+} from '../lib/sessionGroups';
 import {
   disposeTerminalSession,
   ensureTerminalSession,
@@ -1158,6 +1163,46 @@ export interface AppState {
    */
   readonly pinnedCollapsed: boolean;
   /**
+   * The groups the user has made in the sidebar, in the order they were made.
+   *
+   * The third way a session can leave its project heading, after the pin and
+   * the archive, and the only one whose sections a person names themselves. See
+   * {@link CustomGroup} for the shape and `sessionGroups.ts` for why it exists
+   * at all — the short version is an Artemis Server, whose entire history
+   * shares one working directory and therefore one heading.
+   *
+   * **Desktop-local, like the pins.** Nothing here touches the provider's
+   * store, so grouping works against a provider whose CLI cannot even list its
+   * own history, and a group is a fact about this machine's sidebar rather than
+   * about the transcripts. It rides in `prefs.json` beside
+   * {@link pinnedSessions} for exactly that reason.
+   *
+   * Creation order rather than name order, and no reordering control: the list
+   * is meant to be a handful of shelves, and the one thing worse than a shelf
+   * in the wrong place is a shelf that moves when you rename it. `collapsed`
+   * lives on the record instead of in a parallel set like
+   * {@link collapsedProjects}, because a group has an id to hang it on and
+   * deleting the group then takes its fold state with it rather than leaving an
+   * orphan entry behind.
+   */
+  readonly sessionGroups: readonly CustomGroup[];
+  /**
+   * Which group each grouped session is in: `sessionKey` → {@link CustomGroup.id}.
+   *
+   * Keys are `profileId:id` strings, the same ones {@link pinnedSessions} and
+   * {@link archivedSessions} store, so a session held on an Artemis Server is
+   * keyed by the desktop's server profile — which is stable — and all the
+   * alias handling those two already needed applies unchanged. See
+   * `groupIdOf`.
+   *
+   * A flat record rather than an array per group: a session is in at most one
+   * group, the question asked on every render is "which group is this row in",
+   * and one record answers it in a lookup instead of a scan. An entry naming a
+   * group that no longer exists reads as ungrouped; {@link deleteSessionGroup}
+   * sweeps them, so a survivor can only come from a hand-edited file.
+   */
+  readonly sessionGroupOf: GroupMembership;
+  /**
    * Directories worked in, capped at {@link RECENT_FOLDERS_LIMIT}.
    *
    * The folder control above the composer is a list of these rather than a
@@ -1581,6 +1626,10 @@ interface Prefs {
   archivedExpanded?: boolean;
   pinnedSessions?: readonly string[];
   pinnedCollapsed?: boolean;
+  /** See {@link AppState.sessionGroups}. Local to this desktop, like the pins. */
+  sessionGroups?: readonly CustomGroup[];
+  /** See {@link AppState.sessionGroupOf}. */
+  sessionGroupOf?: GroupMembership;
   settingsSection?: SettingsSection;
   quickModelIdsByProfile?: Readonly<Record<string, readonly string[]>>;
   /**
@@ -1668,6 +1717,38 @@ function boolOrUndefined(value: unknown): boolean | undefined {
 function stringList(value: unknown): readonly string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value.filter((entry): entry is string => typeof entry === 'string');
+}
+
+/**
+ * The user's sidebar groups, kept only where each record is whole.
+ *
+ * The same rule as {@link stringList} over a record rather than a string, and
+ * it earns the extra lines: these are *rendered*, not matched. A group whose
+ * `name` survived out of the blob as a number would reach the heading and be
+ * drawn as one; a group with no `id` would collect memberships that can never
+ * be resolved and could never be deleted, because every action on a group names
+ * it by id.
+ *
+ * Duplicate ids are dropped rather than repaired — a second record under a
+ * live id is a heading that cannot be told from the first by any control in the
+ * UI, and the first one is the one the memberships already point at.
+ *
+ * `collapsed` is copied only when it is a real boolean and only when it is
+ * `true`, so the stored shape stays the minimal one: absent means open.
+ */
+function groupList(value: unknown): readonly CustomGroup[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Set<string>();
+  const groups: CustomGroup[] = [];
+  for (const entry of value as readonly unknown[]) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const { id, name, collapsed } = entry as Record<string, unknown>;
+    if (typeof id !== 'string' || id === '' || seen.has(id)) continue;
+    if (typeof name !== 'string') continue;
+    seen.add(id);
+    groups.push(collapsed === true ? { id, name, collapsed: true } : { id, name });
+  }
+  return groups;
 }
 
 /**
@@ -2049,6 +2130,12 @@ function loadPrefs(): Prefs {
     // And again for the pinned set, which is matched against the same keys.
     pinnedSessions: stringList(raw['pinnedSessions']),
     pinnedCollapsed: boolOrUndefined(raw['pinnedCollapsed']),
+    // The groups are drawn rather than matched, so a bad record here would
+    // reach the heading; the membership beside them is matched against session
+    // keys like the pins are, and `stringMap` drops the entries that could
+    // never match. See `groupList` for what "whole" means for a group.
+    sessionGroups: groupList(raw['sessionGroups']),
+    sessionGroupOf: stringMap(raw['sessionGroupOf']),
     // Same treatment again, and here the entry is rendered rather than matched:
     // a non-string surviving into the menu would reach `lastSegment` and throw
     // on a control the user opens to get *out* of a bad directory.
@@ -2178,6 +2265,8 @@ function savePrefs(): void {
     archivedExpanded: s.archivedExpanded,
     pinnedSessions: s.pinnedSessions,
     pinnedCollapsed: s.pinnedCollapsed,
+    sessionGroups: s.sessionGroups,
+    sessionGroupOf: s.sessionGroupOf,
     settingsSection: s.settingsSection,
     quickModelIdsByProfile: s.quickModelIdsByProfile,
     modelBySession: s.modelBySession,
@@ -2467,6 +2556,8 @@ export const useApp = create<AppState>(() => ({
   archivedExpanded: prefs.archivedExpanded ?? false,
   pinnedSessions: prefs.pinnedSessions ?? [],
   pinnedCollapsed: prefs.pinnedCollapsed ?? false,
+  sessionGroups: prefs.sessionGroups ?? [],
+  sessionGroupOf: prefs.sessionGroupOf ?? {},
   recentFolders: initialRecentFolders(prefs),
   // 'local' when unset or when the stored value is garbage; whether a stored
   // server id still names a real, enabled profile is judged where it is used
@@ -8742,6 +8833,118 @@ export function togglePinnedCollapsed(): void {
   savePrefs();
 }
 
+/* -------------------------------------------------------------------------- */
+/* Groups the user made                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The name a group is born with.
+ *
+ * Not empty, because the heading is created before it is named — the button
+ * makes the group and opens the rename field on it in the same gesture, and a
+ * heading with no text would be a blank strip behind an input. Not a clever
+ * generated name either ("Group 3"), which reads as a name the user chose and
+ * has to be deleted before theirs can be typed; this one is obviously a
+ * placeholder and the field opens with it selected.
+ */
+const NEW_GROUP_NAME = 'New group';
+
+/**
+ * Make a group. Returns its id, because the caller's next move needs it.
+ *
+ * Every other control here acts on a group that already exists and is named by
+ * the row that was clicked; this one is the only place an id comes into
+ * being, and the sidebar immediately opens the rename field on the heading it
+ * just created. Returning the id is what makes that one call instead of
+ * creating a group and then guessing which of them is new.
+ *
+ * Appended rather than prepended: the list is in creation order and stays that
+ * way (see {@link AppState.sessionGroups}), so a new group appears at the
+ * bottom of the group stack rather than displacing the ones above it.
+ */
+export function createSessionGroup(name: string = NEW_GROUP_NAME): string {
+  const id = newId('grp');
+  useApp.setState((s) => ({ sessionGroups: [...s.sessionGroups, { id, name }] }));
+  savePrefs();
+  return id;
+}
+
+/**
+ * Rename a group.
+ *
+ * A blank name is declined rather than stored, and that is not input validation
+ * for its own sake: the heading *is* the only handle on a group — it is what
+ * you click to fold it, right-click to delete it and drop a session onto — so a
+ * group named with an empty string would be a strip of nothing that still owns
+ * its sessions. Declining leaves the previous name, which is the state the user
+ * can see and correct.
+ *
+ * Trimmed for the same reason the rename of a session is: leading space in a
+ * heading is invisible and shifts the label away from every other one in the
+ * column.
+ */
+export function renameSessionGroup(id: string, name: string): void {
+  const trimmed = name.trim();
+  if (trimmed === '') return;
+  useApp.setState((s) => ({
+    sessionGroups: s.sessionGroups.map((group) =>
+      group.id === id ? { ...group, name: trimmed } : group,
+    ),
+  }));
+  savePrefs();
+}
+
+/**
+ * Delete a group. Its sessions go back to their project headings.
+ *
+ * Nothing is destroyed, which is why there is no confirmation on this the way
+ * there is on deleting a session: a group is a view of history, the transcripts
+ * are untouched, and every row it held reappears under the project it ran in —
+ * where it would have been all along had the group never existed.
+ *
+ * The membership entries are swept with it rather than left to be ignored.
+ * `groupIdOf` already treats an entry naming a missing group as ungrouped, so
+ * the rows would be filed correctly either way; what the sweep buys is that a
+ * preferences file does not accumulate a growing record of groups that no
+ * longer exist, and that a freshly minted id can never collide with one.
+ */
+export function deleteSessionGroup(id: string): void {
+  useApp.setState((s) => {
+    const membership: Record<string, string> = {};
+    for (const [key, groupId] of Object.entries(s.sessionGroupOf)) {
+      if (groupId !== id) membership[key] = groupId;
+    }
+    return {
+      sessionGroups: s.sessionGroups.filter((group) => group.id !== id),
+      sessionGroupOf: membership,
+    };
+  });
+  savePrefs();
+}
+
+/**
+ * Fold a group shut, or open it.
+ *
+ * The fold lives on the group record rather than in a set beside it — see
+ * {@link AppState.sessionGroups} — so this rewrites one entry. Stored only when
+ * shut, keeping "absent means open" true of a record as well as of the
+ * `collapsedProjects` list, which is what lets a group created in a later build
+ * arrive open rather than folded away.
+ */
+export function toggleSessionGroupCollapsed(id: string): void {
+  useApp.setState((s) => ({
+    sessionGroups: s.sessionGroups.map((group) => {
+      if (group.id !== id) return group;
+      if (group.collapsed === true) {
+        const { collapsed: _shut, ...open } = group;
+        return open;
+      }
+      return { ...group, collapsed: true };
+    }),
+  }));
+  savePrefs();
+}
+
 export function setPermissionMode(mode: PermissionMode, pane: Pane = focusedPane()): void {
   setPaneState(pane, { permissionMode: mode });
   savePrefs();
@@ -10121,6 +10324,48 @@ export function toggleSessionPinned(session: SessionSummary): void {
 }
 
 /**
+ * File a session into one of the user's groups, or take it back out.
+ *
+ * `null` means "back to its project", which is the whole of removal: there is
+ * no third state, because a session that is in no group is filed by the
+ * directory it ran in, exactly as it was before groups existed.
+ *
+ * **It does not touch the pin or the archive.** Those say where the user's
+ * attention is and this says how their history is filed, and the two are
+ * allowed to disagree: a pinned session that is also in a group shows under
+ * Pinned — see `partitionSessions`, which runs first — and reappears in its
+ * group the moment it is unpinned. Clearing the pin here would mean dragging a
+ * row into a group silently unpinned it, an effect nobody asked for on a
+ * gesture about something else.
+ *
+ * Every entry that filed this session is removed before the new one is written,
+ * not just the canonical key. A shared store's rows change the profile half of
+ * their key the first time they are opened, so a session can be carrying an
+ * entry under a profile it no longer reports; leaving that behind would put the
+ * row back in its old group the next time the listing came round the other way.
+ * See {@link entriesFiling}, which pinning and archiving already go through for
+ * the same reason.
+ */
+export function moveSessionToGroup(session: SessionSummary, groupId: string | null): void {
+  const key = sessionKey(session);
+  useApp.setState((s) => {
+    const stale = new Set(entriesFiling(session, Object.keys(s.sessionGroupOf)));
+    const membership: Record<string, string> = {};
+    for (const [entry, id] of Object.entries(s.sessionGroupOf)) {
+      if (!stale.has(entry)) membership[entry] = id;
+    }
+    // A group that has gone away takes nothing with it: writing a membership
+    // for an id that is not in the list would be an entry `deleteSessionGroup`
+    // never got the chance to sweep.
+    if (groupId !== null && s.sessionGroups.some((group) => group.id === groupId)) {
+      membership[key] = groupId;
+    }
+    return { sessionGroupOf: membership };
+  });
+  savePrefs();
+}
+
+/**
  * Destroy a session's transcript. There is no undo.
  *
  * Not optimistic, unlike {@link renameSession}, and the asymmetry is the point:
@@ -10157,8 +10402,17 @@ export async function deleteSession(session: SessionSummary): Promise<boolean> {
     // entry the canonical key would miss. See `entriesFiling`.
     const archivedHits = new Set(entriesFiling(session, s.archivedSessions));
     const pinnedHits = new Set(entriesFiling(session, s.pinnedSessions));
+    // And the group membership, swept the same way and for the same reason as
+    // the pin below: a recycled id would otherwise arrive pre-filed under a
+    // heading the user did not put it in.
+    const groupHits = new Set(entriesFiling(session, Object.keys(s.sessionGroupOf)));
+    const membership: Record<string, string> = {};
+    for (const [entry, id] of Object.entries(s.sessionGroupOf)) {
+      if (!groupHits.has(entry)) membership[entry] = id;
+    }
     return {
       sessions: s.sessions.filter((entry) => sessionKey(entry) !== key),
+      sessionGroupOf: membership,
       // Swept together with the row. An archive key for a session that no
       // longer exists is inert, but it would accumulate in the persisted
       // preferences forever, and a session id that came round again would

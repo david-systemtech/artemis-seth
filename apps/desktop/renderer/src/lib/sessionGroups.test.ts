@@ -12,7 +12,9 @@ import type { ProfileId, SessionSummary } from '@rx-artemis/protocol';
 import {
   entriesFiling,
   flattenGroups,
+  groupIdOf,
   groupSessionsByProject,
+  liftSessionGroups,
   matchesQuery,
   orderSessions,
   partitionSessions,
@@ -812,5 +814,295 @@ describe('flattenGroups with pinned sessions', () => {
     expect(rows[1]).toMatchObject({ group: 1, pinned: true });
     expect(rows[3]).toMatchObject({ group: 0 });
     expect(rows[5]).toMatchObject({ group: 2, archived: true });
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Groups the user made                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The rules a custom group has to keep, and why each one is here.
+ *
+ * The feature exists for a case the project headings cannot answer: every
+ * session held on an Artemis Server shares one working directory, so a month of
+ * unrelated work files under a single heading. A group is the user's own answer
+ * to that, so what these lock down is that membership beats the project, that
+ * the two shelves still beat membership, and that a group nobody has put
+ * anything in is still a place to drop the first session.
+ */
+describe('liftSessionGroups', () => {
+  const groups = [
+    { id: 'g1', name: 'Billing' },
+    { id: 'g2', name: 'Docs' },
+  ];
+
+  it('lifts a session out of the project list and into its group', () => {
+    const grouped = session({ id: 'a', cwd: '/code/api', updatedAt: 10 });
+    const loose = session({ id: 'b', cwd: '/code/api', updatedAt: 20 });
+
+    const lifted = liftSessionGroups([grouped, loose], groups, {
+      [sessionKey(grouped)]: 'g1',
+    });
+
+    expect(lifted.sections.map((s) => s.group.id)).toEqual(['g1', 'g2']);
+    expect(lifted.sections[0]!.sessions.map((s) => s.id)).toEqual(['a']);
+    // And it is gone from what the projects are built out of — a grouped
+    // session leaves its heading rather than appearing under both.
+    expect(lifted.ungrouped.map((s) => s.id)).toEqual(['b']);
+  });
+
+  it('keeps an empty group, because that is the thing you drop the first row on', () => {
+    const lifted = liftSessionGroups(
+      [session({ id: 'a', cwd: '/code/api', updatedAt: 1 })],
+      groups,
+      {},
+    );
+
+    expect(lifted.sections.map((s) => s.group.id)).toEqual(['g1', 'g2']);
+    expect(lifted.sections[0]!.sessions).toEqual([]);
+  });
+
+  it('keeps the groups in their stored order whatever their sessions do', () => {
+    // Same argument as the project headings: furniture holds still. The newest
+    // session in the list is in the second group and it decides nothing.
+    const old = session({ id: 'old', cwd: '/code/api', updatedAt: 1 });
+    const fresh = session({ id: 'fresh', cwd: '/code/api', updatedAt: 9_000 });
+
+    const lifted = liftSessionGroups([old, fresh], groups, {
+      [sessionKey(old)]: 'g1',
+      [sessionKey(fresh)]: 'g2',
+    });
+
+    expect(lifted.sections.map((s) => s.group.name)).toEqual(['Billing', 'Docs']);
+  });
+
+  it('orders the sessions inside a group newest first', () => {
+    const a = session({ id: 'a', cwd: '/code/api', updatedAt: 1 });
+    const b = session({ id: 'b', cwd: '/code/web', updatedAt: 99 });
+    const c = session({ id: 'c', cwd: '/code/cli', updatedAt: 50 });
+
+    const lifted = liftSessionGroups([a, b, c], groups, {
+      [sessionKey(a)]: 'g1',
+      [sessionKey(b)]: 'g1',
+      [sessionKey(c)]: 'g1',
+    });
+
+    // Across three projects, which is the point: a group spans them.
+    expect(lifted.sections[0]!.sessions.map((s) => s.id)).toEqual(['b', 'c', 'a']);
+  });
+
+  it('files a session whose group has gone away back under its project', () => {
+    // `deleteSessionGroup` sweeps the entries it owns, so this is a
+    // hand-edited file or a group deleted in another window. Either way the
+    // project heading is where the session can still be found.
+    const orphan = session({ id: 'a', cwd: '/code/api', updatedAt: 10 });
+
+    const lifted = liftSessionGroups([orphan], groups, { [sessionKey(orphan)]: 'gone' });
+
+    expect(lifted.ungrouped.map((s) => s.id)).toEqual(['a']);
+    expect(lifted.sections.every((s) => s.sessions.length === 0)).toBe(true);
+  });
+
+  it('touches nothing when there are no groups at all', () => {
+    // The overwhelmingly common sidebar, and the hot path: the same array back.
+    const sessions = [session({ id: 'a', cwd: '/code/api', updatedAt: 1 })];
+
+    const lifted = liftSessionGroups(sessions, [], {});
+
+    expect(lifted.sections).toEqual([]);
+    expect(lifted.ungrouped).toBe(sessions);
+  });
+
+  it('filters a group by the query, and drops it when nothing in it matches', () => {
+    const a = session({ id: 'a', cwd: '/code/api', updatedAt: 2, title: 'Billing webhook' });
+    const b = session({ id: 'b', cwd: '/code/api', updatedAt: 1, title: 'Login redirect' });
+
+    const lifted = liftSessionGroups(
+      [a, b],
+      groups,
+      { [sessionKey(a)]: 'g1', [sessionKey(b)]: 'g1' },
+      { query: 'webhook' },
+    );
+
+    // `g2` holds nothing and matches nothing, so it goes with the rest of the
+    // furniture while a search is on: a column of empty headings under "No
+    // match" reads as a broken search.
+    expect(lifted.sections.map((s) => s.group.id)).toEqual(['g1']);
+    expect(lifted.sections[0]!.sessions.map((s) => s.id)).toEqual(['a']);
+  });
+
+  it('holds a grouped row still while its agent works', () => {
+    // The same hold the projects honour: `updatedAt` is an mtime that moves
+    // every few seconds during a run, and a group is not exempt from the
+    // four-second shuffle that made rows trade places under the pointer.
+    const a = session({ id: 'a', cwd: '/code/api', updatedAt: 1 });
+    const b = session({ id: 'b', cwd: '/code/api', updatedAt: 99 });
+
+    const lifted = liftSessionGroups(
+      [a, b],
+      groups,
+      { [sessionKey(a)]: 'g1', [sessionKey(b)]: 'g1' },
+      { orderKey: (s) => (s.id === 'a' ? 1_000 : s.updatedAt) },
+    );
+
+    expect(lifted.sections[0]!.sessions.map((s) => s.id)).toEqual(['a', 'b']);
+  });
+
+  it('groups a session held on an Artemis Server like any other', () => {
+    // The case the whole feature is for: every served conversation shares one
+    // working directory, so the project heading cannot tell a week of
+    // unrelated work apart. The key is `profileId:id` under the desktop's
+    // server profile, which is stable.
+    const served = session({
+      id: 'srv-1',
+      cwd: '/work/SYSTEM-SERVER',
+      updatedAt: 10,
+      providerId: 'artemis',
+      profileId: 'prof_server' as ProfileId,
+    });
+    const other = session({
+      id: 'srv-2',
+      cwd: '/work/SYSTEM-SERVER',
+      updatedAt: 20,
+      providerId: 'artemis',
+      profileId: 'prof_server' as ProfileId,
+    });
+
+    const lifted = liftSessionGroups([served, other], groups, { 'prof_server:srv-1': 'g1' });
+
+    expect(lifted.sections[0]!.sessions.map((s) => s.id)).toEqual(['srv-1']);
+    expect(lifted.ungrouped.map((s) => s.id)).toEqual(['srv-2']);
+  });
+});
+
+describe('groupIdOf', () => {
+  it('answers with the group a session is filed under', () => {
+    const one = session({ id: 'a', cwd: '/code/api', updatedAt: 1 });
+
+    expect(groupIdOf(one, { [sessionKey(one)]: 'g1' })).toBe('g1');
+    expect(groupIdOf(one, {})).toBeUndefined();
+  });
+
+  it('keeps a shared row’s filing when the profile half of its key goes stale', () => {
+    // The same correction that used to unpin a pinned conversation: opening a
+    // session in a shared store records the account it was opened under, and
+    // the listing comes back naming that one instead. The transcript never
+    // moved, so neither should the group.
+    const shared = session({
+      id: 'dup',
+      cwd: '/code/api',
+      updatedAt: 1,
+      profileId: 'prof_work' as ProfileId,
+      alsoInProfiles: ['prof_personal' as ProfileId],
+    });
+
+    expect(groupIdOf(shared, { 'prof_personal:dup': 'g1' })).toBe('g1');
+    // And an entry written under a profile that has since left the
+    // arrangement entirely, which no alias predicts.
+    expect(groupIdOf(shared, { 'prof_gone:dup': 'g1' })).toBe('g1');
+  });
+
+  it('does not let one profile’s entry claim another profile’s unshared row', () => {
+    const mine = session({
+      id: 'dup',
+      cwd: '/code/api',
+      updatedAt: 1,
+      profileId: 'prof_work' as ProfileId,
+    });
+
+    expect(groupIdOf(mine, { 'prof_personal:dup': 'g1' })).toBeUndefined();
+  });
+});
+
+describe('flattenGroups with the user’s groups', () => {
+  const projects = () =>
+    groupSessionsByProject([session({ id: 'loose', cwd: '/code/api', updatedAt: 20 })]);
+  const grouped = [session({ id: 'filed', cwd: '/code/web', updatedAt: 10 })];
+  const pinned = [session({ id: 'kept', cwd: '/code/web', updatedAt: 30 })];
+
+  it('draws the groups between the pin shelf and the projects', () => {
+    const rows = flattenGroups(projects(), new Set(), {
+      pinned: { sessions: pinned, collapsed: false },
+      groups: [{ group: { id: 'g1', name: 'Billing' }, sessions: grouped }],
+    });
+
+    expect(rows.map((r) => r.kind)).toEqual([
+      'pinned-header',
+      'session',
+      'group-header',
+      'session',
+      'header',
+      'session',
+    ]);
+  });
+
+  it('names the group on its heading and counts what it holds', () => {
+    const rows = flattenGroups(projects(), new Set(), {
+      groups: [{ group: { id: 'g1', name: 'Billing' }, sessions: grouped }],
+    });
+
+    expect(rows[0]).toMatchObject({
+      kind: 'group-header',
+      groupId: 'g1',
+      name: 'Billing',
+      count: 1,
+      collapsed: false,
+    });
+  });
+
+  it('emits a heading for a group holding nothing', () => {
+    // The one section in this list that appears while empty, because its
+    // heading is how the first session gets in.
+    const rows = flattenGroups(projects(), new Set(), {
+      groups: [{ group: { id: 'g1', name: 'Billing' }, sessions: [] }],
+    });
+
+    expect(rows.map((r) => r.kind)).toEqual(['group-header', 'header', 'session']);
+  });
+
+  it('drops a folded group’s rows but keeps its heading and its count', () => {
+    const rows = flattenGroups(projects(), new Set(), {
+      groups: [{ group: { id: 'g1', name: 'Billing', collapsed: true }, sessions: grouped }],
+    });
+
+    expect(rows.map((r) => r.kind)).toEqual(['group-header', 'header', 'session']);
+    expect(rows[0]).toMatchObject({ count: 1, collapsed: true });
+  });
+
+  it('tags a grouped row with its group, so the menu knows where it is', () => {
+    const rows = flattenGroups(projects(), new Set(), {
+      groups: [{ group: { id: 'g1', name: 'Billing' }, sessions: grouped }],
+    });
+
+    const sessions = rows.filter((r) => r.kind === 'session');
+    expect(sessions.map((r) => r.groupId)).toEqual(['g1', undefined]);
+  });
+
+  it('keys two groups of the same name apart', () => {
+    // Nothing stops a person calling two shelves the same thing, and a
+    // duplicate React key silently drops the second heading.
+    const rows = flattenGroups(projects(), new Set(), {
+      groups: [
+        { group: { id: 'g1', name: 'Billing' }, sessions: [] },
+        { group: { id: 'g2', name: 'Billing' }, sessions: [] },
+      ],
+    });
+
+    const keys = rows.map((r) => r.key);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('leaves every project’s group index equal to its position', () => {
+    const rows = flattenGroups(projects(), new Set(), {
+      pinned: { sessions: pinned, collapsed: false },
+      groups: [{ group: { id: 'g1', name: 'Billing' }, sessions: grouped }],
+    });
+
+    // Sections are numbered past the projects: pinned at 1, the archive at 2,
+    // and the first custom group at 3. The project keeps 0.
+    expect(rows[1]).toMatchObject({ group: 1, pinned: true });
+    expect(rows[3]).toMatchObject({ group: 3, groupId: 'g1' });
+    expect(rows[5]).toMatchObject({ group: 0 });
   });
 });
