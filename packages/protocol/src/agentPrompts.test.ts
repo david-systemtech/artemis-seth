@@ -478,7 +478,7 @@ describe('renderMemoryBanksPrompt', () => {
     expect(text).toContain('--bank notes draft <slug> --type <user|feedback|project|reference> \\');
     expect(text).not.toContain('--org <org>');
     // The nested bank still says how it is laid out, on its own line.
-    expect(text).toMatch(/`upstream` \(read-only.*filed by project/);
+    expect(text).toMatch(/`upstream` read-only.*filed by project/);
   });
 
   it('carries a bank\'s own instructions, after Artemis\'s text and before the reference line', () => {
