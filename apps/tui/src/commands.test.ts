@@ -96,11 +96,20 @@ describe('matchCommands', () => {
 
   it('ranks a whole name first, then an alias, then the provider', () => {
     const matched = matchCommands('/c', providers);
-    // `cwd` by name; `continue` and `clear` are aliases, in the order the
-    // commands they mean are declared; `compact` is the provider's own, and
-    // `code-review` only matched a word inside its name.
-    expect(usages(matched)).toEqual(['/cwd', '/resume', '/new', '/compact', '/artemis-skills:code-review']);
-    expect(matched.map((match) => match.rank)).toEqual([0, 1, 1, 3, 5]);
+    // `copy` and `cwd` by name, in the order they are declared; `continue`,
+    // `changes` and `clear` are aliases, again in the order the commands they
+    // mean are declared; `compact` is the provider's own, and `code-review`
+    // only matched a word inside its name.
+    expect(usages(matched)).toEqual([
+      '/copy',
+      '/cwd',
+      '/resume',
+      '/diff',
+      '/new',
+      '/compact',
+      '/artemis-skills:code-review',
+    ]);
+    expect(matched.map((match) => match.rank)).toEqual([0, 0, 1, 1, 1, 3, 5]);
   });
 
   it('matches a word inside a name, which is how a bridged skill is reachable', () => {
@@ -168,5 +177,62 @@ describe('matchCommands', () => {
   it('keys every row so the TUI’s and the provider’s cannot collide', () => {
     const matched = matchCommands('/', ['help', ...providers]);
     expect(new Set(matched.map((match) => match.key)).size).toBe(matched.length);
+  });
+});
+
+/*
+ * The commands the overhaul added, and the words people reach for instead.
+ *
+ * All six are about the conversation that has already happened rather than
+ * about the next turn — what it said, what it wrote, what it is called — which
+ * is why they are worth aliases at all: someone who wants the diff types
+ * `/changes` as readily as `/diff`, and a command that answers only to its own
+ * name is one a person has to remember rather than guess.
+ */
+describe('the conversation commands', () => {
+  it('parses each of them by name, arguments and all', () => {
+    expect(parseCommand('/copy')).toEqual({ name: 'copy', args: '' });
+    expect(parseCommand('/diff')).toEqual({ name: 'diff', args: '' });
+    expect(parseCommand('/undo')).toEqual({ name: 'undo', args: '' });
+    expect(parseCommand('/pin')).toEqual({ name: 'pin', args: '' });
+    expect(parseCommand('/export  notes/session.md ')).toEqual({ name: 'export', args: 'notes/session.md' });
+    // The case of a title is the user's; only the command word is folded.
+    expect(parseCommand('/TITLE The Rail Rewrite')).toEqual({ name: 'title', args: 'The Rail Rewrite' });
+  });
+
+  it('answers to the word rather than the name', () => {
+    expect(parseCommand('/save out.md')).toEqual({ name: 'export', args: 'out.md' });
+    expect(parseCommand('/changes')?.name).toBe('diff');
+    expect(parseCommand('/revert')?.name).toBe('undo');
+    expect(parseCommand('/rename Rail')).toEqual({ name: 'title', args: 'Rail' });
+    expect(parseCommand('/name Rail')).toEqual({ name: 'title', args: 'Rail' });
+  });
+
+  it('draws each of them with its arguments spelled out', () => {
+    const usageOf = (name: string): string | undefined => COMMANDS.find((spec) => spec.name === name)?.usage;
+    // The row is the whole of what the menu says about how to call it.
+    expect(usageOf('export')).toBe('/export [file]');
+    expect(usageOf('title')).toBe('/title <name>');
+    expect(usageOf('copy')).toBe('/copy');
+  });
+
+  it('finds them in the menu by name and by alias', () => {
+    expect(completeCommand('/und').map((command) => command.name)).toEqual(['undo']);
+    expect(completeCommand('/pin').map((command) => command.name)).toEqual(['pin']);
+    // `name` and `rename` both mean `/title`, and one row is offered however
+    // many ways it was found.
+    const renamed = matchCommands('/rename');
+    expect(renamed.map((match) => match.usage)).toEqual(['/title <name>']);
+    expect(renamed[0]?.rank).toBe(1);
+    expect(matchCommands('/changes').map((match) => match.usage)).toEqual(['/diff']);
+  });
+
+  it('leaves the provider’s own neighbours alone', () => {
+    // `/pin` is the TUI's; `/plan` and `/compact` are Claude Code's, and a
+    // word that merely starts the same way must not swallow them.
+    expect(parseCommand('/plan')).toBeNull();
+    expect(parseCommand('/compact')).toBeNull();
+    expect(parseCommand('/exports')).toBeNull();
+    expect(parseCommand('/copycat')).toBeNull();
   });
 });

@@ -32,6 +32,17 @@
  * prompt as — `${runId}:prompt:${n}` — which is what lets a later replay merge
  * onto it rather than draw it twice; `pushUserMessage`'s own comment says why.
  *
+ * What the turn *did to the disk* is kept alongside it, in a
+ * {@link ChangeLedger} of this conversation's own. It has to be fed from here
+ * because here is where the events are: the ledger's whole trick is reading a
+ * file on `tool.start`, while the call has been announced and has not run yet,
+ * and nothing downstream of this class sees that moment. One ledger per
+ * conversation and one working directory per ledger — a conversation that
+ * changes directory has nothing to say about the files of the one it left — and
+ * a subagent's edits count, because they land on the same disk as anybody
+ * else's. {@link ConversationState.filesChanged} is the one line of it the
+ * status bar wants, folded on `tool.end` rather than on every delta.
+ *
  * The state also carries *what the agent is doing right now* — the turn's
  * start time, a one-line activity, and the tokens it has written since. That
  * reading belongs here rather than in the status bar because it is a fold over
@@ -85,6 +96,8 @@ import {
   type Scheduler,
   type TranscriptItem,
 } from '@rx-artemis/transcript';
+
+import { ChangeLedger } from './changes.js';
 
 /** The slice of `RunRegistry` a conversation needs. Satisfied structurally. */
 export interface RunDriver {
@@ -292,6 +305,19 @@ export interface ConversationState {
    * guess.
    */
   readonly rewindArmed?: { readonly messageId: string; readonly fork: boolean };
+  /**
+   * What this conversation has done to the working directory, in three
+   * numbers: `3 files · +42 -7`.
+   *
+   * The whole of the ledger in a form a status bar can print without walking
+   * a list on every frame, and absent until something has actually been
+   * edited — a bar that says `0 files` spends columns saying nothing happened.
+   * Folded when a tool call *ends*, which is the only moment the totals can
+   * move: a change is recorded when its call succeeds, so no number here can
+   * change between one `tool.end` and the next. The ledger itself
+   * ({@link Conversation.changes}) has the files, the diffs and the undo.
+   */
+  readonly filesChanged?: { readonly files: number; readonly added: number; readonly removed: number };
 }
 
 export type Outcome = { readonly ok: true } | { readonly ok: false; readonly reason: string };
@@ -305,6 +331,16 @@ export interface ConversationOptions {
   readonly newRunId?: () => RunId;
   /** The host clock, injected so a test can pin what "now" was. */
   readonly now?: () => number;
+  /**
+   * The ledger this conversation records its file edits in, built for the
+   * directory it starts in.
+   *
+   * A factory rather than an instance because the directory is the ledger's
+   * one construction argument and it comes from the settings; injected at all
+   * because {@link ChangeLedger} reads and writes real files, and a test wants
+   * one over a `Map`.
+   */
+  readonly ledger?: (cwd: string) => ChangeLedger;
 }
 
 const describe = (error: unknown): string =>
@@ -402,6 +438,16 @@ function heading(line: string): string {
 export class Conversation {
   readonly transcript: TranscriptModel;
 
+  /**
+   * Every file edit of this conversation, and the way back from the last one.
+   *
+   * Public because everything that reads it — `/diff`, `/undo`, the status
+   * bar's line — lives outside this class; fed from inside it, because the
+   * `tool.start` that a pre-image has to be read at passes through here and
+   * nowhere else. See {@link ConversationState.filesChanged} for the summary.
+   */
+  readonly changes: ChangeLedger;
+
   readonly #driver: RunDriver;
   readonly #capabilitiesFor: (providerId: ProviderId) => Capabilities | undefined;
   readonly #newRunId: () => RunId;
@@ -466,6 +512,18 @@ export class Conversation {
   #rewindCutAt: number | undefined;
   /** Provider-started turns on this session that arrived while a turn of ours was open. See `#fromSibling`. */
   readonly #siblings = new Set<RunId>();
+  /** The ledger's totals, as the snapshot carries them. Absent until an edit lands. */
+  #filesChanged: ConversationState['filesChanged'];
+  /**
+   * Every ledger read this conversation has started, chained.
+   *
+   * The ledger's work is asynchronous — it reads a file — and it is started
+   * from a synchronous event handler, so there is nothing for a caller to hold
+   * on to unless it is kept. One chain rather than a set because the order the
+   * reads finish in is the order they were asked for, and because a chain is
+   * one thing to await. See {@link Conversation.changesSettled}.
+   */
+  #ledgerWork: Promise<void> = Promise.resolve();
   #snapshot: ConversationState;
 
   constructor(options: ConversationOptions) {
@@ -476,6 +534,7 @@ export class Conversation {
     this.#newRunId = options.newRunId ?? (() => randomUUID() as RunId);
     this.#now = options.now ?? Date.now;
     this.transcript = new TranscriptModel(options.scheduler ?? frameScheduler);
+    this.changes = options.ledger?.(options.settings.cwd) ?? new ChangeLedger(options.settings.cwd);
     this.#snapshot = this.#buildSnapshot();
     this.#unsubscribe = this.#driver.subscribe((event) => this.#onEvent(event));
   }
@@ -523,6 +582,7 @@ export class Conversation {
     const changesAccount =
       (patch.profileId !== undefined && patch.profileId !== this.#settings.profileId) ||
       (patch.providerId !== undefined && patch.providerId !== this.#settings.providerId);
+    const movesDirectory = patch.cwd !== undefined && patch.cwd !== this.#settings.cwd;
     if (changesAccount && this.isLive) {
       return { ok: false, reason: 'A conversation belongs to the account it started on. Wait for this turn to finish.' };
     }
@@ -535,6 +595,10 @@ export class Conversation {
       this.#capabilities = this.#capabilitiesFor(this.#settings.providerId) ?? NO_CAPABILITIES;
       this.transcript.reset();
     }
+    // The ledger is about one directory. Its paths were resolved against the
+    // old root and its undos would write there, so moving is the end of it —
+    // as is starting again somewhere else on another account.
+    if (changesAccount || movesDirectory) this.#resetChanges();
     this.#notify();
     return { ok: true };
   }
@@ -551,6 +615,7 @@ export class Conversation {
     this.#clearRewind();
     this.#endTurn();
     this.transcript.reset();
+    this.#resetChanges();
     this.#notify();
     return { ok: true };
   }
@@ -624,6 +689,10 @@ export class Conversation {
   loadHistory(sessionId: SessionId, events: readonly AgentEvent[]): Outcome {
     if (this.isLive) return { ok: false, reason: 'Wait for this turn to finish before switching conversations.' };
     this.transcript.reset();
+    // A stored conversation's edits were made by a process that is no longer
+    // running, in a working tree that has moved on since. Nothing in the
+    // replay can be undone, so nothing in it is recorded as undoable.
+    this.#resetChanges();
     for (const event of events) this.transcript.apply(event);
     this.transcript.flush();
     this.#sessionId = sessionId;
@@ -865,6 +934,107 @@ export class Conversation {
     this.#unsubscribe();
     this.#listeners.clear();
     this.#eventListeners.clear();
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* What changed on disk                                                    */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Resolves once every ledger read started so far has finished.
+   *
+   * The ledger reads and hashes files, and it is fed from an event handler
+   * that cannot wait for it — so between the `tool.end` on the wire and the
+   * change appearing in {@link changes} there is a gap of one disk read. This
+   * is how to be on the far side of it: `/diff` and `/undo` typed the instant a
+   * turn ends should see the turn's last edit, and a test that emits two events
+   * and asserts about the ledger has no other way to know when to look.
+   */
+  changesSettled(): Promise<void> {
+    return this.#ledgerWork;
+  }
+
+  /**
+   * Re-read the ledger's totals into the state.
+   *
+   * The event stream does this for itself on every `tool.end`. It is public for
+   * the one thing that moves the totals without an event behind it: `/undo`,
+   * which takes a change back through {@link changes} directly, and after which
+   * a status line still reading `3 files` would be a count of files one of
+   * which has been put back.
+   */
+  refreshChanges(): void {
+    if (this.#foldChanges()) this.#notify();
+  }
+
+  /**
+   * Show the ledger every tool call, before anything else has an opinion.
+   *
+   * Called before the event switch, and so before its `agentId` early return: a
+   * subagent's `Edit` writes to the same disk as the main agent's, and the
+   * `/diff` that leaves out the three files a delegated agent rewrote is
+   * worse than no `/diff` at all. The reads are started and not waited for —
+   * `onToolStart` files its snapshot promise before it yields, so an end that
+   * arrives first still finds it — and the totals are folded when the end has
+   * been recorded, which is the only moment they can have moved.
+   */
+  #ledgerHears(event: AgentEvent): void {
+    if (event.type === 'tool.start') {
+      this.#track(
+        this.changes.onToolStart({
+          id: event.toolCallId,
+          name: event.name,
+          input: event.input,
+          ts: event.ts,
+        }),
+      );
+      return;
+    }
+    if (event.type !== 'tool.end') return;
+    this.#track(
+      this.changes.onToolEnd({ id: event.toolCallId, status: event.status }).then(() => {
+        this.refreshChanges();
+      }),
+    );
+  }
+
+  /** Keep the chain going whatever one read did. See `#ledgerWork`. */
+  #track(work: Promise<void>): void {
+    this.#ledgerWork = this.#ledgerWork.then(() => work).catch(() => undefined);
+  }
+
+  /** A different conversation, or the same one somewhere else. */
+  #resetChanges(): void {
+    this.changes.reset(this.#settings.cwd);
+    this.#filesChanged = undefined;
+  }
+
+  /**
+   * Fold the ledger into three numbers, and say whether they moved.
+   *
+   * The object is kept when it would be the same object, because the snapshot
+   * is compared by reference and a fresh one per `tool.end` would be a render
+   * of the whole app for every tool call that touched nothing.
+   */
+  #foldChanges(): boolean {
+    const files = this.changes.files();
+    const current = this.#filesChanged;
+    if (files.length === 0) {
+      if (current === undefined) return false;
+      this.#filesChanged = undefined;
+      return true;
+    }
+    let added = 0;
+    let removed = 0;
+    for (const file of files) {
+      added += file.added;
+      removed += file.removed;
+    }
+    if (current !== undefined && current.files === files.length && current.added === added && current.removed === removed) {
+      return false;
+    }
+    this.#filesChanged = { files: files.length, added, removed };
+    return true;
   }
 
   /* ---------------------------------------------------------------------- */
@@ -1234,6 +1404,7 @@ export class Conversation {
       return;
     }
     this.transcript.apply(event);
+    this.#ledgerHears(event);
 
     // The turn has spoken, so the rewind held against it is settled — but only
     // once the arm has gone out. While it is still armed nothing has been asked
@@ -1441,6 +1612,10 @@ export class Conversation {
    */
   #onSiblingEvent(event: AgentEvent): void {
     this.transcript.apply(event);
+    // Its edits are on the same disk as ours, and it is this conversation's
+    // session that they were made for. Whose run id they carry decides
+    // nothing about which files changed.
+    this.#ledgerHears(event);
     if (event.type === 'background.tasks') this.#tasks = event.tasks;
     if (event.type === 'run.end') this.#siblings.delete(event.runId);
     this.#notify();
@@ -1611,6 +1786,7 @@ export class Conversation {
         ? {}
         : { turnTokens: this.#turnTokens }),
       ...(this.#rewindArmed === undefined ? {} : { rewindArmed: this.#rewindArmed }),
+      ...(this.#filesChanged === undefined ? {} : { filesChanged: this.#filesChanged }),
     };
   }
 
@@ -1651,7 +1827,8 @@ export class Conversation {
       next.turnStartedAt === previous.turnStartedAt &&
       next.activity === previous.activity &&
       next.turnTokens === previous.turnTokens &&
-      next.rewindArmed === previous.rewindArmed;
+      next.rewindArmed === previous.rewindArmed &&
+      next.filesChanged === previous.filesChanged;
     if (same) return;
     this.#snapshot = next;
     for (const listener of this.#listeners) listener();

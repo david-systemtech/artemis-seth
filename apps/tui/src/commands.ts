@@ -26,6 +26,12 @@ export type CommandName =
   | 'mode'
   | 'resume'
   | 'attach'
+  | 'copy'
+  | 'export'
+  | 'diff'
+  | 'undo'
+  | 'pin'
+  | 'title'
   | 'tasks'
   | 'usage'
   | 'cwd'
@@ -52,6 +58,12 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: 'mode', usage: '/mode', summary: 'Set the permission mode for the next turn' },
   { name: 'resume', usage: '/resume', summary: 'Pick up a stored conversation from this directory' },
   { name: 'attach', usage: '/attach <path>', summary: 'Send an image or file with the next message' },
+  { name: 'copy', usage: '/copy', summary: 'Copy the last reply, or one of its code blocks, to the clipboard' },
+  { name: 'export', usage: '/export [file]', summary: 'Write this conversation to a markdown file' },
+  { name: 'diff', usage: '/diff', summary: "What this conversation changed, and the working tree's diff" },
+  { name: 'undo', usage: '/undo', summary: 'Take back the last file change the agent made' },
+  { name: 'pin', usage: '/pin', summary: 'Keep this conversation at the top of its folder' },
+  { name: 'title', usage: '/title <name>', summary: 'Name this conversation' },
   { name: 'tasks', usage: '/tasks', summary: 'Background work: what is running, and what a delegated agent did' },
   { name: 'usage', usage: '/usage', summary: "The account's plan windows and how full they are" },
   { name: 'cwd', usage: '/cwd', summary: 'Choose where to work: a folder you have used, or browse for one' },
@@ -83,6 +95,14 @@ const ALIASES: Readonly<Record<string, CommandName>> = {
   limits: 'usage',
   file: 'attach',
   image: 'attach',
+  // The words people reach for when they want the thing rather than the name
+  // of the thing: what came out of the session, what went into the files, and
+  // what this conversation is called.
+  save: 'export',
+  changes: 'diff',
+  revert: 'undo',
+  rename: 'title',
+  name: 'title',
 };
 
 /**

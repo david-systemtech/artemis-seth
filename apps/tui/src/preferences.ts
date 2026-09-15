@@ -20,6 +20,13 @@
  * stored is a small map keyed by profile, and an account that has never been
  * chosen for simply opens on its provider's default.
  *
+ * Pinned conversations are remembered here too, as a list of session ids. They
+ * are a judgement about a conversation rather than about an account, they
+ * outlive the launch that made them by definition — a pin whose whole point is
+ * "keep this at the top" and that is forgotten on exit is a worse feature than
+ * none — and they are the user's own words about their own work, which is the
+ * same promise the rest of this file makes and not the one `cache.ts` makes.
+ *
  * One JSON file, rewritten whole, atomically, and unreadable-means-empty: a
  * launch is never something a preferences file gets to fail.
  */
@@ -77,10 +84,24 @@ export interface Preferences {
   readonly permissionMode?: string;
   /** Model and its effort and speed, per account. See the file header. */
   readonly models?: Readonly<Record<string, ModelChoice>>;
+  /**
+   * Session ids the user has pinned, oldest pin first.
+   *
+   * Session ids and nothing else: a title is the provider's to change and a
+   * path is the directory's, while the id is what the conversation *is*. Ids
+   * of conversations that no longer exist are kept rather than pruned — this
+   * file has no way to ask a provider what it still holds, and a list that
+   * quietly drops what it cannot explain would unpin a conversation for the
+   * duration of an account being logged out.
+   */
+  readonly pinned?: readonly string[];
 }
 
 const FILE_VERSION = 1;
 const FILE_NAME = 'preferences.json';
+
+/** Shared, so that "nothing pinned" is one array and the memo below holds. */
+const NO_PINS: readonly string[] = [];
 
 interface FileShape {
   readonly version: number;
@@ -93,6 +114,9 @@ export class PreferencesStore {
   #value: Preferences = {};
   /** Writes are chained so two quick changes cannot race each other's rename. */
   #writing: Promise<void> = Promise.resolve();
+  /** {@link pinnedSet}'s answer, and the array it was built from. */
+  #pinned: ReadonlySet<string> | undefined;
+  #pinnedFrom: readonly unknown[] | undefined;
 
   constructor(dir: string) {
     this.#dir = dir;
@@ -131,6 +155,52 @@ export class PreferencesStore {
   /** Resolves once every `save` so far is on disk (or has given up). */
   flush(): Promise<void> {
     return this.#writing;
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Pins                                                                    */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Every pinned session id, as a set.
+   *
+   * The rail asks this once per draw and then asks it of every row, so it is a
+   * set rather than a list — and the set is built from the stored array only
+   * when that array is a different array, which is what keeps a redraw of two
+   * hundred rows from being two hundred linear scans. Keying the memo on the
+   * array's identity rather than on a flag is what makes it impossible for a
+   * {@link save} from anywhere to leave a stale answer behind.
+   */
+  pinnedSet(): ReadonlySet<string> {
+    // A file edited by hand can hold anything at all under `pinned`, and the
+    // rail drawing a conversation list is not the place to find that out.
+    const stored: readonly unknown[] = Array.isArray(this.#value.pinned) ? this.#value.pinned : NO_PINS;
+    if (this.#pinnedFrom !== stored || this.#pinned === undefined) {
+      this.#pinnedFrom = stored;
+      this.#pinned = new Set(stored.filter((id): id is string => typeof id === 'string'));
+    }
+    return this.#pinned;
+  }
+
+  isPinned(sessionId: string): boolean {
+    return this.pinnedSet().has(sessionId);
+  }
+
+  /**
+   * Pin an unpinned conversation, or unpin a pinned one; answers with what it
+   * now is, since the caller has to say which happened.
+   *
+   * Newest pin last, so the list reads as the order they were made in. An
+   * unpin of something that was never pinned is a pin, which is what a toggle
+   * means and is also the only sane reading of an id this file has never seen.
+   */
+  togglePin(sessionId: string): boolean {
+    const pinned = this.isPinned(sessionId);
+    const next = pinned
+      ? [...this.pinnedSet()].filter((id) => id !== sessionId)
+      : [...this.pinnedSet(), sessionId];
+    this.save({ pinned: next });
+    return !pinned;
   }
 
   async #write(snapshot: FileShape): Promise<void> {

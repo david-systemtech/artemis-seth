@@ -10,7 +10,8 @@ import type {
 import { NO_CAPABILITIES } from '@rx-artemis/protocol';
 import { syncScheduler } from '@rx-artemis/transcript';
 
-import { Conversation, type ConversationSettings, type RunDriver } from './conversation.js';
+import { ChangeLedger, type ChangeLedgerDeps } from './changes.js';
+import { Conversation, type ConversationSettings, type ConversationState, type RunDriver } from './conversation.js';
 
 const CLAUDE: Capabilities = {
   ...NO_CAPABILITIES,
@@ -1223,5 +1224,209 @@ describe('going back to an earlier prompt', () => {
     // The next turn resumes the branch, and the conversation it came off is
     // left exactly as it was — which is the whole point of having forked.
     expect(driver.start.mock.calls[1]?.[0]?.resumeSessionId).toBe('s-branch');
+  });
+});
+
+/*
+ * What the turn did to the disk.
+ *
+ * The ledger has its own suite, which is where the pre-images, the guards and
+ * the bounds are pinned. What is pinned here is the wiring, and it is the half
+ * that can silently be wrong: the ledger is only as good as the events it is
+ * shown, and every one of them arrives through this class. So each case below
+ * is an event stream in, and a claim about what the conversation can say
+ * afterwards — including the two that a narrower reading of "this
+ * conversation's events" would have dropped on the floor, a subagent's edit and
+ * a call that was refused.
+ *
+ * The filesystem is a `Map`, which is also the check that nothing here touches
+ * a real one.
+ */
+describe('Conversation: the change ledger', () => {
+  const disk = (): { readonly files: Map<string, string>; readonly deps: Partial<ChangeLedgerDeps> } => {
+    const files = new Map<string, string>();
+    const missing = (path: string): Error => Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+    return {
+      files,
+      deps: {
+        readFile: async (path) => {
+          const text = files.get(path);
+          if (text === undefined) throw missing(path);
+          return text;
+        },
+        writeFile: async (path, text) => {
+          files.set(path, text);
+        },
+        stat: async (path) => {
+          const text = files.get(path);
+          if (text === undefined) throw missing(path);
+          return { size: Buffer.byteLength(text, 'utf8') };
+        },
+        rm: async (path) => {
+          files.delete(path);
+        },
+        now: () => 0,
+      },
+    };
+  };
+
+  /** A conversation whose ledger is over the `Map`, and the `Map`. */
+  const ledgered = (overrides: Partial<ConversationSettings> = {}) => {
+    const driver = fakeDriver();
+    const { files, deps } = disk();
+    const c = new Conversation({
+      driver,
+      settings: { ...settings, ...overrides },
+      capabilitiesFor: () => CLAUDE,
+      scheduler: syncScheduler,
+      newRunId: ids,
+      ledger: (cwd) => new ChangeLedger(cwd, deps),
+    });
+    return { driver, c, files };
+  };
+
+  /**
+   * One tool call as the wire delivers it, with whatever the tool did in the
+   * middle.
+   *
+   * The wait between the start and the edit is the point rather than a
+   * nicety: the ledger's pre-image is a read racing the tool, and a test that
+   * wrote the file in the same tick as the announcement would be asserting
+   * about a race it had rigged.
+   */
+  const call = async (
+    driver: ReturnType<typeof fakeDriver>,
+    c: Conversation,
+    event: Record<string, unknown>,
+    apply: () => void,
+    status = 'ok',
+  ): Promise<void> => {
+    const runId = c.getState().runId;
+    const { toolCallId, agentId } = event;
+    driver.emit({ type: 'tool.start', runId, ...event } as never);
+    await c.changesSettled();
+    apply();
+    driver.emit({
+      type: 'tool.end',
+      runId,
+      toolCallId,
+      status,
+      ...(agentId === undefined ? {} : { agentId }),
+    } as never);
+    await c.changesSettled();
+  };
+
+  const edit = (toolCallId: string, path: string, before: string, after: string): Record<string, unknown> => ({
+    toolCallId,
+    name: 'Edit',
+    input: { file_path: path, old_string: before, new_string: after },
+  });
+
+  it('records an edit as it happens, and puts it in the state as three numbers', async () => {
+    const { driver, c, files } = ledgered();
+    files.set('/repo/a.ts', 'one\n');
+    await c.send('change a.ts');
+    const told: ConversationState['filesChanged'][] = [];
+    c.subscribe(() => told.push(c.getState().filesChanged));
+
+    await call(driver, c, edit('t1', 'a.ts', 'one', 'two'), () => files.set('/repo/a.ts', 'two\n'));
+
+    // Relative to the conversation's own cwd, which is the ledger's.
+    expect(c.changes.files()).toMatchObject([{ label: 'a.ts', path: '/repo/a.ts', edits: 1 }]);
+    expect(c.getState().filesChanged).toEqual({ files: 1, added: 1, removed: 1 });
+    // And the bar was told: the fold publishes, so a summary that lands a disk
+    // read after the event still reaches the screen.
+    expect(told.at(-1)).toEqual({ files: 1, added: 1, removed: 1 });
+    // And the pre-image is what the file held *before* the tool ran, which is
+    // the one moment it was available.
+    expect(c.changes.last()?.before).toEqual({ kind: 'content', text: 'one\n' });
+  });
+
+  it('records a subagent’s edits, which land on the same disk as anybody else’s', async () => {
+    const { driver, c, files } = ledgered();
+    files.set('/repo/deep.ts', 'old\n');
+    await c.send('delegate it');
+
+    await call(
+      driver,
+      c,
+      { ...edit('t2', 'deep.ts', 'old', 'new'), agentId: 'a1' },
+      () => files.set('/repo/deep.ts', 'new\n'),
+    );
+
+    // The activity line deliberately ignores a subagent — three delegated
+    // agents must not make the status line flicker between three thoughts —
+    // and the ledger deliberately does not: a `/diff` that left out the files
+    // a delegated agent rewrote would be worse than no `/diff` at all.
+    expect(c.getState().activity).toBeUndefined();
+    expect(c.changes.files().map((file) => file.label)).toEqual(['deep.ts']);
+    expect(c.getState().filesChanged).toEqual({ files: 1, added: 1, removed: 1 });
+  });
+
+  it('records nothing for a call that was refused', async () => {
+    const { driver, c, files } = ledgered();
+    files.set('/repo/a.ts', 'one\n');
+    await c.send('change a.ts');
+
+    // Denied at the permission prompt: the tool never ran, so there is no
+    // change to report and nothing that could be undone.
+    await call(driver, c, edit('t3', 'a.ts', 'one', 'two'), () => undefined, 'denied');
+    expect(c.changes.files()).toEqual([]);
+    expect(c.changes.last()).toBeUndefined();
+    expect(c.getState().filesChanged).toBeUndefined();
+
+    // An error is the same answer, for the same reason.
+    await call(driver, c, edit('t4', 'a.ts', 'one', 'two'), () => undefined, 'error');
+    expect(c.getState().filesChanged).toBeUndefined();
+    expect(files.get('/repo/a.ts')).toBe('one\n');
+  });
+
+  it('forgets what it knew when the conversation is cleared', async () => {
+    const { driver, c, files } = ledgered();
+    files.set('/repo/a.ts', 'one\n');
+    await c.send('change a.ts');
+    await call(driver, c, edit('t5', 'a.ts', 'one', 'two'), () => files.set('/repo/a.ts', 'two\n'));
+    driver.emit({ type: 'run.end', runId: c.getState().runId as RunId, reason: 'completed' });
+
+    expect(c.reset()).toEqual({ ok: true });
+    // "What this conversation changed" is a question about *this* conversation,
+    // and the screen and the ledger are cleared by the same move.
+    expect(c.changes.files()).toEqual([]);
+    expect(c.changes.last()).toBeUndefined();
+    expect(c.getState().filesChanged).toBeUndefined();
+  });
+
+  it('starts again when the conversation moves to another directory', async () => {
+    const { driver, c, files } = ledgered();
+    files.set('/repo/a.ts', 'one\n');
+    await c.send('change a.ts');
+    await call(driver, c, edit('t6', 'a.ts', 'one', 'two'), () => files.set('/repo/a.ts', 'two\n'));
+    driver.emit({ type: 'run.end', runId: c.getState().runId as RunId, reason: 'completed' });
+
+    expect(c.updateSettings({ cwd: '/elsewhere' })).toEqual({ ok: true });
+    expect(c.getState().filesChanged).toBeUndefined();
+
+    files.set('/elsewhere/b.ts', 'old\n');
+    await c.send('now change b.ts');
+    await call(driver, c, edit('t7', 'b.ts', 'old', 'new'), () => files.set('/elsewhere/b.ts', 'new\n'));
+    // Resolved and labelled against the directory it is actually working in;
+    // a path recorded against the old root would name a different file.
+    expect(c.changes.files()).toMatchObject([{ label: 'b.ts', path: '/elsewhere/b.ts' }]);
+  });
+
+  it('recomputes the summary when a change is taken back', async () => {
+    const { driver, c, files } = ledgered();
+    files.set('/repo/a.ts', 'one\n');
+    await c.send('change a.ts');
+    await call(driver, c, edit('t8', 'a.ts', 'one', 'two'), () => files.set('/repo/a.ts', 'two\n'));
+
+    // `/undo` goes to the ledger directly — there is no event behind it — so
+    // the caller says when the totals have moved. Without this the bar would
+    // go on counting a file that has been put back.
+    expect(await c.changes.undo()).toMatchObject({ ok: true, action: 'restored' });
+    expect(files.get('/repo/a.ts')).toBe('one\n');
+    expect(c.getState().filesChanged).toEqual({ files: 1, added: 1, removed: 1 });
+    c.refreshChanges();
+    expect(c.getState().filesChanged).toBeUndefined();
   });
 });

@@ -80,3 +80,110 @@ describe('PreferencesStore', () => {
     expect(new PreferencesStore(dir).get()).toEqual({});
   });
 });
+
+/*
+ * Pinned conversations.
+ *
+ * A pin is a promise about what the rail looks like next time: keep this one at
+ * the top. So the only interesting questions are whether it survives the
+ * launch that made it, whether toggling twice is the same as never having
+ * toggled, and whether a list holding ids of conversations nobody can find any
+ * more is still a list this can be asked about.
+ */
+describe('PreferencesStore pins', () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = join(await mkdtemp(join(tmpdir(), 'artemis-tui-pins-')), 'nested');
+  });
+  afterEach(async () => {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  });
+
+  it('reads pins back, in the order they were made', async () => {
+    const store = new PreferencesStore(dir);
+    expect(store.isPinned('s-1')).toBe(false);
+    expect(store.togglePin('s-1')).toBe(true);
+    expect(store.togglePin('s-2')).toBe(true);
+    await store.flush();
+
+    const reopened = new PreferencesStore(dir);
+    expect(reopened.isPinned('s-1')).toBe(true);
+    expect(reopened.isPinned('s-2')).toBe(true);
+    expect(reopened.isPinned('s-3')).toBe(false);
+    expect(reopened.get().pinned).toEqual(['s-1', 's-2']);
+    expect([...reopened.pinnedSet()]).toEqual(['s-1', 's-2']);
+  });
+
+  it('toggles back off, leaving every other pin where it was', async () => {
+    const store = new PreferencesStore(dir);
+    store.togglePin('s-1');
+    store.togglePin('s-2');
+    expect(store.togglePin('s-1')).toBe(false);
+    await store.flush();
+
+    const reopened = new PreferencesStore(dir);
+    expect(reopened.isPinned('s-1')).toBe(false);
+    expect(reopened.isPinned('s-2')).toBe(true);
+    expect(reopened.get().pinned).toEqual(['s-2']);
+  });
+
+  it('keeps pins through the other settings, and the other settings through a pin', async () => {
+    // One file, and a save of either half must not be a save over the other.
+    const store = new PreferencesStore(dir);
+    store.saveModelFor('prof_work', { model: 'opus' });
+    store.save({ profileId: 'prof_work', permissionMode: 'plan' });
+    store.togglePin('s-1');
+    store.save({ permissionMode: 'acceptEdits' });
+    await store.flush();
+
+    const reopened = new PreferencesStore(dir);
+    expect(reopened.isPinned('s-1')).toBe(true);
+    expect(reopened.modelFor('prof_work')).toEqual({ model: 'opus' });
+    expect(reopened.get()).toMatchObject({ profileId: 'prof_work', permissionMode: 'acceptEdits' });
+  });
+
+  it('answers about an id it has never heard of, and holds on to ones nobody can find', async () => {
+    // A pinned session can be deleted, or belong to an account that is logged
+    // out. Neither is something this file can check, and dropping the id would
+    // silently unpin a conversation that comes back tomorrow.
+    const { mkdir } = await import('node:fs/promises');
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, 'preferences.json'),
+      JSON.stringify({ version: 1, preferences: { pinned: ['s-gone', 's-here'] } }),
+      'utf8',
+    );
+
+    const store = new PreferencesStore(dir);
+    expect(store.isPinned('s-gone')).toBe(true);
+    expect(store.isPinned('never-existed')).toBe(false);
+    store.togglePin('s-here');
+    await store.flush();
+    expect(new PreferencesStore(dir).get().pinned).toEqual(['s-gone']);
+  });
+
+  it('opens on nothing pinned when the file says something else entirely', async () => {
+    // Hand-edited, or written by a version that meant something different by
+    // the word. A launch is never something a preferences file gets to fail.
+    const store = new PreferencesStore(dir);
+    store.save({ pinned: 'yes' as unknown as readonly string[] });
+    expect(store.isPinned('s-1')).toBe(false);
+    expect([...store.pinnedSet()]).toEqual([]);
+    expect(store.togglePin('s-1')).toBe(true);
+    expect([...store.pinnedSet()]).toEqual(['s-1']);
+    await store.flush();
+  });
+
+  it('hands back the same set until the pins change', async () => {
+    // The rail asks once per draw and then asks of every row; rebuilding the
+    // set for each of those would be a scan per row.
+    const store = new PreferencesStore(dir);
+    store.togglePin('s-1');
+    const set = store.pinnedSet();
+    expect(store.pinnedSet()).toBe(set);
+    store.togglePin('s-2');
+    expect(store.pinnedSet()).not.toBe(set);
+    expect([...store.pinnedSet()]).toEqual(['s-1', 's-2']);
+    await store.flush();
+  });
+});
