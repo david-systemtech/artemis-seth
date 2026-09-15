@@ -11,7 +11,13 @@ import { describe, expect, it } from 'vitest';
 import { render } from 'ink-testing-library';
 import type { BackgroundTask, WorkflowAgent } from '@rx-artemis/protocol';
 
-import { DelegatedStrip, delegatedRows, summarizePhases } from './Delegated.js';
+import {
+  DelegatedStrip,
+  delegatedRows,
+  summarizePhases,
+  MAX_AGENT_ROWS,
+  type DelegatedRow,
+} from './Delegated.js';
 
 const NOW = 1_700_000_000_000;
 
@@ -213,5 +219,246 @@ describe('DelegatedStrip', () => {
     // A workflow is known by its name; its description is a paragraph.
     expect(frame).not.toContain('a long paragraph');
     expect(frame).not.toContain('the fifth one');
+  });
+});
+
+/** One agent inside a workflow, as the workflow reports it. */
+const inner = (over: Partial<WorkflowAgent> & { readonly index: number }): WorkflowAgent => ({
+  label: `agent-${String(over.index)}`,
+  state: 'progress',
+  ...over,
+});
+
+/** A workflow task carrying agents of its own. */
+const workflow = (agents: readonly WorkflowAgent[]): BackgroundTask =>
+  task({
+    id: 'w',
+    kind: 'local_workflow',
+    workflowName: 'review-changes',
+    description: 'a long paragraph',
+    workflowProgress: agents,
+  });
+
+const UNFOLDED = { expanded: new Set(['w']) };
+
+describe('delegatedRows · what can be done to a row', () => {
+  it('says which rows open onto a conversation and which only stop', () => {
+    // Three different answers, and none of them guessable from the row's text:
+    // a delegated agent has a transcript filed under the id the task list
+    // carries, a backgrounded shell never had one, and a workflow's own id has
+    // none because the transcripts belong to the agents inside it.
+    const { rows } = delegatedRows(
+      [
+        task({ id: 'agent', kind: 'local_agent', subagentType: 'Explore' }),
+        task({ id: 'shell', kind: 'local_bash', description: 'pnpm test' }),
+        workflow([inner({ index: 0 })]),
+      ],
+      NOW,
+    );
+
+    expect(rows.map((row) => [row.kind, row.openable, row.stoppable])).toEqual([
+      ['task', true, true],
+      ['task', false, true],
+      ['task', false, true],
+    ]);
+    expect(rows[0]?.agentId).toBe('agent');
+    expect(rows[1]?.agentId).toBeUndefined();
+    // Only the workflow can be opened up, and only it draws a fold glyph.
+    expect(rows.map((row) => row.unfoldable)).toEqual([false, false, true]);
+  });
+
+  it('has nothing to unfold on a workflow that has not reported an agent yet', () => {
+    const { rows } = delegatedRows([workflow([])], NOW);
+    expect(rows[0]?.unfoldable).toBe(false);
+  });
+
+  it('leaves a workflow folded until it is asked', () => {
+    // The strip is spending the transcript's own lines. Agents appear because
+    // somebody pressed `→` on that row, never because a workflow started.
+    const { rows } = delegatedRows([workflow([inner({ index: 0 })])], NOW);
+    expect(rows).toHaveLength(1);
+  });
+
+  it('unfolds a workflow into its agents, with phase, type, elapsed and state', () => {
+    const { rows } = delegatedRows(
+      [
+        workflow([
+          inner({
+            index: 0,
+            phaseTitle: 'Review',
+            agentType: 'Explore',
+            durationMs: 40_000,
+            state: 'done',
+            agentId: 'ag-0',
+          }),
+          inner({ index: 1, phaseTitle: 'Verify', agentType: 'Plan', startedAt: NOW - 12_000 }),
+        ]),
+      ],
+      NOW,
+      120,
+      UNFOLDED,
+    );
+
+    expect(rows.map((row) => row.kind)).toEqual(['task', 'agent', 'agent']);
+    expect(rows[1]).toMatchObject({
+      taskId: 'w',
+      agentId: 'ag-0',
+      label: 'Review',
+      description: 'Explore',
+      detail: '40s · done',
+      // The one place in the terminal a workflow's agent can be opened from:
+      // they are not tasks and never appear in the task list.
+      openable: true,
+      // There is no per-agent stop, and `x` here killing the whole workflow is
+      // not what the key would have meant.
+      stoppable: false,
+    });
+    expect(rows[2]).toMatchObject({ label: 'Verify', detail: '12s · progress', openable: false });
+    expect(rows[2]?.agentId).toBeUndefined();
+  });
+
+  it('will not offer to open an agent that has not run', () => {
+    // Queued, or answered from the workflow's journal: either way there is no
+    // conversation behind the row, and no elapsed time to print beside a state
+    // that says so itself.
+    const { rows } = delegatedRows([workflow([inner({ index: 0, state: 'start' })])], NOW, 120, UNFOLDED);
+    expect(rows[1]?.detail).toBe('start');
+    expect(rows[1]?.openable).toBe(false);
+  });
+
+  it('names an agent by its own label when the script never called phase()', () => {
+    const { rows } = delegatedRows(
+      [workflow([inner({ index: 0, label: 'build:chat-reliability' })])],
+      NOW,
+      120,
+      UNFOLDED,
+    );
+    expect(rows[1]?.label).toBe('build:chat-reliability');
+  });
+
+  it('holds the agents in the order the script declared them', () => {
+    // The whole array is replaced on every progress message, so the order it
+    // arrives in is not a promise; the ordinal is.
+    const { rows } = delegatedRows(
+      [
+        workflow([
+          inner({ index: 2, phaseTitle: 'C' }),
+          inner({ index: 0, phaseTitle: 'A' }),
+          inner({ index: 1, phaseTitle: 'B' }),
+        ]),
+      ],
+      NOW,
+      120,
+      UNFOLDED,
+    );
+    expect(rows.filter((row) => row.kind === 'agent').map((row) => row.label)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('caps an unfolded workflow separately from the tasks, and counts the rest', () => {
+    // A reader who opened this row asked to see inside it, so the cap is the
+    // larger one — but a fan-out of twenty still must not take the screen.
+    const agents = Array.from({ length: 12 }, (_, i) => inner({ index: i }));
+    const { rows, hidden, hiddenAgents } = delegatedRows([workflow(agents)], NOW, 120, UNFOLDED);
+
+    expect(rows.filter((row) => row.kind === 'agent')).toHaveLength(MAX_AGENT_ROWS);
+    expect(hiddenAgents.get('w')).toBe(12 - MAX_AGENT_ROWS);
+    // The top-level count is untouched by unfolding: one task, all of it shown.
+    expect(hidden).toBe(0);
+  });
+
+  it('unfolds nothing for a task that has no agents to show', () => {
+    const { rows, hiddenAgents } = delegatedRows(
+      [task({ id: 'w', subagentType: 'Explore' })],
+      NOW,
+      120,
+      UNFOLDED,
+    );
+    expect(rows).toHaveLength(1);
+    expect(hiddenAgents.size).toBe(0);
+  });
+});
+
+describe('DelegatedStrip · the cursor', () => {
+  const two = [
+    task({ id: 'a', kind: 'local_agent', subagentType: 'Explore', description: 'auth call sites' }),
+    task({ id: 'b', kind: 'local_agent', subagentType: 'Plan', description: 'migration steps' }),
+  ];
+
+  const lineWith = (frame: string | undefined, text: string): string =>
+    (frame ?? '').split('\n').find((line) => line.includes(text)) ?? '';
+
+  it('draws the cursor only while it has the focus', async () => {
+    // The composer's cursor and this one must never both be lit — the rail's
+    // rule, and the reason the rail draws its own the same way.
+    const idle = render(<DelegatedStrip tasks={two} />);
+    await tick();
+    expect(idle.lastFrame()).not.toContain('❯');
+
+    const lit = render(<DelegatedStrip tasks={two} focused selected={1} />);
+    await tick();
+    expect(lineWith(lit.lastFrame(), 'Plan')).toContain('❯');
+    expect(lineWith(lit.lastFrame(), 'Explore')).not.toContain('❯');
+  });
+
+  it('says what its keys do, and says it only when the keys are live', async () => {
+    const idle = render(<DelegatedStrip tasks={two} />);
+    await tick();
+    expect(idle.lastFrame()).not.toContain('Enter open');
+
+    const lit = render(<DelegatedStrip tasks={two} focused />);
+    await tick();
+    expect(lit.lastFrame()).toContain('↑↓ · Enter open · x stop · → unfold · Esc back');
+  });
+
+  it('hands the app the row under the cursor, clamped to the rows that exist', async () => {
+    // Rows go as their work settles, so a selection the app set two seconds ago
+    // can be past the end by the time it is drawn.
+    const seen: { readonly row: DelegatedRow | undefined; readonly index: number }[] = [];
+    render(
+      <DelegatedStrip
+        tasks={two}
+        focused
+        selected={9}
+        onSelect={(row, index) => seen.push({ row, index })}
+      />,
+    );
+    await tick();
+
+    expect(seen.at(-1)?.index).toBe(1);
+    expect(seen.at(-1)?.row?.id).toBe('b');
+    expect(seen.at(-1)?.row?.openable).toBe(true);
+  });
+
+  it('tells the app there is nothing to act on when it is not focused', async () => {
+    const seen: (DelegatedRow | undefined)[] = [];
+    render(<DelegatedStrip tasks={two} selected={0} onSelect={(row) => seen.push(row)} />);
+    await tick();
+    expect(seen.at(-1)).toBeUndefined();
+  });
+
+  it('shows an unfolded workflow’s agents, and counts the ones it has no room for', async () => {
+    const agents = [
+      inner({
+        index: 0,
+        phaseTitle: 'Review',
+        agentType: 'Explore',
+        durationMs: 40_000,
+        state: 'done',
+        agentId: 'ag-0',
+      }),
+      ...Array.from({ length: 11 }, (_, i) => inner({ index: i + 1, phaseTitle: 'Verify' })),
+    ];
+
+    const folded = render(<DelegatedStrip tasks={[workflow(agents)]} />);
+    await tick();
+    expect(folded.lastFrame()).toContain('▸');
+    expect(folded.lastFrame()).not.toContain('↳');
+
+    const open = render(<DelegatedStrip tasks={[workflow(agents)]} expanded={new Set(['w'])} />);
+    await tick();
+    const frame = open.lastFrame() ?? '';
+    expect(frame).toContain('▾');
+    expect(frame).toContain('↳ Review · Explore · 40s · done');
+    expect(frame).toContain(`+${String(12 - MAX_AGENT_ROWS)} more`);
   });
 });
