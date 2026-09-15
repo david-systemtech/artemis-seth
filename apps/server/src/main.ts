@@ -39,7 +39,10 @@
  *   ARTEMIS_PERMISSION_PARK_MS    how long a permission prompt waits for an
  *                          answer, while a client is attached, before it is
  *                          denied with the standing "nobody is here" message.
- *                          Default 15m.
+ *                          Off by default: a question waits for the person
+ *                          it was asked of, bounded only by the run's own
+ *                          deadline above. Set it for clients that ask for
+ *                          prompts they will never answer.
  *
  * And one for deployments that cannot run this CLI interactively at all:
  *
