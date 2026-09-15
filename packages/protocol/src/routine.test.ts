@@ -156,3 +156,65 @@ describe('describeSchedule', () => {
     expect(describeSchedule({ kind: 'cron', expression: '*/5 * * * *' })).toContain('*/5');
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* The two kinds the schedule vocabulary grew: days-of-week, and monthly       */
+/* -------------------------------------------------------------------------- */
+
+/** Sunday 2026-03-01, 09:00 local. `getDay()` is 0, `getDate()` is 1. */
+const sunday9 = new Date(2026, 2, 1, 9, 0);
+/** Saturday 2026-03-28, 09:00 local. `getDay()` is 6, `getDate()` is 28. */
+const saturday28 = new Date(2026, 2, 28, 9, 0);
+
+describe('the "days" kind', () => {
+  it('fires only on a listed day, at the time', () => {
+    const schedule = { kind: 'days' as const, days: [1, 3, 5], at: '09:00' };
+    expect(scheduleMatchesMinute(schedule, monday9)).toBe(true); // Monday
+    expect(scheduleMatchesMinute(schedule, sunday9)).toBe(false); // Sunday, not listed
+    expect(scheduleMatchesMinute(schedule, new Date(2026, 2, 2, 9, 1))).toBe(false); // wrong minute
+  });
+
+  it('rejects an empty list, a repeat, and an out-of-range day', () => {
+    expect(scheduleProblem({ kind: 'days', days: [], at: '09:00' })).toContain('at least one');
+    expect(scheduleProblem({ kind: 'days', days: [1, 1], at: '09:00' })).toContain('twice');
+    expect(scheduleProblem({ kind: 'days', days: [7], at: '09:00' })).toContain('Sunday');
+    expect(scheduleProblem({ kind: 'days', days: [1, 3], at: '09:00' })).toBeNull();
+  });
+
+  it('describes itself in week order, abbreviated past two days', () => {
+    expect(describeSchedule({ kind: 'days', days: [5, 1, 3], at: '09:00' })).toBe(
+      'Mon, Wed, Fri at 09:00',
+    );
+    // Two or fewer keep their full names — a row has room for them.
+    expect(describeSchedule({ kind: 'days', days: [1, 3], at: '09:00' })).toBe(
+      'Monday, Wednesday at 09:00',
+    );
+  });
+});
+
+describe('the "monthly" kind', () => {
+  it('fires on the day of the month, at the time', () => {
+    const schedule = { kind: 'monthly' as const, day: 28, at: '09:00' };
+    expect(scheduleMatchesMinute(schedule, saturday28)).toBe(true);
+    expect(scheduleMatchesMinute(schedule, monday9)).toBe(false); // the 2nd, not the 28th
+  });
+
+  it('skips a month that has no such day rather than moving it', () => {
+    // The 31st in a 30-day span is simply never named — the next fire is a
+    // month that has one. From 2026-04-10, that is May 31st.
+    const from = new Date(2026, 3, 10, 0, 0).getTime();
+    const next = nextFireAt({ kind: 'monthly', day: 31, at: '09:00' }, from);
+    expect(next).toBe(new Date(2026, 4, 31, 9, 0).getTime());
+  });
+
+  it('rejects a day outside 1–31 and describes itself with an ordinal', () => {
+    expect(scheduleProblem({ kind: 'monthly', day: 0, at: '09:00' })).toContain('1 to 31');
+    expect(scheduleProblem({ kind: 'monthly', day: 32, at: '09:00' })).toContain('1 to 31');
+    expect(describeSchedule({ kind: 'monthly', day: 1, at: '09:00' })).toBe(
+      'Monthly on the 1st at 09:00',
+    );
+    expect(describeSchedule({ kind: 'monthly', day: 22, at: '17:30' })).toBe(
+      'Monthly on the 22nd at 17:30',
+    );
+  });
+});

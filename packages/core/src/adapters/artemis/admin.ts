@@ -28,9 +28,14 @@
 import type { ServerUsageBody } from '@rx-artemis/protocol';
 import type {
   ProfileId,
+  RoutineDraft,
+  RoutinePatch,
   ServerProfile,
   ServerProfileCreatedBody,
   ServerProfilesBody,
+  ServerRoutineBody,
+  ServerRoutineDeletedBody,
+  ServerRoutinesBody,
   ServerSignInStatus,
 } from '@rx-artemis/protocol';
 import { SERVER_API_VERSION } from '@rx-artemis/protocol';
@@ -193,6 +198,82 @@ export async function cancelRemoteSignIn(
 ): Promise<ServerSignInStatus | null> {
   return absentOnMissing(
     call<ServerSignInStatus>(env, signInPath(accountId), options, { method: 'DELETE' }),
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Routines that live on the server                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Driving a *remote* server's routines — the appointments that fire in the
+ * server itself, with this desktop closed. The client half of the routes in
+ * `server/routines.ts`, reusing the same address and token an ordinary run
+ * against this profile is given: a profile that can run a turn on a server can
+ * schedule one there too. Every call is scoped by the server to the connection
+ * this profile's token names, so a client sees only its own routines.
+ */
+
+/** Every routine this connection owns on the server. */
+export async function listRemoteRoutines(
+  env: ArtemisProfileEnv,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerRoutinesBody> {
+  return call<ServerRoutinesBody>(env, `${API_PREFIX}/routines`, options);
+}
+
+/** Create a routine on the server. Its directory is the connection's — see the route. */
+export async function createRemoteRoutine(
+  env: ArtemisProfileEnv,
+  draft: RoutineDraft,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerRoutineBody> {
+  return call<ServerRoutineBody>(env, `${API_PREFIX}/routines`, options, {
+    method: 'POST',
+    body: { draft },
+  });
+}
+
+/** Edit a routine on the server. Absent fields are left alone. */
+export async function updateRemoteRoutine(
+  env: ArtemisProfileEnv,
+  routineId: string,
+  patch: RoutinePatch,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerRoutineBody> {
+  return call<ServerRoutineBody>(
+    env,
+    `${API_PREFIX}/routines/${encodeURIComponent(routineId)}`,
+    options,
+    { method: 'PATCH', body: { patch } },
+  );
+}
+
+/** Delete a routine on the server. */
+export async function deleteRemoteRoutine(
+  env: ArtemisProfileEnv,
+  routineId: string,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerRoutineDeletedBody> {
+  return call<ServerRoutineDeletedBody>(
+    env,
+    `${API_PREFIX}/routines/${encodeURIComponent(routineId)}`,
+    options,
+    { method: 'DELETE' },
+  );
+}
+
+/** Fire a routine on the server now, schedule and pause notwithstanding. */
+export async function runRemoteRoutine(
+  env: ArtemisProfileEnv,
+  routineId: string,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerRoutineBody> {
+  return call<ServerRoutineBody>(
+    env,
+    `${API_PREFIX}/routines/${encodeURIComponent(routineId)}/run-now`,
+    options,
+    { method: 'POST' },
   );
 }
 

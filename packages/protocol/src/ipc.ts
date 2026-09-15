@@ -37,7 +37,13 @@ import type { PermissionDecision } from './permissions.js';
 import type { PermissionRequestId, ProfileId, RunId, SessionId } from './ids.js';
 import type { ProfileDraft, ProfileMetadata, ProfilePatch } from './profile.js';
 import type { ProviderDescriptor, ProviderId, ProviderModelOption } from './provider.js';
-import type { RoutineDraft, RoutineId, RoutinePatch, RoutinesState } from './routine.js';
+import type {
+  RoutineDraft,
+  RoutineId,
+  RoutinePatch,
+  RoutineSnapshot,
+  RoutinesState,
+} from './routine.js';
 import type { RunHandle, RunInput } from './run.js';
 import type {
   SecretAuthMethod,
@@ -371,6 +377,21 @@ export const IPC = {
   serverAccountsSubmitCode: 'artemis:server-accounts:submit-code',
   /** Give up: the server kills the login subprocess. */
   serverAccountsCancelSignIn: 'artemis:server-accounts:cancel-sign-in',
+
+  /**
+   * Routines that live on a *remote* server: the appointments that fire there
+   * with this desktop closed. The client half of `/api/v0/routines`, reached
+   * the same way the account channels above reach the server — through the
+   * local Artemis-Server profile whose token says which server, and scoped by
+   * that server to the connection it names. Distinct from `routines:*`, which
+   * are the desktop's own local appointments.
+   */
+  serverRoutinesList: 'artemis:server-routines:list',
+  serverRoutinesCreate: 'artemis:server-routines:create',
+  serverRoutinesUpdate: 'artemis:server-routines:update',
+  serverRoutinesDelete: 'artemis:server-routines:delete',
+  /** Fire one server routine now, schedule and pause notwithstanding. */
+  serverRoutinesRunNow: 'artemis:server-routines:run-now',
 
   /**
    * Window chrome.
@@ -2024,6 +2045,56 @@ export interface ServerAccountSignInResponse {
   readonly signIn: ServerSignInStatus | null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Routines on a remote Artemis                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which server, in every remote-routine request.
+ *
+ * The *local* Artemis-Server profile id, exactly as {@link ServerAccountsRequest}
+ * — it carries the address and the connection token. The server scopes every
+ * call to the connection that token names.
+ */
+export interface ServerRoutinesRequest {
+  readonly profileId: ProfileId;
+}
+
+export interface ServerRoutinesListResponse {
+  /** Every routine the server lets this connection see, next appointment and all. */
+  readonly routines: readonly RoutineSnapshot[];
+}
+
+export interface ServerRoutinesCreateRequest extends ServerRoutinesRequest {
+  /**
+   * The routine to create. Its `cwd` is ignored — a server routine runs in the
+   * connection's own pinned directory, decided by the server, not the client.
+   */
+  readonly draft: RoutineDraft;
+}
+
+export interface ServerRoutinesUpdateRequest extends ServerRoutinesRequest {
+  readonly routineId: string;
+  readonly patch: RoutinePatch;
+}
+
+export interface ServerRoutinesDeleteRequest extends ServerRoutinesRequest {
+  readonly routineId: string;
+}
+
+export interface ServerRoutinesRunNowRequest extends ServerRoutinesRequest {
+  readonly routineId: string;
+}
+
+/** One routine, for create, update and run-now alike. */
+export interface ServerRoutineResponse {
+  readonly routine: RoutineSnapshot;
+}
+
+export interface ServerRoutinesDeleteResponse {
+  readonly removed: boolean;
+}
+
 export interface UsagePlanRequest {
   readonly profileId: ProfileId;
 }
@@ -3036,6 +3107,11 @@ export type IpcRequestMap = {
   [IPC.serverAccountsSignInStatus]: ServerAccountSignInRequest;
   [IPC.serverAccountsSubmitCode]: ServerAccountSubmitCodeRequest;
   [IPC.serverAccountsCancelSignIn]: ServerAccountSignInRequest;
+  [IPC.serverRoutinesList]: ServerRoutinesRequest;
+  [IPC.serverRoutinesCreate]: ServerRoutinesCreateRequest;
+  [IPC.serverRoutinesUpdate]: ServerRoutinesUpdateRequest;
+  [IPC.serverRoutinesDelete]: ServerRoutinesDeleteRequest;
+  [IPC.serverRoutinesRunNow]: ServerRoutinesRunNowRequest;
   [IPC.windowMinimize]: WindowRequest;
   [IPC.windowToggleMaximize]: WindowRequest;
   [IPC.windowClose]: WindowRequest;
@@ -3140,6 +3216,11 @@ export type IpcResponseMap = {
   [IPC.serverAccountsSignInStatus]: ServerAccountSignInResponse;
   [IPC.serverAccountsSubmitCode]: ServerAccountSignInResponse;
   [IPC.serverAccountsCancelSignIn]: ServerAccountSignInResponse;
+  [IPC.serverRoutinesList]: ServerRoutinesListResponse;
+  [IPC.serverRoutinesCreate]: ServerRoutineResponse;
+  [IPC.serverRoutinesUpdate]: ServerRoutineResponse;
+  [IPC.serverRoutinesDelete]: ServerRoutinesDeleteResponse;
+  [IPC.serverRoutinesRunNow]: ServerRoutineResponse;
   [IPC.windowMinimize]: WindowStateResponse;
   [IPC.windowToggleMaximize]: WindowStateResponse;
   [IPC.windowClose]: WindowStateResponse;
@@ -3737,6 +3818,28 @@ export interface ArtemisBridge {
     cancelSignIn(
       request: ServerAccountSignInRequest,
     ): Promise<IpcResult<ServerAccountSignInResponse>>;
+  };
+
+  /**
+   * Routines that fire *on a remote server*, with this desktop closed.
+   *
+   * The client half of `/api/v0/routines`, reached through the local
+   * Artemis-Server profile whose token names the server. Distinct from
+   * {@link routines}, which are this machine's own appointments and fire only
+   * while it is open. Every call is scoped by the server to the connection the
+   * token names.
+   */
+  readonly serverRoutines: {
+    /** Every routine this connection owns on the server, next appointment and all. */
+    list(request: ServerRoutinesRequest): Promise<IpcResult<ServerRoutinesListResponse>>;
+    /** Create one. Its directory is the connection's — the draft's `cwd` is ignored. */
+    create(request: ServerRoutinesCreateRequest): Promise<IpcResult<ServerRoutineResponse>>;
+    /** Edit one. Absent fields are left alone. */
+    update(request: ServerRoutinesUpdateRequest): Promise<IpcResult<ServerRoutineResponse>>;
+    /** Delete one. */
+    delete(request: ServerRoutinesDeleteRequest): Promise<IpcResult<ServerRoutinesDeleteResponse>>;
+    /** Fire one now, schedule and pause notwithstanding. */
+    runNow(request: ServerRoutinesRunNowRequest): Promise<IpcResult<ServerRoutineResponse>>;
   };
 
   /**

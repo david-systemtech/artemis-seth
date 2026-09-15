@@ -36,6 +36,7 @@ import type {
   ProfileId,
   ProviderId,
   RunId,
+  ServerConnection,
   SessionDelegatedWork,
 } from '@rx-artemis/protocol';
 import {
@@ -45,6 +46,7 @@ import {
   createDefaultProviderRegistry,
   createPushFeed,
   createRemoteRunGuard,
+  createServerRoutineStore,
   createSessionLedger,
   createWorkspaceResolver,
   joinSystemPromptAppends,
@@ -64,6 +66,7 @@ import {
   type RemoteRunGuard,
   type RunSource,
   type ServerProfileRecord,
+  type ServerRoutineStore,
   type SessionLedger,
   type SessionSource,
   type UsageSource,
@@ -89,6 +92,15 @@ export interface HeadlessHost {
   readonly runSource: RunSource;
   readonly sessionSource: SessionSource;
   readonly usageSource: UsageSource;
+  /**
+   * Routines that fire *in this server*, on schedule, with every client closed.
+   *
+   * The half of the routines feature that only a server can offer: the desktop
+   * fires appointments while it is open, and this fires them whether or not
+   * anything is watching. Scoped per connection exactly as the session ledger
+   * is — see `server/routines.ts` in core.
+   */
+  readonly routines: ServerRoutineStore;
   /** What the account-administration routes act through. See `signin.ts`. */
   readonly profileAdmin: ProfileAdmin;
   /** Every push the server can stream to a remote client. See `server/feed.ts`. */
@@ -109,7 +121,17 @@ export interface HeadlessHost {
   dispose(): Promise<void>;
 }
 
-export function createHeadlessHost(dataDir: string): HeadlessHost {
+export function createHeadlessHost(
+  dataDir: string,
+  /**
+   * The configured connections, read live. A routine outlives the request that
+   * made it, so a firing looks its own connection up here to learn where to
+   * run — and a revoked token's routines find no connection and quietly do
+   * nothing. Defaults to none, for the CLI verbs that build a host to add an
+   * account and never serve.
+   */
+  connections: () => readonly ServerConnection[] = () => [],
+): HeadlessHost {
   const providers = createDefaultProviderRegistry({
     claude: {
       /*
@@ -521,6 +543,26 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
   };
 
   /*
+   * The server's own routines: appointments that fire here, on schedule, with
+   * no client attached. Started through `startUserRun` — a routine is the
+   * connection owner's own scheduled work, so it runs with the whole
+   * `RunInput` (metadata and mode and all), the same entry point the remote
+   * bridge uses — and pinned to the connection's directory, resolved afresh on
+   * every firing exactly as a completion's is. Its scheduler is begun by the
+   * `serve` command after the port is bound and stopped by {@link dispose}.
+   */
+  const routines = createServerRoutineStore({
+    dataDir,
+    runs: {
+      start: (input) => runs.start(input),
+      subscribe: (listener) => runs.subscribe(listener),
+    },
+    workspaces,
+    catalogue,
+    connections,
+  });
+
+  /*
    * Interrupt-on-disconnect, and the attribution record in one wiring: a
    * bridge run whose client stays gone past the grace is interrupted, and the
    * session it announced is written into the ledger against the connection
@@ -645,12 +687,16 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
     runSource,
     sessionSource,
     usageSource,
+    routines,
     profileAdmin,
     feed,
     guard,
     recordAccess: (event) => accessLog.record(event),
     dispose: async () => {
       guard.dispose();
+      // Before the registry: a firing in flight would otherwise be torn out
+      // from under its own history row on the way down.
+      await routines.dispose();
       await runs.disposeAll();
       await ledger.flush();
       await workspaces.disposeAll();

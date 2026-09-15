@@ -76,6 +76,9 @@ import type {
   ServerProfile,
   ServerProfileCreatedBody,
   ServerProfilesBody,
+  ServerRoutineBody,
+  ServerRoutineDeletedBody,
+  ServerRoutinesBody,
   ServerSessionDeletedBody,
   ServerUsageBody,
   ServerSessionMessagesBody,
@@ -83,6 +86,8 @@ import type {
   ServerSessionsBody,
   ServerSessionTaggedBody,
   ServerSessionSummary,
+  RoutineDraft,
+  RoutinePatch,
   SessionSummary,
 } from '@rx-artemis/protocol';
 import {
@@ -116,6 +121,7 @@ import type { RemoteAccessEvent } from '../sessions/lifecycleLog.js';
 import type { PushFeed } from './feed.js';
 import type { RemoteRunGuard } from './guard.js';
 import { workspaceKeyFor, type LedgerScope, type SessionLedger } from './ledger.js';
+import type { ServerRoutineStore } from './routines.js';
 import { resolveResumeModel, type RouteRedirect } from './sessionHome.js';
 import { handleRemoteRequest, isRemotePath, type RemoteStreamOptions } from './remote.js';
 import { CORS_HEADERS, JSON_HEADERS, fail, ok } from './replies.js';
@@ -232,6 +238,15 @@ export interface ServerContext {
   readonly usage?: UsageSource;
   /** How to read stored sessions. Required alongside {@link ledger}. */
   readonly sessions?: SessionSource;
+  /**
+   * Routines that fire *in the server*, scoped per connection.
+   *
+   * Absent means this build keeps no server-side schedule and the routine
+   * routes answer `501` — a catalogue-only deployment, or a test that is not
+   * about routines. Present, it is the store the routes read and write, and its
+   * scheduler is the thing that fires an appointment with every client closed.
+   */
+  readonly routines?: ServerRoutineStore;
   /**
    * Host-header names this server answers to, besides the loopback set.
    *
@@ -768,6 +783,20 @@ export async function handleServerRequest(
     }
   }
 
+  /*
+   * The routine surface: the whole of `/api/v0/routines`, dispatched here
+   * because it writes (POST, PATCH, DELETE) and would otherwise be refused by
+   * the read-only method gate below before its route was ever resolved. Its
+   * own GET is answered here too rather than falling through, so one block owns
+   * the scope rule the whole surface shares. Disjoint from every other
+   * prefix — `/runs`, `/profiles`, `/sessions` — so nothing above can shadow it
+   * and it can shadow nothing.
+   */
+  if (path === `${apiPrefix}/routines` || path.startsWith(`${apiPrefix}/routines/`)) {
+    const reply = await handleRoutinesRequest(request, context, connection, method, path, visibleProfiles);
+    return { ...reply, connectionId: connection.id };
+  }
+
   if (method !== 'GET' && method !== 'HEAD') {
     // 405 only for a route that genuinely exists and genuinely refuses the
     // verb. Anything else is a 404, because "wrong method" on a path this
@@ -1241,6 +1270,8 @@ export interface ArtemisServerOptions {
   readonly ledger?: SessionLedger;
   /** How to read stored sessions. Required alongside {@link ledger}. */
   readonly sessions?: SessionSource;
+  /** Routines that fire in the server. Absent answers 501. See {@link ServerContext.routines}. */
+  readonly routines?: ServerRoutineStore;
   /** How to read each account's plan gauge. Absent answers 501. */
   readonly usage?: UsageSource;
   /** See {@link ServerContext.allowedHosts}. */
@@ -1373,6 +1404,7 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
           ...(options.workspaces === undefined ? {} : { workspaces: options.workspaces }),
           ...(options.ledger === undefined ? {} : { ledger: options.ledger }),
           ...(options.sessions === undefined ? {} : { sessions: options.sessions }),
+          ...(options.routines === undefined ? {} : { routines: options.routines }),
           ...(options.usage === undefined ? {} : { usage: options.usage }),
           ...(options.allowedHosts === undefined ? {} : { allowedHosts: options.allowedHosts }),
           ...(options.feed === undefined ? {} : { feed: options.feed }),
@@ -1556,6 +1588,209 @@ function unknownSession(): ServerReply {
     'unknown_session',
     'No such conversation for this connection.',
   );
+}
+
+/* -------------------------------------------------------------------------- */
+/* The routine surface                                                        */
+/* -------------------------------------------------------------------------- */
+
+/** The routine equivalent of {@link unknownSession}: "not yours" reads as "not there". */
+function unknownRoutine(): ServerReply {
+  return fail(404, 'invalid_request_error', 'unknown_routine', 'No such routine for this connection.');
+}
+
+/** A string field a routine draft may carry, or `undefined` when absent. Wrong
+ * types and over-length strings are dropped — the store is the final gate on a
+ * routine's usability, and this only has to keep a client bug from becoming a
+ * type error. */
+function wireString(value: unknown, max: number): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value.length <= max ? value : undefined;
+}
+
+/** Read a routine draft off the wire. `cwd`, `scope` and `connectionId` are the
+ * server's to decide, so a draft that names them is read as if it had not. */
+function readWireRoutineDraft(value: unknown): { readonly value: RoutineDraft } | { readonly error: string } {
+  if (typeof value !== 'object' || value === null) {
+    return { error: 'The request body must be a JSON object.' };
+  }
+  const draft = (value as { draft?: unknown }).draft;
+  if (typeof draft !== 'object' || draft === null) {
+    return { error: '`draft` must be an object.' };
+  }
+  const record = draft as Record<string, unknown>;
+  const name = record['name'];
+  const instructions = record['instructions'];
+  const profileId = record['profileId'];
+  const providerId = record['providerId'];
+  if (typeof name !== 'string' || name.trim().length === 0 || name.length > 200) {
+    return { error: '`draft.name` must be a non-empty string of at most 200 characters.' };
+  }
+  if (typeof instructions !== 'string' || instructions.trim().length === 0 || instructions.length > 20_000) {
+    return { error: '`draft.instructions` must be a non-empty string of at most 20000 characters.' };
+  }
+  if (typeof profileId !== 'string' || profileId.length === 0) {
+    return { error: '`draft.profileId` names the account each firing bills.' };
+  }
+  if (typeof providerId !== 'string' || providerId.length === 0) {
+    return { error: '`draft.providerId` is required.' };
+  }
+  if (typeof record['schedule'] !== 'object' || record['schedule'] === null) {
+    return { error: '`draft.schedule` is required.' };
+  }
+  const model = wireString(record['model'], 200);
+  const effort = wireString(record['effort'], 100);
+  const permissionMode = wireString(record['permissionMode'], 40);
+  return {
+    value: {
+      name: name.trim(),
+      instructions,
+      profileId,
+      providerId: providerId as ProviderId,
+      schedule: record['schedule'] as RoutineDraft['schedule'],
+      ...(model === undefined ? {} : { model }),
+      ...(effort === undefined ? {} : { effort }),
+      ...(permissionMode === undefined
+        ? {}
+        : { permissionMode: permissionMode as RoutineDraft['permissionMode'] }),
+      ...(typeof record['paused'] === 'boolean' ? { paused: record['paused'] } : {}),
+    },
+  };
+}
+
+/** Read a routine edit off the wire. Only the fields a server routine will
+ * actually change are read; the rest are the routine's fixed identity. */
+function readWireRoutinePatch(value: unknown): { readonly value: RoutinePatch } | { readonly error: string } {
+  if (typeof value !== 'object' || value === null) {
+    return { error: 'The request body must be a JSON object.' };
+  }
+  const patch = (value as { patch?: unknown }).patch;
+  if (typeof patch !== 'object' || patch === null) {
+    return { error: '`patch` must be an object.' };
+  }
+  const record = patch as Record<string, unknown>;
+  const built: {
+    -readonly [K in keyof RoutinePatch]: RoutinePatch[K];
+  } = {};
+  const name = wireString(record['name'], 200);
+  if (name !== undefined) built.name = name;
+  if (typeof record['instructions'] === 'string' && record['instructions'].length <= 20_000) {
+    built.instructions = record['instructions'];
+  }
+  // Empty clears, exactly as the store's own merge reads it.
+  if (typeof record['model'] === 'string' && record['model'].length <= 200) built.model = record['model'];
+  if (typeof record['effort'] === 'string' && record['effort'].length <= 100) built.effort = record['effort'];
+  const permissionMode = wireString(record['permissionMode'], 40);
+  if (permissionMode !== undefined) {
+    built.permissionMode = permissionMode as RoutinePatch['permissionMode'];
+  }
+  if (typeof record['schedule'] === 'object' && record['schedule'] !== null) {
+    built.schedule = record['schedule'] as RoutinePatch['schedule'];
+  }
+  if (typeof record['paused'] === 'boolean') built.paused = record['paused'];
+  return { value: built };
+}
+
+/**
+ * The whole of `/api/v0/routines`, scoped by the connection's workspace key.
+ *
+ * The scope rule is the session surface's, applied to a different noun: a token
+ * touches exactly the routines whose `scope` matches its own pin, create stamps
+ * that pin, and every "not yours" answers like "not there". The store is the
+ * one that enforces it — this resolves the scope and the id and hands them
+ * over.
+ */
+async function handleRoutinesRequest(
+  request: ServerRequestInfo,
+  context: ServerContext,
+  connection: ServerConnection,
+  method: string,
+  path: string,
+  visibleProfiles: () => Promise<readonly ServerProfile[]>,
+): Promise<ServerReply> {
+  const apiPrefix = `/api/${SERVER_API_VERSION}`;
+  const store = context.routines;
+  if (store === undefined) {
+    return fail(
+      501,
+      'invalid_request_error',
+      'not_implemented',
+      'This Artemis build serves its catalogue but keeps no server-side routines.',
+    );
+  }
+  const scope = workspaceKeyFor(connection);
+
+  if (path === `${apiPrefix}/routines`) {
+    if (method === 'GET') {
+      const body: ServerRoutinesBody = { object: 'artemis.routines', routines: store.listFor(scope) };
+      return ok(body);
+    }
+    if (method === 'POST') {
+      const draft = readWireRoutineDraft(request.body);
+      if ('error' in draft) {
+        return fail(400, 'invalid_request_error', 'invalid_body', draft.error);
+      }
+      // The account each firing bills must be one this connection can see —
+      // otherwise a token could schedule work on an account it may not run,
+      // and enumerate the hidden ones by which ids are accepted.
+      const profiles = await visibleProfiles();
+      if (!profiles.some((profile) => String(profile.id) === draft.value.profileId)) {
+        return fail(404, 'invalid_request_error', 'unknown_profile', 'No such account for this connection.');
+      }
+      try {
+        const routine = await store.create({ draft: draft.value, connection });
+        const body: ServerRoutineBody = { object: 'artemis.routine', routine };
+        return ok(body);
+      } catch (error) {
+        return fail(
+          400,
+          'invalid_request_error',
+          'invalid_body',
+          error instanceof Error ? error.message : 'The routine could not be created.',
+        );
+      }
+    }
+    return fail(405, 'invalid_request_error', 'method_not_allowed', `${method} is not supported on ${path}.`);
+  }
+
+  const rest = path.slice(`${apiPrefix}/routines/`.length);
+  const isRunNow = method === 'POST' && rest.endsWith('/run-now');
+  const idText = isRunNow ? rest.slice(0, -'/run-now'.length) : rest;
+  // Anything with a further slash is a sub-route this surface does not have.
+  if (idText.length === 0 || idText.includes('/')) return unknownRoutine();
+  let id: string;
+  try {
+    id = decodeURIComponent(idText);
+  } catch {
+    return fail(400, 'invalid_request_error', 'invalid_url', 'The routine id could not be parsed.');
+  }
+  if (id.length === 0) return unknownRoutine();
+
+  if (isRunNow) {
+    const routine = await store.runNow(scope, id);
+    if (routine === undefined) return unknownRoutine();
+    const body: ServerRoutineBody = { object: 'artemis.routine', routine };
+    return ok(body);
+  }
+
+  if (method === 'PATCH') {
+    const patch = readWireRoutinePatch(request.body);
+    if ('error' in patch) {
+      return fail(400, 'invalid_request_error', 'invalid_body', patch.error);
+    }
+    const routine = await store.update(scope, id, patch.value);
+    if (routine === undefined) return unknownRoutine();
+    const body: ServerRoutineBody = { object: 'artemis.routine', routine };
+    return ok(body);
+  }
+
+  if (method === 'DELETE') {
+    const removed = await store.remove(scope, id);
+    if (!removed) return unknownRoutine();
+    const body: ServerRoutineDeletedBody = { object: 'artemis.routine.deleted', deleted: true };
+    return ok(body);
+  }
+
+  return fail(405, 'invalid_request_error', 'method_not_allowed', `${method} is not supported on ${path}.`);
 }
 
 /* -------------------------------------------------------------------------- */
