@@ -119,10 +119,56 @@ describe('Conversation', () => {
     driver.emit({ type: 'run.end', runId, reason: 'completed' });
     expect(c.getState().status).toBe('idle');
     expect(c.getState().sessionId).toBe('s1');
-    expect(driver.dispose).toHaveBeenCalledWith(runId);
 
     await c.send('again');
     expect(driver.start.mock.calls[1]?.[0]).toMatchObject({ prompt: 'again', resumeSessionId: 's1' });
+  });
+
+  /*
+   * A turn that ends is not a turn that is finished with.
+   *
+   * `dispose()` is the one call that overrules the provider's retention of a
+   * process — `ClaudeRun.release` exists precisely to stop the registry
+   * reaching for it at every turn boundary, and says so. Calling it here killed
+   * the CLI the moment a turn ended, and with it every subagent the turn had
+   * deliberately left running in the background: measured against a real run,
+   * the subagent's own transcript stopped mid-tool-call at 9 lines where an
+   * undisposed one wrote 16 and a finished report. What the next turn then saw
+   * was a fresh process whose ledger had never heard of the work — one row
+   * reading `stopped`, `0 tools`, `0 tokens`, which is exactly what "the
+   * subagents did no work" looks like from the outside.
+   *
+   * The registry retires a finished run on its own: the pump's `finally` calls
+   * `#finalize`, which *releases* rather than disposes. Nothing here has to
+   * help, and helping is the bug.
+   */
+  it('does not dispose a run that ended on its own, which would kill its background work', async () => {
+    const driver = fakeDriver();
+    const c = conversation(driver);
+    await c.send('delegate something');
+    const runId = driver.start.mock.calls[0]?.[0]?.runId as RunId;
+
+    driver.emit({ type: 'session.started', runId, sessionId: 's1' as never, providerId: 'claude', cwd: '/repo' });
+    driver.emit({
+      type: 'background.tasks',
+      runId,
+      tasks: [{ id: 't1', kind: 'local_agent', description: 'summarise the notes', status: 'running', startedAt: 0, subagentType: 'Explore' }],
+    });
+    driver.emit({ type: 'run.end', runId, reason: 'completed' });
+
+    expect(c.getState().status).toBe('idle');
+    expect(driver.dispose).not.toHaveBeenCalled();
+    // The work outlives the turn, and so does the row that reports it.
+    expect(c.getState().tasks.map((task) => task.status)).toEqual(['running']);
+  });
+
+  it('interrupting is not disposing: the turn is stopped, the process is left alone', async () => {
+    const driver = fakeDriver();
+    const c = conversation(driver);
+    await c.send('go');
+    await c.interrupt();
+    expect(driver.interrupt).toHaveBeenCalled();
+    expect(driver.dispose).not.toHaveBeenCalled();
   });
 
   it('steers a live run when the provider allows it, and tracks queued delivery', async () => {
@@ -337,5 +383,124 @@ describe('Conversation', () => {
     expect(c.getState().usage?.costUsd).toBe(0.5);
     driver.emit({ type: 'usage', runId, usage: { scope: 'cumulative', tokens: { inputTokens: 100, outputTokens: 9 } } });
     expect(c.getState().usage?.tokens.inputTokens).toBe(100);
+  });
+});
+
+/*
+ * The provider can speak unprompted. When background work settles the CLI
+ * takes a turn of its own about it — a new run, with an id nothing here ever
+ * minted — and routing is by run id, so the default answer to an unknown one
+ * is to drop it. Right for another conversation's run; wrong for this one's,
+ * and the two are told apart by the session on `session.started`.
+ */
+describe('a turn the provider started on its own', () => {
+  const started = (runId: RunId, sessionId: string) =>
+    ({ type: 'session.started', runId, sessionId: sessionId as never, providerId: 'claude', cwd: '/repo' }) as const;
+  const task = { id: 't1', kind: 'local_agent', description: 'map the keybindings', status: 'running', startedAt: 0, subagentType: 'Explore' } as const;
+
+  /** A conversation whose turn delegated and ended, with the subagent still running. */
+  async function afterDelegating() {
+    const driver = fakeDriver();
+    const c = conversation(driver);
+    await c.send('delegate something');
+    const runId = c.getState().runId as RunId;
+    driver.emit(started(runId, 's1'));
+    driver.emit({ type: 'background.tasks', runId, tasks: [task] });
+    driver.emit({ type: 'run.end', runId, reason: 'completed' });
+    expect(c.getState().status).toBe('idle');
+    return { driver, c };
+  }
+
+  it('is taken as this conversation\'s own when it names this session and nothing else is running', async () => {
+    const { driver, c } = await afterDelegating();
+    const foreign = 'run-c1' as RunId;
+
+    driver.emit(started(foreign, 's1'));
+    expect(c.getState().status).toBe('running');
+    expect(c.getState().runId).toBe(foreign);
+
+    driver.emit({ type: 'background.tasks', runId: foreign, tasks: [{ ...task, status: 'completed' }] });
+    expect(c.getState().tasks.map((row) => row.status)).toEqual(['completed']);
+
+    driver.emit({ type: 'text.complete', runId: foreign, role: 'assistant', messageId: 'm1', blockIndex: 0, text: 'The Explore agent found 14 bindings.' } as never);
+    expect(JSON.stringify(rows(c))).toContain('The Explore agent found 14 bindings.');
+
+    driver.emit({ type: 'run.end', runId: foreign, reason: 'completed' });
+    expect(c.getState().status).toBe('idle');
+    expect(c.getState().runId).toBeUndefined();
+  });
+
+  it('is left alone when it belongs to another session', async () => {
+    const { driver, c } = await afterDelegating();
+    driver.emit(started('run-c1' as RunId, 'someone-else'));
+    expect(c.getState().status).toBe('idle');
+    driver.emit({ type: 'background.tasks', runId: 'run-c1' as RunId, tasks: [] });
+    expect(c.getState().tasks.map((row) => row.status)).toEqual(['running']);
+  });
+
+  it('does not displace a turn this conversation is already running', async () => {
+    const { driver, c } = await afterDelegating();
+    await c.send('and another thing');
+    const own = c.getState().runId as RunId;
+    driver.emit(started('run-c1' as RunId, 's1'));
+    expect(c.getState().runId).toBe(own);
+  });
+});
+
+/*
+ * The one window the adoption above cannot cover: the next prompt is already
+ * typed when the CLI takes its settle turn first. Two runs of this session are
+ * then alive at once — the prompt's, waiting, and the continuation — and
+ * `#runId` can hold only one. The continuation is not adopted, but it is not
+ * nobody's either: what it says about the work is this conversation's to show,
+ * and the row it settles must settle here.
+ */
+describe('a provider turn arriving while a prompt is waiting', () => {
+  const started = (runId: RunId, sessionId: string) =>
+    ({ type: 'session.started', runId, sessionId: sessionId as never, providerId: 'claude', cwd: '/repo' }) as const;
+  const task = { id: 't1', kind: 'local_agent', description: 'map the keybindings', status: 'running', startedAt: 0, subagentType: 'Explore' } as const;
+
+  it('settles the row and shows what was said, without touching the waiting prompt', async () => {
+    const driver = fakeDriver();
+    const c = conversation(driver);
+    await c.send('delegate something');
+    const first = c.getState().runId as RunId;
+    driver.emit(started(first, 's1'));
+    driver.emit({ type: 'background.tasks', runId: first, tasks: [task] });
+    driver.emit({ type: 'run.end', runId: first, reason: 'completed' });
+
+    await c.send('and another thing');
+    const own = c.getState().runId as RunId;
+    const sibling = 'run-c1' as RunId;
+
+    driver.emit(started(sibling, 's1'));
+    driver.emit({ type: 'background.tasks', runId: sibling, tasks: [{ ...task, status: 'completed' }] });
+    driver.emit({ type: 'text.complete', runId: sibling, role: 'assistant', messageId: 'm1', blockIndex: 0, text: 'The Explore agent found 14 bindings.' } as never);
+    driver.emit({ type: 'run.end', runId: sibling, reason: 'completed' });
+
+    expect(c.getState().tasks.map((row) => row.status)).toEqual(['completed']);
+    expect(JSON.stringify(rows(c))).toContain('The Explore agent found 14 bindings.');
+    // The prompt's own turn is untouched by any of it.
+    expect(c.getState().runId).toBe(own);
+    expect(c.getState().status).toBe('running');
+
+    driver.emit(started(own, 's1'));
+    driver.emit({ type: 'run.end', runId: own, reason: 'completed' });
+    expect(c.getState().status).toBe('idle');
+  });
+
+  it('ignores the same sequence from another session', async () => {
+    const driver = fakeDriver();
+    const c = conversation(driver);
+    await c.send('delegate something');
+    const first = c.getState().runId as RunId;
+    driver.emit(started(first, 's1'));
+    driver.emit({ type: 'background.tasks', runId: first, tasks: [task] });
+    driver.emit({ type: 'run.end', runId: first, reason: 'completed' });
+    await c.send('and another thing');
+
+    driver.emit(started('run-x' as RunId, 'someone-else'));
+    driver.emit({ type: 'background.tasks', runId: 'run-x' as RunId, tasks: [] });
+    expect(c.getState().tasks.map((row) => row.status)).toEqual(['running']);
   });
 });
