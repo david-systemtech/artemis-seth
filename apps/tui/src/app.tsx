@@ -110,6 +110,15 @@
  * conversations parked and working, that is most of the time. `terminal.ts`
  * owns the bytes, `attention.ts` the reduction, and the effects under "The
  * window, from outside" the policy.
+ *
+ * Two of those channels point inwards rather than out, and they are under
+ * "Who needs you, and what you missed". Ctrl+] goes to the next conversation
+ * with a claim on you — stuck on a permission first, then finished since you
+ * last had it on screen — and the status line carries the same count, because
+ * a rail glyph only works on somebody who thought to look. And a keystroke
+ * that ends three minutes of stillness is a return rather than a press, so it
+ * brings one longer-lived flash with it saying what changed while nobody was
+ * here. Both are `pool.ts` and `attention.ts` deciding; this file times them.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
@@ -134,10 +143,10 @@ import { formatDuration, formatRelative, formatUntil, oneLine } from '@rx-artemi
 import { isArchived } from '@rx-artemis/protocol';
 
 import { browseRowLabel, browseRows, browseStart, recentDirectories, shortenPath } from './directories.js';
-import { prunePool, railActivityFor } from './pool.js';
+import { needsYou, prunePool, railActivityFor, type Needing } from './pool.js';
 
 import { attachmentFromBytes, readAttachment } from './attachments.js';
-import { noticeFor, titleStateOf } from './attention.js';
+import { awayRecap, noticeFor, titleStateOf, type RecapSubject, type RunEnded } from './attention.js';
 import { CATALOGUE_KEY, commandsKey, modelsKey, usageKey } from './cache.js';
 import { fileLines, gitDiff, type ChangedFile } from './changes.js';
 import { checkForUpdate, currentVersion, installRoot } from './update.js';
@@ -387,6 +396,43 @@ const TEXT_VIEW_CHROME = 6;
 /** How long the taskbar light stays red after a failed turn before it goes out. */
 const PROGRESS_ERROR_MS = 5_000;
 
+/**
+ * How long the keyboard has to be still before coming back to it is a return.
+ *
+ * Three minutes is well past a pause for thought and well short of a lunch, so
+ * the line it triggers lands on somebody who has genuinely lost the thread
+ * rather than on somebody who stopped to read the screen. It is longer than
+ * either bell's delay on purpose: a notification is worth sending at six
+ * seconds because it goes somewhere else, and a line in the terminal is only
+ * worth drawing once you have stopped watching the terminal.
+ */
+const AWAY_MS = 3 * 60_000;
+
+/**
+ * How long the welcome-back line holds the status bar.
+ *
+ * Four times an ordinary flash. The usual one answers a key that was just
+ * pressed and the eye is already on the place it appears; this one is news
+ * about something else, arriving on a keystroke that was aimed at something
+ * else, and it has a sentence to be read rather than two words to be
+ * recognised.
+ */
+const RECAP_FLASH_MS = 8_000;
+
+/**
+ * Ctrl+] as the two kinds of terminal report it.
+ *
+ * One that speaks the kitty keyboard protocol sends the bracket with a Ctrl
+ * flag on it. Every other terminal sends the C0 byte the chord has meant since
+ * ASCII, and Ink — which folds Ctrl+A..Z back into letters and nothing else —
+ * hands that over as a one-character string with no modifier set at all. Both
+ * are the same press, and a key map that only knew one of them would work on
+ * about half the terminals people use.
+ */
+const NEXT_NEEDY_BYTE = '\u001d';
+const isNextNeedy = (input: string, key: { readonly ctrl: boolean }): boolean =>
+  input === NEXT_NEEDY_BYTE || (key.ctrl && input === ']');
+
 const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /** `3 lines`, for a row of `/copy`'s list. */
@@ -464,6 +510,51 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   const poolRef = useRef(pool);
   poolRef.current = pool;
 
+  /*
+   * What this file remembers about each pooled conversation.
+   *
+   * Three facts a `Conversation` has no reason to keep and this file cannot
+   * work out twice: when it was last on the screen, how its last turn ended,
+   * and when it stopped to ask. They are what Ctrl+] and the welcome-back
+   * line are built from — see "Who needs you, and what you missed".
+   *
+   * Refs, because none of them changes what is on the frame they are written
+   * in: every one is written from a subscription the conversation's own store
+   * is already going to re-render for, and a `useState` here would be a
+   * second render for a number nothing drew yet.
+   *
+   * Keyed by a name minted here rather than by the session id. A conversation
+   * nothing has been sent in has no session and can still be the one that
+   * needs you; and a session id arrives some seconds after the object does, so
+   * a key that appears late is a key that loses whatever was written under the
+   * old one. The `WeakMap` is what makes the name stable for as long as the
+   * object is and no longer.
+   */
+  const conversationKeys = useRef(new WeakMap<Conversation, string>());
+  const keysMinted = useRef(0);
+  const keyFor = useCallback((alive: Conversation): string => {
+    const known = conversationKeys.current.get(alive);
+    if (known !== undefined) return known;
+    const minted = `c${String(keysMinted.current++)}`;
+    conversationKeys.current.set(alive, minted);
+    return minted;
+  }, []);
+
+  /**
+   * When each conversation was last looked at.
+   *
+   * Written as one leaves the screen, because that is the last moment it was
+   * being looked at. The one *on* the screen is a special case handled where
+   * the map is read rather than written: it is being looked at now, whatever
+   * was last recorded, and a turn that finished in front of somebody must not
+   * queue itself up as something they have not seen.
+   */
+  const seenAt = useRef(new Map<string, number>());
+  /** How each conversation's last turn ended, for the welcome-back line. */
+  const runEnds = useRef(new Map<string, RunEnded>());
+  /** When each stopped to ask. Stale, harmlessly, once the question is answered. */
+  const askedAt = useRef(new Map<string, number>());
+
   useEffect(
     () => () => {
       for (const alive of poolRef.current) alive.dispose();
@@ -471,18 +562,24 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     [],
   );
 
-  const switchTo = useCallback((next: Conversation) => {
-    if (next === conversationRef.current) return;
-    // Decided by `prunePool`, disposed here: the rule is pure and tested, and
-    // a state updater with side effects is a thing React may run twice.
-    const { kept, dropped } = prunePool(poolRef.current, next, (parked) => parked.isLive);
-    for (const gone of dropped) gone.dispose();
-    poolRef.current = kept;
-    setPool(kept);
-    conversationRef.current = next;
-    setConversation(next);
-    setScroll(0);
-  }, []);
+  const switchTo = useCallback(
+    (next: Conversation) => {
+      if (next === conversationRef.current) return;
+      // The moment it stopped being looked at, which is what "finished since
+      // you last looked at it" is measured against.
+      seenAt.current.set(keyFor(conversationRef.current), Date.now());
+      // Decided by `prunePool`, disposed here: the rule is pure and tested, and
+      // a state updater with side effects is a thing React may run twice.
+      const { kept, dropped } = prunePool(poolRef.current, next, (parked) => parked.isLive);
+      for (const gone of dropped) gone.dispose();
+      poolRef.current = kept;
+      setPool(kept);
+      conversationRef.current = next;
+      setConversation(next);
+      setScroll(0);
+    },
+    [keyFor],
+  );
 
   const state = useSyncExternalStore(conversation.subscribe, conversation.getState);
 
@@ -573,9 +670,21 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     [transcript],
   );
 
-  const showFlash = useCallback((text: string) => {
+  /**
+   * Which flash is on the line, so an older one's timer cannot take a newer
+   * one off. Two of them now have very different lives — the welcome-back
+   * line lasts four times as long as "pinned" — and without this the short one
+   * pressed a moment later would clear the long one when *its* two seconds
+   * were up, which reads as a message that flickered rather than one that was
+   * replaced.
+   */
+  const flashToken = useRef(0);
+  const showFlash = useCallback((text: string, ms = QUIT_WINDOW_MS) => {
+    const mine = ++flashToken.current;
     setFlash(text);
-    setTimeout(() => setFlash(undefined), QUIT_WINDOW_MS).unref?.();
+    setTimeout(() => {
+      if (flashToken.current === mine) setFlash(undefined);
+    }, ms).unref?.();
   }, []);
 
   // A new row arriving while scrolled back is the one moment "follow" would
@@ -2533,6 +2642,188 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   }, [conversation, live]);
 
   /* ---------------------------------------------------------------------- */
+  /* Who needs you, and what you missed                                      */
+  /* ---------------------------------------------------------------------- */
+
+  /*
+   * The pool's other half of the bargain.
+   *
+   * Several conversations working at once buys you parallelism and hands you
+   * a new problem with it: the thing that wants you is, by construction, not
+   * the thing you are looking at. The rail answers "which one" with a glyph
+   * per row, and a glyph only works on somebody who thought to look. These
+   * two do the looking for them.
+   *
+   *  - **Ctrl+]** goes to the next conversation with a claim on you — every
+   *    one that is stuck on a permission first, then every one whose turn
+   *    ended since you last had it on screen. `needsYou` is that ordering,
+   *    pure and tested; the same list is the count the status line draws, so
+   *    the number beside the composer and the conversation the key opens can
+   *    never disagree.
+   *  - **The welcome-back line** is for the other direction: not "where
+   *    should I go" but "what did I miss", on the keystroke that ends three
+   *    minutes of stillness. `awayRecap` writes it.
+   *
+   * Both are built from `runEnds` and `askedAt` above, which this is where
+   * they are filled in. One subscription per pooled conversation, taken off
+   * the event stream rather than off the state, because a run's length and
+   * its cost are on `run.end` and nowhere else — `ConversationState` keeps
+   * what is true *now*, and both of these are facts about a turn that is
+   * over.
+   */
+  useEffect(() => {
+    // A conversation dropped by `prunePool` is never coming back as the same
+    // object, so what was written under its key is dead weight. Pruned here
+    // rather than in `switchTo` so that one rule — "the pool is what exists" —
+    // governs all three maps.
+    const alive = new Set(pool.map((parked) => keyFor(parked)));
+    for (const remembered of [seenAt.current, runEnds.current, askedAt.current]) {
+      for (const key of [...remembered.keys()]) if (!alive.has(key)) remembered.delete(key);
+    }
+    const offs = pool.map((parked) => {
+      const key = keyFor(parked);
+      /*
+       * Which run is this conversation's own turn.
+       *
+       * A conversation forwards its *siblings'* events as well — work the
+       * provider started beside the turn, which lands in the same transcript —
+       * and a sibling's `run.end` is not the end of anybody's turn. The state
+       * says which run is the conversation's while one is in flight and clears
+       * it as that run ends, so it is remembered from the events that came
+       * before rather than asked for at the one moment it is gone.
+       */
+      let ownRun = parked.getState().runId;
+      return parked.subscribeEvents((event) => {
+        ownRun = parked.getState().runId ?? ownRun;
+        if (event.type === 'permission.request') {
+          askedAt.current.set(key, Date.now());
+          return;
+        }
+        if (event.type !== 'run.end' || event.runId !== ownRun) return;
+        runEnds.current.set(key, {
+          // The host's clock and not the provider's: this is compared against
+          // the moment of a keystroke, which only this process saw.
+          at: Date.now(),
+          durationMs: event.durationMs,
+          costUsd: event.usage?.costUsd,
+          failed: event.reason === 'error',
+        });
+      });
+    });
+    return () => {
+      for (const off of offs) off();
+    };
+  }, [pool, keyFor]);
+
+  /**
+   * Where each conversation sits in the rail, by session id.
+   *
+   * Ctrl+] walks the pool in the order the eye is about to travel rather than
+   * in the order conversations happened to be opened, which is what makes
+   * repeated presses feel like going down a list instead of being thrown
+   * about one. A conversation the rail has no row for — nothing sent in it
+   * yet, or a filter is hiding it — sorts to the end rather than out: the
+   * order decides which one is *next*, never which ones count.
+   */
+  const railOrder = useMemo(() => {
+    const at = new Map<string, number>();
+    rail.forEach((row, index) => {
+      if (row.kind === 'session') at.set(row.session.id, index);
+    });
+    return at;
+  }, [rail]);
+
+  /** Every conversation with a claim on you, in the order Ctrl+] will visit them. */
+  const needing = useMemo(() => {
+    const ranked = [...pool].sort(
+      (a, b) =>
+        (railOrder.get(a.getState().sessionId ?? '') ?? Number.MAX_SAFE_INTEGER) -
+        (railOrder.get(b.getState().sessionId ?? '') ?? Number.MAX_SAFE_INTEGER),
+    );
+    const looked = new Map(seenAt.current);
+    // The one on the screen is being looked at now, whatever the map last
+    // recorded about it. Written here rather than by an effect because an
+    // effect runs after the render that would already have counted it.
+    looked.set(keyFor(conversation), Date.now());
+    return needsYou(
+      ranked.map((parked) => {
+        const parkedState = parked.getState();
+        return {
+          key: keyFor(parked),
+          status: parkedState.status,
+          pendingPermissions: parkedState.pendingPermissions,
+          finishedAt: runEnds.current.get(keyFor(parked))?.at,
+        };
+      }),
+      looked,
+    );
+    // The same two signals the rail's activity map watches — `parkedTick` for
+    // a parked conversation, `state` for the one on screen — plus the rail's
+    // own order.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pool, parkedTick, state, conversation, railOrder, keyFor]);
+
+  /** Read at the moment the key is pressed, not when the handler was built. */
+  const needingNow = useRef<readonly Needing[]>(needing);
+  needingNow.current = needing;
+
+  /**
+   * Ctrl+]: go to whoever is waiting.
+   *
+   * The step is always to the one *after* the current conversation in the
+   * queue, so a second press walks on instead of staying put — and since
+   * arriving somewhere counts as looking at it, the "finished" half of the
+   * queue drains as you go while the stuck half stays until the questions are
+   * answered, which is exactly the difference between the two.
+   *
+   * A conversation with no claim of its own is not in the queue at all, so the
+   * search comes back empty-handed and the step lands on the first — the
+   * common case, since the reason to press this is that the screen is showing
+   * something that does *not* need you.
+   */
+  const goToNeedy = useCallback(() => {
+    const queue = needingNow.current;
+    if (queue.length === 0) {
+      showFlash('nothing needs you');
+      return;
+    }
+    const here = keyFor(conversationRef.current);
+    const at = queue.findIndex((row) => row.key === here);
+    const next = queue[(at + 1) % queue.length];
+    const target = next === undefined ? undefined : poolRef.current.find((parked) => keyFor(parked) === next.key);
+    // The one thing that needs you is the one you are on: the card is already
+    // on the screen, and moving nowhere without a word reads as a dead key.
+    if (target === undefined || target === conversationRef.current) {
+      showFlash('nothing else needs you');
+      return;
+    }
+    switchTo(target);
+  }, [keyFor, showFlash, switchTo]);
+
+  /**
+   * The pool as the welcome-back line needs to read it.
+   *
+   * Built at the keystroke rather than kept in a memo: it is wanted once every
+   * few minutes at most, and the names come from the rail's own list, which
+   * moves for reasons that have nothing to do with this.
+   */
+  const recapSubjects = useCallback(
+    (): readonly RecapSubject[] =>
+      poolRef.current.map((parked) => {
+        const parkedState = parked.getState();
+        const key = keyFor(parked);
+        return {
+          title: parkedState.sessionId === undefined ? undefined : sessions.find((row) => row.id === parkedState.sessionId)?.title,
+          status: parkedState.status,
+          pendingPermissions: parkedState.pendingPermissions,
+          lastRun: runEnds.current.get(key),
+          askedAt: askedAt.current.get(key),
+        };
+      }),
+    [keyFor, sessions],
+  );
+
+  /* ---------------------------------------------------------------------- */
   /* The delegated strip, pointed at                                         */
   /* ---------------------------------------------------------------------- */
 
@@ -2820,8 +3111,21 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
      * noise is how a feature like this gets switched off. It is the first
      * thing in the handler because it is true of every key, including the
      * ones a modal below is about to answer.
+     *
+     * How long they had been gone is read *before* the press is recorded,
+     * because the press is what ends the absence. Past three minutes the same
+     * keystroke is a return, and a return is owed an account of what happened
+     * while nobody was here: see `awayRecap`, which says nothing at all when
+     * the answer is nothing. It goes first so that a key with a flash of its
+     * own — Ctrl+C, a pin — has the last word on the line, which is right:
+     * that one is about what was just pressed.
      */
+    const away = attention.current?.idleMs() ?? 0;
     attention.current?.touch();
+    if (away >= AWAY_MS) {
+      const recap = awayRecap(recapSubjects(), Date.now() - away);
+      if (recap !== undefined) showFlash(recap, RECAP_FLASH_MS);
+    }
 
     if (key.ctrl && input === 'c') {
       if (quitArmed.current !== null) {
@@ -2842,6 +3146,27 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     // its own, so the key reaches here whatever has focus.
     if (key.ctrl && input === 't') {
       setTodoExpanded((open) => !open);
+      return;
+    }
+
+    /*
+     * Ctrl+] goes to the next conversation that needs you.
+     *
+     * Above the modal guard on purpose, because the commonest reason to press
+     * it is that *this* conversation has stopped to ask — and a permission
+     * card counts as a modal. Leaving it up over a different conversation is
+     * harmless: it is drawn from the state of whichever one is on screen, so
+     * it goes with the switch and is waiting again on the way back.
+     *
+     * A list or the pager is a different matter and is left alone: both are
+     * about the conversation being left, and a picker whose subject was
+     * swapped underneath it is a picker about nothing. A reverse search is
+     * holding the box's text, for the same reason Ctrl+O declines to.
+     */
+    if (isNextNeedy(input, key)) {
+      if (modal !== null) return;
+      if (composerActive && composerRef.current?.isCapturing() === true) return;
+      goToNeedy();
       return;
     }
 
@@ -3404,6 +3729,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
             <StatusBar
               state={state}
               columns={mainWidth}
+              needing={needing.length}
               {...(flash === undefined ? {} : { flash })}
               {...(update === undefined ? {} : { update })}
               /*

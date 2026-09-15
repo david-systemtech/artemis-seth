@@ -13,7 +13,7 @@ import { NO_CAPABILITIES, PERMISSION_MODES } from '@rx-artemis/protocol';
 
 import type { ConversationState } from '../conversation.js';
 import { ACCENT } from '../theme.js';
-import { changedSummary, elapsedClock, meterBar, meterCells, meterTone, modeBadge, workingLine } from './StatusBar.js';
+import { changedSummary, elapsedClock, meterBar, meterCells, meterTone, modeBadge, needYouLabel, workingLine } from './StatusBar.js';
 
 describe('meterBar', () => {
   it('fills in proportion', () => {
@@ -310,5 +310,28 @@ describe('changedSummary', () => {
     // leaving it out would make the pair read as a single number.
     expect(changedSummary({ files: 1, added: 0, removed: 12 })).toEqual({ files: '1 file', added: '+0', removed: '−12' });
     expect(changedSummary({ files: 2, added: 9, removed: 0 })).toEqual({ files: '2 files', added: '+9', removed: '−0' });
+  });
+});
+
+/*
+ * The one reading on this line that is about the other conversations.
+ *
+ * The rail has a glyph per row and the window title has the same sentence for
+ * a taskbar nobody can see from inside the app; this is the count at eye
+ * level, and what is worth pinning is the silence at zero.
+ */
+describe('needYouLabel', () => {
+  it('says how many are waiting, in the words the window title uses', () => {
+    expect(needYouLabel(2)).toBe('2 need you');
+    // Ungrammatical for one, and deliberately the same as `titleFor`'s: two
+    // surfaces reporting one number in two different sentences reads worse
+    // than one wrong verb in both.
+    expect(needYouLabel(1)).toBe('1 need you');
+  });
+
+  it('says nothing when nothing is waiting', () => {
+    // `0 need you` is columns spent saying that nothing is wrong.
+    expect(needYouLabel(0)).toBeUndefined();
+    expect(needYouLabel(-1)).toBeUndefined();
   });
 });

@@ -96,6 +96,13 @@ export interface StatusBarProps {
   /** A newer release than this copy, when the daily check found one. */
   readonly update?: string;
   /**
+   * How many conversations anywhere in the pool are waiting on the person —
+   * the count `Ctrl+]` walks. About every conversation and not this one, which
+   * is why it is a number from above rather than something read out of
+   * {@link state}.
+   */
+  readonly needing?: number;
+  /**
    * The width this bar actually has — the terminal less the rail, not the
    * terminal. Handing it the whole screen is how the bars came to cost
    * "BYPASS PERMISSIONS" its tail on a terminal wide enough for both.
@@ -311,6 +318,26 @@ export interface ChangedSummary {
  * at the same weight, a hyphen reads as punctuation rather than as the other
  * half of a pair.
  */
+/**
+ * How many conversations are waiting on the person, in the words the window
+ * title already uses.
+ *
+ * The rail draws a glyph per row and the title draws `⚿ 2 need you` to a
+ * taskbar nobody can see from here; this is the same reading at eye level, for
+ * the case the whole pool exists to create — two conversations parked and one
+ * of them stuck, with the screen showing a third. Nothing at all when the
+ * count is zero, because a status line reading `0 need you` spends columns
+ * saying that nothing is wrong.
+ *
+ * `2 need you` and not `1 needs you`: the grammar is wrong for one and it is
+ * deliberately the same wrong as `titleFor`'s. Two surfaces reporting one
+ * number in two different sentences is a worse reading than one ungrammatical
+ * sentence in both, and the number is what is being read.
+ */
+export function needYouLabel(count: number): string | undefined {
+  return count > 0 ? `${String(Math.floor(count))} need you` : undefined;
+}
+
 export function changedSummary(changed: ConversationState['filesChanged']): ChangedSummary | undefined {
   if (changed === undefined || changed.files === 0) return undefined;
   return {
@@ -320,7 +347,7 @@ export function changedSummary(changed: ConversationState['filesChanged']): Chan
   };
 }
 
-export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBarProps): React.JSX.Element {
+export function StatusBar({ state, flash, hint, update, needing = 0, columns = 0 }: StatusBarProps): React.JSX.Element {
   const { settings, usage } = state;
   const badge = modeBadge(settings.permissionMode);
   const tokens = totalInputTokens(usage?.tokens);
@@ -329,6 +356,7 @@ export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBar
   const slots = planMeterSlots(state.planUsage);
   const changed = changedSummary(state.filesChanged);
   const liveTasks = state.tasks.filter(isTaskLive).length;
+  const needYou = needYouLabel(needing);
   const busy = state.status === 'starting' || state.status === 'running';
   const spinner = useSpinner(busy);
   // The clock runs only while there is a turn to time it against, so an idle
@@ -405,6 +433,12 @@ export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBar
             </Text>
           )}
           {liveTasks > 0 && <Text color="cyan">{` · ${String(liveTasks)} task${liveTasks === 1 ? '' : 's'}`}</Text>}
+          {/* Yellow, which on this line means "a person is the hold-up" — the
+              same colour `awaiting_permission` paints the left half. Beside
+              the tasks because both are counts of work that is not on the
+              screen; before the update notice because one of them can be
+              acted on with a keystroke and the other is news. */}
+          {needYou !== undefined && <Text color="yellow">{` · ${needYou}`}</Text>}
           {update !== undefined && <Text color="yellow">{` · ${update} is out: artemis-tui --update`}</Text>}
           <Text dimColor>{' · /help'}</Text>
         </Text>

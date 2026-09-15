@@ -95,6 +95,10 @@ describe('KEYMAP: the keys the terminal grew', () => {
     expect(anywhere.get('Ctrl+O')).toContain('transcript');
     expect(anywhere.get('Esc Esc')).toContain('earlier prompt');
     expect(anywhere.get('?')).toBeDefined();
+    // The one key that is about the *pool* rather than about the conversation
+    // in front of you, which is exactly why it has to be written down: nobody
+    // guesses at a key for a thing they have not noticed the app can do.
+    expect(anywhere.get('Ctrl+]')).toContain('needs you');
   });
 
   it('writes down the composer keys that only its own header used to mention', () => {

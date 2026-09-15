@@ -1,14 +1,15 @@
 /**
- * The chrome's two decisions.
+ * The chrome's decisions.
  *
- * Both are about a person who is not looking at the screen, which is why they
- * are worth pinning: nobody watching a test run would ever notice the title
- * saying "ready" over a conversation that had stopped to ask something.
+ * Every one of them is about a person who is not looking at the screen, which
+ * is why they are worth pinning: nobody watching a test run would ever notice
+ * the title saying "ready" over a conversation that had stopped to ask
+ * something, or a welcome-back line reporting news from before they left.
  */
 
 import { describe, expect, it } from 'vitest';
 
-import { noticeFor, titleStateOf, type ConversationActivity } from './attention.js';
+import { awayRecap, noticeFor, titleStateOf, type ConversationActivity, type RecapSubject, type RunEnded } from './attention.js';
 import { titleFor } from './terminal.js';
 
 const idle: ConversationActivity = { status: 'idle', pendingPermissions: [] };
@@ -94,5 +95,89 @@ describe('noticeFor', () => {
 
   it('treats a blank conversation name as no name', () => {
     expect(noticeFor('finished', { conversation: '   ' }).title).toBe('Artemis');
+  });
+});
+
+/*
+ * The line somebody reads on the keystroke that brings them back.
+ *
+ * Everything worth pinning here is a judgement about a person who was not
+ * watching: what counts as news, how much of it a flash can carry, and what
+ * to say when the honest answer is nothing.
+ */
+describe('awayRecap', () => {
+  const away = 1_000;
+  const back = 2_000;
+
+  const finished = (title: string, run: Partial<RunEnded> = {}): RecapSubject => ({
+    title,
+    status: 'idle',
+    pendingPermissions: [],
+    lastRun: { at: back, ...run },
+  });
+  const asking = (title: string, askedAt = back): RecapSubject => ({
+    title,
+    status: 'awaiting_permission',
+    pendingPermissions: [{}],
+    askedAt,
+  });
+
+  it('names what finished and what it cost, and what stopped to ask', () => {
+    // The duration and the money are `formatDuration` and `formatUsd`, the
+    // same pair the status line and the transcript print — which is why a
+    // cost under a dollar keeps three decimals here too. A recap that rounded
+    // its own way would be a second answer to "what did that turn cost".
+    expect(awayRecap([finished('refactor', { durationMs: 130_000, costUsd: 0.08 }), asking('release notes')], away)).toBe(
+      'while you were away: refactor finished (2m 10s, $0.080) · release notes is waiting on a permission',
+    );
+  });
+
+  it('drops the parenthesis rather than apologising inside it', () => {
+    // A provider that reports neither number leaves the sentence complete as
+    // it stands; `finished (—, —)` would be punctuation saying "don't know".
+    expect(awayRecap([finished('refactor')], away)).toBe('while you were away: refactor finished');
+    expect(awayRecap([finished('refactor', { durationMs: 4_000 })], away)).toBe('while you were away: refactor finished (4.0s)');
+    expect(awayRecap([finished('refactor', { costUsd: 0.5 })], away)).toBe('while you were away: refactor finished ($0.500)');
+  });
+
+  it('names two and counts the rest', () => {
+    const line = awayRecap([finished('one'), finished('two'), finished('three'), finished('four')], away);
+    expect(line).toBe('while you were away: one finished · two finished · +2 more');
+  });
+
+  it('says nothing at all when nothing changed', () => {
+    expect(awayRecap([], away)).toBeUndefined();
+    // Ended before the person stopped typing: they watched it happen.
+    expect(awayRecap([finished('refactor', { at: 500 })], away)).toBeUndefined();
+    // Asked before they left, and still asking: not news, just unfinished.
+    expect(awayRecap([asking('release notes', 500)], away)).toBeUndefined();
+    expect(awayRecap([{ status: 'idle', pendingPermissions: [] }], away)).toBeUndefined();
+  });
+
+  it('keeps quiet about a turn that is still running', () => {
+    // Its last run ended while nobody was here, but a new one is in flight and
+    // the rail's own glyph would contradict the word "finished".
+    expect(awayRecap([{ ...finished('refactor'), status: 'running' }], away)).toBeUndefined();
+  });
+
+  it('does not call a crash an answer', () => {
+    expect(awayRecap([finished('refactor', { failed: true, durationMs: 130_000 })], away)).toBe(
+      'while you were away: refactor stopped with an error',
+    );
+  });
+
+  it('has something to call a conversation the store has not named', () => {
+    expect(awayRecap([{ ...finished('x'), title: '  ' }], away)).toBe('while you were away: a conversation finished');
+  });
+
+  it('reads down the pool in the order it was given', () => {
+    // Rail order, so the line names conversations in the order the eye is
+    // about to travel. Which one to *go* to is `needsYou`'s question.
+    expect(awayRecap([asking('b'), finished('a')], away)).toBe(
+      'while you were away: b is waiting on a permission · a finished',
+    );
+    expect(awayRecap([finished('a'), asking('b')], away)).toBe(
+      'while you were away: a finished · b is waiting on a permission',
+    );
   });
 });

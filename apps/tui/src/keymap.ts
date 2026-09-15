@@ -138,6 +138,7 @@ const GROUPS: readonly KeyGroup[] = [
       { keys: ['Ctrl+C'], does: 'Interrupt; again in a moment to quit' },
       { keys: ['Ctrl+O'], does: 'Unfold the whole transcript' },
       { keys: ['Ctrl+T'], does: 'Show or hide the checklist' },
+      { keys: ['Ctrl+]'], does: 'Go to the next conversation that needs you' },
       { keys: ['?'], does: 'Open this map, from an empty composer' },
     ],
   },

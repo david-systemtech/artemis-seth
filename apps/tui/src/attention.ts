@@ -2,9 +2,10 @@
  * What the window chrome should say, worked out from what the pool is doing.
  *
  * `terminal.ts` knows how to write a title, light a taskbar and ring a bell,
- * and deliberately knows nothing about when. This is the when: two pure
- * functions that turn the state of several conversations into the one line a
- * taskbar button shows, and the two sentences a notification carries.
+ * and deliberately knows nothing about when. This is the when: pure functions
+ * that turn the state of several conversations into the one line a taskbar
+ * button shows, the two sentences a notification carries, and the sentence
+ * that greets somebody who has been away from the keyboard.
  *
  * They live here rather than in `app.tsx` because they are the only part of
  * the chrome that can be wrong in a way a test would catch. Everything else up
@@ -14,8 +15,10 @@
  * app-level harness, so logic that can be got wrong goes in a module that has
  * one.
  *
- * Neither function touches the clock, the environment or a stream.
+ * None of them touches the clock, the environment or a stream.
  */
+
+import { formatDuration, formatUsd } from '@rx-artemis/transcript';
 
 import type { AttentionEvent, AttentionKind, TerminalActivity } from './terminal.js';
 import type { ConversationStatus } from './conversation.js';
@@ -132,4 +135,94 @@ function firstLine(text: string | undefined): string | undefined {
     if (trimmed.length > 0) return trimmed;
   }
   return undefined;
+}
+
+/* -------------------------------------------------------------------------- */
+/* What happened while nobody was here                                        */
+/* -------------------------------------------------------------------------- */
+
+/** A turn that ended, in the parts worth reporting afterwards. */
+export interface RunEnded {
+  /** Host clock when the run ended. */
+  readonly at: number;
+  /** Wall-clock length of the run, where the provider reported one. */
+  readonly durationMs?: number | undefined;
+  /** What the run cost, where the provider reported it. */
+  readonly costUsd?: number | undefined;
+  /** It ended in an error rather than in an answer. */
+  readonly failed?: boolean | undefined;
+}
+
+/** One pooled conversation, as the recap needs to read it. */
+export interface RecapSubject {
+  /** Its name, when the store has given it one. */
+  readonly title?: string | undefined;
+  readonly status: ConversationStatus;
+  readonly pendingPermissions: readonly unknown[];
+  /** Its last finished turn, whenever that was. */
+  readonly lastRun?: RunEnded | undefined;
+  /** Host clock when it stopped to ask. Stale once the question is answered. */
+  readonly askedAt?: number | undefined;
+}
+
+/** How many things the line names before it starts counting them instead. */
+export const RECAP_CLAUSES = 2;
+
+/** What the recap calls a conversation the store has not named yet. */
+const UNNAMED = 'a conversation';
+
+/**
+ * What changed across the pool while the keyboard was untouched.
+ *
+ * The one line somebody sees on the keystroke that brings them back, so it is
+ * written for a person who has lost the thread rather than for one who is
+ * following it: names first, then the two numbers that decide whether the
+ * answer was worth what it cost. Everything in it is news — `since` is the
+ * moment of the last keypress, and a turn that ended or a question that was
+ * asked *before* that was watched happening. Nothing changed, nothing is said:
+ * a line that appears on every return is furniture, and furniture is ignored.
+ *
+ * Two clauses and then a count, because this is a flash and not a report. The
+ * third thing that happened is real but it is not what the eye has time for,
+ * and `+2 more` is an honest promise that the rail can be read for the rest —
+ * where the same facts are already drawn, per row, with no cap at all.
+ *
+ * The caller's order is kept rather than sorted by urgency. The caller passes
+ * the pool in rail order, so the line reads down the same list the eye is
+ * about to travel; a recap that ranked its clauses would name conversations in
+ * an order that matches nothing else on the screen. Which one to *go* to is a
+ * different question and `needsYou` answers it.
+ */
+export function awayRecap(states: readonly RecapSubject[], since: number): string | undefined {
+  const clauses = states.map((state) => recapClause(state, since)).filter((clause): clause is string => clause !== undefined);
+  if (clauses.length === 0) return undefined;
+  const named = clauses.slice(0, RECAP_CLAUSES);
+  const rest = clauses.length - named.length;
+  return `while you were away: ${named.join(' · ')}${rest > 0 ? ` · +${String(rest)} more` : ''}`;
+}
+
+/**
+ * One conversation's news, or nothing at all.
+ *
+ * A question outranks a finished turn for the reason it does everywhere else
+ * here: it is the state that stays until a person deals with it. The parenthesis
+ * is dropped rather than padded when the provider reported neither a duration
+ * nor a cost — `finished (—, —)` is three characters of apology where the
+ * sentence was already complete.
+ */
+function recapClause(state: RecapSubject, since: number): string | undefined {
+  const name = oneWord(state.title) ?? UNNAMED;
+  if (state.pendingPermissions.length > 0) {
+    return state.askedAt !== undefined && state.askedAt > since ? `${name} is waiting on a permission` : undefined;
+  }
+  const run = state.lastRun;
+  // Still working: whatever it finished before this turn is not the news, and
+  // saying it finished would be a line the rail's own glyph contradicts.
+  if (run === undefined || run.at <= since || state.status !== 'idle') return undefined;
+  if (run.failed === true) return `${name} stopped with an error`;
+  const spent = [
+    run.durationMs === undefined ? undefined : formatDuration(run.durationMs),
+    run.costUsd === undefined ? undefined : formatUsd(run.costUsd),
+  ].filter((part): part is string => part !== undefined);
+  return spent.length === 0 ? `${name} finished` : `${name} finished (${spent.join(', ')})`;
 }
