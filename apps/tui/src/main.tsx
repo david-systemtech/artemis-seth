@@ -24,6 +24,7 @@ import { App } from './app.js';
 import { artemisDataDir } from './dataDir.js';
 import { Frecency, defaultFrecencyPath } from './fileIndex.js';
 import { launch } from './launch.js';
+import { clearTitle, progressState } from './terminal.js';
 import { currentVersion, installRoot, runUpdate } from './update.js';
 import { runPrint } from './print.js';
 
@@ -179,6 +180,19 @@ async function main(): Promise<number> {
     await instance.waitUntilExit();
     return 0;
   } finally {
+    /*
+     * Hand the window back. The title and the taskbar light belong to Artemis
+     * only while it is running, and a shell prompt left under `⠹ working` or
+     * behind a taskbar button still pulsing is a window that lies about a
+     * process that has exited. Here rather than in an unmount effect because
+     * this runs on every way out of a launched session — the `--print` path
+     * included, where both are no-ops off a terminal, which is exactly what
+     * they should be. See `terminal.ts` for why there is no restore, only a
+     * clear: a title stack needs a pop on every exit, including the ones that
+     * are a crash, and an unbalanced one leaves the *wrong* title behind.
+     */
+    clearTitle();
+    progressState('clear');
     await launched.cache.flush();
     await launched.preferences.flush();
     await launched.history.flush();

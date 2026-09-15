@@ -285,6 +285,41 @@ export function workingLine(state: ConversationState, now = Date.now()): Working
   };
 }
 
+/** `3 files`, `+42` and `−7`, kept apart because each is painted differently. */
+export interface ChangedSummary {
+  readonly files: string;
+  readonly added: string;
+  readonly removed: string;
+}
+
+/**
+ * What this conversation has done to the working directory, as three pieces.
+ *
+ * The one thing on this line that is not about the *turn*: tokens and cost say
+ * what was spent, and this says what came of it. It belongs on the bar rather
+ * than behind `/diff` because the question it answers — has the agent started
+ * writing to my files — is one people ask by glancing, and an answer you have
+ * to type a command for is an answer nobody has while the turn is running.
+ *
+ * Absent until something has actually been edited: a bar reading `0 files`
+ * spends columns saying nothing happened. Split into three rather than joined
+ * as `summarizeFiles` does, because `+` and `−` carry their own colours here —
+ * the one convention every diff everywhere shares — and a component should not
+ * have to find the numbers inside a sentence in order to paint them.
+ *
+ * `−` is the true minus sign, as the desktop's churn counts use: beside a `+`
+ * at the same weight, a hyphen reads as punctuation rather than as the other
+ * half of a pair.
+ */
+export function changedSummary(changed: ConversationState['filesChanged']): ChangedSummary | undefined {
+  if (changed === undefined || changed.files === 0) return undefined;
+  return {
+    files: `${String(changed.files)} file${changed.files === 1 ? '' : 's'}`,
+    added: `+${String(changed.added)}`,
+    removed: `−${String(changed.removed)}`,
+  };
+}
+
 export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBarProps): React.JSX.Element {
   const { settings, usage } = state;
   const badge = modeBadge(settings.permissionMode);
@@ -292,6 +327,7 @@ export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBar
   const ratio = contextRatio(usage);
   const cost = usage?.costUsd;
   const slots = planMeterSlots(state.planUsage);
+  const changed = changedSummary(state.filesChanged);
   const liveTasks = state.tasks.filter(isTaskLive).length;
   const busy = state.status === 'starting' || state.status === 'running';
   const spinner = useSpinner(busy);
@@ -358,6 +394,16 @@ export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBar
             </Text>
           )}
           {cost !== undefined && <Text dimColor>{' · '}{formatUsd(cost)}</Text>}
+          {/* The count is furniture and the churn is the reading, so only the
+              two numbers carry colour. */}
+          {changed !== undefined && (
+            <Text>
+              <Text dimColor>{` · ${changed.files} `}</Text>
+              <Text color="green">{changed.added}</Text>
+              <Text dimColor> </Text>
+              <Text color="red">{changed.removed}</Text>
+            </Text>
+          )}
           {liveTasks > 0 && <Text color="cyan">{` · ${String(liveTasks)} task${liveTasks === 1 ? '' : 's'}`}</Text>}
           {update !== undefined && <Text color="yellow">{` · ${update} is out: artemis-tui --update`}</Text>}
           <Text dimColor>{' · /help'}</Text>

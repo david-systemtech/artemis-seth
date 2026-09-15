@@ -1079,6 +1079,40 @@ describe('going back to an earlier prompt', () => {
     expect(c.userTurns().map((turn) => turn.messageId)).toEqual(['u-1', 'u-2']);
   });
 
+  it('brings a shell line back as a shell line, not as a slash command', () => {
+    // A `!git status` row is drawn with `$` and a `/compact` row with `/`,
+    // and the difference is one field. Dropped on the way back through the
+    // redraw, the restored row claimed the app had a `/git` it does not.
+    const { c } = resumed();
+    c.transcript.apply({
+      type: 'command.run',
+      runId: 'local-shell' as RunId,
+      seq: 0,
+      ts: 20,
+      command: { name: 'git', args: 'status', output: 'nothing to commit' },
+      source: 'shell',
+    } as AgentEvent);
+    c.transcript.apply({
+      type: 'command.run',
+      runId: 'old-run' as RunId,
+      seq: 4,
+      ts: 21,
+      command: { name: 'compact' },
+    } as AgentEvent);
+
+    c.armRewind('u-1');
+    c.disarmRewind();
+
+    const commands = rows(c).filter((row): row is Extract<typeof row, { kind: 'command' }> =>
+      row !== undefined && 'kind' in row && row.kind === 'command',
+    );
+    expect(commands.map((row) => [row.name, row.source])).toEqual([
+      ['git', 'shell'],
+      // A provider's own command has no source, and must not acquire one.
+      ['compact', undefined],
+    ]);
+  });
+
   it('does nothing when the arm is dropped after the turn has gone out', async () => {
     // The composer empties as the prompt is sent, and that must not redraw the
     // conversation over a rewind the provider is already making.

@@ -1368,6 +1368,10 @@ export class Conversation {
               output: item.output,
               failed: item.failed,
             },
+            // Which table the name came from. Without it a restored `!git
+            // status` comes back wearing a slash, which reads as a command
+            // the app has and does not.
+            source: item.source,
           });
           break;
         case 'run-end':

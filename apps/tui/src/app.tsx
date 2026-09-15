@@ -70,6 +70,34 @@
  *
  * The settings a picker changes are the *next* turn's; the line under the
  * composer shows what the provider actually reported for the current one.
+ *
+ * The rest of the commands are about what came out of the conversation and
+ * what went into the files. Their thinking is in `exportTranscript.ts`,
+ * `clipboard.ts` and `changes.ts`; what is here is the wiring and the words:
+ *
+ *  - `/copy`    — the last reply, or one of its fenced blocks, as source.
+ *    "Copied" and "sent to the terminal" are different promises and the flash
+ *    keeps them apart: over SSH the bytes go to the emulator by OSC 52, which
+ *    no terminal acknowledges.
+ *  - `/export`  — the whole conversation as markdown, written through a temp
+ *    file and a rename so a half-written export cannot be opened and believed.
+ *    Its title is the conversation's own name, which only the rail knows.
+ *  - `/diff`    — two questions, one list. `git` answers what is different
+ *    from the last commit, whoever changed it; the ledger answers what *this
+ *    conversation* did, which is the one that can be answered in a directory
+ *    that is not a repository. Either opens into `TextView`.
+ *  - `/undo`    — the last file change, taken back, and refused rather than
+ *    guessed at whenever the file has moved since.
+ *  - `/pin`     — held at the top of its folder, remembered in the
+ *    preferences against the session id, which is what a conversation *is*.
+ *  - `/title`   — a name, written into the provider's own store through the
+ *    same door the automatic namer uses. A provider without that field says so.
+ *
+ * Last, the window itself. The title, the taskbar light and the bell are the
+ * only channel to somebody who has tabbed away — and with several
+ * conversations parked and working, that is most of the time. `terminal.ts`
+ * owns the bytes, `attention.ts` the reduction, and the effects under "The
+ * window, from outside" the policy.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
@@ -97,16 +125,22 @@ import { browseRowLabel, browseRows, browseStart, recentDirectories, shortenPath
 import { prunePool, railActivityFor } from './pool.js';
 
 import { attachmentFromBytes, readAttachment } from './attachments.js';
+import { noticeFor, titleStateOf } from './attention.js';
 import { CATALOGUE_KEY, commandsKey, modelsKey, usageKey } from './cache.js';
+import { fileLines, gitDiff, type ChangedFile } from './changes.js';
 import { checkForUpdate, currentVersion, installRoot } from './update.js';
+import { copyText } from './clipboard.js';
 import { parseCommand, type Command } from './commands.js';
 import { Conversation, type ConversationSettings } from './conversation.js';
+import { codeBlocksOf, exportFilename, lastAssistantText, transcriptToMarkdown } from './exportTranscript.js';
 import { editInExternalEditor, type ExternalEditResult } from './externalEditor.js';
 import { listFiles, type Frecency } from './fileIndex.js';
 import type { HistoryScope } from './history.js';
 import type { Launched } from './launch.js';
 import type { ModelListing } from './host.js';
+import { renderDiff } from './render/diff.js';
 import { runShell } from './shell.js';
+import { AttentionTimer, notify, progressState, setTitle, titleFor } from './terminal.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
 import { ACCENT } from './theme.js';
 import { Composer, type ComposerHandle, type FileIndex, type PastedImage } from './components/Composer.js';
@@ -119,12 +153,13 @@ import { Picker, type PickerItem } from './components/Picker.js';
 import { QueuedStrip } from './components/QueuedStrip.js';
 import { Sidebar, railRows, type RailRow } from './components/Sidebar.js';
 import { TodoStrip } from './components/TodoStrip.js';
-import { basename } from 'node:path';
+import { basename, isAbsolute, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
-import { readdir, stat } from 'node:fs/promises';
+import { readdir, rename, stat, writeFile } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import { describeWorkspace } from '@rx-artemis/core';
 import { StatusBar } from './components/StatusBar.js';
+import { TextView } from './components/TextView.js';
 import { ReplayRows, TranscriptViewport } from './components/Transcript.js';
 
 export interface AppProps {
@@ -185,11 +220,33 @@ interface HelpModal {
   readonly kind: 'help';
 }
 
-type Modal = PickerModal | LoadingModal | ReplayModal | PagerModal | HelpModal;
+/**
+ * A wall of text with a way through it: what `/diff` opens into.
+ *
+ * The lines are built once, at the width the pane had when the command ran,
+ * because `renderDiff` cuts to a width and the alternative is re-rendering
+ * every diff on every resize for a view somebody is reading rather than
+ * living in. A resize while it is open therefore truncates rather than
+ * reflows, and closing and reopening is exact again.
+ */
+interface TextModal {
+  readonly kind: 'text';
+  readonly title: string;
+  readonly lines: readonly string[];
+}
+
+type Modal = PickerModal | LoadingModal | ReplayModal | PagerModal | HelpModal | TextModal;
 type Focus = 'composer' | 'sidebar';
 
 /** The row that leaves the recents list for the filesystem. Not a path, so it cannot be one. */
 const BROWSE_KEY = '\u0000browse';
+
+/**
+ * `/diff`'s first row: git's answer rather than one of the ledger's files.
+ * A leading NUL for the same reason `BROWSE_KEY` has one — the rows beside it
+ * are indices, and this must not be able to collide with one.
+ */
+const WORKING_TREE_KEY = '\u0000working-tree';
 
 const MODE_LABEL: Readonly<Record<PermissionMode, string>> = {
   default: 'Ask',
@@ -246,7 +303,33 @@ const SCROLL_STEP = 2;
  */
 const SHELL_RUN_ID = 'local-shell';
 
+/**
+ * The same trick for the commands this file answers itself.
+ *
+ * `/export` and `/undo` leave a row behind — what was written, what was put
+ * back — and neither came off the provider's stream either. A run id apart
+ * from the shell's, because the two are different sources and a `$` row and a
+ * `/` row sharing a numbering would be one accident away from being sorted
+ * together.
+ */
+const LOCAL_RUN_ID = 'local-command';
+
+/**
+ * The columns a {@link TextModal}'s lines are built to: the pane, less its own
+ * padding, the reader's border and the reader's padding.
+ */
+const TEXT_VIEW_CHROME = 6;
+
+/** How long the taskbar light stays red after a failed turn before it goes out. */
+const PROGRESS_ERROR_MS = 5_000;
+
 const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** `3 lines`, for a row of `/copy`'s list. */
+const countOfLines = (text: string): string => {
+  const lines = text.split('\n').length;
+  return `${String(lines)} line${lines === 1 ? '' : 's'}`;
+};
 
 export function App({ launched, files }: AppProps): React.JSX.Element {
   const { host, descriptors, cache, preferences, history } = launched;
@@ -554,9 +637,24 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         : accounts.find((profile) => profile.id === session.profileId)?.label ?? 'another account',
     [accounts, state.settings.profileId],
   );
+  /**
+   * The conversations held at the top of their folder.
+   *
+   * The store memoises the set on the identity of the array it was built from,
+   * so `pinnedSet()` is free to call on every draw — but that also means
+   * nothing here re-renders when a pin is toggled, since the call site never
+   * changes. `pinTick` is the nudge: `/pin` bumps it, this re-derives, and the
+   * rail and the sidebar both see the new set. See `preferences.ts`.
+   */
+  const [pinTick, setPinTick] = useState(0);
+  const pinned = useMemo(
+    () => preferences.pinnedSet(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [preferences, pinTick],
+  );
   const rail: readonly RailRow[] = useMemo(
-    () => railRows(sessions, openFolders, projectOf, accountOf, expandedFolders),
-    [sessions, openFolders, projectOf, accountOf, expandedFolders],
+    () => railRows(sessions, openFolders, projectOf, accountOf, expandedFolders, { pinned }),
+    [sessions, openFolders, projectOf, accountOf, expandedFolders, pinned],
   );
 
   /* ---------------------------------------------------------------------- */
@@ -1154,6 +1252,342 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   }, [refreshPlanUsage, conversation, say, state.settings.providerLabel]);
 
   /* ---------------------------------------------------------------------- */
+  /* Taking it out, and taking it back                                       */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * This conversation's row in the rail, when the store has one for it.
+   *
+   * The only place the terminal learns what a conversation is *called*: a
+   * title is the provider's, written beside the transcript, and the rail is
+   * already reading every account's list. A conversation that has not been
+   * saved yet — nothing sent, or sent and not yet listed — has no row and no
+   * name, which is a fact the callers below say out loud rather than paper
+   * over with the folder's name.
+   */
+  const currentSession = useMemo(
+    () => (state.sessionId === undefined ? undefined : sessions.find((session) => session.id === state.sessionId)),
+    [sessions, state.sessionId],
+  );
+
+  /**
+   * A row for something this terminal did rather than something the model did.
+   *
+   * The same row `!` writes and the same row a provider's own slash command
+   * gets, because it is the same kind of thing: the host did it, and nothing
+   * was sampled. See {@link LOCAL_RUN_ID} for why it is not on the provider's
+   * numbering.
+   */
+  const recordCommand = useCallback(
+    (name: string, args: string | undefined, output: string, failed = false) => {
+      transcript.apply({
+        type: 'command.run',
+        runId: LOCAL_RUN_ID,
+        seq: 0,
+        ts: Date.now(),
+        command: {
+          name,
+          ...(args === undefined || args.length === 0 ? {} : { args }),
+          ...(output.length === 0 ? {} : { output }),
+          ...(failed ? { failed: true } : {}),
+        },
+      });
+    },
+    [transcript],
+  );
+
+  /**
+   * Put text on the clipboard and say which of the two routes it took.
+   *
+   * "Copied" and "sent to the terminal" are different promises and the flash
+   * keeps them apart: OSC 52 hands the bytes to whatever emulator the person
+   * is sitting in front of, through however many hops of SSH, and no terminal
+   * acknowledges it. See `clipboard.ts`.
+   */
+  const putOnClipboard = useCallback(
+    async (text: string) => {
+      const method = await copyText(text);
+      showFlash(method === 'native' ? 'copied' : method === 'osc52' ? 'sent to the terminal' : 'no way to copy here');
+    },
+    [showFlash],
+  );
+
+  /**
+   * `/copy` — the last reply, or one piece of it.
+   *
+   * Source rather than the rendering on screen: the point of copying a reply
+   * is to paste it somewhere that renders it again, and what the terminal drew
+   * is ANSI escapes and hard-wrapped lines. A reply with fenced blocks opens a
+   * list first, because the thing people mean most of the time is the command
+   * in the middle of the explanation rather than the explanation.
+   */
+  const copyLastReply = useCallback(() => {
+    const text = lastAssistantText(transcript);
+    if (text === null) {
+      showFlash('nothing to copy');
+      return;
+    }
+    const blocks = codeBlocksOf(text);
+    if (blocks.length === 0) {
+      void putOnClipboard(text);
+      return;
+    }
+    openPicker({
+      title: 'Copy',
+      items: [
+        { key: 'all', label: 'the whole reply', detail: countOfLines(text) },
+        ...blocks.map((block, index) => {
+          const opening = block.code.split('\n').find((line) => line.trim().length > 0) ?? '';
+          return {
+            key: String(index),
+            // The language and the first line that has anything on it: between
+            // them they identify a block without the person having to count
+            // fences back through the reply.
+            label: [block.lang, oneLine(opening, 60)].filter((part) => part.length > 0).join(' · ') || 'an empty block',
+            detail: countOfLines(block.code),
+          };
+        }),
+      ],
+      onSelect: (item) => {
+        setModal(null);
+        if (item.key === 'all') {
+          void putOnClipboard(text);
+          return;
+        }
+        const block = blocks[Number(item.key)];
+        if (block !== undefined) void putOnClipboard(block.code);
+      },
+    });
+  }, [transcript, showFlash, putOnClipboard, openPicker]);
+
+  /**
+   * `/export` — the whole conversation as a markdown file.
+   *
+   * Written beside itself and renamed into place, as `preferences.ts` writes:
+   * a rename is atomic on every filesystem this runs on, and the failure it
+   * rules out — a half-written export that someone opens and believes — is the
+   * one failure a saved file must not have.
+   *
+   * The name is the caller's when they gave one, relative to where the
+   * conversation is working rather than to wherever this process happens to
+   * have been started. Otherwise it is `exportFilename`'s, which carries the
+   * conversation's own name and the time, because exporting twice in an
+   * afternoon is the normal case.
+   */
+  const exportConversation = useCallback(
+    (args: string) => {
+      const title = currentSession?.title;
+      const startedAt = currentSession?.createdAt;
+      const markdown = transcriptToMarkdown(transcript, {
+        ...(title === undefined ? {} : { title }),
+        ...(startedAt === undefined ? {} : { startedAt }),
+      });
+      if (markdown.trim().length === 0) {
+        showFlash('nothing to export');
+        return;
+      }
+      const named = args.length > 0 ? args : exportFilename(title);
+      const path = isAbsolute(named) ? named : resolvePath(state.settings.cwd, named);
+      void (async () => {
+        try {
+          const temp = `${path}.${String(process.pid)}.tmp`;
+          await writeFile(temp, markdown, 'utf8');
+          await rename(temp, path);
+        } catch (error) {
+          showFlash('could not write that file');
+          say('error', `Could not write ${path}: ${describeError(error)}`);
+          return;
+        }
+        showFlash(shortenPath(path, homedir()));
+        recordCommand('export', args.length > 0 ? args : undefined, path);
+      })();
+    },
+    [currentSession, transcript, state.settings.cwd, showFlash, say, recordCommand],
+  );
+
+  /**
+   * One file's edits, oldest first, as the transcript draws them.
+   *
+   * Newest last on purpose: a file read top to bottom should end on the edit
+   * that left it as it is now, and the ledger hands its changes back newest
+   * first because that is the order `/undo` wants them in.
+   */
+  const diffOfFile = useCallback(
+    (file: ChangedFile, columns: number): readonly string[] =>
+      conversation.changes
+        .changes()
+        .filter((change) => change.path === file.path)
+        .reverse()
+        .flatMap((change, index) => [
+          ...(index === 0 ? [] : ['']),
+          // No cap: this is the view someone opened *because* the transcript
+          // capped it. The gutter is on for the same reason — there is room,
+          // and a line number is how a diff is talked about.
+          ...renderDiff(change.edit, Number.POSITIVE_INFINITY, { columns, numbers: 'on' }),
+        ]),
+    [conversation],
+  );
+
+  /**
+   * `/diff` — what changed, from two directions.
+   *
+   * The ledger answers "what has this conversation done", which is the
+   * question during a turn; `git` answers "what is different from the last
+   * commit, whoever changed it", which is the question before committing.
+   * Both are offered because neither is a superset: the ledger sees edits in a
+   * directory that is not a repository at all, and git sees the work the
+   * person did themselves.
+   *
+   * Waited on first. The ledger is fed from an event handler that cannot wait
+   * for a disk read, so a `/diff` typed the instant a turn ends would
+   * otherwise be missing that turn's last edit — see `changesSettled`.
+   */
+  const openDiff = useCallback(() => {
+    void (async () => {
+      await conversation.changesSettled();
+      const files = conversation.changes.files();
+      const columns = Math.max(20, mainWidth - TEXT_VIEW_CHROME);
+
+      const workingTree = async (): Promise<void> => {
+        setModal({ kind: 'loading', title: 'Working tree — asking git…' });
+        const result = await gitDiff(conversation.getState().settings.cwd);
+        setModal(null);
+        if (!result.ok) {
+          showFlash(result.reason);
+          return;
+        }
+        if (result.text.trim().length === 0) {
+          showFlash('nothing changed');
+          return;
+        }
+        setModal({ kind: 'text', title: `Working tree · ${workspace}`, lines: result.text.split('\n') });
+      };
+
+      // Nothing recorded means there is only one row to offer, and a picker of
+      // one row is a keystroke asking to be skipped.
+      if (files.length === 0) {
+        await workingTree();
+        return;
+      }
+
+      const labels = fileLines(files, columns);
+      openPicker({
+        title: 'What changed',
+        items: [
+          { key: WORKING_TREE_KEY, label: 'working tree', detail: 'everything different from the last commit' },
+          ...files.map((file, index) => ({ key: String(index), label: labels[index] ?? file.label })),
+        ],
+        hint: '↑↓ move · Enter opens the diff · Esc back',
+        onSelect: (item) => {
+          setModal(null);
+          if (item.key === WORKING_TREE_KEY) {
+            void workingTree();
+            return;
+          }
+          const file = files[Number(item.key)];
+          if (file === undefined) return;
+          setModal({ kind: 'text', title: file.label, lines: diffOfFile(file, columns) });
+        },
+      });
+    })();
+  }, [conversation, mainWidth, workspace, openPicker, showFlash, diffOfFile]);
+
+  /**
+   * `/undo` — the last file change, taken back.
+   *
+   * The whole of the rule is the ledger's: it refuses unless the file still
+   * looks exactly as it did when the call finished, so a later edit, a save
+   * from an editor or a formatter all mean "cannot undo" rather than a write
+   * over work nobody asked to lose. What is here is the waiting, the re-read
+   * of the totals — the one thing that moves them without an event behind it —
+   * and saying which of the three happened.
+   */
+  const undoLastChange = useCallback(() => {
+    void (async () => {
+      await conversation.changesSettled();
+      const result = await conversation.changes.undo();
+      conversation.refreshChanges();
+      if (!result.ok) {
+        showFlash(`cannot undo: ${result.reason}`);
+        recordCommand('undo', undefined, `cannot undo: ${result.reason}`, true);
+        return;
+      }
+      const said = `${result.action} ${result.path}`;
+      showFlash(said);
+      recordCommand('undo', undefined, said);
+    })();
+  }, [conversation, showFlash, recordCommand]);
+
+  /**
+   * `/pin` — hold this conversation at the top of its folder.
+   *
+   * A judgement about a conversation rather than about an account, so it is
+   * remembered in the preferences and not in the cache, and it is the session
+   * id that is written down: a title is the provider's to change and a path is
+   * the directory's, while the id is what the conversation *is*.
+   */
+  const togglePin = useCallback(() => {
+    const sessionId = state.sessionId;
+    if (sessionId === undefined) {
+      showFlash('nothing to pin yet');
+      return;
+    }
+    const nowPinned = preferences.togglePin(sessionId);
+    setPinTick((tick) => tick + 1);
+    showFlash(nowPinned ? 'pinned' : 'unpinned');
+  }, [preferences, state.sessionId, showFlash]);
+
+  /**
+   * `/title` — name this conversation.
+   *
+   * Written into the provider's own store, through the same door the automatic
+   * namer uses and the desktop's rename menu item uses: a typed title and a
+   * generated one are the same fact about a session, and a second store kept
+   * here would be a fact about one installation — invisible to the desktop,
+   * absent on another machine. A provider whose store has no such field says
+   * so and nothing is written; see `Capabilities.renameSession`.
+   */
+  const renameConversation = useCallback(
+    (name: string) => {
+      const sessionId = state.sessionId;
+      if (sessionId === undefined) {
+        showFlash('nothing to name yet');
+        return;
+      }
+      if (name.length === 0) {
+        showFlash('/title <name> names this conversation');
+        return;
+      }
+      if (host.capabilitiesFor(state.settings.providerId)?.renameSession !== true) {
+        showFlash('this provider does not let a conversation be renamed');
+        return;
+      }
+      void (async () => {
+        try {
+          const done = await host.renameSession(
+            state.settings.profileId,
+            state.settings.providerId,
+            sessionId,
+            state.settings.cwd,
+            name,
+          );
+          if (!done) {
+            showFlash('this provider does not let a conversation be renamed');
+            return;
+          }
+          showFlash(`named ${oneLine(name, 48)}`);
+          // The rail is where the name is read back from, and it is what
+          // `/export` takes its title and its filename from.
+          await refreshRail();
+        } catch (error) {
+          say('error', `Could not rename this conversation: ${describeError(error)}`);
+        }
+      })();
+    },
+    [host, state.sessionId, state.settings.profileId, state.settings.providerId, state.settings.cwd, showFlash, say, refreshRail],
+  );
+
+  /* ---------------------------------------------------------------------- */
   /* Commands and messages                                                   */
   /* ---------------------------------------------------------------------- */
 
@@ -1397,6 +1831,24 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         case 'attach':
           void attach(command.args);
           return;
+        case 'copy':
+          copyLastReply();
+          return;
+        case 'export':
+          exportConversation(command.args);
+          return;
+        case 'diff':
+          openDiff();
+          return;
+        case 'undo':
+          undoLastChange();
+          return;
+        case 'pin':
+          togglePin();
+          return;
+        case 'title':
+          renameConversation(command.args);
+          return;
         case 'tasks':
           openTasksPicker();
           return;
@@ -1421,6 +1873,12 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       openResumePicker,
       loadSession,
       attach,
+      copyLastReply,
+      exportConversation,
+      openDiff,
+      undoLastChange,
+      togglePin,
+      renameConversation,
       openTasksPicker,
       showUsage,
       confirm,
@@ -1603,11 +2061,205 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
             ...(result.output.length === 0 ? {} : { output: result.output }),
             ...(result.failed ? { failed: true } : {}),
           },
+          // Which table the name came from. Nothing looked `git` up in a
+          // command list and there is no `/git`, so the row wears a `$`
+          // rather than a slash — and keeps it through a redraw.
+          source: 'shell',
         });
       })();
     },
     [history, state.settings.cwd, state.sessionId, submit, transcript],
   );
+
+  /* ---------------------------------------------------------------------- */
+  /* The window, from outside                                                */
+  /* ---------------------------------------------------------------------- */
+
+  /*
+   * Artemis is the one agent terminal where several conversations work at
+   * once, which makes the window's own chrome the only channel it has to
+   * someone who has tabbed away. `terminal.ts` is all of the bytes and none of
+   * the policy; this is the policy.
+   *
+   * Three signals, three different questions:
+   *
+   *  - The **title** answers "what is Artemis doing", across the whole pool
+   *    rather than for whichever conversation happens to be on screen — the
+   *    person reading a taskbar button cannot see which one that is. The
+   *    reduction is `titleStateOf`, which is pure and tested; this is the
+   *    effect that writes its answer out.
+   *  - The **taskbar light** answers "is this window still busy", and belongs
+   *    to the conversation in front of you: it is the window's own progress,
+   *    and a parked conversation's turn is reported by the rail.
+   *  - The **bell** answers "do I need to come back", and waits until nobody
+   *    is looking. `AttentionTimer` is that rule — every keystroke pushes both
+   *    kinds back out, so a notification never fires at someone mid-sentence.
+   */
+
+  /** One timer for the process, built on first render and never replaced. */
+  const attention = useRef<AttentionTimer | null>(null);
+  attention.current ??= new AttentionTimer();
+  useEffect(
+    () => () => {
+      attention.current?.disarmAll();
+    },
+    [],
+  );
+
+  /**
+   * What this conversation is called, and a mirror of it for the callbacks.
+   *
+   * The title effect wants the value it rendered with; a notification wants
+   * the value at the moment it fires, which may be a minute later and by then
+   * may be a name the rail had not read when the bell was armed.
+   */
+  const conversationTitle = currentSession?.title;
+  const conversationName = useRef<string | undefined>(undefined);
+  conversationName.current = conversationTitle;
+
+  const chrome = useMemo(
+    () => titleStateOf(pool.map((alive) => alive.getState())),
+    // The same two signals the rail's activity map watches: `parkedTick` says
+    // a parked conversation moved, `state` that the one on screen did.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [pool, parkedTick, state],
+  );
+
+  useEffect(() => {
+    // The folder is the subject when the conversation has no name yet, which
+    // `titleFor` arranges: `◇ ready · (artemis)` would be a hole where a name
+    // should be.
+    setTitle(
+      titleFor({
+        state: chrome.state,
+        ...(conversationTitle === undefined ? {} : { title: conversationTitle }),
+        folder: workspace,
+        needing: chrome.needing,
+      }),
+    );
+  }, [chrome.state, chrome.needing, conversationTitle, workspace]);
+
+  /**
+   * When the last turn failed, so the light is not cleared out from under its
+   * own red. `progressState('done')` and `'clear'` are the same sequence, and
+   * the status going idle arrives on the heels of the `run.end` that failed.
+   */
+  const failedAt = useRef(0);
+  /**
+   * Which state of the light a pending clear belongs to.
+   *
+   * A turn started inside the five seconds takes the bar back to working, and
+   * the timer that was going to clear the red must not then clear *that* — a
+   * pulse that stops halfway through a turn is a worse lie than a red bar that
+   * outstays its welcome.
+   */
+  const progressGeneration = useRef(0);
+
+  useEffect(() => {
+    const off = conversation.subscribeEvents((event) => {
+      if (event.type !== 'run.end' || event.reason !== 'error') return;
+      failedAt.current = Date.now();
+      const generation = ++progressGeneration.current;
+      progressState('error');
+      const clearing = setTimeout(() => {
+        if (progressGeneration.current === generation) progressState('clear');
+      }, PROGRESS_ERROR_MS);
+      clearing.unref?.();
+    });
+    return off;
+  }, [conversation]);
+
+  useEffect(() => {
+    if (live) {
+      progressGeneration.current += 1;
+      progressState('working');
+      return;
+    }
+    // The `run.end` that failed has already lit the bar red, and the status
+    // going idle arrives on its heels; `done` and `clear` are the same
+    // sequence, so letting this through would take the red straight back off.
+    if (Date.now() - failedAt.current < PROGRESS_ERROR_MS) return;
+    progressState('done');
+  }, [live]);
+
+  /**
+   * The first conversation anywhere in the pool that has stopped to ask.
+   *
+   * Anywhere, because the whole reason a parked conversation is worth a bell
+   * is that its question is invisible: the rail shows a glyph, and the rail is
+   * not what the person is looking at.
+   */
+  const waiting = useMemo(() => {
+    for (const alive of pool) {
+      const asking = alive.getState();
+      const request = asking.pendingPermissions[0];
+      if (request === undefined) continue;
+      const named = asking.sessionId === undefined ? undefined : sessions.find((row) => row.id === asking.sessionId)?.title;
+      return { title: named, tool: request.toolName };
+    }
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pool, parkedTick, state, sessions]);
+
+  /*
+   * Read at the moment the bell rings rather than captured when it was armed:
+   * six seconds is long enough for the rail to have learned the conversation's
+   * name, and a notification that says which one is asking is the whole value
+   * of the notification.
+   */
+  const waitingNow = useRef(waiting);
+  waitingNow.current = waiting;
+  const someoneWaiting = waiting !== undefined;
+
+  useEffect(() => {
+    const timer = attention.current;
+    if (timer === null) return;
+    if (!someoneWaiting) {
+      timer.disarm('needs-you');
+      return;
+    }
+    timer.arm('needs-you', () => {
+      const asking = waitingNow.current;
+      notify(
+        noticeFor('needs-you', {
+          ...(asking?.title === undefined ? {} : { conversation: asking.title }),
+          ...(asking?.tool === undefined ? {} : { tool: asking.tool }),
+        }),
+      );
+    });
+  }, [someoneWaiting]);
+
+  /**
+   * Whether the conversation on screen was running the last time this looked.
+   *
+   * A finished turn is a *transition* and not a state: a conversation resumed
+   * from the store is idle without having just finished anything, and
+   * switching from a live conversation to a parked idle one is not the end of
+   * a turn either. So the conversation is remembered beside the flag, and only
+   * the same one going from live to idle arms the bell.
+   */
+  const lastTurn = useRef<{ readonly conversation: Conversation; readonly live: boolean } | null>(null);
+  useEffect(() => {
+    const timer = attention.current;
+    const previous = lastTurn.current;
+    lastTurn.current = { conversation, live };
+    if (timer === null) return;
+    if (live) {
+      // A new turn is the answer to the last one; nothing is owed about it.
+      timer.disarm('finished');
+      return;
+    }
+    if (previous === null || previous.conversation !== conversation || !previous.live) return;
+    timer.arm('finished', () => {
+      const said = lastAssistantText(conversation.transcript);
+      notify(
+        noticeFor('finished', {
+          ...(conversationName.current === undefined ? {} : { conversation: conversationName.current }),
+          ...(said === null ? {} : { reply: said }),
+        }),
+      );
+    });
+  }, [conversation, live]);
 
   /* ---------------------------------------------------------------------- */
   /* Keys                                                                    */
@@ -1878,6 +2530,15 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   }, [conversation, openPicker, showFlash]);
 
   useInput((input, key) => {
+    /*
+     * Somebody is here. Every press pushes both bells back out to their full
+     * delay — a notification that fires while you are typing is noise, and
+     * noise is how a feature like this gets switched off. It is the first
+     * thing in the handler because it is true of every key, including the
+     * ones a modal below is about to answer.
+     */
+    attention.current?.touch();
+
     if (key.ctrl && input === 'c') {
       if (quitArmed.current !== null) {
         clearTimeout(quitArmed.current);
@@ -2097,6 +2758,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
             focused={sidebarActive}
             {...(state.sessionId === undefined ? {} : { activeSessionId: state.sessionId })}
             activity={railActivity}
+            pinned={pinned}
             currentProject={currentProject}
             width={SIDEBAR_WIDTH}
             height={bodyRows}
@@ -2196,6 +2858,20 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
                   everything else in this column; the overlay decides for
                   itself whether that is wide enough for two columns of keys. */}
               <Help columns={mainWidth - 2} rows={Math.max(8, bodyRows - 8)} onClose={() => setModal(null)} />
+            </Box>
+          )}
+          {modal?.kind === 'text' && (
+            <Box paddingX={1} flexShrink={0}>
+              {/* Sized to the pane, like everything else in this column. The
+                  lines were built to the same width when the command ran —
+                  see `TextModal` — so this is a fit and not a reflow. */}
+              <TextView
+                title={modal.title}
+                lines={modal.lines}
+                columns={mainWidth - 2}
+                rows={Math.max(8, bodyRows - 8)}
+                onClose={() => setModal(null)}
+              />
             </Box>
           )}
           {modal?.kind === 'replay' && (

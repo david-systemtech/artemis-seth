@@ -13,7 +13,7 @@ import { NO_CAPABILITIES, PERMISSION_MODES } from '@rx-artemis/protocol';
 
 import type { ConversationState } from '../conversation.js';
 import { ACCENT } from '../theme.js';
-import { elapsedClock, meterBar, meterCells, meterTone, modeBadge, workingLine } from './StatusBar.js';
+import { changedSummary, elapsedClock, meterBar, meterCells, meterTone, modeBadge, workingLine } from './StatusBar.js';
 
 describe('meterBar', () => {
   it('fills in proportion', () => {
@@ -272,5 +272,43 @@ describe('modeBadge', () => {
     // A mode added to the protocol and not to this record would draw nothing
     // at all where the line says what the next turn goes out as.
     for (const mode of PERMISSION_MODES) expect(modeBadge(mode).text.trim()).not.toBe('');
+  });
+});
+
+/*
+ * What the conversation has done to the files.
+ *
+ * The one reading on this line that is not about the turn: tokens and cost say
+ * what was spent, this says what came of it. The rule that matters is when it
+ * says nothing at all — a bar reading `0 files` spends columns reporting that
+ * nothing happened.
+ */
+describe('changedSummary', () => {
+  it('splits the count from the churn, so each can be painted', () => {
+    expect(changedSummary({ files: 3, added: 42, removed: 7 })).toEqual({
+      files: '3 files',
+      added: '+42',
+      // The true minus sign, as the desktop's churn counts use: a hyphen
+      // beside a `+` reads as punctuation rather than as its opposite.
+      removed: '−7',
+    });
+  });
+
+  it('says "1 file" for one', () => {
+    expect(changedSummary({ files: 1, added: 2, removed: 0 })?.files).toBe('1 file');
+  });
+
+  it('is nothing at all until something has been edited', () => {
+    expect(changedSummary(undefined)).toBeUndefined();
+    // A ledger folded to zero files — every change undone — is the same
+    // nothing, and must not leave `0 files +0 −0` on the bar.
+    expect(changedSummary({ files: 0, added: 0, removed: 0 })).toBeUndefined();
+  });
+
+  it('keeps a file that was only added to, or only cut from', () => {
+    // `+0` is worth drawing: it is what a pure deletion looks like, and
+    // leaving it out would make the pair read as a single number.
+    expect(changedSummary({ files: 1, added: 0, removed: 12 })).toEqual({ files: '1 file', added: '+0', removed: '−12' });
+    expect(changedSummary({ files: 2, added: 9, removed: 0 })).toEqual({ files: '2 files', added: '+9', removed: '−0' });
   });
 });
