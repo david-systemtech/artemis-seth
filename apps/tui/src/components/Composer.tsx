@@ -485,6 +485,19 @@ interface Search {
   readonly at: number;
 }
 
+/**
+ * What a keystroke adds to the search query.
+ *
+ * The editor scrubs control bytes on the way into the buffer; the query is a
+ * plain string and did not. Ink folds only Ctrl+A..Z back into letters, so a
+ * chord like Ctrl+] arrives as a bare U+001D that would otherwise land in the
+ * query as an invisible character nothing matches. Newlines become spaces, as
+ * a pasted phrase is still one phrase.
+ */
+function typedForQuery(input: string): string {
+  return input.replace(/[\r\n]+/gu, ' ').replace(/[\u0000-\u0008\u000B-\u001F\u007F]/gu, '');
+}
+
 export interface ComposerProps {
   /**
    * What was typed, the `@paths` in it that name a real file — in order, once
@@ -868,7 +881,7 @@ export function Composer({
     if (search !== null) {
       // A pasted query is still a query; its line breaks would be a row the
       // search cannot draw, so they become spaces.
-      searchFor(search.query + text.replace(/[\r\n]+/gu, ' '), search.scopeIndex, 0, search.draft);
+      searchFor(search.query + typedForQuery(text), search.scopeIndex, 0, search.draft);
       return;
     }
     const rows = text.split('\n').length;
@@ -1100,7 +1113,7 @@ export function Composer({
         if (input.length === 0 || input === '\n') return;
         // A pasted query is still a query; its line breaks would be a row the
         // search cannot draw, so they become spaces.
-        searchFor(search.query + input.replace(/[\r\n]+/gu, ' '), search.scopeIndex, 0, search.draft);
+        searchFor(search.query + typedForQuery(input), search.scopeIndex, 0, search.draft);
         return;
       }
       /*

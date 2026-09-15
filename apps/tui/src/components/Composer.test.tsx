@@ -1329,3 +1329,19 @@ describe('Composer: a chip says what it is', () => {
     expect(onSubmit).toHaveBeenCalledWith(`\`\`\`\n${NODE_TRACE}`, []);
   });
 });
+
+describe('Composer: a chord the terminal cannot name', () => {
+  it('keeps a bare control byte out of the search query', async () => {
+    const history = fakeHistory({ folder: ['fix the build'], all: [], session: [] });
+    const { lastFrame, stdin } = render(<Composer onSubmit={() => undefined} live={false} locked={false} history={history} historyScopes={[{ kind: 'folder', cwd: '/repo' }]} />);
+    await tick();
+    stdin.write(CTRL_R);
+    await tick();
+    stdin.write('fix');
+    await tick();
+    stdin.write('\u001d');
+    await tick();
+    expect(lastFrame()).toContain('reverse-i-search [folder]: fix ');
+    expect(lastFrame()).not.toContain('\u001d');
+  });
+});
