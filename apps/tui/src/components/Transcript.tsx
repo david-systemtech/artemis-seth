@@ -67,6 +67,23 @@
  * when the row is clipped — see {@link TranscriptViewport}, which also says
  * what happens to a row that is taller than the screen.
  *
+ * ## An offer is not a tool card
+ *
+ * One tool call in the stream is not the agent doing something: it is the agent
+ * offering the reader a piece of follow-up work — ADR 0005, and the reason the
+ * model keeps such a call out of the activity fold. Drawn as a tool row it read
+ * as `mcp__artemisTasks__suggest_task(…)`, a machine name for a question, with
+ * the sentence its handler echoes back hanging underneath. So a well-formed
+ * offer is drawn instead as a row of chips — `1. Add tests for the parser   2.
+ * Update the README` — and the numbers on them are the keys that take one. See
+ * {@link SuggestionRow}, `suggestions.ts` for which offers are still answerable,
+ * and {@link RowView.suggestionDigits} for why the numbers come and go.
+ *
+ * A call the agent got *wrong* — no prompt, no title — keeps the ordinary tool
+ * row, which is the desktop's rule as well: a chip with no words on it is a
+ * control that says nothing and does something, and the mistake is worth
+ * seeing.
+ *
  * ## Pictures, and the one row that has any
  *
  * Images live on a *user* item and nowhere else. `UserItem.attachments` holds
@@ -125,6 +142,7 @@ import { renderDiff } from '../render/diff.js';
 import type { ImageProtocol } from '../render/images.js';
 import { renderMarkdownLines } from '../render/markdown.js';
 import { EDIT_LINES, RESULT_HEAD, RESULT_TAIL, WRITE_LINES, resultPreviewLines } from '../rowVerbs.js';
+import { SUGGESTION_DIGITS, offerDrawnBy, type Suggestion } from '../suggestions.js';
 import { ImageRow } from './ImageRow.js';
 
 /* -------------------------------------------------------------------------- */
@@ -153,6 +171,14 @@ interface Snapshot {
   readonly item?: TranscriptItem;
   readonly group?: ActivityGroup;
   readonly members?: readonly TranscriptItem[];
+  /**
+   * The offers this row draws as chips, for the one row kind that is a question
+   * rather than a report. Present only on an offer row: `offerDrawnBy` answers
+   * an empty list for the second call of a burst, which is a row that draws
+   * nothing at all, and `undefined` — the field left off — for every other row
+   * in the conversation. See {@link SuggestionRow}.
+   */
+  readonly chips?: readonly Suggestion[];
 }
 
 function snapshotRow(id: string, transcript: TranscriptModel, key: string): Snapshot | null {
@@ -163,7 +189,15 @@ function snapshotRow(id: string, transcript: TranscriptModel, key: string): Snap
     return { key, group, members };
   }
   const item = transcript.getItem(id);
-  return item === undefined ? null : { key, item };
+  if (item === undefined) return null;
+  /*
+   * Asked of the offer rows and of nothing else. Working out which chips a row
+   * carries means a walk over the model's list, and a conversation has hundreds
+   * of rows and at most a handful of offers; the test in front of it is a string
+   * comparison on a tool name.
+   */
+  const chips = item.kind === 'tool' ? offerDrawnBy(transcript, id) : null;
+  return chips === null ? { key, item } : { key, item, chips };
 }
 
 function rowSettled(id: string, transcript: TranscriptModel): boolean {
@@ -243,6 +277,22 @@ export interface RowView {
    * viewport. Nothing but a user row with image attachments reads it.
    */
   readonly images?: ImageProtocol;
+  /**
+   * The offer on the screen can be taken with a digit, so its chips wear one.
+   *
+   * A number on a chip is a promise about the keyboard, and the keyboard is the
+   * app's: the digits are bound only while the newest answer's offers are the
+   * ones on screen, the box is empty and nothing is running — press `2` with a
+   * half-typed message in the composer and what should happen is a `2`. So the
+   * app sets this exactly when it has the keys free, every other surface leaves
+   * it off, and a chip in the pager or in a replayed subagent transcript reads
+   * as what it is: an offer that was made, not one that can be taken from here.
+   *
+   * Off, the chips are the same chips without their numbers — the titles are
+   * still the record of what was offered. See `suggestionsOf`, which is where
+   * the app gets the offers these numbers are counted over.
+   */
+  readonly suggestionDigits?: boolean;
 }
 
 const COLLAPSED: RowView = {};
@@ -568,6 +618,101 @@ function ToolRow({
   );
 }
 
+/** The mark an offer of work wears. See {@link SuggestionRow}. */
+const OFFER_MARKER = '◇';
+
+/** What separates two chips on one line. Wide enough to read as a gap, not a space. */
+const CHIP_GAP = '   ';
+
+/** The shortest title worth drawing: fewer columns than this and nobody recognises the offer. */
+const MIN_CHIP_COLUMNS = 14;
+
+/**
+ * How many columns one chip's title may take when they share a line.
+ *
+ * The truncate on the row would already stop an overflow; what it would not
+ * stop is one long title spending the whole line and leaving `2.` and nothing
+ * after it. So the width is shared out, less the gaps and the numbers, and
+ * floored at {@link MIN_CHIP_COLUMNS} — below that, cutting further only costs
+ * the reader the chance of telling which offer this is.
+ */
+function chipColumns(columns: number | undefined, count: number): number {
+  const room = (columns ?? 80) - (CHIP_GAP.length + 3) * (count - 1) - 3;
+  return Math.max(MIN_CHIP_COLUMNS, Math.floor(room / count));
+}
+
+/**
+ * An offer, as a row of chips.
+ *
+ * `◇` rather than the tool marker it would otherwise wear: the same shape,
+ * because this *is* a tool call, and hollow, because nothing was done. The
+ * filled diamonds down a transcript are the work; this one is a question.
+ *
+ * Numbers, not `①②③④`. The enclosed digits are the prettier answer and they are
+ * the same trap `⏺` was — see {@link SPEECH_MARKER}: many terminal fonts give
+ * U+2460 an emoji presentation two cells wide while the layout allots one, and
+ * the ones that lack the glyph draw a replacement box. `1.` is one cell per
+ * character in every font a terminal has ever shipped with, and it has the
+ * property the pretty version does not: what is printed is exactly the key to
+ * press.
+ *
+ * One line while the conversation is being followed — the chips side by side,
+ * titles cut to a fair share of the width so that a wordy first offer cannot
+ * push the second one off the screen — and one chip per line with the sentence
+ * behind it once nothing is folded. A row of chips with no chips on it draws
+ * nothing: that is the second call of a burst, whose chip the row above is
+ * already carrying.
+ */
+function SuggestionRow({
+  chips,
+  view = COLLAPSED,
+}: {
+  readonly chips: readonly Suggestion[];
+  readonly view?: RowView;
+}): React.JSX.Element | null {
+  if (chips.length === 0) return null;
+  const numbered = view.suggestionDigits === true;
+  /* The digit is a key, so it is drawn in the colour the app's keys are drawn
+     in, and only as far as there are keys — a fifth offer is still shown, and
+     showing it a `5.` would name a press that does nothing. */
+  const digit = (chip: Suggestion): React.JSX.Element | null =>
+    numbered && chip.index <= SUGGESTION_DIGITS ? <Text color={ACCENT}>{`${String(chip.index)}. `}</Text> : null;
+
+  if (view.expanded === true) {
+    return (
+      <Block marker={OFFER_MARKER} view={view}>
+        {chips.map((chip) => (
+          <Box key={chip.id} flexDirection="column" flexShrink={0}>
+            <Text wrap="truncate">
+              {digit(chip)}
+              <Text bold>{oneLine(chip.title, 160)}</Text>
+            </Text>
+            {chip.tldr.length > 0 && (
+              // Indented under the title rather than level with it: level, a
+              // second line of prose reads as a second chip that lost its number.
+              <Text dimColor wrap="truncate">{`  ${oneLine(chip.tldr, 300)}`}</Text>
+            )}
+          </Box>
+        ))}
+      </Block>
+    );
+  }
+  const room = chipColumns(view.columns, chips.length);
+  return (
+    <Block marker={OFFER_MARKER} view={view}>
+      <Text wrap="truncate">
+        {chips.map((chip, index) => (
+          <Text key={chip.id}>
+            {index === 0 ? '' : CHIP_GAP}
+            {digit(chip)}
+            <Text bold>{oneLine(chip.title, room)}</Text>
+          </Text>
+        ))}
+      </Text>
+    </Block>
+  );
+}
+
 function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; readonly view?: RowView }): React.JSX.Element | null {
   /*
    * The clock, and only on the two rows that are a *turn*. Every item carries
@@ -809,6 +954,9 @@ function GroupRow({
 
 function RowContent({ snapshot, view = COLLAPSED }: { readonly snapshot: Snapshot; readonly view?: RowView }): React.JSX.Element | null {
   if (snapshot.group !== undefined) return <GroupRow group={snapshot.group} members={snapshot.members ?? []} view={view} />;
+  // Before the item, because an offer *is* an item and the chips are the whole
+  // of what it draws; `snapshotRow` has already decided which rows have any.
+  if (snapshot.chips !== undefined) return <SuggestionRow chips={snapshot.chips} view={view} />;
   if (snapshot.item !== undefined) return <ItemRow item={snapshot.item} view={view} />;
   return null;
 }
@@ -944,6 +1092,17 @@ export interface TranscriptViewportProps {
    * hands it down. See {@link RowView.images}.
    */
   readonly imageProtocol?: ImageProtocol;
+  /**
+   * The digits are bound to the newest answer's offers, so its chips wear them.
+   *
+   * The app's to decide and nobody else's, because the app owns the keyboard —
+   * and a boolean rather than the list of offers, because a row works out its
+   * own numbers from the model it is already drawing and two numberings of one
+   * offer is the one bug this feature can have. See
+   * {@link RowView.suggestionDigits}, and `suggestionsOf` for the list the app
+   * binds the keys to.
+   */
+  readonly suggestionDigits?: boolean;
 }
 
 /** Where the cursor row sits in the content column, in lines from its top. */
@@ -1043,6 +1202,7 @@ export function TranscriptViewport({
   onCursorRows,
   expandedRows,
   imageProtocol,
+  suggestionDigits,
 }: TranscriptViewportProps): React.JSX.Element {
   const rows = useSyncExternalStore(transcript.subscribeList, transcript.getRowsSnapshot);
   const terminal = useTerminalSize();
@@ -1058,8 +1218,9 @@ export function TranscriptViewport({
       planDeltaFor,
       gutter,
       images: imageProtocol ?? 'none',
+      suggestionDigits: suggestionDigits === true,
     }),
-    [expanded, live, columns, terminal.columns, planDeltaFor, gutter, imageProtocol],
+    [expanded, live, columns, terminal.columns, planDeltaFor, gutter, imageProtocol, suggestionDigits],
   );
   /*
    * Four views for a viewport, not one per row: a row is either under the

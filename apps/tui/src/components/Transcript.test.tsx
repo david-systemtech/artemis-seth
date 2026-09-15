@@ -730,3 +730,100 @@ describe('a turn with an image in it', () => {
     expect(frame).not.toContain('[image');
   });
 });
+
+/**
+ * An offer of follow-up work.
+ *
+ * The agent's last act in a turn is often a call to one tool — ADR 0005 — whose
+ * only effect is to say "here is something I noticed and did not do". Drawn as a
+ * tool row that read as `mcp__artemisTasks__suggest_task(…)`: a machine name for
+ * a question, with the sentence the handler echoes back hanging under it on a
+ * connector. So it is drawn as chips instead, and the numbers on them are the
+ * keys that take one — which is why they are absent on every surface that has no
+ * keys to offer. `suggestions.test.ts` pins which offers those are.
+ */
+describe('an offer of follow-up work', () => {
+  const offer = (
+    id: string,
+    task: { readonly title: string; readonly prompt?: string; readonly tldr?: string },
+  ): Array<Omit<AgentEvent, 'runId' | 'seq' | 'ts'>> => [
+    { type: 'tool.start', toolCallId: id, name: SUGGESTED_TASK_TOOL, input: { ...task } },
+    { type: 'tool.end', toolCallId: id, status: 'ok', resultText: 'Suggested.' },
+  ];
+
+  const both = stream(
+    { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'Done. Two things I noticed:' },
+    ...offer('s1', { title: 'Add tests for the parser', tldr: 'Nothing covers it.', prompt: 'Write the tests.' }),
+    ...offer('s2', { title: 'Update the README', tldr: 'The flags changed.', prompt: 'Document the flags.' }),
+  );
+
+  const lineWith = (frame: string, text: string): string => frame.split('\n').find((line) => line.includes(text)) ?? '';
+
+  it('draws the titles as chips on one row rather than as tool cards', async () => {
+    const { lastFrame } = render(<ReplayRows events={both} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    // Two calls, one row: three rows each carrying one chip would read as three
+    // things the agent did rather than one question with two answers.
+    expect(lineWith(frame, 'Add tests for the parser')).toContain('Update the README');
+    // Neither the machine name of the tool nor the sentence its handler returns.
+    expect(frame).not.toContain('suggest_task');
+    expect(frame).not.toContain('Suggested.');
+    // `◇`: the tool marker's shape, because this is a tool call, and hollow,
+    // because nothing was done — the filled diamonds are the work.
+    expect(lineWith(frame, 'Add tests for the parser').trimStart().startsWith('◇')).toBe(true);
+    // Followed, the row is titles only. The sentences are what unfolding adds.
+    expect(frame).not.toContain('Nothing covers it.');
+  });
+
+  it('puts the sentence behind each title on its own line once nothing is folded', async () => {
+    const { lastFrame } = render(<ReplayRows events={both} expanded />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(frame).toContain('Add tests for the parser');
+    expect(frame).toContain('Nothing covers it.');
+    expect(frame).toContain('The flags changed.');
+    // A chip a line, so that each title has its sentence under it rather than
+    // under the pair of them.
+    expect(lineWith(frame, 'Add tests for the parser')).not.toContain('Update the README');
+  });
+
+  it('numbers the chips only while the digits are bound to them', async () => {
+    const bound = render(<TranscriptViewport transcript={model(both)} live={false} offset={0} suggestionDigits />);
+    await tick();
+    const live = bound.lastFrame() ?? '';
+    bound.unmount();
+
+    // What is printed is the key to press, which is the whole reason it is `1.`
+    // and not `①`: the pretty glyph is two cells wide in half the terminal fonts
+    // that have it and a replacement box in the ones that do not.
+    expect(live).toContain('1. Add tests for the parser');
+    expect(live).toContain('2. Update the README');
+
+    const idle = render(<TranscriptViewport transcript={model(both)} live={false} offset={0} />);
+    await tick();
+    const frame = idle.lastFrame() ?? '';
+    idle.unmount();
+
+    // The offer is still the record of what was offered; what it has stopped
+    // doing is promising a keystroke the app is not listening for.
+    expect(frame).toContain('Add tests for the parser');
+    expect(frame).toContain('Update the README');
+    expect(frame).not.toMatch(/\d\.\s*Add tests/);
+  });
+
+  it('keeps the ordinary tool row for a call the agent got wrong', async () => {
+    const { lastFrame } = render(<ReplayRows events={stream(...offer('s1', { title: 'Follow up' }))} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    // No prompt, so there is nothing a chip could do — and a chip that starts
+    // nothing is worse than the mistake shown where it can be read. The
+    // desktop's rule, in `SuggestedTask.tsx`, and the terminal keeps it.
+    expect(frame).toContain(SUGGESTED_TASK_TOOL);
+    expect(frame).toContain('Suggested.');
+    expect(frame).not.toContain('◇');
+  });
+});
