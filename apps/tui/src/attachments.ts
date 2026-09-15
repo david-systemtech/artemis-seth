@@ -91,3 +91,28 @@ export async function readAttachment(path: string, cwd: string, options: ReadAtt
     attachment: { kind: 'file', id: randomUUID(), name, data, ...(mediaType === undefined ? {} : { mediaType }) },
   };
 }
+
+/**
+ * The same `Attachment`, from bytes that are already in hand.
+ *
+ * A clipboard image has no path: `readClipboardImage` hands back PNG bytes and
+ * a media type, and there is nothing on disk to stat. Everything after that is
+ * identical to what `readAttachment` builds, so it is built here rather than
+ * inline at the one call site — the size cap above all, which is the rule a
+ * screenshot of a 6K display can actually reach.
+ *
+ * `null` is over the cap, which the caller reports in one line.
+ */
+export function attachmentFromBytes(name: string, mediaType: string, bytes: Uint8Array): Attachment | null {
+  if (bytes.byteLength > MAX_ATTACHMENT_BYTES) return null;
+  const data = Buffer.from(bytes).toString('base64');
+  if (isImageMediaType(mediaType)) return { kind: 'image', id: randomUUID(), mediaType, data, name };
+  return { kind: 'file', id: randomUUID(), name, data, mediaType };
+}
+
+/** The four the protocol allows, which is the same list `IMAGE_BY_EXTENSION` maps on to. */
+const IMAGE_MEDIA_TYPES: readonly ImageMediaType[] = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+
+function isImageMediaType(mediaType: string): mediaType is ImageMediaType {
+  return IMAGE_MEDIA_TYPES.some((allowed) => allowed === mediaType);
+}

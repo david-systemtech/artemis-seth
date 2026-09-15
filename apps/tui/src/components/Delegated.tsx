@@ -37,22 +37,76 @@
  * Order is the order the tasks were delegated in, and rows do not re-sort as
  * they settle — a row that moved would be a row the eye has to find again.
  *
- * ## The clock ticks here
+ * ## The clock is no longer this file's own
  *
- * Elapsed time is computed against a clock this component owns, ticking once a
- * second while something is live and stopped otherwise. The alternative — an
- * elapsed number carried in the event — is a store write per task per second to
- * move one digit. The provider's own `durationMs` wins once it arrives, because
- * it measures the work rather than the time since Artemis first heard of it.
+ * Elapsed time is computed against `hooks/useNow.ts` — a clock that ticks once a
+ * second while something is live and stops dead otherwise. This file kept a
+ * private copy of exactly that for as long as it was the only thing that needed
+ * one; it is not any more, and two copies are two timers waking an idle terminal
+ * at two different moments. The alternative — an elapsed number carried in the
+ * event — is a store write per task per second to move one digit. The provider's
+ * own `durationMs` wins once it arrives, because it measures the work rather
+ * than the time since Artemis first heard of it.
+ *
+ * ## It can be pointed at
+ *
+ * The strip used to be a readout and nothing else: it said what was running, and
+ * doing anything about what it said meant `/tasks` — a modal, over the
+ * transcript, listing the same rows again. It is a list with a cursor now.
+ * `focused` lights it and draws a `❯` in a gutter every row reserves, which is
+ * the rail's rule and is kept here for the rail's reasons: the composer's cursor
+ * and this one must never both be lit, and a row must not shift sideways at the
+ * moment focus arrives on it.
+ *
+ * It still has no keys of its own, and that is deliberate. Ink delivers input to
+ * one place; the app is that place, and it is what knows that Tab walks composer
+ * → rail → strip and what holds a selection steady while the rows are redrawn
+ * underneath it. What the strip offers instead is the answer to "what is the
+ * cursor on, and what can be done to it": every row carries
+ * {@link DelegatedRow.openable} and {@link DelegatedRow.stoppable}, and
+ * `onSelect` hands the app the row under the cursor whenever that changes — so
+ * Enter and `x` are a lookup rather than a second, divergent reading of
+ * `state.tasks`.
+ *
+ * `openable` is a fact about the provider's own filing rather than a wish. A
+ * transcript exists for work that *is* an agent — a `Task`/`Agent` call — and is
+ * filed under the id the task list carries; a backgrounded `local_bash` never
+ * had one, and a workflow's own id has none either, because its agents each
+ * write their own. The desktop answers this with the same two clauses in
+ * `taskHasTranscript`, for the same reasons written out at more length.
+ *
+ * `stoppable` is only ever the task. There is no per-agent stop inside a
+ * workflow, and `x` on one agent's row killing the whole workflow is not what
+ * anyone pressing it would have meant.
+ *
+ * ## A workflow unfolds into its agents
+ *
+ * A workflow row reads `Review 3/3 · Verify 1/4`, which is the shape of the work
+ * rather than the work. `expanded` names the task ids whose agents are drawn
+ * beneath them, one indented row each:
+ *
+ *       ↳ Review · Explore · 40s · done
+ *
+ * — the phase it belongs to, what kind of agent it is, how long it has taken and
+ * where it has got to. This is the only place in the terminal those rows can be
+ * reached from: a workflow's agents are not tasks and never appear in the task
+ * list, so the `agentId` nested in its progress is the one route to the
+ * transcript each of them wrote.
+ *
+ * Unfolded agents are bounded by {@link MAX_AGENT_ROWS} and count their own
+ * overflow, separately from {@link MAX_ROWS}. The two caps are separate because
+ * they answer to different people: the top-level one bounds what the strip does
+ * unasked, and this one bounds what a reader has deliberately opened.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { Box, Text } from 'ink';
 
 import { isTaskLive, type BackgroundTask, type WorkflowAgent } from '@rx-artemis/protocol';
 import { formatDuration, formatTokens, oneLine } from '@rx-artemis/transcript';
 
 import { ACCENT } from '../theme.js';
+import { useNow } from '../hooks/useNow.js';
 import { useSpinner } from '../hooks/useSpinner.js';
 
 /**
@@ -64,6 +118,19 @@ import { useSpinner } from '../hooks/useSpinner.js';
  * to use and an unbounded one would hand a twenty-agent workflow the screen.
  */
 export const MAX_ROWS = 3;
+
+/**
+ * How many agents an unfolded workflow shows before `+n more`.
+ *
+ * Eight rather than three, because this cap is answering a different question.
+ * {@link MAX_ROWS} is what the strip does to a reader who asked for nothing; a
+ * fan-out arrives on its own and must not take the screen. An unfolded workflow
+ * is a reader who has pressed `→` on that row and is asking to see inside it,
+ * and answering with three of twenty would send them to `/tasks` for the thing
+ * they just opened. Eight is the number of rows that still leaves a transcript
+ * on a short terminal.
+ */
+export const MAX_AGENT_ROWS = 8;
 
 /** How much of the right-hand readout survives before it is cut. */
 const DETAIL_CHARS = 52;
@@ -104,28 +171,88 @@ const KIND_LABELS: Readonly<Record<string, string>> = {
   monitor: 'Monitor',
 };
 
-/** One line of the strip, already in words. */
+/**
+ * One line of the strip, already in words — and now a thing that can be chosen.
+ *
+ * Every row here is something a cursor can land on and a key can act on. The
+ * overflow counts are deliberately *not* rows for that reason: `+2 more · /tasks`
+ * is a sentence about rows that are missing, and a cursor that could stop on it
+ * would be a cursor on nothing.
+ */
 export interface DelegatedRow {
   readonly id: string;
+  /**
+   * A whole task, or one agent inside an unfolded workflow.
+   *
+   * The two are drawn differently and answer differently to every key, so the
+   * distinction is in the data rather than inferred at the point of use from
+   * whether {@link agentId} happens to be set — a queued workflow agent has no
+   * id yet and is an agent row all the same.
+   */
+  readonly kind: 'task' | 'agent';
+  /** The task this row is, or the task the agent is running inside. */
+  readonly taskId: string;
+  /**
+   * The conversation behind this row, when there is one.
+   *
+   * For a task, this is the task's own id: the provider files a subagent's
+   * transcript under exactly the id the task list carries. For a workflow's
+   * agent it is the id nested in the workflow's progress. Absent when nothing
+   * can be opened — see {@link openable}, which is the flag to test.
+   */
+  readonly agentId?: string;
   /**
    * What kind of thing this is — `Explore`, `Shell`, a workflow's own name.
    *
    * First, and bold, because it is the part that never changes: down a list of
    * rows whose middles are all different lengths, it is the thing the eye can
-   * find in the same place every time.
+   * find in the same place every time. An agent row puts its phase here, which
+   * is the same promise: the left edge says which part of the run this is.
    */
   readonly label: string;
   /** What it was asked to do. Empty when the label already said it. */
   readonly description: string;
   /** Elapsed, then what it is doing, then what it has spent. */
   readonly detail: string;
+  /** Whether Enter on this row opens a transcript. See {@link agentId}. */
+  readonly openable: boolean;
+  /** Whether `x` on this row asks the provider to stop something. */
+  readonly stoppable: boolean;
+  /**
+   * Whether `→` on this row has anything to show.
+   *
+   * True only for a workflow that has reported agents. The fold glyph is drawn
+   * from this, so a row without one is a row where the key does nothing and
+   * says as much by staying quiet.
+   */
+  readonly unfoldable: boolean;
+}
+
+/** What `delegatedRows` is told beyond the tasks themselves. */
+export interface DelegatedOptions {
+  /**
+   * Task ids whose workflow agents are drawn.
+   *
+   * The app's, not the strip's: which rows are open must survive the strip
+   * being redrawn, and the strip is redrawn on every tick of the clock.
+   */
+  readonly expanded?: ReadonlySet<string>;
 }
 
 export interface Delegated {
   readonly rows: readonly DelegatedRow[];
   /** Live tasks past {@link MAX_ROWS}, which the overflow line counts. */
   readonly hidden: number;
+  /**
+   * Agents an unfolded workflow had no room for, by task id.
+   *
+   * A map rather than a number because two workflows can be open at once and
+   * each owes its own `+n more`, drawn under its own agents.
+   */
+  readonly hiddenAgents: ReadonlyMap<string, number>;
 }
+
+const NOTHING_EXPANDED: ReadonlySet<string> = new Set<string>();
 
 /**
  * The strip's contents, as text.
@@ -140,20 +267,119 @@ export function delegatedRows(
   now: number,
   /** The width the strip has. Narrow terminals get the elapsed time alone. */
   columns = Number.POSITIVE_INFINITY,
+  options: DelegatedOptions = {},
 ): Delegated {
   // `ambient` is the provider asking not to be shown inline — housekeeping it
   // reports for completeness. `/tasks` makes the same exclusion.
   const live = tasks.filter((task) => task.ambient !== true && isTaskLive(task));
   const terse = columns < TERSE_BELOW;
-  return {
-    rows: live.slice(0, MAX_ROWS).map((task) => ({
+  const expanded = options.expanded ?? NOTHING_EXPANDED;
+
+  const rows: DelegatedRow[] = [];
+  const hiddenAgents = new Map<string, number>();
+
+  for (const task of live.slice(0, MAX_ROWS)) {
+    const agents = agentsOf(task);
+    const openable = hasTranscript(task);
+    rows.push({
       id: task.id,
+      kind: 'task',
+      taskId: task.id,
+      agentId: openable ? task.id : undefined,
       label: labelFor(task),
       description: descriptionFor(task),
       detail: terse ? elapsed(task, now) : detailFor(task, now),
-    })),
-    hidden: Math.max(0, live.length - MAX_ROWS),
+      openable,
+      // Every row drawn is live, so this is `true` throughout today. It is
+      // still read from the task rather than written as one, because what the
+      // flag means is "the provider has something left to stop" and the day
+      // the strip draws a settled row is not the day to discover that.
+      stoppable: isTaskLive(task),
+      unfoldable: agents.length > 0,
+    });
+
+    if (!expanded.has(task.id)) continue;
+    for (const agent of agents.slice(0, MAX_AGENT_ROWS)) rows.push(agentRow(task, agent, now));
+    if (agents.length > MAX_AGENT_ROWS) hiddenAgents.set(task.id, agents.length - MAX_AGENT_ROWS);
+  }
+
+  return { rows, hidden: Math.max(0, live.length - MAX_ROWS), hiddenAgents };
+}
+
+/**
+ * A workflow's agents, in the order the script declared them.
+ *
+ * Sorted by `index` rather than trusted as they arrive: the whole array is
+ * replaced on every progress message, and a row that swapped places with its
+ * neighbour between two ticks is a row the eye has to find again. The ordinal
+ * is stable across updates by contract, which makes it the one safe key.
+ */
+function agentsOf(task: BackgroundTask): readonly WorkflowAgent[] {
+  const agents = task.workflowProgress;
+  if (agents === undefined || agents.length === 0) return [];
+  return [...agents].sort((a, b) => a.index - b.index);
+}
+
+/**
+ * Whether this row opens into a conversation.
+ *
+ * Both clauses are needed and neither implies the other: the kind is what names
+ * a delegated agent in the beat before its type arrives, and `subagentType` is
+ * only ever set on work that genuinely is one — so a CLI that grows another
+ * agent-shaped kind keeps working. Both spellings of the kind are accepted for
+ * {@link KIND_LABELS}' reason, which is that the field is an open string.
+ *
+ * Everything else answers no on purpose. A backgrounded shell is a process and
+ * never had a transcript; a workflow's own id has none either, because the
+ * transcripts belong to its agents — and those are reached through the rows
+ * this strip now unfolds, which is the whole point of unfolding.
+ */
+function hasTranscript(task: BackgroundTask): boolean {
+  return task.kind === 'local_agent' || task.kind === 'local_subagent' || task.subagentType !== undefined;
+}
+
+/**
+ * One agent of an unfolded workflow: `↳ Review · Explore · 40s · done`.
+ *
+ * Phase first, for the reason every row puts its label first — it is the part
+ * shared with the neighbours above and below, so a phase that is running four
+ * agents reads as four rows of one thing rather than four things. The state is
+ * passed through as the workflow said it (`start`, `progress`, `done`, `error`,
+ * and whatever a later CLI adds), because it is already a word.
+ */
+function agentRow(task: BackgroundTask, agent: WorkflowAgent, now: number): DelegatedRow {
+  const spent = agentElapsed(agent, now);
+  return {
+    id: `${task.id}#${String(agent.index)}`,
+    kind: 'agent',
+    taskId: task.id,
+    agentId: agent.agentId,
+    // A script that never called `phase()` leaves the agent's own label to name
+    // it — `build:chat-reliability` says more than a blank column does.
+    label: agent.phaseTitle ?? agent.label,
+    description: agent.agentType ?? '',
+    detail: [spent, agent.state].filter((part) => part !== undefined && part.length > 0).join(' · '),
+    // Absent until the agent has actually been spawned, and absent for ever on
+    // one answered from the workflow's journal: there is no conversation behind
+    // a row for work that never ran.
+    openable: agent.agentId !== undefined,
+    stoppable: false,
+    unfoldable: false,
   };
+}
+
+/**
+ * How long this agent has been at it, or nothing at all.
+ *
+ * Nothing, rather than a zero, for an agent that is still queued: `0ms` next to
+ * `start` reads as a stopwatch that is broken rather than as work that has not
+ * begun. The workflow's own measurement wins when it has one, for the reason
+ * {@link elapsed} prefers the provider's.
+ */
+function agentElapsed(agent: WorkflowAgent, now: number): string | undefined {
+  if (agent.durationMs !== undefined) return formatDuration(agent.durationMs);
+  if (agent.startedAt === undefined) return undefined;
+  return formatDuration(Math.max(0, now - agent.startedAt));
 }
 
 /** A workflow is known by its script's name; anything else by what kind it is. */
@@ -251,19 +477,8 @@ export function summarizePhases(agents: readonly WorkflowAgent[] | undefined): s
     : parts.join(' · ');
 }
 
-/** A clock that runs only while something is live. */
-function useNow(active: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return undefined;
-    // Set once on the way in as well: a task that arrives between ticks would
-    // otherwise read as having started in the future until the next second.
-    setNow(Date.now());
-    const timer = setInterval(() => setNow(Date.now()), 1_000);
-    return () => clearInterval(timer);
-  }, [active]);
-  return now;
-}
+/** What the strip says it can do, while it has the focus. */
+const HINT = '↑↓ · Enter open · x stop · → unfold · ← fold · Esc back';
 
 export interface DelegatedStripProps {
   readonly tasks: readonly BackgroundTask[];
@@ -273,6 +488,25 @@ export interface DelegatedStripProps {
    * exists to prevent.
    */
   readonly columns?: number;
+  /**
+   * Whether the strip has the focus: the cursor and the hint line are drawn
+   * only then, and a strip nobody has tabbed to is the readout it always was.
+   */
+  readonly focused?: boolean;
+  /** Which row the cursor is on. Clamped here; the app need not tidy up. */
+  readonly selected?: number;
+  /** Task ids whose workflow agents are unfolded. See {@link DelegatedOptions}. */
+  readonly expanded?: ReadonlySet<string>;
+  /**
+   * Told which row the cursor came to rest on, and where.
+   *
+   * The strip is the only thing that knows what the rows are — they are read
+   * out of the tasks on every render, and unfolding changes how many there are
+   * — so the app would otherwise have to build the same list a second time to
+   * find out what Enter should open. `undefined` when the strip is not focused,
+   * which is also how the app hears that its keys have nothing to act on.
+   */
+  readonly onSelect?: (row: DelegatedRow | undefined, index: number) => void;
 }
 
 /**
@@ -282,32 +516,109 @@ export interface DelegatedStripProps {
  * `null` rather than an empty box, so a conversation that never delegates is
  * laid out exactly as it was before this existed.
  */
-export function DelegatedStrip({ tasks, columns }: DelegatedStripProps): React.JSX.Element | null {
+export function DelegatedStrip({
+  tasks,
+  columns,
+  focused = false,
+  selected = 0,
+  expanded,
+  onSelect,
+}: DelegatedStripProps): React.JSX.Element | null {
   const anyLive = tasks.some((task) => task.ambient !== true && isTaskLive(task));
   const now = useNow(anyLive);
   const spinner = useSpinner(anyLive);
-  const { rows, hidden } = delegatedRows(tasks, now, columns);
+  const { rows, hidden, hiddenAgents } = delegatedRows(tasks, now, columns, { expanded });
+
+  /*
+   * The cursor is clamped rather than trusted, because the rows move on their
+   * own: a task settles, its row goes, and a selection the app set two seconds
+   * ago is now past the end. Clamping here and reporting the result through
+   * `onSelect` means the app's number and the drawn cursor cannot disagree.
+   */
+  const cursor = rows.length === 0 ? -1 : Math.min(Math.max(selected, 0), rows.length - 1);
+  const current = focused ? rows[cursor] : undefined;
+  /*
+   * A key over the parts of the row the app acts on, so the callback fires when
+   * the cursor comes to rest on something different — and not once a second as
+   * the clock ticks and every row object is rebuilt with the same contents.
+   *
+   * The callback itself is held in a ref and kept out of the dependencies, or
+   * the identity of an inline arrow — which is what every caller will pass —
+   * would put it back to once per render, and a `setState` inside it into a
+   * loop: new function, new effect, new state, new render.
+   */
+  const key =
+    current === undefined
+      ? ''
+      : [current.id, cursor, current.openable, current.stoppable, current.unfoldable].join('|');
+  const notify = useRef(onSelect);
+  useEffect(() => {
+    notify.current = onSelect;
+  });
+  useEffect(() => {
+    // `current` and `cursor` are the pair from the render `key` last changed
+    // in, which is the pair being announced.
+    notify.current?.(current, cursor);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+
   if (rows.length === 0) return null;
 
   return (
     <Box flexDirection="column" flexShrink={0} paddingX={1}>
-      {rows.map((row) => (
-        <Box key={row.id} flexDirection="row" justifyContent="space-between" flexShrink={0}>
-          <Box flexShrink={1} minWidth={0}>
-            <Text wrap="truncate">
-              <Text color={ACCENT}>{spinner} </Text>
-              <Text bold>{row.label}</Text>
-              {row.description.length > 0 && <Text dimColor>{`  ${row.description}`}</Text>}
-            </Text>
+      {rows.map((row, index) => {
+        const isSelected = focused && index === cursor;
+        // The gutter is reserved whether or not anything is in it: a row that
+        // slid two columns sideways the moment Tab reached the strip would be
+        // the focus moving the thing it is trying to point at.
+        const mark = isSelected ? '❯' : ' ';
+        if (row.kind === 'agent') {
+          const next = rows[index + 1];
+          const last = next === undefined || next.kind !== 'agent' || next.taskId !== row.taskId;
+          const overflow = hiddenAgents.get(row.taskId) ?? 0;
+          return (
+            <Box key={row.id} flexDirection="column" flexShrink={0}>
+              <Text wrap="truncate">
+                <Text color={ACCENT}>{mark} </Text>
+                <Text color={isSelected ? ACCENT : undefined} dimColor={!isSelected}>
+                  {`  ↳ ${[row.label, row.description, row.detail]
+                    .filter((part) => part.length > 0)
+                    .join(' · ')}`}
+                </Text>
+              </Text>
+              {last && overflow > 0 && <Text dimColor>{`      +${String(overflow)} more`}</Text>}
+            </Box>
+          );
+        }
+        return (
+          <Box key={row.id} flexDirection="row" justifyContent="space-between" flexShrink={0}>
+            <Box flexShrink={1} minWidth={0}>
+              <Text wrap="truncate">
+                <Text color={ACCENT}>{mark} </Text>
+                <Text color={ACCENT}>{spinner} </Text>
+                {row.unfoldable && (
+                  <Text dimColor>{expanded?.has(row.taskId) === true ? '▾ ' : '▸ '}</Text>
+                )}
+                <Text bold color={isSelected ? ACCENT : undefined}>
+                  {row.label}
+                </Text>
+                {row.description.length > 0 && <Text dimColor>{`  ${row.description}`}</Text>}
+              </Text>
+            </Box>
+            <Box flexShrink={0} marginLeft={1}>
+              <Text dimColor>{row.detail}</Text>
+            </Box>
           </Box>
-          <Box flexShrink={0} marginLeft={1}>
-            <Text dimColor>{row.detail}</Text>
-          </Box>
-        </Box>
-      ))}
+        );
+      })}
       {hidden > 0 && (
         <Box flexShrink={0}>
           <Text dimColor>{`  +${String(hidden)} more · /tasks`}</Text>
+        </Box>
+      )}
+      {focused && (
+        <Box flexShrink={0}>
+          <Text dimColor>{`  ${HINT}`}</Text>
         </Box>
       )}
     </Box>
