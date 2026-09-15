@@ -72,6 +72,7 @@ import type { PlanUsage } from './usage.js';
 import type { AgentEvent } from './events.js';
 import type { ProfileId } from './ids.js';
 import type { Capabilities, ProviderId, ProviderKind } from './provider.js';
+import type { RoutineDraft, RoutinePatch, RoutineSnapshot } from './routine.js';
 
 /* -------------------------------------------------------------------------- */
 /* Addresses                                                                  */
@@ -743,6 +744,78 @@ export interface ServerSessionTaggedBody {
   readonly tagged: boolean;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Routines: appointments that fire in the server                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The server's routines, as `GET /api/v0/routines` reports them.
+ * ============================================================================
+ *
+ * A routine that runs *in the server* fires on schedule with every client
+ * closed — which is the point of it, and the difference from a desktop routine
+ * that fires only while the app is open. These five routes are how a client
+ * makes and manages them:
+ *
+ * ```
+ *   GET    /api/v0/routines                 the ones this connection owns
+ *   POST   /api/v0/routines                 create one, owned by this connection
+ *   PATCH  /api/v0/routines/{id}            edit one this connection owns
+ *   DELETE /api/v0/routines/{id}            delete one this connection owns
+ *   POST   /api/v0/routines/{id}/run-now    fire one now, schedule notwithstanding
+ * ```
+ *
+ * ## Scope is the connection's, exactly as it is for sessions
+ *
+ * Every route is scoped by the same `workspaceKey` the session ledger uses: a
+ * token sees, edits and fires exactly the routines whose scope matches its own
+ * pin, and "not yours" answers like "not there" — a token must not be able to
+ * sound out which routines exist. Create stamps the caller's scope and
+ * connection id; the client never sends either.
+ *
+ * ## The directory and the mode are the server's to decide
+ *
+ * A served firing runs in the connection's own workspace and nowhere else, so
+ * a `cwd` on the draft is ignored — a server routine belongs to a connection
+ * with a fixed directory, and one without is refused. And because a server has
+ * nobody in front of it to answer a permission prompt, a firing opens in
+ * `bypassPermissions` unless the routine names a stricter mode; the client is
+ * expected to leave it at the default.
+ */
+
+/** The routine a client sends to create one. `cwd` is ignored — see the header. */
+export interface ServerRoutineCreateRequest {
+  readonly draft: RoutineDraft;
+}
+
+/** The edit a client sends. Absent fields are left alone. */
+export interface ServerRoutineUpdateRequest {
+  readonly patch: RoutinePatch;
+}
+
+/** The body of `GET /api/v0/routines`. */
+export interface ServerRoutinesBody {
+  readonly object: 'artemis.routines';
+  readonly routines: readonly RoutineSnapshot[];
+}
+
+/**
+ * The body of a single-routine route — create, edit, and run-now alike.
+ *
+ * One shape for all three so a client has one thing to read: the routine as it
+ * now stands, next appointment and firing state included.
+ */
+export interface ServerRoutineBody {
+  readonly object: 'artemis.routine';
+  readonly routine: RoutineSnapshot;
+}
+
+/** Body of `DELETE /api/v0/routines/{id}`. False when there was nothing to remove. */
+export interface ServerRoutineDeletedBody {
+  readonly object: 'artemis.routine.deleted';
+  readonly deleted: boolean;
+}
+
 /** One row of `GET /v1/models`, in OpenAI's shape. */
 export interface OpenAiModel {
   /** The route. What a caller puts in `model`. */
@@ -1410,6 +1483,33 @@ export interface ArtemisChatExtensions {
    * prompts.
    */
   readonly systemPrompt?: string;
+  /**
+   * Branch the conversation named by {@link sessionId} into a new session,
+   * leaving the original whole. The reply announces the branch's own id.
+   *
+   * Needs {@link sessionId}: there is nothing to fork otherwise, and the
+   * server refuses the request rather than starting a fresh conversation
+   * that a caller would mistake for a branch. Honoured only where the serving
+   * account's provider can fork — `ServerProfile.capabilities.forkSession` —
+   * and refused elsewhere, never dropped: a fork that was quietly set aside
+   * would append the next turn to the very conversation the caller meant to
+   * leave untouched.
+   */
+  readonly forkSession?: boolean;
+  /**
+   * Cut the conversation named by {@link sessionId} back to just before this
+   * stored message before continuing.
+   *
+   * The id is the serving provider's own, as its stored transcript names it
+   * — read back through `GET /api/v0/sessions/{id}/messages`, which is where a
+   * client learns it. Needs {@link sessionId}, and is refused rather than
+   * dropped where the account cannot rewind (`capabilities.rewind`), for the
+   * same reason as {@link forkSession}: a cut that silently did not happen
+   * leaves the caller continuing a conversation they believe they shortened.
+   * With {@link forkSession} the cut lands in the branch and the original is
+   * left whole.
+   */
+  readonly rewindToMessageId?: string;
 }
 
 /**
@@ -1552,6 +1652,13 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
       : {}),
     ...(typeof extensions['systemPrompt'] === 'string' && extensions['systemPrompt'].length > 0
       ? { systemPrompt: extensions['systemPrompt'] as string }
+      : {}),
+    // `true` only: a fork is asked for or it is not, and `false` sent
+    // explicitly means the same as absent.
+    ...(extensions['forkSession'] === true ? { forkSession: true } : {}),
+    ...(typeof extensions['rewindToMessageId'] === 'string' &&
+    extensions['rewindToMessageId'].length > 0
+      ? { rewindToMessageId: extensions['rewindToMessageId'] as string }
       : {}),
     ...readRemoteOptions(extensions['remote']),
   };

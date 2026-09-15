@@ -118,6 +118,28 @@ export interface SessionSummary {
   readonly createdAt?: number;
 
   /**
+   * For a conversation served by an Artemis Server: the serving side's own
+   * account that holds it.
+   *
+   * On this machine {@link profileId} names the *server profile* — one profile
+   * wearing every account the server offers — and says nothing about which of
+   * those accounts ran the conversation. But a transcript lives in exactly one
+   * account's store over there, and a resume sent on any other account fails
+   * with the provider's "no conversation found". So the listing carries the
+   * account the server's ledger recorded: `accountId` is the server's own
+   * profile id and `accountSlug` the route prefix (`work-max` in
+   * `work-max/opus`), which is what a resume needs to land on that account's
+   * route rather than on whichever one the column happened to be showing.
+   *
+   * Absent for local providers, and for a server too old to name the account
+   * per row — in which case the resume goes wherever the column is, and the
+   * server's own redirect is what saves it.
+   */
+  readonly accountId?: string;
+  /** See {@link accountId}. */
+  readonly accountSlug?: string;
+
+  /**
    * Set when a machine opened this conversation, not a person.
    *
    * `'scheduled-task'` covers every firing of Claude's scheduler — cron jobs

@@ -153,6 +153,11 @@ import {
   type ServerAccountsUpdateRequest,
   type ServerAccountSignInRequest,
   type ServerAccountSubmitCodeRequest,
+  type ServerRoutinesRequest,
+  type ServerRoutinesCreateRequest,
+  type ServerRoutinesUpdateRequest,
+  type ServerRoutinesDeleteRequest,
+  type ServerRoutinesRunNowRequest,
   type UsagePlanRequest,
   type UpdatesCheckRequest,
   type UpdatesDismissRequest,
@@ -2913,6 +2918,13 @@ export function validateRoutinesCreate(raw: unknown): RoutinesCreateRequest {
   if (!isProviderId(providerId)) throw new ValidationError('draft.providerId', 'is not a provider');
 
   const model = optionalString(draft['model'], 'draft.model', 200);
+  // Both bounded rather than trusted from the form: they are written to the
+  // file the host reads on every boot, and the engine — not this validator —
+  // is what rejects an effort or a mode the provider does not know, so the
+  // shape check here is only length. A mode is at most a couple of dozen
+  // characters (`bypassPermissions`); effort is a short provider word.
+  const effort = optionalString(draft['effort'], 'draft.effort', 100);
+  const permissionMode = optionalString(draft['permissionMode'], 'draft.permissionMode', 40);
   const paused = optionalBoolean(draft['paused'], 'draft.paused');
 
   const built: RoutineDraft = {
@@ -2922,6 +2934,8 @@ export function validateRoutinesCreate(raw: unknown): RoutinesCreateRequest {
     profileId: requireString(draft['profileId'], 'draft.profileId', 200),
     providerId,
     ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }),
+    ...(permissionMode === undefined ? {} : { permissionMode: permissionMode as RoutineDraft['permissionMode'] }),
     schedule: requireSchedule(draft['schedule'], 'draft.schedule'),
     ...(paused === undefined ? {} : { paused }),
   };
@@ -2966,6 +2980,25 @@ export function validateRoutinesUpdate(raw: unknown): RoutinesUpdateRequest {
     model = patch['model'];
   }
 
+  /*
+   * `effort: ''` clears, exactly as `model: ''` does, so the empty string is
+   * read by hand rather than through `optionalString` (which refuses empties).
+   * A mode never clears — a routine always opens in *some* mode — so it is an
+   * ordinary optional string, bounded and passed through for the engine to
+   * check against the provider's set.
+   */
+  let effort: string | undefined;
+  if (patch['effort'] !== undefined && patch['effort'] !== null) {
+    if (typeof patch['effort'] !== 'string') {
+      throw new ValidationError('patch.effort', 'must be a string');
+    }
+    if (patch['effort'].length > 100) {
+      throw new ValidationError('patch.effort', 'must be at most 100 characters');
+    }
+    effort = patch['effort'];
+  }
+  const permissionMode = optionalString(patch['permissionMode'], 'patch.permissionMode', 40);
+
   const built: RoutinePatch = {
     ...(name === undefined ? {} : { name }),
     ...(instructions === undefined ? {} : { instructions }),
@@ -2973,6 +3006,10 @@ export function validateRoutinesUpdate(raw: unknown): RoutinesUpdateRequest {
     ...(profileId === undefined ? {} : { profileId }),
     ...(providerId === undefined || providerId === null ? {} : { providerId }),
     ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }),
+    ...(permissionMode === undefined
+      ? {}
+      : { permissionMode: permissionMode as RoutinePatch['permissionMode'] }),
     ...(patch['schedule'] === undefined || patch['schedule'] === null
       ? {}
       : { schedule: requireSchedule(patch['schedule'], 'patch.schedule') }),
@@ -2990,4 +3027,116 @@ export function validateRoutinesDelete(raw: unknown): RoutinesDeleteRequest {
 export function validateRoutinesRunNow(raw: unknown): RoutinesRunNowRequest {
   const request = requireRequest(raw);
   return { id: requireString(request['id'], 'id', 100) };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Routines on a remote server                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The server-routine channels, validated the way the account channels are:
+ * `profileId` names the local Artemis-Server profile — which server — and the
+ * ones that act on a routine take the server's own id for it, checked as a
+ * string because its shape is that server's business. A server routine carries
+ * no `cwd`; the server pins its directory, so the field is neither read here
+ * nor sent.
+ */
+export function validateServerRoutines(raw: unknown): ServerRoutinesRequest {
+  const request = requireRequest(raw);
+  return { profileId: requireId(request['profileId'], 'profileId') };
+}
+
+export function validateServerRoutinesCreate(raw: unknown): ServerRoutinesCreateRequest {
+  const request = requireRequest(raw);
+  const draft = requireObject(request['draft'], 'draft');
+
+  const providerId = draft['providerId'];
+  if (!isProviderId(providerId)) throw new ValidationError('draft.providerId', 'is not a provider');
+  const model = optionalString(draft['model'], 'draft.model', 200);
+  const effort = optionalString(draft['effort'], 'draft.effort', 100);
+  const permissionMode = optionalString(draft['permissionMode'], 'draft.permissionMode', 40);
+  const paused = optionalBoolean(draft['paused'], 'draft.paused');
+
+  const built: RoutineDraft = {
+    name: requireString(draft['name'], 'draft.name', ROUTINE_NAME_MAX),
+    instructions: requireString(draft['instructions'], 'draft.instructions', ROUTINE_INSTRUCTIONS_MAX),
+    profileId: requireString(draft['profileId'], 'draft.profileId', 200),
+    providerId,
+    ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }),
+    ...(permissionMode === undefined
+      ? {}
+      : { permissionMode: permissionMode as RoutineDraft['permissionMode'] }),
+    schedule: requireSchedule(draft['schedule'], 'draft.schedule'),
+    ...(paused === undefined ? {} : { paused }),
+  };
+  return { profileId: requireId(request['profileId'], 'profileId'), draft: built };
+}
+
+export function validateServerRoutinesUpdate(raw: unknown): ServerRoutinesUpdateRequest {
+  const request = requireRequest(raw);
+  const patch = requireObject(request['patch'], 'patch');
+
+  const name = optionalString(patch['name'], 'patch.name', ROUTINE_NAME_MAX);
+  const instructions = optionalString(
+    patch['instructions'],
+    'patch.instructions',
+    ROUTINE_INSTRUCTIONS_MAX,
+  );
+  const paused = optionalBoolean(patch['paused'], 'patch.paused');
+  const permissionMode = optionalString(patch['permissionMode'], 'patch.permissionMode', 40);
+
+  // `model` and `effort` clear on the empty string, which `optionalString`
+  // refuses, so both are read by hand — the same convention the local
+  // routine patch uses.
+  let model: string | undefined;
+  if (patch['model'] !== undefined && patch['model'] !== null) {
+    if (typeof patch['model'] !== 'string' || patch['model'].length > 200) {
+      throw new ValidationError('patch.model', 'must be a string of at most 200 characters');
+    }
+    model = patch['model'];
+  }
+  let effort: string | undefined;
+  if (patch['effort'] !== undefined && patch['effort'] !== null) {
+    if (typeof patch['effort'] !== 'string' || patch['effort'].length > 100) {
+      throw new ValidationError('patch.effort', 'must be a string of at most 100 characters');
+    }
+    effort = patch['effort'];
+  }
+
+  const built: RoutinePatch = {
+    ...(name === undefined ? {} : { name }),
+    ...(instructions === undefined ? {} : { instructions }),
+    ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }),
+    ...(permissionMode === undefined
+      ? {}
+      : { permissionMode: permissionMode as RoutinePatch['permissionMode'] }),
+    ...(patch['schedule'] === undefined || patch['schedule'] === null
+      ? {}
+      : { schedule: requireSchedule(patch['schedule'], 'patch.schedule') }),
+    ...(paused === undefined ? {} : { paused }),
+  };
+  return {
+    profileId: requireId(request['profileId'], 'profileId'),
+    routineId: requireString(request['routineId'], 'routineId', LIMITS.id),
+    patch: built,
+  };
+}
+
+export function validateServerRoutinesDelete(raw: unknown): ServerRoutinesDeleteRequest {
+  const request = requireRequest(raw);
+  return {
+    profileId: requireId(request['profileId'], 'profileId'),
+    routineId: requireString(request['routineId'], 'routineId', LIMITS.id),
+  };
+}
+
+/** @see validateServerRoutinesDelete */
+export function validateServerRoutinesRunNow(raw: unknown): ServerRoutinesRunNowRequest {
+  const request = requireRequest(raw);
+  return {
+    profileId: requireId(request['profileId'], 'profileId'),
+    routineId: requireString(request['routineId'], 'routineId', LIMITS.id),
+  };
 }

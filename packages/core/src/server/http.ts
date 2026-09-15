@@ -76,6 +76,9 @@ import type {
   ServerProfile,
   ServerProfileCreatedBody,
   ServerProfilesBody,
+  ServerRoutineBody,
+  ServerRoutineDeletedBody,
+  ServerRoutinesBody,
   ServerSessionDeletedBody,
   ServerUsageBody,
   ServerSessionMessagesBody,
@@ -83,6 +86,8 @@ import type {
   ServerSessionsBody,
   ServerSessionTaggedBody,
   ServerSessionSummary,
+  RoutineDraft,
+  RoutinePatch,
   SessionSummary,
 } from '@rx-artemis/protocol';
 import {
@@ -116,6 +121,8 @@ import type { RemoteAccessEvent } from '../sessions/lifecycleLog.js';
 import type { PushFeed } from './feed.js';
 import type { RemoteRunGuard } from './guard.js';
 import { workspaceKeyFor, type LedgerScope, type SessionLedger } from './ledger.js';
+import type { ServerRoutineStore } from './routines.js';
+import { resolveResumeModel, type RouteRedirect } from './sessionHome.js';
 import { handleRemoteRequest, isRemotePath, type RemoteStreamOptions } from './remote.js';
 import { CORS_HEADERS, JSON_HEADERS, fail, ok } from './replies.js';
 import { createRunDirectory, reviewPermissionDecision, type RunDirectory } from './runs.js';
@@ -231,6 +238,15 @@ export interface ServerContext {
   readonly usage?: UsageSource;
   /** How to read stored sessions. Required alongside {@link ledger}. */
   readonly sessions?: SessionSource;
+  /**
+   * Routines that fire *in the server*, scoped per connection.
+   *
+   * Absent means this build keeps no server-side schedule and the routine
+   * routes answer `501` — a catalogue-only deployment, or a test that is not
+   * about routines. Present, it is the store the routes read and write, and its
+   * scheduler is the thing that fires an appointment with every client closed.
+   */
+  readonly routines?: ServerRoutineStore;
   /**
    * Host-header names this server answers to, besides the loopback set.
    *
@@ -767,6 +783,20 @@ export async function handleServerRequest(
     }
   }
 
+  /*
+   * The routine surface: the whole of `/api/v0/routines`, dispatched here
+   * because it writes (POST, PATCH, DELETE) and would otherwise be refused by
+   * the read-only method gate below before its route was ever resolved. Its
+   * own GET is answered here too rather than falling through, so one block owns
+   * the scope rule the whole surface shares. Disjoint from every other
+   * prefix — `/runs`, `/profiles`, `/sessions` — so nothing above can shadow it
+   * and it can shadow nothing.
+   */
+  if (path === `${apiPrefix}/routines` || path.startsWith(`${apiPrefix}/routines/`)) {
+    const reply = await handleRoutinesRequest(request, context, connection, method, path, visibleProfiles);
+    return { ...reply, connectionId: connection.id };
+  }
+
   if (method !== 'GET' && method !== 'HEAD') {
     // 405 only for a route that genuinely exists and genuinely refuses the
     // verb. Anything else is a 404, because "wrong method" on a path this
@@ -1240,6 +1270,8 @@ export interface ArtemisServerOptions {
   readonly ledger?: SessionLedger;
   /** How to read stored sessions. Required alongside {@link ledger}. */
   readonly sessions?: SessionSource;
+  /** Routines that fire in the server. Absent answers 501. See {@link ServerContext.routines}. */
+  readonly routines?: ServerRoutineStore;
   /** How to read each account's plan gauge. Absent answers 501. */
   readonly usage?: UsageSource;
   /** See {@link ServerContext.allowedHosts}. */
@@ -1372,6 +1404,7 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
           ...(options.workspaces === undefined ? {} : { workspaces: options.workspaces }),
           ...(options.ledger === undefined ? {} : { ledger: options.ledger }),
           ...(options.sessions === undefined ? {} : { sessions: options.sessions }),
+          ...(options.routines === undefined ? {} : { routines: options.routines }),
           ...(options.usage === undefined ? {} : { usage: options.usage }),
           ...(options.allowedHosts === undefined ? {} : { allowedHosts: options.allowedHosts }),
           ...(options.feed === undefined ? {} : { feed: options.feed }),
@@ -1555,6 +1588,209 @@ function unknownSession(): ServerReply {
     'unknown_session',
     'No such conversation for this connection.',
   );
+}
+
+/* -------------------------------------------------------------------------- */
+/* The routine surface                                                        */
+/* -------------------------------------------------------------------------- */
+
+/** The routine equivalent of {@link unknownSession}: "not yours" reads as "not there". */
+function unknownRoutine(): ServerReply {
+  return fail(404, 'invalid_request_error', 'unknown_routine', 'No such routine for this connection.');
+}
+
+/** A string field a routine draft may carry, or `undefined` when absent. Wrong
+ * types and over-length strings are dropped — the store is the final gate on a
+ * routine's usability, and this only has to keep a client bug from becoming a
+ * type error. */
+function wireString(value: unknown, max: number): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value.length <= max ? value : undefined;
+}
+
+/** Read a routine draft off the wire. `cwd`, `scope` and `connectionId` are the
+ * server's to decide, so a draft that names them is read as if it had not. */
+function readWireRoutineDraft(value: unknown): { readonly value: RoutineDraft } | { readonly error: string } {
+  if (typeof value !== 'object' || value === null) {
+    return { error: 'The request body must be a JSON object.' };
+  }
+  const draft = (value as { draft?: unknown }).draft;
+  if (typeof draft !== 'object' || draft === null) {
+    return { error: '`draft` must be an object.' };
+  }
+  const record = draft as Record<string, unknown>;
+  const name = record['name'];
+  const instructions = record['instructions'];
+  const profileId = record['profileId'];
+  const providerId = record['providerId'];
+  if (typeof name !== 'string' || name.trim().length === 0 || name.length > 200) {
+    return { error: '`draft.name` must be a non-empty string of at most 200 characters.' };
+  }
+  if (typeof instructions !== 'string' || instructions.trim().length === 0 || instructions.length > 20_000) {
+    return { error: '`draft.instructions` must be a non-empty string of at most 20000 characters.' };
+  }
+  if (typeof profileId !== 'string' || profileId.length === 0) {
+    return { error: '`draft.profileId` names the account each firing bills.' };
+  }
+  if (typeof providerId !== 'string' || providerId.length === 0) {
+    return { error: '`draft.providerId` is required.' };
+  }
+  if (typeof record['schedule'] !== 'object' || record['schedule'] === null) {
+    return { error: '`draft.schedule` is required.' };
+  }
+  const model = wireString(record['model'], 200);
+  const effort = wireString(record['effort'], 100);
+  const permissionMode = wireString(record['permissionMode'], 40);
+  return {
+    value: {
+      name: name.trim(),
+      instructions,
+      profileId,
+      providerId: providerId as ProviderId,
+      schedule: record['schedule'] as RoutineDraft['schedule'],
+      ...(model === undefined ? {} : { model }),
+      ...(effort === undefined ? {} : { effort }),
+      ...(permissionMode === undefined
+        ? {}
+        : { permissionMode: permissionMode as RoutineDraft['permissionMode'] }),
+      ...(typeof record['paused'] === 'boolean' ? { paused: record['paused'] } : {}),
+    },
+  };
+}
+
+/** Read a routine edit off the wire. Only the fields a server routine will
+ * actually change are read; the rest are the routine's fixed identity. */
+function readWireRoutinePatch(value: unknown): { readonly value: RoutinePatch } | { readonly error: string } {
+  if (typeof value !== 'object' || value === null) {
+    return { error: 'The request body must be a JSON object.' };
+  }
+  const patch = (value as { patch?: unknown }).patch;
+  if (typeof patch !== 'object' || patch === null) {
+    return { error: '`patch` must be an object.' };
+  }
+  const record = patch as Record<string, unknown>;
+  const built: {
+    -readonly [K in keyof RoutinePatch]: RoutinePatch[K];
+  } = {};
+  const name = wireString(record['name'], 200);
+  if (name !== undefined) built.name = name;
+  if (typeof record['instructions'] === 'string' && record['instructions'].length <= 20_000) {
+    built.instructions = record['instructions'];
+  }
+  // Empty clears, exactly as the store's own merge reads it.
+  if (typeof record['model'] === 'string' && record['model'].length <= 200) built.model = record['model'];
+  if (typeof record['effort'] === 'string' && record['effort'].length <= 100) built.effort = record['effort'];
+  const permissionMode = wireString(record['permissionMode'], 40);
+  if (permissionMode !== undefined) {
+    built.permissionMode = permissionMode as RoutinePatch['permissionMode'];
+  }
+  if (typeof record['schedule'] === 'object' && record['schedule'] !== null) {
+    built.schedule = record['schedule'] as RoutinePatch['schedule'];
+  }
+  if (typeof record['paused'] === 'boolean') built.paused = record['paused'];
+  return { value: built };
+}
+
+/**
+ * The whole of `/api/v0/routines`, scoped by the connection's workspace key.
+ *
+ * The scope rule is the session surface's, applied to a different noun: a token
+ * touches exactly the routines whose `scope` matches its own pin, create stamps
+ * that pin, and every "not yours" answers like "not there". The store is the
+ * one that enforces it — this resolves the scope and the id and hands them
+ * over.
+ */
+async function handleRoutinesRequest(
+  request: ServerRequestInfo,
+  context: ServerContext,
+  connection: ServerConnection,
+  method: string,
+  path: string,
+  visibleProfiles: () => Promise<readonly ServerProfile[]>,
+): Promise<ServerReply> {
+  const apiPrefix = `/api/${SERVER_API_VERSION}`;
+  const store = context.routines;
+  if (store === undefined) {
+    return fail(
+      501,
+      'invalid_request_error',
+      'not_implemented',
+      'This Artemis build serves its catalogue but keeps no server-side routines.',
+    );
+  }
+  const scope = workspaceKeyFor(connection);
+
+  if (path === `${apiPrefix}/routines`) {
+    if (method === 'GET') {
+      const body: ServerRoutinesBody = { object: 'artemis.routines', routines: store.listFor(scope) };
+      return ok(body);
+    }
+    if (method === 'POST') {
+      const draft = readWireRoutineDraft(request.body);
+      if ('error' in draft) {
+        return fail(400, 'invalid_request_error', 'invalid_body', draft.error);
+      }
+      // The account each firing bills must be one this connection can see —
+      // otherwise a token could schedule work on an account it may not run,
+      // and enumerate the hidden ones by which ids are accepted.
+      const profiles = await visibleProfiles();
+      if (!profiles.some((profile) => String(profile.id) === draft.value.profileId)) {
+        return fail(404, 'invalid_request_error', 'unknown_profile', 'No such account for this connection.');
+      }
+      try {
+        const routine = await store.create({ draft: draft.value, connection });
+        const body: ServerRoutineBody = { object: 'artemis.routine', routine };
+        return ok(body);
+      } catch (error) {
+        return fail(
+          400,
+          'invalid_request_error',
+          'invalid_body',
+          error instanceof Error ? error.message : 'The routine could not be created.',
+        );
+      }
+    }
+    return fail(405, 'invalid_request_error', 'method_not_allowed', `${method} is not supported on ${path}.`);
+  }
+
+  const rest = path.slice(`${apiPrefix}/routines/`.length);
+  const isRunNow = method === 'POST' && rest.endsWith('/run-now');
+  const idText = isRunNow ? rest.slice(0, -'/run-now'.length) : rest;
+  // Anything with a further slash is a sub-route this surface does not have.
+  if (idText.length === 0 || idText.includes('/')) return unknownRoutine();
+  let id: string;
+  try {
+    id = decodeURIComponent(idText);
+  } catch {
+    return fail(400, 'invalid_request_error', 'invalid_url', 'The routine id could not be parsed.');
+  }
+  if (id.length === 0) return unknownRoutine();
+
+  if (isRunNow) {
+    const routine = await store.runNow(scope, id);
+    if (routine === undefined) return unknownRoutine();
+    const body: ServerRoutineBody = { object: 'artemis.routine', routine };
+    return ok(body);
+  }
+
+  if (method === 'PATCH') {
+    const patch = readWireRoutinePatch(request.body);
+    if ('error' in patch) {
+      return fail(400, 'invalid_request_error', 'invalid_body', patch.error);
+    }
+    const routine = await store.update(scope, id, patch.value);
+    if (routine === undefined) return unknownRoutine();
+    const body: ServerRoutineBody = { object: 'artemis.routine', routine };
+    return ok(body);
+  }
+
+  if (method === 'DELETE') {
+    const removed = await store.remove(scope, id);
+    if (!removed) return unknownRoutine();
+    const body: ServerRoutineDeletedBody = { object: 'artemis.routine.deleted', deleted: true };
+    return ok(body);
+  }
+
+  return fail(405, 'invalid_request_error', 'method_not_allowed', `${method} is not supported on ${path}.`);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2388,43 +2624,96 @@ async function describeScopedSessions(
     group.ids.add(entry.sessionId);
   }
 
-  const described = new Map<string, SessionSummary>();
-  for (const group of groups.values()) {
-    const profile = bySlug.get(group.profileId);
-    if (profile === undefined) continue;
+  /*
+   * One read per (profile × directory), kept, so the second pass below can
+   * consult a store the first pass already opened without opening it again.
+   */
+  const pages = new Map<string, readonly SessionSummary[]>();
+  const pageFor = async (
+    profile: ServerProfile,
+    cwd: string,
+  ): Promise<readonly SessionSummary[]> => {
+    const key = `${String(profile.id)}\u0000${cwd}`;
+    const cached = pages.get(key);
+    if (cached !== undefined) return cached;
+    let page: readonly SessionSummary[] = [];
     try {
-      const page = await sessions.list({
-        providerId: String(profile.provider.id),
-        profileId: group.profileId,
-        cwd: group.cwd,
-        limit: 200,
-      });
-      for (const summary of page.sessions) {
-        if (group.ids.has(String(summary.id))) described.set(String(summary.id), summary);
-      }
+      page = (
+        await sessions.list({
+          providerId: String(profile.provider.id),
+          profileId: String(profile.id),
+          cwd,
+          limit: 200,
+        })
+      ).sessions;
     } catch {
       // One unreadable store must not fail the listing — the other groups'
       // conversations are still real. The missing ones simply do not appear,
       // which is also what a store mid-rotation looks like.
     }
+    pages.set(key, page);
+    return page;
+  };
+
+  /** Each conversation a store could describe, and whose store it was in. */
+  const described = new Map<string, { summary: SessionSummary; profileId: string }>();
+  for (const group of groups.values()) {
+    const profile = bySlug.get(group.profileId);
+    if (profile === undefined) continue;
+    for (const summary of await pageFor(profile, group.cwd)) {
+      const id = String(summary.id);
+      if (group.ids.has(id)) described.set(id, { summary, profileId: group.profileId });
+    }
+  }
+
+  /*
+   * The second pass: entries whose transcript the ledger's own account does
+   * not hold.
+   *
+   * Dropping them was what made a conversation vanish with its transcript
+   * intact. The ledger is last-writer-wins and is written the moment a resume
+   * is accepted — before the provider has looked for the file — so a resume
+   * sent on the wrong account re-recorded the session against that account,
+   * and every listing after that looked in the wrong store. The transcript
+   * was in another visible store the whole time. So the other stores are
+   * asked for that directory, the row is reported under the account that
+   * actually holds it, and the ledger is corrected so the next listing needs
+   * no second pass. Only an entry no visible store can describe is dropped,
+   * and that one really is gone.
+   */
+  for (const entry of entries) {
+    if (described.has(entry.sessionId)) continue;
+    for (const profile of profiles) {
+      if (String(profile.id) === entry.profileId) continue;
+      const summary = (await pageFor(profile, entry.cwd)).find(
+        (candidate) => String(candidate.id) === entry.sessionId,
+      );
+      if (summary === undefined) continue;
+      described.set(entry.sessionId, { summary, profileId: String(profile.id) });
+      ledger.reattribute(entry.sessionId, String(profile.id));
+      break;
+    }
   }
 
   const rows: ServerSessionSummary[] = [];
   for (const entry of entries) {
-    const summary = described.get(entry.sessionId);
-    if (summary === undefined) continue;
-    const profile = bySlug.get(entry.profileId);
+    const found = described.get(entry.sessionId);
+    if (found === undefined) continue;
+    const { summary } = found;
+    const profile = bySlug.get(found.profileId);
     rows.push({
       id: entry.sessionId,
       title: summary.title,
       ...(summary.firstPrompt === undefined ? {} : { firstPrompt: summary.firstPrompt }),
       updatedAt: summary.updatedAt,
-      profileSlug: profile?.slug ?? entry.profileId,
+      profileSlug: profile?.slug ?? found.profileId,
       // The ledger's account, not the store's: `SessionSummary.profileId` is a
       // pick when several profiles reach one store (see `profileIsUnknown`),
-      // and the ledger *knows* which connection ran this one. The provider is
-      // the account's own, which is the only one it could have been.
-      profileId: entry.profileId,
+      // and the ledger *knows* which connection ran this one — corrected
+      // above where the store it named turned out not to hold the file. The
+      // provider is the account's own, which is the only one it could have
+      // been.
+      profileId: found.profileId,
       providerId: String(profile?.provider.id ?? summary.providerId),
       // The store's own tag, so a client can tell an archived conversation
       // from a live one. The tag route writes this; dropping it here made
@@ -2514,32 +2803,10 @@ async function handleChatCompletions(
   // The route is resolved against what *this connection* may see, so a model
   // outside its allowance is indistinguishable from one that does not exist.
   const profiles = visibleToConnection(connection, await context.catalogue.read({}));
-  const model = findModel(profiles, chat.model);
-  if (model === undefined) {
+  const requested = findModel(profiles, chat.model);
+  if (requested === undefined) {
     return attribute(modelNotFound(chat.model));
   }
-
-  /*
-   * Standing instructions reach the run only where the serving account's
-   * provider can append to its preset. Codex and OpenCode have no append —
-   * `systemPromptAppend: false` on their descriptors, and the catalogue
-   * publishes that per account — and their adapters never read the field, so
-   * a prompt handed to them would be accepted and silently unread. That is the
-   * one failure the capability flag exists to prevent, and it is the reverse of
-   * the permission mode's convention: a mode is dropped quietly because the
-   * run then opens in the serving user's setting, which is a real outcome; an
-   * instruction the model never saw is not an outcome, it is a client that
-   * believes it was heard. So the field is dropped *and reported*, under
-   * `artemis.ignored` beside any lenient parameter, and a client can say so.
-   */
-  const account = profiles.find((profile) => String(profile.id) === String(model.profileId));
-  const { systemPrompt, ...withoutSystemPrompt } = extensions;
-  const dropSystemPrompt =
-    systemPrompt !== undefined && account?.capabilities.systemPromptAppend !== true;
-  const applied: ArtemisChatExtensions = dropSystemPrompt ? withoutSystemPrompt : extensions;
-  const ignored: readonly string[] = dropSystemPrompt
-    ? [...review.ignored, 'artemis.systemPrompt']
-    : review.ignored;
 
   /*
    * The resume gate. A `sessionId` names a stored conversation, and the only
@@ -2556,6 +2823,91 @@ async function handleChatCompletions(
       return attribute(unknownSession());
     }
   }
+
+  /*
+   * The account that holds the conversation continues it.
+   *
+   * A transcript lives in one account's store and the provider looks nowhere
+   * else, so a resume on any other route fails before its first token — and
+   * used to take the conversation with it, because the ownership record below
+   * was written first. The route is corrected here instead, and the reply says
+   * so. Nothing is read on the ordinary path: see `sessionHome.ts`.
+   */
+  const resumed: { readonly model: ServerModel; readonly redirected?: RouteRedirect } =
+    extensions.sessionId === undefined
+      ? { model: requested }
+      : await resolveResumeModel({
+          sessions: context.sessions,
+          ledger: context.ledger,
+          profiles,
+          requested,
+          sessionId: extensions.sessionId,
+        });
+  const { model, redirected } = resumed;
+
+  /*
+   * Standing instructions reach the run only where the serving account's
+   * provider can append to its preset. Codex and OpenCode have no append —
+   * `systemPromptAppend: false` on their descriptors, and the catalogue
+   * publishes that per account — and their adapters never read the field, so
+   * a prompt handed to them would be accepted and silently unread. That is the
+   * one failure the capability flag exists to prevent, and it is the reverse of
+   * the permission mode's convention: a mode is dropped quietly because the
+   * run then opens in the serving user's setting, which is a real outcome; an
+   * instruction the model never saw is not an outcome, it is a client that
+   * believes it was heard. So the field is dropped *and reported*, under
+   * `artemis.ignored` beside any lenient parameter, and a client can say so.
+   */
+  const account = profiles.find((profile) => String(profile.id) === String(model.profileId));
+
+  /*
+   * Forking and rewinding, refused rather than dropped.
+   *
+   * Both reshape the conversation the caller is continuing — a fork writes the
+   * next turn to a new session, a rewind cuts the stored one before it — and
+   * a request for either that was quietly set aside would produce the worst
+   * kind of wrong answer: a turn appended to the conversation the caller
+   * believed they had branched from or wound back. So each needs the session
+   * it acts on, and the serving account's provider has to be able to honour
+   * it; the catalogue publishes both flags per account for exactly this
+   * check, and the registry behind the run would refuse anyway, only later
+   * and with less to say.
+   */
+  if (extensions.forkSession === true || extensions.rewindToMessageId !== undefined) {
+    const wanted = extensions.forkSession === true ? 'artemis.forkSession' : 'artemis.rewindToMessageId';
+    if (extensions.sessionId === undefined) {
+      return attribute(
+        fail(
+          400,
+          'invalid_request_error',
+          'invalid_body',
+          `\`${wanted}\` needs \`artemis.sessionId\`: there is no conversation to ${extensions.forkSession === true ? 'fork' : 'rewind'}.`,
+        ),
+      );
+    }
+    const capable =
+      extensions.forkSession === true
+        ? account?.capabilities.forkSession === true
+        : account?.capabilities.rewind === true;
+    if (!capable) {
+      return attribute(
+        fail(
+          400,
+          'invalid_request_error',
+          'unsupported_parameter',
+          `The account behind ${model.route} cannot ${extensions.forkSession === true ? 'fork' : 'rewind'} a conversation, so \`${wanted}\` cannot be honoured.`,
+        ),
+      );
+    }
+  }
+
+  const { systemPrompt, ...withoutSystemPrompt } = extensions;
+  const dropSystemPrompt =
+    systemPrompt !== undefined && account?.capabilities.systemPromptAppend !== true;
+  const applied: ArtemisChatExtensions = dropSystemPrompt ? withoutSystemPrompt : extensions;
+  const ignored: readonly string[] = dropSystemPrompt
+    ? [...review.ignored, 'artemis.systemPrompt']
+    : review.ignored;
 
   let workspace;
   try {
@@ -2610,6 +2962,7 @@ async function handleChatCompletions(
     request: chat,
     extensions: applied,
     ignored,
+    ...(redirected === undefined ? {} : { redirected }),
     ...(request.signal === undefined ? {} : { signal: request.signal }),
     // Absent when this build has no directory: with nothing to hold the
     // deadline, a detach would be an abandonment, so the turn keeps its old
@@ -2696,6 +3049,7 @@ async function handleChatCompletions(
       created,
       result,
       ignored,
+      ...(redirected === undefined ? {} : { redirected }),
       ...(model.resolvedModel === undefined ? {} : { resolvedModel: model.resolvedModel }),
     }),
   });
@@ -2946,13 +3300,22 @@ async function* streamTurn(input: {
   // What was accepted and not applied rides the role chunk — first, so a
   // client learns before the first token that something it sent was set
   // aside. The whole-response shape carries the same list on its `artemis`
-  // block; a streaming client had no way to see it at all until now.
-  const { ignored } = input.turn;
+  // block; a streaming client had no way to see it at all until now. A resume
+  // moved to the account holding the conversation rides the same chunk, for
+  // the same reason.
+  const { ignored, redirected } = input.turn;
   yield sseEvent(
     chatChunk({
       ...frame,
       delta: { role: 'assistant' },
-      ...(ignored.length === 0 ? {} : { artemis: { ignored } }),
+      ...(ignored.length === 0 && redirected === undefined
+        ? {}
+        : {
+            artemis: {
+              ...(ignored.length === 0 ? {} : { ignored }),
+              ...(redirected === undefined ? {} : { redirected }),
+            },
+          }),
     }),
   );
 

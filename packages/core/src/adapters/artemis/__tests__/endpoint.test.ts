@@ -592,14 +592,18 @@ describe('what a run refuses up front', () => {
     expect(run).toBeDefined();
   });
 
-  it('fork and rewind, which the wire cannot carry yet', async () => {
-    await expect(
-      adapter.createRun({
-        ...base,
-        resumeSessionId: 'sess-abc',
-        forkSession: true,
-      } as unknown as ResolvedRunInput),
-    ).rejects.toMatchObject({ agentError: { code: 'invalid_request' } });
+  it('no longer refuses a fork or a rewind: the wire carries both now', async () => {
+    // Both ride the completions request as `artemis.forkSession` and
+    // `artemis.rewindToMessageId`; a server whose account cannot honour one
+    // refuses the request outright, which is the honest failure. The run
+    // must accept them here.
+    const run = await adapter.createRun({
+      ...base,
+      resumeSessionId: 'sess-abc',
+      forkSession: true,
+      rewindToMessageId: 'msg-7',
+    } as unknown as ResolvedRunInput);
+    expect(run).toBeDefined();
   });
 
   it('a replacing system prompt, which would displace the serving preset', async () => {
@@ -793,6 +797,207 @@ describe('a live run: steering, interrupting and answering', () => {
     const answer = seen.find((row) => row.url === '/api/v0/runs/srv-3/permission');
     expect(answer?.authorization).toBe('Bearer tok');
     expect(answer?.body).toEqual({ requestId: 'perm-1', decision: { behavior: 'allow', scope: 'once' } });
+  });
+  it('keeps a parked ask where it was asked: the reasoning after it is a new block', async () => {
+    // The agent thinks, stops to ask, and thinks again once the answer lands.
+    // On the wire that is reasoning, a permission chunk, reasoning — the same
+    // kind either side of the park, which used to mean the same block index:
+    // the transcript writes a later delta of a block back into the row it
+    // opened, so everything the agent thought *after* the question was
+    // appended to the fold above the card, and the card read as the end of
+    // the reasoning it was asked in the middle of. A park closes the block.
+    let completion: ServerResponse | undefined;
+    const { origin } = await serve((request, response) => {
+      if (request.url === '/v1/chat/completions') {
+        completion = response;
+        response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        response.write(sse(chunk({ role: 'assistant' }, { artemis: { runId: 'srv-4' } })));
+        response.write(sse(chunk({ reasoning_content: 'Two libraries would do. ' })));
+        response.write(sse(chunk({ reasoning_content: 'Better ask.' })));
+        response.write(
+          sse(
+            chunk(
+              {},
+              {
+                artemis: {
+                  permission: {
+                    status: 'requested',
+                    request: {
+                      id: 'ask-1',
+                      runId: 'srv-4',
+                      toolName: 'AskUserQuestion',
+                      input: {},
+                      requestedAt: 1,
+                      question: {
+                        questions: [
+                          {
+                            question: 'Which library?',
+                            header: 'Library',
+                            multiSelect: false,
+                            options: [
+                              { label: 'date-fns', description: 'one' },
+                              { label: 'Luxon', description: 'two' },
+                            ],
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              },
+            ),
+          ),
+        );
+        return; // parks; the answer arrives on the run route, below
+      }
+      if (request.url === '/api/v0/runs/srv-4/permission') {
+        completion?.write(
+          sse(
+            chunk(
+              {},
+              {
+                artemis: {
+                  permission: {
+                    status: 'resolved',
+                    requestId: 'ask-1',
+                    outcome: 'allowed',
+                  },
+                },
+              },
+            ),
+          ),
+        );
+        // The serving side sets the provider's next reasoning block apart
+        // with a paragraph break, as it does between any two blocks.
+        completion?.write(sse(chunk({ reasoning_content: '\n\nLuxon it is.' })));
+        completion?.write(sse(chunk({ content: 'Using Luxon.' })));
+        completion?.write(
+          sse(chunk({}, { finish_reason: 'stop', artemis: { sessionId: 'sess-q', endReason: 'completed' } })),
+        );
+        completion?.write(sse('[DONE]'));
+        completion?.end();
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ requestId: 'ask-1' }));
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      runId: 'run-ask' as RunId,
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+
+    const events: AgentEvent[] = [];
+    for await (const event of run.events) {
+      events.push(event);
+      if (event.type === 'permission.request') {
+        void run.respondToPermission(event.requestId, {
+          behavior: 'allow',
+          scope: 'once',
+          answers: [{ question: 'Which library?', options: ['Luxon'] }],
+        });
+      }
+    }
+
+    const story = events
+      .filter((event) => event.type !== 'session.started' && event.type !== 'run.end')
+      .map((event) => {
+        const { type, blockIndex, text } = event as { type: string; blockIndex?: number; text?: string };
+        return blockIndex === undefined ? { type } : { type, blockIndex, text };
+      });
+
+    expect(story).toEqual([
+      { type: 'thinking.delta', blockIndex: 0, text: 'Two libraries would do. ' },
+      { type: 'thinking.delta', blockIndex: 0, text: 'Better ask.' },
+      { type: 'permission.request' },
+      { type: 'permission.resolved' },
+      // A fresh block, so the transcript opens a fresh row under the card —
+      // and the server's break between the two blocks is not carried to the
+      // head of it, where it would separate nothing.
+      { type: 'thinking.delta', blockIndex: 1, text: 'Luxon it is.' },
+      { type: 'text.delta', blockIndex: 2, text: 'Using Luxon.' },
+      { type: 'text.complete', blockIndex: 2, text: 'Using Luxon.' },
+    ]);
+  });
+
+  it('closes an answer in progress when the agent stops to ask, and finalises it', async () => {
+    // The same boundary on the answer's side: what the agent said before the
+    // question is one block, finalised with its `text.complete`, and what it
+    // says after is the next — not more of the same paragraph above the card.
+    let completion: ServerResponse | undefined;
+    const { origin } = await serve((request, response) => {
+      if (request.url === '/v1/chat/completions') {
+        completion = response;
+        response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        response.write(sse(chunk({ role: 'assistant' }, { artemis: { runId: 'srv-5' } })));
+        response.write(sse(chunk({ content: 'One thing first.' })));
+        response.write(
+          sse(
+            chunk(
+              {},
+              {
+                artemis: {
+                  permission: {
+                    status: 'requested',
+                    request: { id: 'perm-5', runId: 'srv-5', toolName: 'Bash', input: { command: 'ls' }, requestedAt: 1 },
+                  },
+                },
+              },
+            ),
+          ),
+        );
+        return;
+      }
+      if (request.url === '/api/v0/runs/srv-5/permission') {
+        completion?.write(
+          sse(chunk({}, { artemis: { permission: { status: 'resolved', requestId: 'perm-5', outcome: 'allowed' } } })),
+        );
+        completion?.write(sse(chunk({ content: 'Done.' })));
+        completion?.write(sse(chunk({}, { finish_reason: 'stop', artemis: { sessionId: 'sess-5', endReason: 'completed' } })));
+        completion?.write(sse('[DONE]'));
+        completion?.end();
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ requestId: 'perm-5' }));
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      runId: 'run-5' as RunId,
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+
+    const events: AgentEvent[] = [];
+    for await (const event of run.events) {
+      events.push(event);
+      if (event.type === 'permission.request') {
+        void run.respondToPermission(event.requestId, { behavior: 'allow', scope: 'once' });
+      }
+    }
+
+    const story = events
+      .filter((event) => event.type !== 'session.started' && event.type !== 'run.end')
+      .map((event) => {
+        const { type, blockIndex, text } = event as { type: string; blockIndex?: number; text?: string };
+        return blockIndex === undefined ? { type } : { type, blockIndex, text };
+      });
+
+    expect(story).toEqual([
+      { type: 'text.delta', blockIndex: 0, text: 'One thing first.' },
+      { type: 'text.complete', blockIndex: 0, text: 'One thing first.' },
+      { type: 'permission.request' },
+      { type: 'permission.resolved' },
+      { type: 'text.delta', blockIndex: 1, text: 'Done.' },
+      { type: 'text.complete', blockIndex: 1, text: 'Done.' },
+    ]);
   });
 });
 
@@ -1176,6 +1381,277 @@ describe('a stream that dies under the run', () => {
     expect(seen.map((request) => request.url)).toEqual([
       '/v1/chat/completions',
       '/api/v0/runs/run-x/interrupt',
+    ]);
+  });
+});
+
+/**
+ * A served row carries the account that holds it.
+ *
+ * On this machine the row's `profileId` is the Artemis Server profile — one
+ * profile wearing every account the server offers — so the account whose store
+ * actually has the transcript has to travel separately, or a resume goes out
+ * on whatever route the column was showing and the server's provider cannot
+ * find the conversation.
+ */
+describe('listing served conversations', () => {
+  it('carries the serving account, and tolerates a server that sends none', async () => {
+    const { origin } = await serve((request, response) => {
+      expect(request.url).toBe('/api/v0/sessions');
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(
+        JSON.stringify({
+          object: 'artemis.sessions',
+          sessions: [
+            {
+              id: 'sess-1',
+              title: 'Held by work',
+              updatedAt: 5,
+              profileSlug: 'work-max',
+              profileId: 'p1',
+              providerId: 'claude',
+              cwd: '/srv/repo',
+            },
+            // A 2.4.x server: slug only, no id.
+            { id: 'sess-2', title: 'From an older server', updatedAt: 4, profileSlug: 'work-max', cwd: '/srv/repo' },
+          ],
+        }),
+      );
+    });
+
+    const adapter = createArtemisAdapter();
+    const page = await adapter.listSessions?.({
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok_123' },
+      cwd: process.cwd(),
+      profileId: 'desk-1' as never,
+    });
+
+    expect(page?.sessions[0]).toMatchObject({
+      id: 'sess-1',
+      profileId: 'desk-1',
+      accountSlug: 'work-max',
+      accountId: 'p1',
+      cwd: '/srv/repo',
+    });
+    expect(page?.sessions[1]).toMatchObject({ id: 'sess-2', accountSlug: 'work-max' });
+    expect(page?.sessions[1]).not.toHaveProperty('accountId');
+  });
+});
+
+/**
+ * Reshaping a served conversation, and reading a queued message now.
+ *
+ * A fork and a rewind cross the wire as `artemis.forkSession` and
+ * `artemis.rewindToMessageId`, beside the session id they act on. What these
+ * pin, beyond the body: a fork's session is the *branch* the server announces,
+ * never the original it was told to branch from — announcing that first would
+ * name the branch after its parent and send every later prompt back to it.
+ *
+ * "Read it now" is an interrupt with something queued behind the turn. The
+ * server keeps the queued message across the interrupt and opens the next
+ * turn on it, on the same stream; the adapter used to abort that stream the
+ * moment the interrupt was acknowledged, which ended the conversation on this
+ * side a second after the click while the server went on answering a message
+ * nobody was listening for.
+ */
+describe('forking, rewinding and reading a queued message now', () => {
+  const base = {
+    runId: 'run-fr' as RunId,
+    providerId: 'artemis' as const,
+    profileId: 'profile-1',
+    cwd: process.cwd(),
+    prompt: 'again, differently',
+    model: 'work/opus',
+  };
+
+  function branchStream(response: ServerResponse, sessionId: string): void {
+    response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+    response.write(sse(chunk({ role: 'assistant' })));
+    response.write(sse(chunk({}, { artemis: { sessionId } })));
+    response.write(sse(chunk({ content: 'from here on' })));
+    response.write(
+      sse(chunk({}, { finish_reason: 'stop', artemis: { sessionId, endReason: 'completed' } })),
+    );
+    response.write(sse('[DONE]'));
+    response.end();
+  }
+
+  it('sends the fork beside the session and adopts the branch the server announces', async () => {
+    const { origin, seen } = await serve((_request, response) => branchStream(response, 'branch-1'));
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      resumeSessionId: 'orig-1',
+      forkSession: true,
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+    const events: AgentEvent[] = [];
+    for await (const event of run.events) events.push(event);
+
+    const body = seen[0]?.body as { artemis: Record<string, unknown> };
+    expect(body.artemis).toMatchObject({ sessionId: 'orig-1', forkSession: true });
+    expect(body.artemis).not.toHaveProperty('rewindToMessageId');
+
+    const announced = events.filter((event) => event.type === 'session.started');
+    expect(announced).toHaveLength(1);
+    expect(announced[0]).toMatchObject({ sessionId: 'branch-1', resumedFrom: 'orig-1' });
+    expect(run.sessionId).toBe('branch-1');
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', sessionId: 'branch-1' });
+  });
+
+  it('sends the rewind anchor and keeps the session it cuts', async () => {
+    const { origin, seen } = await serve((_request, response) => branchStream(response, 'orig-1'));
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      resumeSessionId: 'orig-1',
+      rewindToMessageId: 'msg-7',
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+    const events: AgentEvent[] = [];
+    for await (const event of run.events) events.push(event);
+
+    const body = seen[0]?.body as { artemis: Record<string, unknown> };
+    expect(body.artemis).toMatchObject({ sessionId: 'orig-1', rewindToMessageId: 'msg-7' });
+    expect(body.artemis).not.toHaveProperty('forkSession');
+    // A rewind stays in its conversation, so the session is known before the
+    // first byte, exactly as for any other resume.
+    expect(events[0]).toMatchObject({ type: 'session.started', sessionId: 'orig-1' });
+  });
+
+  it('keeps the stream open when the server still holds a queued message', async () => {
+    let held: ServerResponse | undefined;
+    const { origin } = await serve((request, response) => {
+      if (request.url === '/v1/chat/completions') {
+        held = response;
+        response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        response.write(sse(chunk({ role: 'assistant' })));
+        response.write(sse(chunk({}, { artemis: { runId: 'srv-q' } })));
+        response.write(sse(chunk({ content: 'first turn…' })));
+        return; // holds: the test steers, then asks for the message to be read now
+      }
+      if (request.url === '/api/v0/runs/srv-q/messages') {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ runId: 'srv-q', deliveredImmediately: false }));
+        return;
+      }
+      if (request.url === '/api/v0/runs/srv-q/interrupt') {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ runId: 'srv-q', stillQueued: ['srv-m1'] }));
+        // The provider over there takes the queued message up, and the next
+        // turn arrives on the stream it already has.
+        held?.write(sse(chunk({ content: ' second turn' })));
+        held?.write(sse(chunk({}, { finish_reason: 'stop', artemis: { endReason: 'completed' } })));
+        held?.write(sse('[DONE]'));
+        held?.end();
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      runId: 'run-q' as RunId,
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+
+    const events: AgentEvent[] = [];
+    let outcome: { readonly stillQueued: readonly string[] } | undefined;
+    for await (const event of run.events) {
+      events.push(event);
+      if (event.type === 'text.delta' && outcome === undefined) {
+        await run.send('read this next', undefined, 'local-m1' as never);
+        outcome = await run.interrupt();
+      }
+    }
+
+    // Named in this side's ids: the one steer that had not been delivered.
+    expect(outcome?.stillQueued).toEqual(['local-m1']);
+    // The conversation went on rather than ending at the click.
+    expect(events.some((event) => event.type === 'text.delta' && event.text === ' second turn')).toBe(
+      true,
+    );
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+  });
+
+  it('still stops outright when nothing is queued', async () => {
+    const { origin, seen } = await serve((request, response) => {
+      if (request.url === '/v1/chat/completions') {
+        response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        response.write(sse(chunk({ role: 'assistant' })));
+        response.write(sse(chunk({}, { artemis: { runId: 'srv-s' } })));
+        response.write(sse(chunk({ content: 'working…' })));
+        return; // holds forever; the stop is the only exit
+      }
+      if (request.url === '/api/v0/runs/srv-s/interrupt') {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ runId: 'srv-s', stillQueued: [] }));
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      runId: 'run-s' as RunId,
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+
+    const events: AgentEvent[] = [];
+    for await (const event of run.events) {
+      events.push(event);
+      if (event.type === 'text.delta') void run.interrupt();
+    }
+
+    expect(seen.some((row) => row.url === '/api/v0/runs/srv-s/interrupt')).toBe(true);
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'interrupted' });
+  });
+});
+
+/**
+ * The paragraph break the server puts between two answer blocks.
+ *
+ * On its flat stream the server parts two blocks of answer with a paragraph
+ * break, exactly as it parts two reasoning blocks. When a stretch of reasoning
+ * sat between them this adapter opens a fresh row for the second block anyway,
+ * and the break at its head would stand as blank lines; when nothing sat
+ * between them the break is what keeps the two paragraphs apart in one row.
+ */
+describe('two answer blocks on one stream', () => {
+  it('drops the break at the head of a fresh row, keeps it inside a continuing one', async () => {
+    const { origin } = await serve((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      response.write(sse(chunk({ role: 'assistant' })));
+      response.write(sse(chunk({ content: 'Starting the probe.' })));
+      // Reasoning between: the adapter opens a new answer row after it.
+      response.write(sse(chunk({ reasoning_content: 'ran it' })));
+      response.write(sse(chunk({ content: '\n\n**Probe complete.**' })));
+      // No reasoning between: same row, so the break is the paragraph.
+      response.write(sse(chunk({ content: '\n\nAnd a footnote.' })));
+      response.write(
+        sse(chunk({}, { finish_reason: 'stop', artemis: { sessionId: 's-1', endReason: 'completed' } })),
+      );
+      response.write(sse('[DONE]'));
+      response.end();
+    });
+
+    const events = await drive(origin);
+    const texts = events
+      .filter((event) => event.type === 'text.delta')
+      .map((event) => ({
+        blockIndex: (event as { blockIndex: number }).blockIndex,
+        text: (event as { text: string }).text,
+      }));
+    expect(texts).toEqual([
+      { blockIndex: 0, text: 'Starting the probe.' },
+      { blockIndex: 2, text: '**Probe complete.**' },
+      { blockIndex: 2, text: '\n\nAnd a footnote.' },
     ]);
   });
 });

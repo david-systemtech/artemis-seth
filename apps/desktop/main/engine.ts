@@ -70,6 +70,9 @@ import type {
   BuiltInPromptId,
   ServerProfileCreatedBody,
   ServerSignInStatus,
+  RoutineDraft,
+  RoutinePatch,
+  RoutineSnapshot,
   ToolServerConfig,
 } from '@rx-artemis/protocol';
 
@@ -84,8 +87,13 @@ import {
   checkAuthStatus,
   createDefaultProviderRegistry,
   createRemoteAccount,
+  createRemoteRoutine,
   deleteRemoteAccount,
+  deleteRemoteRoutine,
+  listRemoteRoutines,
+  runRemoteRoutine,
   updateRemoteAccount,
+  updateRemoteRoutine,
   managedEnvKeys,
   ProfileStore,
   profileConfigDir,
@@ -509,6 +517,25 @@ export interface ArtemisEngine {
     code: string,
   ): Promise<ServerSignInStatus>;
   cancelRemoteSignIn(profileId: ProfileId, accountId: string): Promise<ServerSignInStatus | null>;
+
+  /**
+   * Routines that live on a *remote* server — the appointments that fire there
+   * with this desktop closed, distinct from the desktop's own local ones.
+   *
+   * Each takes the local Artemis-Server profile id (whose address and token
+   * name the server) and, where it acts on one, the server's id for the
+   * routine. The server scopes every call to the connection this profile's
+   * token names, so a call only ever reaches this profile's own routines.
+   */
+  remoteRoutines(profileId: ProfileId): Promise<readonly RoutineSnapshot[]>;
+  createRemoteRoutine(profileId: ProfileId, draft: RoutineDraft): Promise<RoutineSnapshot>;
+  updateRemoteRoutine(
+    profileId: ProfileId,
+    routineId: string,
+    patch: RoutinePatch,
+  ): Promise<RoutineSnapshot>;
+  deleteRemoteRoutine(profileId: ProfileId, routineId: string): Promise<{ readonly removed: boolean }>;
+  runRemoteRoutine(profileId: ProfileId, routineId: string): Promise<RoutineSnapshot>;
 
   listSessions(options: {
     readonly providerId: ProviderId;
@@ -1716,6 +1743,26 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       stopSignInForwarder(accountId);
       return cancelRemoteSignIn(await remoteEnvFor(profileId), accountId);
     },
+
+    /*
+     * The remote routines, on the same authenticated wire as the accounts
+     * above and the runs beside them. Each unwraps the route's body to the one
+     * thing the renderer wants — the routine, or the list — so the IPC layer
+     * carries a `RoutineSnapshot` rather than an envelope. `remoteEnvFor`
+     * refuses a profile that is not an Artemis Server, so a stray id cannot be
+     * sent to the default loopback address.
+     */
+    remoteRoutines: async (profileId) =>
+      (await listRemoteRoutines(await remoteEnvFor(profileId))).routines,
+    createRemoteRoutine: async (profileId, draft) =>
+      (await createRemoteRoutine(await remoteEnvFor(profileId), draft)).routine,
+    updateRemoteRoutine: async (profileId, routineId, patch) =>
+      (await updateRemoteRoutine(await remoteEnvFor(profileId), routineId, patch)).routine,
+    deleteRemoteRoutine: async (profileId, routineId) => ({
+      removed: (await deleteRemoteRoutine(await remoteEnvFor(profileId), routineId)).deleted,
+    }),
+    runRemoteRoutine: async (profileId, routineId) =>
+      (await runRemoteRoutine(await remoteEnvFor(profileId), routineId)).routine,
 
     getSessionMessages: async (query) => {
       const profile = await profiles.require(query.profileId);

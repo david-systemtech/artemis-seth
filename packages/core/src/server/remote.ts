@@ -82,6 +82,7 @@ import type {
 } from './http.js';
 import { workspaceKeyFor } from './ledger.js';
 import { CORS_HEADERS, fail, ok } from './replies.js';
+import { resolveResumeProfile } from './sessionHome.js';
 import { pathsOf, readRunInput, RunInputError, type ParsedRunInput } from './runInput.js';
 import { TooManyRemoteTerminalsError, UnknownRemoteTerminalError } from './terminals.js';
 import { WorkspaceUnavailableError } from './workspaces.js';
@@ -525,6 +526,32 @@ async function handleStartRun(input: RemoteRequestInput): Promise<ServerReply> {
       profileIds: profiles.map((profile) => String(profile.id)),
     };
     if (!ledger.mayAccess(scope, String(runInput.resumeSessionId))) return unknownSession();
+
+    /*
+     * The account that holds the conversation continues it. A resume that
+     * names another account would fail in the provider — it looks in one
+     * store only — and, worse, would already have been recorded against the
+     * wrong account by the time it did. The bridge's spelling of the redirect
+     * is the profile id, with the model kept where the holding account offers
+     * it. The handle in the reply names the account the run is really on.
+     * See `sessionHome.ts`.
+     */
+    const home = await resolveResumeProfile({
+      sessions: context.sessions,
+      ledger,
+      profiles,
+      requestedProfileId: runInput.profileId,
+      requestedModel: runInput.model,
+      sessionId: String(runInput.resumeSessionId),
+    });
+    if (home.redirected !== undefined) {
+      const { model: _requestedModel, ...rest } = runInput;
+      runInput = {
+        ...rest,
+        profileId: home.profileId,
+        ...(home.model === undefined ? {} : { model: home.model }),
+      };
+    }
   }
 
   const pinned = await resolvePinnedCwd(input, runInput.cwd, runInput.resumeSessionId);

@@ -627,6 +627,26 @@ describe('what gets sent to the provider', () => {
     await drain(source, turn({ extensions: { sessionId: 'sess-3' } }));
     expect(source.started[0]?.input).toMatchObject({ resumeSessionId: 'sess-3' });
   });
+
+  it('carries a fork and a rewind anchor beside the session', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed' }]);
+    await drain(
+      source,
+      turn({ extensions: { sessionId: 'sess-3', forkSession: true, rewindToMessageId: 'msg-7' } }),
+    );
+    expect(source.started[0]?.input).toMatchObject({
+      resumeSessionId: 'sess-3',
+      forkSession: true,
+      rewindToMessageId: 'msg-7',
+    });
+  });
+
+  it('sends neither when neither was asked for', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed' }]);
+    await drain(source, turn({ extensions: { sessionId: 'sess-3' } }));
+    expect(source.started[0]?.input).not.toHaveProperty('forkSession');
+    expect(source.started[0]?.input).not.toHaveProperty('rewindToMessageId');
+  });
 });
 
 describe('promptFromMessages', () => {
@@ -1678,5 +1698,53 @@ describe('a resumed conversation', () => {
     ) as { result: { sessionId?: string } };
 
     expect(done.result.sessionId).toBe('sess-forked');
+  });
+});
+
+describe('every block of the answer reaches the wire, not only the first', () => {
+  it('keeps a completed block that arrives after earlier text — the summary after a tool call', async () => {
+    // The bug this prevents, seen on a served session on 2026-09-15: the agent
+    // said an opening sentence, ran a tool, and wrote its bolded summary as a
+    // block that arrived whole. The check was "has any text been sent this
+    // turn", so the first block won and the summary — the one message a person
+    // reads — was dropped, while the transcript on the server had it.
+    const source = fakeRuns([
+      { type: 'text.complete', role: 'assistant', text: 'Starting the probe.', messageId: 'm1', blockIndex: 0 },
+      { type: 'tool.start', toolCallId: 't1', name: 'Bash', input: {} },
+      { type: 'text.complete', role: 'assistant', text: '**Probe complete.**', messageId: 'm1', blockIndex: 2 },
+      { type: 'run.end', reason: 'completed' },
+    ]);
+
+    const events = await drain(source);
+    const texts = events.filter((e) => e.kind === 'text').map((e) => (e as { text: string }).text);
+    // Two paragraphs, parted the way two reasoning blocks are.
+    expect(texts).toEqual(['Starting the probe.', '\n\n**Probe complete.**']);
+    const done = events.at(-1) as { result: { text: string } };
+    expect(done.result.text).toBe('Starting the probe.\n\n**Probe complete.**');
+  });
+
+  it('dedupes by block: a streamed block is not repeated, a later whole block still lands', async () => {
+    const source = fakeRuns([
+      { type: 'text.delta', text: 'Hel', messageId: 'm1', blockIndex: 0 },
+      { type: 'text.delta', text: 'lo', messageId: 'm1', blockIndex: 0 },
+      { type: 'text.complete', role: 'assistant', text: 'Hello', messageId: 'm1', blockIndex: 0 },
+      { type: 'text.complete', role: 'assistant', text: 'Bye', messageId: 'm1', blockIndex: 1 },
+      { type: 'run.end', reason: 'completed' },
+    ]);
+
+    const done = (await drain(source)).at(-1) as { result: { text: string } };
+    expect(done.result.text).toBe('Hello\n\nBye');
+  });
+
+  it('treats a delta and a completion that carry no block index as one block', async () => {
+    // Adapters that never numbered their blocks keep the old guarantee: one
+    // answer, once. `blockKey` reads an absent index as the same key.
+    const source = fakeRuns([
+      { type: 'text.delta', text: 'Hello' },
+      { type: 'text.complete', role: 'assistant', text: 'Hello' },
+      { type: 'run.end', reason: 'completed' },
+    ]);
+    const done = (await drain(source)).at(-1) as { result: { text: string } };
+    expect(done.result.text).toBe('Hello');
   });
 });

@@ -146,6 +146,18 @@ export interface SessionLedger {
   isProgramSession(sessionId: string): boolean;
   /** The record itself, for a caller that has already passed {@link mayAccess}. */
   get(sessionId: string): LedgerEntry | undefined;
+  /**
+   * Correct the account an entry names, in place.
+   *
+   * For a listing that found the transcript in a different store than the
+   * entry says — a resume that was sent on the wrong account and re-recorded
+   * the session against it before the provider had refused it, or a store
+   * that moved. Position and recency are kept on purpose: this is a
+   * correction, not activity, and moving the entry to the tail would make a
+   * repaired conversation look like the newest one. False when the entry is
+   * absent or already says so.
+   */
+  reattribute(sessionId: string, profileId: string): boolean;
   /** Every session a connection with this pin may see, newest first. */
   listFor(scope: LedgerScope): readonly LedgerEntry[];
   /**
@@ -296,6 +308,16 @@ export function createSessionLedger(dataDir: string): SessionLedger {
 
     get(sessionId): LedgerEntry | undefined {
       return entries.get(sessionId);
+    },
+
+    reattribute(sessionId, profileId): boolean {
+      const entry = entries.get(sessionId);
+      if (entry === undefined || entry.profileId === profileId) return false;
+      // `set` on a present key keeps its place in the map, which is the
+      // insertion order `listFor` and the cap both read.
+      entries.set(sessionId, { ...entry, profileId });
+      persistSoon();
+      return true;
     },
 
     listFor(scope): readonly LedgerEntry[] {

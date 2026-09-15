@@ -75,6 +75,7 @@ import type {
   RunEndReason,
   RunId,
   RunsSendResponse,
+  ServerRunInterruptBody,
   RunStatus,
   ServerSessionDeletedBody,
   ServerSessionMessagesBody,
@@ -161,6 +162,16 @@ export const ARTEMIS_CAPABILITIES: Capabilities = {
   // A message can be steered into the turn already in flight —
   // `POST /api/v0/runs/{id}/messages` — so the composer stays live mid-run.
   midRunSteering: true,
+  // A conversation can be branched into a new session, or cut back to one of
+  // its stored messages, from here: `artemis.forkSession` and
+  // `artemis.rewindToMessageId` ride the completions request beside the
+  // session id, and the server's own provider does the work in its store. The
+  // rewind anchor is read from that store too — the renderer replays the
+  // conversation through this adapter to find it — so the id it names is one
+  // the serving provider recognises. A server whose account cannot do either
+  // refuses the request rather than dropping it.
+  forkSession: true,
+  rewind: true,
   // The server reports every served account's plan gauges on
   // `GET /api/v0/usage`, fanned out by the desktop's poller into one push per
   // account. The flag is what lets the status-bar meter mount at all; the
@@ -408,6 +419,8 @@ class ArtemisRun implements Run {
   #notices = 0;
   /** Whether the "instructions set aside" notice has been said. Once per run. */
   #instructionsDropped = false;
+  /** The redirect notice is said once per run, like the instructions one. */
+  #redirectNoted = false;
   /**
    * The ids this run's caller filed its steers under, in send order.
    *
@@ -502,8 +515,12 @@ class ArtemisRun implements Run {
 
   async #drive(): Promise<void> {
     try {
-      // A resumed turn knows its session before the first byte arrives.
-      if (this.#input.resumeSessionId !== undefined) {
+      // A resumed turn knows its session before the first byte arrives — unless
+      // it is a fork, whose session is the *new* one the server mints and
+      // announces on the stream. Announcing the original here would name the
+      // branch after the conversation it branched from, and every prompt after
+      // this one would go back to the original.
+      if (this.#input.resumeSessionId !== undefined && this.#input.forkSession !== true) {
         this.#noteSession(this.#input.resumeSessionId);
       }
 
@@ -512,6 +529,16 @@ class ArtemisRun implements Run {
         ...(this.#input.resumeSessionId === undefined
           ? {}
           : { sessionId: this.#input.resumeSessionId }),
+        // Reshaping the conversation being continued: a branch into a new
+        // session, or a cut at a stored message. The server refuses either on
+        // an account whose provider cannot honour it, which is the honest
+        // failure; an older server drops both, and this run then continues
+        // the original conversation unchanged — the one case the strict
+        // check in `createRun` cannot catch from this side.
+        ...(this.#input.forkSession === true ? { forkSession: true } : {}),
+        ...(this.#input.rewindToMessageId === undefined
+          ? {}
+          : { rewindToMessageId: this.#input.rewindToMessageId }),
         // The wire already carries thinking as `artemis.thinking`; the picker's
         // choice is `input.effort`, validated against the route's own levels
         // before it ever reaches here. A route that takes none has an empty
@@ -689,13 +716,31 @@ class ArtemisRun implements Run {
       endReason: undefined,
       remoteError: undefined,
       thinking: (text) => {
+        /*
+         * The server sets two of the provider's reasoning blocks apart with a
+         * paragraph break, because on its flat stream that is the only way to
+         * keep the last word of one off the first word of the next. At the
+         * head of a block of this run's own — the first fragment after an
+         * answer, or after a parked ask — the break separates nothing, and
+         * would stand as blank lines at the top of a fresh fold.
+         */
+        const fresh = blockKind !== 'thinking';
+        const fragment = fresh ? text.replace(/^\n+/, '') : text;
+        if (fragment === '') return;
         open('thinking');
-        this.#emit({ type: 'thinking.delta', messageId, blockIndex, text } as never);
+        this.#emit({ type: 'thinking.delta', messageId, blockIndex, text: fragment } as never);
       },
       text: (text) => {
+        // The same rule the reasoning handler applies, for the same reason:
+        // the server parts two answer blocks with a paragraph break, and at
+        // the head of a row this run opens itself — the first words after a
+        // stretch of reasoning — the break separates nothing.
+        const fresh = blockKind !== 'text';
+        const fragment = fresh ? text.replace(/^\n+/, '') : text;
+        if (fragment === '') return;
         open('text');
-        blockText += text;
-        this.#emit({ type: 'text.delta', messageId, blockIndex, text } as never);
+        blockText += fragment;
+        this.#emit({ type: 'text.delta', messageId, blockIndex, text: fragment } as never);
       },
       close,
     };
@@ -766,10 +811,45 @@ class ArtemisRun implements Run {
         "The serving account's provider cannot take standing instructions, so this run started without your prompt library. Pick an account on a provider that can (Claude, or a local model) to have them apply.",
       );
     }
+    /*
+     * The server moved the run to the account that holds this conversation.
+     * The column asked for another one — a route it was left on — and the
+     * transcript lives in exactly one account's store, so the alternative was
+     * a failed turn. Said once, so the status line's account and the account
+     * being billed are never silently different.
+     */
+    if (extensions?.redirected !== undefined && !this.#redirectNoted) {
+      this.#redirectNoted = true;
+      const { redirected } = extensions;
+      this.#notice(
+        `This conversation is held by the account "${redirected.profileLabel}", so it continued there on ${redirected.to} rather than on ${redirected.from}. Pick a model on that account to keep the status line honest.`,
+      );
+    }
     // Learned like the session id: the server announces it once and early,
     // and every native run route addresses it from here on.
     if (extensions?.runId !== undefined) this.#remoteRunId = extensions.runId as RunId;
-    if (extensions?.permission !== undefined) this.#notePermission(extensions.permission);
+    /*
+     * A park stands in the thread where it was raised, so the block in
+     * progress closes before the card is drawn.
+     *
+     * The wire has no blocks (see the class comment), and this run makes them
+     * by kind: reasoning, then answer, then reasoning again. A question the
+     * agent stopped to ask is a boundary of the same weight — the thinking
+     * before it and the thinking after it are two stretches with a decision
+     * between them — but it is not a change of kind, so without this the
+     * reasoning that resumes once the answer lands carried the *same* block
+     * index as the reasoning before the ask. The transcript keys a block by
+     * (message, index) and writes a later delta back into the row it opened,
+     * so every thought the agent had after the question was appended to the
+     * fold above the card, and the card read as the last thing in a stretch
+     * of reasoning it was actually in the middle of. Closing here is what a
+     * tool call does to a block on a local run: the next fragment of either
+     * kind opens a fresh one, and the card keeps the place it was asked in.
+     */
+    if (extensions?.permission !== undefined) {
+      if (extensions.permission.status === 'requested') stream.close();
+      this.#notePermission(extensions.permission);
+    }
     // The whole live set, re-stamped onto this run so the renderer files the
     // rows under the conversation it is drawing. Remembered on the adapter
     // too, keyed by session, so the rows outlive the turn — see
@@ -971,7 +1051,29 @@ class ArtemisRun implements Run {
     // *local* stream; a server too old for the run routes never announced an id,
     // so it is stopped by that abort alone, as it always was.
     if (this.#remoteRunId !== undefined) {
-      await this.#post(this.#runRoute('interrupt'), {}).catch(() => undefined);
+      const queued = await this.#post(this.#runRoute('interrupt'), {})
+        .then(async (response) => {
+          if (!response.ok) return 0;
+          const reply = (await response.json()) as Partial<ServerRunInterruptBody>;
+          return Array.isArray(reply.stillQueued) ? reply.stillQueued.length : 0;
+        })
+        .catch(() => 0);
+      /*
+       * Messages were queued behind the turn that was just stopped, and the
+       * server keeps them: the provider over there holds a queued message
+       * across an interrupt by design and opens the next turn on it, and that
+       * turn arrives on this same stream. So the stream stays open. Aborting
+       * it here — which is what "read it now" used to do — ended the local
+       * run a second after the click and left the conversation looking
+       * stopped, while the server went on answering a message nobody was
+       * listening for.
+       *
+       * The server names the queued messages by its own filing; this side
+       * knows only what it sent and has not yet seen delivered, in order. The
+       * ones still queued are the most recent of those, which is the count
+       * the server gave.
+       */
+      if (queued > 0) return { stillQueued: this.#steered.slice(-queued) };
     }
     this.#abort.abort();
     return { stillQueued: [] };
@@ -1175,6 +1277,17 @@ async function fetchServerSessions(
       // Carried through so `isArchived` can answer for a served conversation
       // the same way it answers for a local one.
       ...(typeof row.tag === 'string' ? { tag: row.tag } : {}),
+      // The server's own account that holds the transcript — what a resume
+      // has to land on, whatever route the column is showing. The slug is
+      // what routes are spelled in; the id is what a client keys on. Absent
+      // from a server too old to send them, and the resume then goes where
+      // the column points and relies on the server's redirect.
+      ...(typeof row.profileSlug === 'string' && row.profileSlug.length > 0
+        ? { accountSlug: row.profileSlug }
+        : {}),
+      ...(typeof row.profileId === 'string' && row.profileId.length > 0
+        ? { accountId: row.profileId }
+        : {}),
       updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : 0,
     });
   }
@@ -1402,12 +1515,10 @@ export function createArtemisAdapter(
       // Strict about what the wire cannot carry — the same rule every adapter
       // follows, and doubly important where the run happens on another
       // machine: silently dropping a setting here means it is silently
-      // different over there.
-      if (input.forkSession === true || input.rewindToMessageId !== undefined) {
-        return Promise.reject(
-          adapterError('invalid_request', 'The Artemis server cannot fork or rewind a session yet.'),
-        );
-      }
+      // different over there. A fork or a rewind crosses as `artemis.forkSession`
+      // and `artemis.rewindToMessageId`; a server that cannot honour one
+      // refuses the request outright rather than dropping it, so neither is
+      // ever silently different over there.
       if (input.systemPrompt?.kind === 'replace') {
         return Promise.reject(
           adapterError(

@@ -979,6 +979,18 @@ export function createRemoteBridge(
       cancelSignIn: async () => absent(SERVER_ACCOUNTS_REASON),
     },
 
+    // Managing a *third* server's routines from inside a remote window is a
+    // machine-to-machine hop this bridge does not make — the same rule that
+    // makes `serverAccounts` absent here. A remote window drives its own host,
+    // not the servers that host points at.
+    serverRoutines: {
+      list: async () => absent(SERVER_ACCOUNTS_REASON),
+      create: async () => absent(SERVER_ACCOUNTS_REASON),
+      update: async () => absent(SERVER_ACCOUNTS_REASON),
+      delete: async () => absent(SERVER_ACCOUNTS_REASON),
+      runNow: async () => absent(SERVER_ACCOUNTS_REASON),
+    },
+
     /*
      * Rule 2: the window, the updater, the menu, the prefs file and the
      * remote-origin grant all describe the machine the user is sitting at.
