@@ -7,9 +7,10 @@
  * touched, and nothing can put one of them back. Every other CLI answers this
  * somehow — Claude Code has `/diff` and checkpoints, Gemini `/restore` and
  * `/rewind`, OpenCode `/undo` over git snapshots, Aider a commit per edit — and
- * the answer here is a ledger: one record per *successful* file-editing tool
- * call, each carrying the content that file had immediately **before** the tool
- * ran, plus the totals that let a status line say `3 files · +42 -7`.
+ * the answer here is a ledger: one record per *file* of every successful
+ * file-editing tool call, each carrying the content that file had immediately
+ * **before** the tool ran, plus the totals that let a status line say
+ * `3 files · +42 -7`.
  *
  * ## Why pre-images rather than a git snapshot
  *
@@ -33,6 +34,23 @@
  * yields a pre-image equal to the post-image, and the undo is then a harmless
  * no-op rather than a wrong restore. Everything here is arranged so that the
  * failure modes are "cannot undo" and never "undid the wrong thing".
+ *
+ * ## One call, several files
+ *
+ * A patch tool rewrites four files in one call, and a ledger that kept only the
+ * first of them would be wrong in both directions: the file list would be short
+ * by three, and `/undo` would put one file back and leave its neighbours
+ * rewritten while reporting success. So every file the call names is read at
+ * the same moment — before any of them has been written — and each becomes its
+ * own record, because restoring is a decision a person makes one file at a
+ * time. A single-file call keeps the provider's call id as its handle, which is
+ * the id a person sees; the files of a multi-file one take `id#1`, `id#2`, …
+ *
+ * Some calls name a file without saying what they did to it. Those are recorded
+ * too — a file the agent touched is worth naming even with no diff to show —
+ * with zero counts, no read of the disk at all, and no way back: there is no
+ * pre-image to restore and none could be invented, so `/undo` says that rather
+ * than writing something plausible over the file.
  *
  * ## The guard
  *
@@ -70,7 +88,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 import type { JsonObject } from '@rx-artemis/protocol';
-import { detectFileEdit, type FileEdit } from '@rx-artemis/transcript';
+import { detectFileEdits, type FileEdit } from '@rx-artemis/transcript';
 
 const run = promisify(execFile);
 
@@ -124,11 +142,20 @@ export type PreImage =
   | { readonly kind: 'absent' }
   | { readonly kind: 'too large'; readonly bytes: number }
   /** Unreadable, or not text: binary content cannot survive the round trip. */
-  | { readonly kind: 'unknown' };
+  | { readonly kind: 'unknown' }
+  /**
+   * Never read, because the call named the file and described no change to it.
+   * Distinct from `unknown`, which is a file that was there and would not be
+   * read: this one was deliberately left alone.
+   */
+  | { readonly kind: 'not taken' };
 
-/** One successful file-editing tool call. */
+/** One file of one successful file-editing tool call. */
 export interface Change {
-  /** The provider's tool call id, which is also the handle `/undo` takes. */
+  /**
+   * The handle `/undo` takes: the provider's tool call id, or `id#1`, `id#2`, …
+   * when one call edited several files and each needs addressing on its own.
+   */
   readonly id: string;
   /** Absolute, resolved against the ledger's `cwd`. */
   readonly path: string;
@@ -241,9 +268,9 @@ export class ChangeLedger {
   #cwd: string;
   readonly #deps: ChangeLedgerDeps;
 
-  /** Keyed by tool call id, oldest first. Holds the *promise* of a snapshot so
-   *  that an end arriving before the read finishes still waits for it. */
-  readonly #pending = new Map<string, Promise<Snapshot>>();
+  /** Keyed by tool call id, oldest first. Holds the *promise* of that call's
+   *  snapshots so that an end arriving before the reads finish still waits. */
+  readonly #pending = new Map<string, Promise<readonly Snapshot[]>>();
 
   /** Oldest first, so eviction is from the front and `last()` is the end. */
   #changes: Change[] = [];
@@ -274,26 +301,27 @@ export class ChangeLedger {
    * .onToolStart(...)` from a synchronous event handler is correct.
    */
   async onToolStart(item: ToolStartLike): Promise<void> {
-    const edit = detectFileEdit(item.name, item.input);
-    if (edit === null) return;
-    const path = resolve(this.#cwd, edit.path);
+    const edits = detectFileEdits(item.name, item.input);
+    if (edits.length === 0) return;
     const ts = item.ts ?? this.#deps.now();
-    const taking = this.#snapshot(item.id, path, ts, edit);
+    const taking = this.#snapshots(item.id, ts, edits);
     this.#pending.set(item.id, taking);
     this.#trimPending();
     await taking;
   }
 
-  /** The call finished. On `ok` the snapshot becomes a change; otherwise it goes. */
+  /** The call finished. On `ok` the snapshots become changes; otherwise they go. */
   async onToolEnd(item: ToolEndLike): Promise<void> {
     const taking = this.#pending.get(item.id);
     if (taking === undefined) return;
     this.#pending.delete(item.id);
-    const snapshot = await taking;
+    const snapshots = await taking;
     // A tool that failed, was denied or was cancelled did not edit anything —
-    // and if it partially did, the pre-image is the wrong thing to trust.
+    // and if it partially did, the pre-images are the wrong thing to trust.
     if (item.status !== 'ok') return;
-    await this.#record(snapshot);
+    // In the order the call named the files, which is the order they are shown
+    // in and the order the after-images have to be taken in.
+    for (const snapshot of snapshots) await this.#record(snapshot);
   }
 
   /** A new conversation. Optionally a new working directory with it. */
@@ -349,6 +377,11 @@ export class ChangeLedger {
 
     const label = this.#label(change.path);
     const before = change.before;
+    // Nothing was ever read for this one, so there is nothing to write back and
+    // no after-image to check it against.
+    if (before.kind === 'not taken') {
+      return { ok: false, reason: 'this edit carried no content to restore' };
+    }
     if (before.kind === 'too large') return { ok: false, reason: `${label} was too large to snapshot before the edit` };
     if (before.kind === 'unknown') return { ok: false, reason: `${label} could not be read before the edit` };
 
@@ -372,8 +405,33 @@ export class ChangeLedger {
   /* Internals                                                               */
   /* ---------------------------------------------------------------------- */
 
-  async #snapshot(id: string, path: string, ts: number, edit: FileEdit): Promise<Snapshot> {
-    return { id, path, ts, edit, before: await this.#preImage(path) };
+  /**
+   * One snapshot per file the call named, all read at the same moment.
+   *
+   * In parallel rather than in sequence: the call is already announced and the
+   * tool is free to start writing, so the window in which the files still hold
+   * their old contents is exactly as long as these reads take.
+   */
+  async #snapshots(
+    id: string,
+    ts: number,
+    edits: readonly FileEdit[],
+  ): Promise<readonly Snapshot[]> {
+    return Promise.all(
+      edits.map(async (edit, index) => {
+        const path = resolve(this.#cwd, edit.path);
+        return {
+          id: handle(id, index, edits.length),
+          path,
+          ts,
+          edit,
+          before:
+            edit.summaryOnly === true
+              ? ({ kind: 'not taken' } as const)
+              : await this.#preImage(path),
+        };
+      }),
+    );
   }
 
   async #preImage(path: string): Promise<PreImage> {
@@ -401,7 +459,13 @@ export class ChangeLedger {
   }
 
   async #record(snapshot: Snapshot): Promise<void> {
-    const after = await this.#imageOf(snapshot.path);
+    // A file that was never read has nothing to guard: the after-image exists
+    // to prove the pre-image is still the right thing to write, and there is no
+    // pre-image here.
+    const after: Image =
+      snapshot.before.kind === 'not taken'
+        ? { kind: 'unknown' }
+        : await this.#imageOf(snapshot.path);
     const change: Change = {
       id: snapshot.id,
       path: snapshot.path,
@@ -501,6 +565,17 @@ export class ChangeLedger {
     return within.split(sep).join('/');
   }
 }
+
+/**
+ * The handle one file of one call is undone by.
+ *
+ * A call that edited a single file keeps the provider's own id: it is the id
+ * the transcript shows, and it is what a person would type. Several files need
+ * several handles, and a suffix keeps the call they came from legible in a way
+ * a fresh identifier would not.
+ */
+const handle = (id: string, index: number, total: number): string =>
+  total === 1 ? id : `${id}#${String(index + 1)}`;
 
 const sameImage = (current: Image, after: Image): boolean => {
   if (current.kind === 'absent' && after.kind === 'absent') return true;

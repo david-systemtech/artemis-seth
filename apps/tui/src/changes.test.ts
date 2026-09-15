@@ -64,6 +64,44 @@ const write = (id: string, path: string, content: string, ts = NOW): ToolStartLi
   ts,
 });
 
+/** One entry of a patch: a path, what became of the file, and its own diff. */
+interface PatchChange {
+  readonly path: string;
+  readonly kind: string;
+  readonly diff?: string;
+}
+
+/**
+ * An `ApplyPatch` call, in the shape the Codex adapter hands over.
+ *
+ * One entry per file, each carrying that file's patch text — which is what
+ * makes this the multi-file case the single-file helpers above cannot express.
+ */
+const patch = (id: string, changes: readonly PatchChange[], ts = NOW): ToolStartLike => ({
+  id,
+  name: 'ApplyPatch',
+  input: { changes },
+  ts,
+});
+
+/** A one-line replacement in one file of a patch. */
+const applied = (path: string, before: string, after: string): PatchChange => ({
+  path,
+  kind: 'update',
+  diff: `@@ -1,1 +1,1 @@\n-${before}\n+${after}\n`,
+});
+
+/** A file the patch removes outright, in the envelope Codex's own patches use. */
+const deleted = (path: string, content: string): PatchChange => ({
+  path,
+  kind: 'delete',
+  diff: `*** Begin Patch\n*** Delete File: ${path}\n${content
+    .trimEnd()
+    .split('\n')
+    .map((line) => `-${line}`)
+    .join('\n')}\n*** End Patch\n`,
+});
+
 /**
  * One tool call, start to finish, with whatever the tool did in the middle.
  *
@@ -381,6 +419,89 @@ describe('ChangeLedger', () => {
     // never happened: "files changed" still counts all of them.
     expect(ledger.files()).toHaveLength(count);
     expect(summarizeFiles(ledger.files())).toBe(`${String(count)} files · +${String(count)} -${String(count)}`);
+  });
+
+  it('snapshots every file of a patch and records one change for each', async () => {
+    const directory = await temporaryDirectory();
+    const a = join(directory, 'a.txt');
+    const b = join(directory, 'b.txt');
+    await writeFile(a, 'one\n');
+    await writeFile(b, 'alpha\n');
+    const ledger = new ChangeLedger(directory);
+
+    await call(ledger, patch('p1', [applied(a, 'one', 'two'), applied(b, 'alpha', 'beta')]), async () => {
+      await writeFile(a, 'two\n');
+      await writeFile(b, 'beta\n');
+    });
+
+    // Both files, each with the content that is no longer on disk — the second
+    // one is the whole point: it used to be dropped.
+    expect(ledger.changes().map((change) => change.id)).toEqual(['p1#2', 'p1#1']);
+    expect(ledger.changes().map((change) => change.path)).toEqual([b, a]);
+    expect(ledger.changes().map((change) => change.before)).toEqual([
+      { kind: 'content', text: 'alpha\n' },
+      { kind: 'content', text: 'one\n' },
+    ]);
+    expect(ledger.files()).toEqual([
+      { path: a, label: 'a.txt', added: 1, removed: 1, edits: 1, last: NOW },
+      { path: b, label: 'b.txt', added: 1, removed: 1, edits: 1, last: NOW },
+    ]);
+
+    // And each is undone on its own: the patch is not the unit a person takes
+    // back, the file is.
+    expect(await ledger.undo('p1#1')).toEqual({ ok: true, path: a, action: 'restored' });
+    expect(await readFile(a, 'utf8')).toBe('one\n');
+    expect(await readFile(b, 'utf8')).toBe('beta\n');
+    expect(ledger.files().map((file) => file.label)).toEqual(['b.txt']);
+  });
+
+  it('lists a file named without a diff, and refuses to undo it', async () => {
+    const directory = await temporaryDirectory();
+    const path = join(directory, 'named.ts');
+    await writeFile(path, 'one\n');
+    const reads: string[] = [];
+    const ledger = new ChangeLedger(directory, {
+      readFile: async (target) => {
+        reads.push(target);
+        return readFile(target, 'utf8');
+      },
+    });
+
+    await call(ledger, patch('p1', [{ path, kind: 'update' }]), () => writeFile(path, 'two\n'));
+
+    // Named, counted as an edit, and honest about knowing nothing else: zero is
+    // what is known, not a claim that nothing changed.
+    expect(ledger.files()).toEqual([
+      { path, label: 'named.ts', added: 0, removed: 0, edits: 1, last: NOW },
+    ]);
+    expect(ledger.last()?.before).toEqual({ kind: 'not taken' });
+    // Never read, before the edit or after it: there is nothing to compare.
+    expect(reads).toEqual([]);
+
+    expect(await ledger.undo()).toEqual({
+      ok: false,
+      reason: 'this edit carried no content to restore',
+    });
+    // Refused, and the file left exactly as the tool left it.
+    expect(await readFile(path, 'utf8')).toBe('two\n');
+    expect(ledger.changes()).toHaveLength(1);
+  });
+
+  it('puts back a file the patch deleted', async () => {
+    const directory = await temporaryDirectory();
+    const path = join(directory, 'gone.txt');
+    await writeFile(path, 'one\ntwo\n');
+    const ledger = new ChangeLedger(directory);
+
+    await call(ledger, patch('p1', [deleted(path, 'one\ntwo\n')]), () => rm(path));
+
+    const change = ledger.last();
+    expect(change?.edit.operation).toBe('delete');
+    expect(change?.before).toEqual({ kind: 'content', text: 'one\ntwo\n' });
+    // A deleted file is the case the after-image has to handle as a state
+    // rather than as a hash: absent is what it is supposed to be now.
+    expect(await ledger.undo()).toEqual({ ok: true, path, action: 'restored' });
+    expect(await readFile(path, 'utf8')).toBe('one\ntwo\n');
   });
 
   it('stops retaining pre-images once they add up past the budget', async () => {
