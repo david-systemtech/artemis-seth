@@ -763,10 +763,18 @@ export function TranscriptViewport({ transcript, live, offset, onExtent, columns
         overflowY="hidden"
         justifyContent="flex-end"
       >
+        {/*
+          * What this session is stands under the composer already — the
+          * account, the model, the mode, the folder in the header — so the
+          * empty conversation says what to try rather than who Artemis is:
+          * the four things a first message most often needs, and the key
+          * that lists the rest.
+          */}
         {rows.length === 0 && (
           <Box flexDirection="column" justifyContent="center" flexGrow={1} paddingLeft={1}>
-            <Text dimColor>Type a message to begin. /help lists commands.</Text>
-            <Text dimColor>Tab moves to the sidebar. ↑↓ or the wheel scroll back; Esc interrupts a turn. Ctrl+C twice quits.</Text>
+            <Text dimColor>Type a message to begin, or try:</Text>
+            <Text dimColor>{'  '}<Text>@</Text> names a file · <Text>/model</Text> picks the model · <Text>Shift+Tab</Text> steps the permission mode · <Text>!</Text> runs a shell line</Text>
+            <Text dimColor>{'  '}<Text>?</Text> lists every key · Tab moves to the conversations · Esc interrupts a turn · Ctrl+C twice quits</Text>
           </Box>
         )}
         <Box ref={contentRef} flexDirection="column" flexShrink={0} marginBottom={-clamped}>
