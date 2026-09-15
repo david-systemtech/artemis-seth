@@ -881,7 +881,7 @@ describe('Composer: a big paste is a chip', () => {
     await tick();
     await press(stdin, 'look at ', pasted(LONG_PASTE));
 
-    expect(lastFrame()).toContain('[Pasted #1 · 12 lines]');
+    expect(lastFrame()).toContain('[Pasted #1 · 12 lines · text]');
     expect(lastFrame()).not.toContain('line 7');
 
     await press(stdin, ENTER);
@@ -904,7 +904,7 @@ describe('Composer: a big paste is a chip', () => {
     const { lastFrame, stdin } = composer();
     await tick();
     await press(stdin, pasted('x'.repeat(900)));
-    expect(lastFrame()).toContain('[Pasted #1 · 1 line]');
+    expect(lastFrame()).toContain('[Pasted #1 · 1 line · text]');
   });
 
   it('numbers them up, and expands every one on send', async () => {
@@ -913,8 +913,8 @@ describe('Composer: a big paste is a chip', () => {
     await tick();
     await press(stdin, pasted(LONG_PASTE), ' and ', pasted('a\nb\nc\nd\ne'));
 
-    expect(lastFrame()).toContain('[Pasted #1 · 12 lines]');
-    expect(lastFrame()).toContain('[Pasted #2 · 5 lines]');
+    expect(lastFrame()).toContain('[Pasted #1 · 12 lines · text]');
+    expect(lastFrame()).toContain('[Pasted #2 · 5 lines · text]');
 
     await press(stdin, ENTER);
     expect(onSubmit).toHaveBeenCalledWith(`${LONG_PASTE} and a\nb\nc\nd\ne`, []);
@@ -941,7 +941,7 @@ describe('Composer: a big paste is a chip', () => {
     await tick();
     await press(stdin, pasted(LONG_PASTE), BACKSPACE, 'never mind: ', pasted('a\nb\nc\nd'));
 
-    expect(lastFrame()).toContain('[Pasted #2 · 4 lines]');
+    expect(lastFrame()).toContain('[Pasted #2 · 4 lines · text]');
     await press(stdin, ENTER);
     expect(onSubmit).toHaveBeenCalledWith('never mind: a\nb\nc\nd', []);
   });
@@ -1012,7 +1012,7 @@ describe('Composer: Ctrl+V', () => {
     await tick();
     await press(stdin, CTRL_V);
     await tick();
-    expect(lastFrame()).toContain('[Pasted #1 · 12 lines]');
+    expect(lastFrame()).toContain('[Pasted #1 · 12 lines · text]');
 
     await press(stdin, ENTER);
     expect(onSubmit).toHaveBeenCalledWith(LONG_PASTE, []);
@@ -1276,5 +1276,56 @@ describe('Composer: the keys it shares with the app', () => {
     await press(stdin, '?');
     expect(lastFrame()).not.toContain(PLACEHOLDER);
     expect(lastFrame()).toContain('?');
+  });
+});
+
+/*
+ * The label on a chip, and the fence a chip goes out in.
+ *
+ * `pasteKind.test.ts` holds the reading itself — which samples are traces and
+ * which are prose. These three are about the two places the composer uses the
+ * answer: the marker it types into the box, and the text it hands over on
+ * Enter.
+ */
+const NODE_TRACE = [
+  'Error: connect ECONNREFUSED 127.0.0.1:5432',
+  '    at connect (/code/repos/artemis/apps/tui/src/app.tsx:1442:19)',
+  '    at Socket.emit (node:events:517:28)',
+  '    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1595:16)',
+].join('\n');
+
+const PROSE_PASTE = [
+  'I have been staring at this all morning and I am going in circles.',
+  'The button works the first time and then stops, but only in the packaged build.',
+  'There is nothing in the console, which is what makes it maddening.',
+  'Any idea where to start looking?',
+].join('\n');
+
+describe('Composer: a chip says what it is', () => {
+  it('names the kind in the marker, beside the count', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, pasted(NODE_TRACE));
+    expect(lastFrame()).toContain('[Pasted #1 · 4 lines · Node stack trace from app.tsx:1442]');
+    expect(lastFrame()).not.toContain('ECONNREFUSED');
+  });
+
+  it('a trace goes out fenced, and prose goes out exactly as it came in', async () => {
+    const onSubmit = vi.fn();
+    const { stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, 'what is this? ', pasted(NODE_TRACE), ENTER);
+    expect(onSubmit).toHaveBeenCalledWith(`what is this? \n\`\`\`\n${NODE_TRACE}\n\`\`\``, []);
+
+    await press(stdin, pasted(PROSE_PASTE), ENTER);
+    expect(onSubmit).toHaveBeenLastCalledWith(PROSE_PASTE, []);
+  });
+
+  it('leaves a fence the person opened to do the wrapping', async () => {
+    const onSubmit = vi.fn();
+    const { stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, '```', CTRL_J, pasted(NODE_TRACE), ENTER);
+    expect(onSubmit).toHaveBeenCalledWith(`\`\`\`\n${NODE_TRACE}`, []);
   });
 });

@@ -147,10 +147,21 @@
  * Pasting a four-hundred-line stack trace into a box eight rows tall loses the
  * message it was going to illustrate: the words above it scroll away and the
  * cursor is somewhere in the middle of somebody else's Java. So a paste of more
- * than a few lines is stood in for by one token — `[Pasted #1 · 412 lines]` —
- * and the text is kept beside the buffer until the message is sent, when every
- * chip becomes its content again. What the agent receives is exactly what was
- * pasted; what the person sees while typing is one line they can move past.
+ * than a few lines is stood in for by one token — `[Pasted #1 · 412 lines ·
+ * Node stack trace from app.tsx:1442]` — and the text is kept beside the
+ * buffer until the message is sent, when every chip becomes its content again.
+ * What the agent receives is what was pasted; what the person sees while
+ * typing is one line they can move past.
+ *
+ * The last part of that token is `pasteKind.ts`'s, and it is the part worth
+ * having: every terminal can say how many lines went in, and none of them says
+ * what the lines *were*, which is the only way to tell at a glance that the
+ * paste was the wrong one. The same reading decides how the chip goes out —
+ * a trace, a diff, a log, JSON or code is fenced on the way to the agent, with
+ * the language on the fence where there is one to name — unless the words
+ * around the chip have already opened a fence, in which case the person has
+ * said what they want. Prose and a URL go out exactly as they came in, since
+ * fencing a paragraph only tells the agent something untrue about it.
  *
  * The chip is a marker *in the text* rather than a decoration beside it, which
  * is what makes every other key keep working: the cursor walks over it, the
@@ -254,6 +265,7 @@ import {
 } from '../editor.js';
 import { fuzzyMatch, mentionAt, replaceMention, type FileMatch, type FrecencyLike } from '../fileIndex.js';
 import { HistoryCursor, type HistoryMatch, type HistoryScope } from '../history.js';
+import { classifyPaste, expandChip, pasteMarker, type PasteClassification } from '../pasteKind.js';
 import { ACCENT } from '../theme.js';
 import { Completions } from './Completions.js';
 
@@ -413,7 +425,14 @@ const REAL_CLIPBOARD: ComposerClipboard = {
  * all do the obvious thing without a single line of bookkeeping.
  */
 type Chip =
-  | { readonly kind: 'paste'; readonly number: number; readonly marker: string; readonly text: string }
+  | {
+      readonly kind: 'paste';
+      readonly number: number;
+      readonly marker: string;
+      readonly text: string;
+      /** What the text turned out to be: the marker's label, and the fence it goes out in. */
+      readonly paste: PasteClassification;
+    }
   | { readonly kind: 'image'; readonly number: number; readonly marker: string; readonly image: PastedImage };
 
 /** What the app can do to the box from outside a keystroke. */
@@ -784,9 +803,16 @@ export function Composer({
   /* Chips                                                                   */
   /* ---------------------------------------------------------------------- */
 
-  /** `text` with every paste chip in it back to being what it stood for. */
+  /**
+   * `text` with every paste chip in it back to being what it stood for, in the
+   * fence its kind asks for. `pasteKind.ts` decides both; this only knows the
+   * order to put the chips back in.
+   */
   const expand = (text: string): string =>
-    chips.current.reduce((out, chip) => (chip.kind === 'paste' ? out.split(chip.marker).join(chip.text) : out), text);
+    chips.current.reduce(
+      (out, chip) => (chip.kind === 'paste' ? expandChip(out, chip.marker, chip.text, chip.paste) : out),
+      text,
+    );
 
   /** The images whose chips are still in `text`: one backspaced away does not travel. */
   const imagesIn = (text: string): readonly PastedImage[] =>
@@ -854,11 +880,16 @@ export function Composer({
       return;
     }
     const number = nextNumber('paste');
+    // Read once, here, and kept: what the text is cannot change while it sits
+    // in a chip, and a keystroke is no place to classify four hundred lines
+    // over again.
+    const classified = classifyPaste(text);
     addChip({
       kind: 'paste',
       number,
-      marker: `[Pasted #${String(number)} · ${String(rows)} line${rows === 1 ? '' : 's'}]`,
+      marker: pasteMarker(number, rows, classified.label),
       text,
+      paste: classified,
     });
   };
 
