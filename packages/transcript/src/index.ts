@@ -41,5 +41,6 @@
 export * from './transcript.js';
 export * from './search.js';
 export * from './tools.js';
+export * from './todos.js';
 export * from './diff.js';
 export * from './format.js';
