@@ -211,6 +211,7 @@ const devServerUrl = process.env['ELECTRON_RENDERER_URL'] ?? null;
 
 let ipcLayer: IpcLayer | null = null;
 let stopEventForwarding: (() => void) | null = null;
+let stopAskNotifying: (() => void) | null = null;
 let stopSuggestionForwarding: (() => void) | null = null;
 let stopTerminalForwarding: (() => void) | null = null;
 let stopBrowserForwarding: (() => void) | null = null;
@@ -544,6 +545,26 @@ async function bootstrap(): Promise<void> {
   });
   stopEventForwarding = forwardAgentEvents(engineHost);
   stopSuggestionForwarding = forwardRunSuggestions(engineHost);
+  /*
+   * A question the agent stops to ask waits for the person it was asked of —
+   * the server no longer answers on their behalf after a quarter of an hour
+   * (see `server/runs.ts`) — so the person has to find out it is waiting. The
+   * pane pins the card and the sidebar marks the session, but both are only
+   * visible to someone looking at Artemis. When no window is focused, an OS
+   * notification says so once per question; when one is, the card in the
+   * pane is the notification, and a system toast over it would be noise.
+   */
+  stopAskNotifying = engineHost.ready
+    ? engineHost.require().subscribe((event) => {
+        if (event.type !== 'permission.request') return;
+        if (BrowserWindow.getFocusedWindow() !== null) return;
+        if (!Notification.isSupported()) return;
+        new Notification({
+          title: 'Waiting for your answer',
+          body: 'An agent stopped to ask you something. It will wait until you answer.',
+        }).show();
+      })
+    : null;
   stopTerminalForwarding = forwardTerminalEvents(terminals);
   stopBrowserForwarding = forwardBrowserEvents(browsers);
   // Reads every profile's plan limits on a timer, so the profile menu can say
@@ -640,6 +661,7 @@ app.on('before-quit', (event) => {
   // adapter make the app unquittable.
   event.preventDefault();
   stopEventForwarding?.();
+  stopAskNotifying?.();
   // Local ends of any loopback sign-ins: plain HTTP servers on fixed ports,
   // exactly the kind of thing that must not outlive the app that opened them.
   stopAllSignInForwarders();

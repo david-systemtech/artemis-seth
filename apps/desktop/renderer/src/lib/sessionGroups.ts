@@ -86,6 +86,24 @@
  * the profile that owns it, not globally, because each profile has its own
  * provider config directory. Two profiles could in principle surface the same
  * id, and duplicate React keys inside one list silently drop a row.
+ *
+ * ## A third way out of a project: a group the user made
+ *
+ * Everything above files a session somewhere the *machine* decided — the
+ * directory it ran in, or one of the two shelves at the ends of the list. That
+ * is the right default and the wrong only option, and the case that proves it
+ * is an Artemis Server: every conversation held on one shares a single working
+ * directory, so the entire server's history lands under one heading with no way
+ * to tell a week of unrelated work apart.
+ *
+ * So there is a fourth kind of section — see {@link CustomGroup} — holding
+ * whatever the user dragged into it, from any project, filed by the same
+ * `sessionKey` values pins and the archive use. Groups sit between Pinned and
+ * the project headings, keep their stored order, and lift their members out of
+ * the project list exactly the way pinning does. Pinned and Archived still win:
+ * a grouped session that is also pinned shows under Pinned, because the two
+ * shelves are about *where your attention is* and a group is about how the
+ * history is filed, and only one of those can have the row.
  */
 
 import { isArchived, type ProfileId, type SessionSummary } from '@rx-artemis/protocol';
@@ -482,6 +500,159 @@ export function sessionKeyAliases(session: SessionSummary): readonly string[] {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Groups the user made                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One group a person created and dragged sessions into.
+ *
+ * Deliberately *not* called `SessionGroup`: that name was taken years earlier
+ * by a project bucket, which is the thing this exists to be an alternative to.
+ * Renaming the older type to free the better name would have touched every
+ * caller of `groupSessionsByProject` for a cosmetic win, so the newer concept
+ * takes the adjective instead.
+ *
+ * Three fields and no more. The `id` is what membership points at, so it must
+ * outlive every rename — filing by name would re-home every session in a group
+ * the moment its heading was corrected for a typo. The `name` is what the
+ * heading shows and is the only part the user edits. `collapsed` is optional
+ * and absent-means-open, the same polarity `collapsedProjects` uses and for the
+ * same reason: a group that has never been touched should be open, and a fold
+ * state nobody has expressed should not have to be written down.
+ *
+ * There is no `sessions` array. Membership lives in one flat
+ * {@link GroupMembership} record beside the group list rather than inside the
+ * group, because a session belongs to at most one group and the question asked
+ * on every render is "which group is this row in" — one lookup against a record
+ * rather than a scan of every group's array. It also makes the two halves fail
+ * independently: a corrupt membership entry loses one row's filing, where a
+ * corrupt array inside a group would take the group with it.
+ */
+export interface CustomGroup {
+  readonly id: string;
+  readonly name: string;
+  readonly collapsed?: boolean;
+}
+
+/**
+ * Session key → group id.
+ *
+ * Keys are {@link sessionKey} values, the same strings `pinnedSessions` stores,
+ * so everything the aliasing note on {@link sessionKeyAliases} says about a
+ * shared store applies here unchanged — and is honoured by {@link groupIdOf}.
+ */
+export type GroupMembership = Readonly<Record<string, string>>;
+
+/** One custom group, with the sessions filed into it. */
+export interface CustomGroupSection {
+  readonly group: CustomGroup;
+  /** Newest first, filtered by the query like every other section. */
+  readonly sessions: readonly SessionSummary[];
+}
+
+/**
+ * Which group this session is filed under, if any.
+ *
+ * Matched exactly the way pins and the archive are matched — every alias first,
+ * then an id-only match for a row in a shared store whose stored key has gone
+ * stale. See {@link entriesFiling} for the whole argument; the short version is
+ * that the profile half of a shared row's key changes the first time the
+ * session is opened, and a group that emptied itself because of a background
+ * correction the user never asked for would be indistinguishable from the app
+ * losing their filing.
+ *
+ * The alias loop runs first and answers for every ordinary row without touching
+ * the record's key list, which matters because this is called once per session
+ * per render of the sidebar.
+ */
+export function groupIdOf(
+  session: SessionSummary,
+  membership: GroupMembership,
+): string | undefined {
+  for (const key of sessionKeyAliases(session)) {
+    const id = membership[key];
+    if (id !== undefined) return id;
+  }
+  // Only for shared rows, and only ever as a fallback: for an unshared session
+  // the old guarantee stands that one profile's entry must not claim another
+  // profile's row. See `entriesFiling`.
+  if (!isSharedRow(session)) return undefined;
+  for (const [key, id] of Object.entries(membership)) {
+    if (entryId(key) === session.id) return id;
+  }
+  return undefined;
+}
+
+/**
+ * Lift the grouped sessions out of the list the projects are built from.
+ *
+ * The same shape of move {@link partitionSessions} makes for Pinned and
+ * Archived, and a separate step for the same reason: a grouped session *leaves*
+ * its project heading rather than picking up a marker inside it. Called after
+ * that partition, on `active` alone, which is what gives Pinned and Archived
+ * their precedence — a row that has already been lifted onto a shelf is not
+ * here to be lifted again.
+ *
+ * ## Empty groups still get a section
+ *
+ * A group with nothing in it is the state every group starts in, and the only
+ * way to put the first session in one is to drop a row onto its heading. A
+ * section that appeared only once it had a member would therefore be
+ * unreachable by the gesture that creates its first member. Project headings
+ * behave the opposite way — they are derived from the sessions, so an empty one
+ * is a contradiction — which is exactly the difference between furniture the
+ * app infers and furniture the user put there.
+ *
+ * The one exception is a filter: while a query is typed, a group with no match
+ * is dropped like an unmatched project, because "No match" is the answer and a
+ * column of empty headings under it reads as a broken search rather than as a
+ * set of drop targets. Drag-and-drop into a group while searching is not a
+ * gesture anyone makes — the row being dragged is one of the matches.
+ *
+ * Membership naming a group that no longer exists is treated as ungrouped
+ * rather than dropped or repaired: {@link deleteSessionGroup} sweeps the
+ * entries it owns, so a survivor is either a hand-edited preferences file or a
+ * group that went away in another window, and in both cases the session's
+ * project heading is the correct place to find it.
+ */
+export function liftSessionGroups(
+  sessions: readonly SessionSummary[],
+  groups: readonly CustomGroup[],
+  membership: GroupMembership,
+  options: GroupOptions = {},
+): {
+  readonly sections: readonly CustomGroupSection[];
+  readonly ungrouped: readonly SessionSummary[];
+} {
+  // The common case is a sidebar nobody has made a group in, and walking every
+  // session to discover that is waste on the list's hot path.
+  if (groups.length === 0) return { sections: [], ungrouped: sessions };
+
+  const buckets = new Map<string, SessionSummary[]>();
+  for (const group of groups) buckets.set(group.id, []);
+
+  const ungrouped: SessionSummary[] = [];
+  for (const session of sessions) {
+    const id = groupIdOf(session, membership);
+    const bucket = id === undefined ? undefined : buckets.get(id);
+    if (bucket) bucket.push(session);
+    else ungrouped.push(session);
+  }
+
+  const query = options.query ?? '';
+  const sections: CustomGroupSection[] = [];
+  for (const group of groups) {
+    // Ordered and filtered by the same function the flat sections use, so a
+    // group's rows cannot drift from Pinned's in how they sort or in what a
+    // search hides.
+    const kept = orderSessions(buckets.get(group.id) ?? [], options);
+    if (query && kept.length === 0) continue;
+    sections.push({ group, sessions: kept });
+  }
+  return { sections, ungrouped };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Flattening, for the virtualised list                                       */
 /* -------------------------------------------------------------------------- */
 
@@ -528,6 +699,30 @@ export interface ArchiveHeaderRow {
   readonly collapsed: boolean;
 }
 
+/**
+ * A custom group's heading.
+ *
+ * Its own kind for the reason the two section headings have theirs: nothing a
+ * project heading renders applies. There is no directory to name and no "you
+ * are here" to mark — a group spans projects by construction — and there *is*
+ * something neither of the others has, an id the rename, the delete and every
+ * drop need to name the group they are acting on.
+ *
+ * The name travels on the row rather than being looked up from the id at paint
+ * time, so the heading component stays a function of its props and does not
+ * have to subscribe to the group list to draw its own label.
+ */
+export interface GroupHeaderRow {
+  readonly kind: 'group-header';
+  readonly key: string;
+  /** {@link CustomGroup.id} — what a rename, a delete or a drop names. */
+  readonly groupId: string;
+  readonly name: string;
+  /** Sessions in the group — the full count, even when it is folded shut. */
+  readonly count: number;
+  readonly collapsed: boolean;
+}
+
 export interface SessionRow {
   readonly kind: 'session';
   readonly key: string;
@@ -549,9 +744,19 @@ export interface SessionRow {
    * styled as put-away without a second lookup per frame.
    */
   readonly archived?: boolean;
+  /**
+   * The custom group this row is sitting in, when it is sitting in one.
+   *
+   * Same bargain as {@link pinned} and {@link archived}: the row's menu has to
+   * know whether to offer "Remove from group", and which group to tick in the
+   * "Move to group" list, and the flattening has already answered that question
+   * once. Asking again per row per frame would be a second lookup that can
+   * disagree with the section the row is actually drawn under.
+   */
+  readonly groupId?: string;
 }
 
-export type ListRow = HeaderRow | PinnedHeaderRow | ArchiveHeaderRow | SessionRow;
+export type ListRow = HeaderRow | PinnedHeaderRow | ArchiveHeaderRow | GroupHeaderRow | SessionRow;
 
 /**
  * Groups → one flat array of rows.
@@ -580,6 +785,18 @@ export type ListRow = HeaderRow | PinnedHeaderRow | ArchiveHeaderRow | SessionRo
  * these are *passed* has nothing to do with the order they are drawn in, and a
  * third positional argument that renders first would read as the opposite of
  * what it does.
+ *
+ * ## Custom groups sit between the pin shelf and the projects
+ *
+ * Below Pinned because a pin is the strongest claim in the list — "I am coming
+ * back to this one" outranks "this is how I have filed my history" — and above
+ * the projects because a group is something a person made and a project heading
+ * is something the app inferred from a path. The furniture someone built by
+ * hand goes at eye level; the furniture that was always there holds the rest.
+ *
+ * Unlike every other section, a group with nothing in it still draws its
+ * heading: it is the drop target that puts the first session into it. See
+ * {@link liftSessionGroups}.
  */
 export function flattenGroups(
   groups: readonly SessionGroup[],
@@ -587,6 +804,8 @@ export function flattenGroups(
   sections?: {
     readonly pinned?: SessionSection;
     readonly archived?: SessionSection;
+    /** The user's own groups, in stored order. See {@link CustomGroup}. */
+    readonly groups?: readonly CustomGroupSection[];
   },
 ): readonly ListRow[] {
   const rows: ListRow[] = [];
@@ -621,6 +840,42 @@ export function flattenGroups(
       }
     }
   }
+
+  /*
+   * The user's groups, in the order they were created, each one always drawing
+   * its heading.
+   *
+   * Their section indices start two past the end of the project array, after
+   * the two the flat sections took. The number identifies a section rather than
+   * describing where it sits — see the note on Pinned's index above — and
+   * numbering the groups last is what leaves every project's index equal to its
+   * own position in `groups`, which is the one thing that field is read for.
+   */
+  const custom = sections?.groups ?? [];
+  custom.forEach((section, index) => {
+    const folded = section.group.collapsed === true;
+    rows.push({
+      kind: 'group-header',
+      // Prefixed and keyed on the id rather than the name: two groups may
+      // honestly be called the same thing, and a duplicate React key silently
+      // drops the second heading.
+      key: `h:group:${section.group.id}`,
+      groupId: section.group.id,
+      name: section.group.name,
+      count: section.sessions.length,
+      collapsed: folded,
+    });
+    if (folded) return;
+    for (const session of section.sessions) {
+      rows.push({
+        kind: 'session',
+        key: sessionKey(session),
+        session,
+        group: groups.length + 2 + index,
+        groupId: section.group.id,
+      });
+    }
+  });
 
   groups.forEach((group, index) => {
     const folded = collapsed.has(group.project);
