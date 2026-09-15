@@ -10,10 +10,12 @@
  * "… n more" row that stands in for what the cap hides.
  */
 
+import { createElement } from 'react';
 import { describe, expect, it } from 'vitest';
+import { render } from 'ink-testing-library';
 import type { ProfileId, SessionId, SessionSummary } from '@rx-artemis/protocol';
 
-import { ARCHIVED_FOLDER, railRows, type RailRow } from './Sidebar.js';
+import { ARCHIVED_FOLDER, countSessions, railRows, Sidebar, type RailRow } from './Sidebar.js';
 
 /** A SessionSummary with only the fields the rail reads. */
 function session(
@@ -193,5 +195,198 @@ describe('railRows', () => {
     expect(rows[3]).toMatchObject({ kind: 'session' });
     expect(rows[3]).not.toHaveProperty('account');
     expect(rows[4]).toMatchObject({ kind: 'session', account: 'work' });
+  });
+});
+
+/*
+ * Typing at the rail. A list of two hundred conversations is not browsed, and
+ * the question these answer is what a query is allowed to do to the shape of
+ * the rail: which rows it keeps, which headings survive, what happens to the
+ * folds and the caps, and which rows it drops because they are not answers to
+ * a question about what already exists.
+ */
+
+const searchable: readonly SessionSummary[] = [
+  session({ id: 'parser', title: 'Rewrite the parser', cwd: '/w/api', updatedAt: 300, gitBranch: 'main', model: 'opus' }),
+  session({ id: 'rail', title: 'Rail filtering', cwd: '/w/web', updatedAt: 200, gitBranch: 'tui/overhaul' }),
+  session({ id: 'release', title: 'Ship the release', cwd: '/w/web', updatedAt: 100, gitBranch: 'main' }),
+];
+
+describe('railRows, filtered', () => {
+  it('keeps the conversations that answer the query, and the headings over them', () => {
+    const rows = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { query: 'rail' });
+
+    expect(script(rows)).toEqual(['folder:web', 'session:rail']);
+  });
+
+  it('opens the folders it left, however they were folded', () => {
+    // Nothing is open, so unfiltered this is two headings and no rows at all.
+    const rows = railRows(searchable, new Set(), identity, undefined, undefined, { query: 'rail' });
+
+    expect(script(rows)).toEqual(['folder:web', 'session:rail']);
+    expect(rows[0]).toMatchObject({ kind: 'folder', open: true, count: 1 });
+  });
+
+  it('drops the two ways to start a new conversation, which are not answers', () => {
+    const rows = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { query: 'ship' });
+
+    expect(script(rows)).not.toContain('new');
+    expect(script(rows)).not.toContain('new-elsewhere');
+    expect(script(rows)).toEqual(['folder:web', 'session:release']);
+  });
+
+  it('looks at the branch, the model, the account and the folder, not only the title', () => {
+    const branch = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { query: 'overhaul' });
+    expect(script(branch)).toEqual(['folder:web', 'session:rail']);
+
+    const model = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { query: 'opus' });
+    expect(script(model)).toEqual(['folder:api', 'session:parser']);
+
+    // A project name narrows to the project, not to the conversations that
+    // happen to mention it.
+    const folder = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { query: 'web' });
+    expect(script(folder)).toEqual(['folder:web', 'session:rail', 'session:release']);
+
+    const account = railRows(
+      searchable,
+      ALL_OPEN,
+      identity,
+      (candidate) => (candidate.id === 'release' ? 'work' : undefined),
+      undefined,
+      { query: 'work' },
+    );
+    expect(script(account)).toEqual(['folder:web', 'session:release']);
+  });
+
+  it('shows every match, past the cap that hides conversations when nothing is typed', () => {
+    const many = Array.from({ length: 11 }, (_unused, i) =>
+      session({ id: `bug${String(i)}`, title: `bugfix ${String(i)}`, cwd: '/w/api', updatedAt: i }),
+    );
+
+    const rows = railRows(many, ALL_OPEN, identity, undefined, undefined, { query: 'bugfix' });
+
+    expect(countSessions(rows)).toBe(11);
+    expect(script(rows).some((row) => row.startsWith('more:'))).toBe(false);
+  });
+
+  it('keeps nothing, and no heading, when the query answers nothing', () => {
+    const rows = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { query: 'zzz' });
+
+    expect(rows).toEqual([]);
+    expect(countSessions(rows)).toBe(0);
+  });
+
+  it('is the rail exactly as it was when nothing is typed', () => {
+    const plain = script(railRows(searchable, ALL_OPEN, identity));
+
+    expect(script(railRows(searchable, ALL_OPEN, identity, undefined, undefined, {}))).toEqual(plain);
+    expect(script(railRows(searchable, ALL_OPEN, identity, undefined, undefined, { query: '   ' }))).toEqual(plain);
+    expect(script(railRows(searchable, ALL_OPEN, identity, undefined, undefined, { pinned: new Set() }))).toEqual(plain);
+  });
+});
+
+describe('railRows, pinned', () => {
+  it('holds a pinned conversation at the top of its folder, whatever has been touched since', () => {
+    const rows = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { pinned: new Set(['release']) });
+
+    // `release` is the oldest in `web` and comes first anyway; `parser` is
+    // alone in `api` and does not move to the top of the rail.
+    expect(script(rows)).toEqual([
+      'new',
+      'new-elsewhere',
+      'folder:api',
+      'session:parser',
+      'folder:web',
+      'session:release',
+      'session:rail',
+    ]);
+  });
+
+  it('orders two pinned conversations between themselves as it orders any two', () => {
+    const rows = railRows(
+      [
+        session({ id: 'old-pin', cwd: '/w/api', updatedAt: 100 }),
+        session({ id: 'loose', cwd: '/w/api', updatedAt: 300 }),
+        session({ id: 'new-pin', cwd: '/w/api', updatedAt: 200 }),
+      ],
+      ALL_OPEN,
+      identity,
+      undefined,
+      undefined,
+      { pinned: new Set(['old-pin', 'new-pin']) },
+    );
+
+    expect(script(rows).slice(3)).toEqual(['session:new-pin', 'session:old-pin', 'session:loose']);
+  });
+});
+
+/*
+ * The rail as it is drawn. Only the parts filtering and pinning added: what a
+ * query looks like on screen, what it says it found, and the one glyph that
+ * says a conversation is being kept to hand.
+ */
+describe('Sidebar', () => {
+  const draw = (
+    rows: readonly RailRow[],
+    over: Partial<Parameters<typeof Sidebar>[0]> = {},
+  ): string => {
+    const { lastFrame } = render(
+      createElement(Sidebar, {
+        rows,
+        selected: 0,
+        focused: true,
+        currentProject: '/w/api',
+        width: 34,
+        height: 14,
+        loading: false,
+        ...over,
+      }),
+    );
+    return lastFrame() ?? '';
+  };
+
+  it('draws the query under the title with what it found', () => {
+    const rows = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { query: 'rail' });
+    const frame = draw(rows, { query: 'rail' });
+
+    expect(frame).toContain('CONVERSATIONS');
+    expect(frame).toContain('/ rail');
+    expect(frame).toContain('1 found');
+    expect(frame).toContain('Rail filtering');
+  });
+
+  it('says when a query found nothing, rather than going blank', () => {
+    const frame = draw([], { query: 'zzz' });
+
+    expect(frame).toContain('0 found');
+    expect(frame).toContain('nothing matches');
+  });
+
+  it('offers the filter while nothing is typed and offers to clear it once something is', () => {
+    const rows = railRows(searchable, ALL_OPEN, identity);
+
+    expect(draw(rows)).toContain('/ filter');
+    expect(draw(rows, { query: 'rail' })).toContain('Esc clears');
+    expect(draw(rows, { query: 'rail' })).not.toContain('/ filter');
+    expect(draw(rows, { focused: false })).toContain('Tab: conversations');
+  });
+
+  it('marks a pinned conversation, and only a pinned one', () => {
+    const rows = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { pinned: new Set(['release']) });
+    const frame = draw(rows, { pinned: new Set(['release']) });
+
+    expect(frame).toContain('◈ Ship the release');
+    expect(frame).not.toContain('◈ Rail filtering');
+  });
+
+  it('gives the glyph to what a conversation is doing before what it is to you', () => {
+    const rows = railRows(searchable, ALL_OPEN, identity, undefined, undefined, { pinned: new Set(['release']) });
+    const frame = draw(rows, {
+      pinned: new Set(['release']),
+      activity: new Map([['release', 'running' as const]]),
+    });
+
+    expect(frame).toContain('◐ Ship the release');
+    expect(frame).not.toContain('◈');
   });
 });

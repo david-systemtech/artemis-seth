@@ -40,6 +40,23 @@
  * this one are never both lit. Colours are the terminal's own: the accent is
  * the theme's magenta, the rest is foreground and dim.
  *
+ * A rail of two hundred conversations is browsed badly and searched well, so
+ * it can be typed at. A query keeps the conversations whose title, folder,
+ * account, branch or model it matches, and drops everything the search is not
+ * about: the two "new" rows, because a filter is a question about what already
+ * exists, and every folder with no match left in it. The folders that survive
+ * are forced open and uncapped — a heading someone has just narrowed the list
+ * to must not still be folded, and "… 3 more" hiding a conversation whose name
+ * was just typed is the one thing a filter must not do. The query is drawn
+ * under the title with what it found, so a rail that has gone quiet says why.
+ *
+ * Pinning is the other half of the same problem: the handful of conversations
+ * somebody returns to every day, held at the top of their folder with a `◈`
+ * rather than sinking as newer ones arrive. The glyph shares the column with
+ * the activity ones and loses to them — running and awaiting are what a
+ * conversation is doing now, and that outranks what it is to you. What is
+ * pinned belongs to the app's preferences; the rail is told.
+ *
  * Nothing here decides anything. What Enter *does* is the app's; the rail
  * reports which row was chosen.
  */
@@ -53,6 +70,7 @@ import { compareFolderNames, formatRelative, oneLine } from '@rx-artemis/transcr
 
 import { shortenPath } from '../directories.js';
 import { ACCENT } from '../theme.js';
+import { matchQuery } from './Picker.js';
 
 export type RailRow =
   | { readonly kind: 'new' }
@@ -101,6 +119,10 @@ function newestFirst(a: SessionSummary, b: SessionSummary): number {
  *
  * `expanded` names the folders showing every conversation rather than the
  * newest `PER_FOLDER`; the "… n more" row is what adds a folder to it.
+ *
+ * `options` is where searching and pinning arrive — an object rather than two
+ * more positional arguments, because four of those are already as many as a
+ * call can be read with.
  */
 export function railRows(
   sessions: readonly SessionSummary[],
@@ -109,7 +131,12 @@ export function railRows(
   /** Label for a session's account when it is not the current one; `undefined` when it is. */
   accountOf: (session: SessionSummary) => string | undefined = () => undefined,
   expanded: ReadonlySet<string> = new Set(),
+  options: RailOptions = {},
 ): readonly RailRow[] {
+  const query = (options.query ?? '').trim();
+  const filtering = query.length > 0;
+  const pinned = options.pinned ?? NOTHING_PINNED;
+
   const byProject = new Map<string, SessionSummary[]>();
   const archived: SessionSummary[] = [];
   for (const session of sessions) {
@@ -126,23 +153,22 @@ export function railRows(
   const folders = [...byProject.entries()].sort(([a], [b]) => compareFolderNames(a, b));
   if (archived.length > 0) folders.push([ARCHIVED_FOLDER, archived]);
 
-  const rows: RailRow[] = [{ kind: 'new' }, { kind: 'new-elsewhere' }];
-  for (const [project, list] of folders) {
+  // A filter is a question about the conversations that exist; the two ways to
+  // start a new one are not an answer to it.
+  const rows: RailRow[] = filtering ? [] : [{ kind: 'new' }, { kind: 'new-elsewhere' }];
+  for (const [project, all] of folders) {
+    const label = project === ARCHIVED_FOLDER ? 'archived' : basename(project) || project;
+    const list = filtering ? all.filter((session) => sessionMatches(query, session, label, accountOf(session))) : all;
     // An empty folder is not drawn: a heading over no rows promises contents
     // it does not have, and the only folder that could be empty is the one the
-    // working directory is in, which is already named twice on screen.
+    // working directory is in, which is already named twice on screen. Under a
+    // filter, a folder is empty whenever nothing in it matched.
     if (list.length === 0) continue;
-    const isOpen = open.has(project);
-    rows.push({
-      kind: 'folder',
-      project,
-      label: project === ARCHIVED_FOLDER ? 'archived' : basename(project) || project,
-      count: list.length,
-      open: isOpen,
-    });
+    const isOpen = filtering || open.has(project);
+    rows.push({ kind: 'folder', project, label, count: list.length, open: isOpen });
     if (!isOpen) continue;
-    const ordered = [...list].sort(newestFirst);
-    const shown = expanded.has(project) ? ordered : ordered.slice(0, PER_FOLDER);
+    const ordered = pinnedFirst([...list].sort(newestFirst), pinned);
+    const shown = filtering || expanded.has(project) ? ordered : ordered.slice(0, PER_FOLDER);
     for (const session of shown) {
       const account = accountOf(session);
       rows.push({ kind: 'session', session, ...(account === undefined ? {} : { account }) });
@@ -150,6 +176,46 @@ export function railRows(
     if (shown.length < ordered.length) rows.push({ kind: 'more', project, hidden: ordered.length - shown.length });
   }
   return rows;
+}
+
+/** Conversations a query keeps, and conversations held at the top of their folder. */
+export interface RailOptions {
+  /** Absent or blank shows everything; anything else is typed at the rail. */
+  readonly query?: string;
+  /** Session ids pinned to the top of their folder. */
+  readonly pinned?: ReadonlySet<string>;
+}
+
+const NOTHING_PINNED: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Whether a conversation answers what was typed.
+ *
+ * Every field the rail can show, because the thing someone half-remembers
+ * about a conversation is as likely to be the branch it ran on or the account
+ * it belongs to as its title. The folder is included so that typing a project
+ * name narrows to that project rather than to the handful of conversations
+ * that happen to mention it.
+ */
+function sessionMatches(
+  query: string,
+  session: SessionSummary,
+  folder: string,
+  account: string | undefined,
+): boolean {
+  const fields = [session.title, folder, account, session.gitBranch, session.model];
+  return fields.some((field) => field !== undefined && field.length > 0 && matchQuery(query, field) !== null);
+}
+
+/** Pinned conversations first, each group still newest first. */
+function pinnedFirst(ordered: readonly SessionSummary[], pinned: ReadonlySet<string>): readonly SessionSummary[] {
+  if (pinned.size === 0) return ordered;
+  return [...ordered.filter((session) => pinned.has(session.id)), ...ordered.filter((session) => !pinned.has(session.id))];
+}
+
+/** How many conversations a rail is showing — what a filter reports it found. */
+export function countSessions(rows: readonly RailRow[]): number {
+  return rows.reduce((total, row) => total + (row.kind === 'session' ? 1 : 0), 0);
 }
 
 /**
@@ -174,6 +240,10 @@ export interface SidebarProps {
   readonly width: number;
   readonly height: number;
   readonly loading: boolean;
+  /** What is being typed at the rail; blank or absent when nothing is. */
+  readonly query?: string;
+  /** Session ids held at the top of their folder, for the `◈`. */
+  readonly pinned?: ReadonlySet<string>;
 }
 
 export function Sidebar({
@@ -186,11 +256,15 @@ export function Sidebar({
   width,
   height,
   loading,
+  query,
+  pinned,
 }: SidebarProps): React.JSX.Element {
   const inner = Math.max(8, width - 3);
-  // Rows the screen can hold: title, hint, and one line each. The window
-  // follows the cursor so a long list can still be walked.
-  const budget = Math.max(3, height - 4);
+  const filter = query ?? '';
+  const filtering = filter.length > 0;
+  // Rows the screen can hold: title, hint, and one line each — one fewer while
+  // a query is on screen, which has a line of its own under the title.
+  const budget = Math.max(3, height - 4 - (filtering ? 1 : 0));
   const first = focused ? Math.max(0, Math.min(selected - Math.floor(budget / 2), rows.length - budget)) : 0;
   const visible = rows.slice(first, first + budget);
 
@@ -210,6 +284,15 @@ export function Sidebar({
       <Text color={ACCENT} bold>
         CONVERSATIONS
       </Text>
+      {filtering && (
+        <Text>
+          <Text dimColor>/ </Text>
+          <Text>{oneLine(filter, Math.max(4, inner - 12))}</Text>
+          <Text dimColor>{`  ${String(countSessions(rows))} found`}</Text>
+        </Text>
+      )}
+      {/* "Nothing matches" is a lie while the stores are still being read. */}
+      {filtering && !loading && countSessions(rows) === 0 && <Text dimColor>  nothing matches</Text>}
       {loading && !rows.some((row) => row.kind === 'session') && <Text dimColor>  reading…</Text>}
       {visible.map((row, i) => {
         const index = first + i;
@@ -260,7 +343,8 @@ export function Sidebar({
              * under the cursor, which is two different things wearing one
              * face.
              */
-            const glyph = doing === 'awaiting' ? '⚿' : doing === 'running' ? '◐' : active ? '●' : ' ';
+            const isPinned = pinned?.has(row.session.id) === true;
+            const glyph = doing === 'awaiting' ? '⚿' : doing === 'running' ? '◐' : active ? '●' : isPinned ? '◈' : ' ';
             const glyphColour = doing === 'awaiting' ? 'yellow' : doing === 'running' ? 'cyan' : ACCENT;
             return (
               <Box key={`session:${row.session.id}`} flexDirection="column">
@@ -305,7 +389,9 @@ export function Sidebar({
         }
       })}
       <Box flexGrow={1} />
-      <Text dimColor>{focused ? '↑↓ · Enter · a · d · Esc' : 'Tab: conversations'}</Text>
+      <Text dimColor>
+        {focused ? (filtering ? '↑↓ · Enter · a · d · Esc clears' : '↑↓ · Enter · a · d · / filter · Esc') : 'Tab: conversations'}
+      </Text>
     </Box>
   );
 }
