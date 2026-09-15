@@ -142,6 +142,44 @@
  * snapshot and files move. The row under the box names everything that will
  * go, so what travels is never a guess.
  *
+ * ## `;;` is a snippet
+ *
+ * The third popup under the box, over the templates somebody has saved.
+ * `snippets.ts` owns the trigger and says why it is two semicolons and why the
+ * ones in `foo();;` are not it; the rows are the names it could mean, matched
+ * the way the picker matches — a subsequence over the name, with the body's
+ * first line dimmed beside it, because a name half-remembered is recognised by
+ * the words it stood for. Tab and Enter both expand, for the reason they both
+ * insert a path: this is a word being finished, not a message being sent.
+ *
+ * Three popups, one at a time, and the order is the order the sigils are
+ * reached: a single word beginning with a slash is a command, then an `@` is a
+ * file, then `;;` is a snippet. No two can claim the same token — no command's
+ * name has an `@` in it and neither sigil begins a `;;` — so asking in order is
+ * all the arbitration there is to do.
+ *
+ * What expanding leaves behind is the part worth explaining. A template's holes
+ * come back from `expand` as offsets, and those become tab stops: Tab walks to
+ * the next, Shift+Tab to the one before, and the Tab after the last lands on
+ * `$0` — or, in a body that named none, on the end of the hole it was in —
+ * and puts the stops away. The editor has no selection, so a stop with a
+ * default is not selected but *pending*: the cursor sits at the front of it and
+ * the first thing typed or pasted takes the whole default out. Deleting the
+ * range on arrival would have been fewer moving parts and the wrong feature —
+ * Tab pressed straight through a template would have wiped every default it
+ * came with, which is the one thing defaults are for. Moving the cursor ends
+ * the pending too, because somebody who has gone to look at a default is
+ * somebody who means to edit it rather than replace it.
+ *
+ * The offsets are noticed rather than maintained, the way a history walk is.
+ * They are remembered against the text they were measured in, and every render
+ * asks one question of the buffer: is everything outside the current hole
+ * still where it was? Then the hole has grown or shrunk and the rest slides;
+ * otherwise somebody has moved on and the stops go. That is one rule in one
+ * place instead of bookkeeping in twenty key branches — and it is why only a
+ * send and Ctrl+U say anything about stops outright, both of them taking away
+ * the whole line the holes were in.
+ *
  * ## A big paste is a chip
  *
  * Pasting a four-hundred-line stack trace into a box eight rows tall loses the
@@ -266,8 +304,17 @@ import {
 import { fuzzyMatch, mentionAt, replaceMention, type FileMatch, type FrecencyLike } from '../fileIndex.js';
 import { HistoryCursor, type HistoryMatch, type HistoryScope } from '../history.js';
 import { classifyPaste, expandChip, pasteMarker, type PasteClassification } from '../pasteKind.js';
+import {
+  expand as expandTemplate,
+  expandInText,
+  snippetAt,
+  type Expansion,
+  type SlotRange,
+  type SnippetTemplate,
+} from '../snippets.js';
 import { ACCENT } from '../theme.js';
-import { Completions } from './Completions.js';
+import { Completions, type CompletionItem } from './Completions.js';
+import { filterItems } from './Picker.js';
 
 /** Lines drawn at once before the box scrolls instead of growing. */
 const MAX_ROWS = 8;
@@ -276,6 +323,14 @@ const MAX_ROWS = 8;
 const MENTION_ROWS = 8;
 
 const MENTION_HINT = '↑↓ move · Tab/Enter insert';
+
+/** Snippets offered at once: the same window the file popup gets, under the same box. */
+const SNIPPET_ROWS = 8;
+
+const SNIPPET_HINT = '↑↓ move · Tab/Enter expand';
+
+/** How much of a body's first line stands beside the name before it is cut. */
+const SNIPPET_DETAIL_CHARS = 48;
 
 /** Ctrl+_ , which most terminals send as a unit separator and no letter. */
 const UNDO_INPUT = '\u001F';
@@ -369,22 +424,135 @@ function mentionsIn(text: string, known: ReadonlySet<string>): readonly string[]
 }
 
 /**
- * `replaceAll`, with the cursor left somewhere other than the end.
+ * The buffer with its cursor at `offset`.
  *
- * A path completed in the middle of a sentence wants the cursor just past the
- * space it added, not past the rest of the line. `editor.ts` keeps its cursor
- * moves private and its whole-text replacement ends at the end, so the walk
- * back is made of its own `left`: no second undo entry, and no chance of
- * landing inside a surrogate pair.
+ * `editor.ts` keeps its cursor moves private — everything it exports moves by a
+ * character, a word or a line — so the walk is made of its own steps. That is
+ * what it costs to land on an offset somebody else counted, and it is what
+ * buys the two things that matter: a move is never an undo entry, and a cursor
+ * never lands inside a surrogate pair.
  */
-function replaceLeavingCursor(state: EditorState, text: string, cursor: number): EditorState {
-  let next = replaceAll(state, text);
-  while (next.cursor > cursor) {
+function cursorAt(state: EditorState, offset: number): EditorState {
+  let next = state;
+  while (next.cursor > offset) {
     const back = left(next);
     if (back.cursor === next.cursor) break;
     next = back;
   }
+  while (next.cursor < offset) {
+    const on = right(next);
+    if (on.cursor === next.cursor) break;
+    next = on;
+  }
   return next;
+}
+
+/**
+ * `replaceAll`, with the cursor left somewhere other than the end.
+ *
+ * A path completed in the middle of a sentence wants the cursor just past the
+ * space it added, not past the rest of the line; a template wants it in the
+ * first hole. `editor.ts`'s whole-text replacement ends at the end, so the walk
+ * back to either is {@link cursorAt}'s.
+ */
+function replaceLeavingCursor(state: EditorState, text: string, cursor: number): EditorState {
+  return cursorAt(replaceAll(state, text), cursor);
+}
+
+/**
+ * The saved snippets, as the composer reads them.
+ *
+ * The two methods of `Snippets` that reading needs, for the reason
+ * {@link HistoryLookup} is an interface rather than the class: nothing here
+ * should depend on a file being on disk, and a test hands over an array.
+ */
+export interface SnippetLookup {
+  /** Every snippet, in the order they should be offered — alphabetical, as it happens. */
+  list(): readonly SnippetTemplate[];
+  /** One by name: what `/snip name` looks up and what a chosen row expands. */
+  get(name: string): { readonly body: string } | undefined;
+}
+
+/**
+ * The holes a template left behind, and the text they were counted in.
+ *
+ * `at` is the one the cursor is in. `text` is what keeps the rest honest: an
+ * offset means nothing without the buffer it was measured against, and
+ * comparing the two is how an edit is noticed rather than tracked.
+ */
+interface Stops {
+  readonly slots: readonly SlotRange[];
+  readonly at: number;
+  /** Where `$0` was: the stop after the last hole, and the last one there is. */
+  readonly final?: number;
+  readonly text: string;
+}
+
+/** The stops an expansion leaves, or nothing when it left no hole to fill. */
+function stopsFrom(expansion: Expansion, text: string): Stops | null {
+  if (expansion.slots.length === 0) return null;
+  const stops: Stops = { slots: expansion.slots, at: 0, text };
+  return expansion.final === undefined ? stops : { ...stops, final: expansion.final };
+}
+
+/**
+ * `stops` moved to where they are in `text`, or `null` when the edit was not
+ * one they survive.
+ *
+ * Asked the other way round from a diff, because a diff of two strings is
+ * ambiguous exactly where it matters — typing a `b` into an empty hole in `ab`
+ * is indistinguishable from typing one after it — and an ambiguity resolved
+ * against the person would throw the template away mid-word. So the question
+ * is not *what* changed but whether anything outside the hole did: what stands
+ * before it must be untouched and what stands after it must be the same text,
+ * moved by the difference in length. If so the hole has grown or shrunk and
+ * everything past it slides; if not, somebody has moved on and there is
+ * nothing left to walk. One comparison, once per render, instead of every key
+ * that touches the buffer remembering it must adjust some numbers.
+ */
+function stopsIn(stops: Stops, text: string): Stops | null {
+  if (stops.text === text) return stops;
+  const current = stops.slots[stops.at];
+  if (current === undefined) return null;
+
+  const old = stops.text;
+  const delta = text.length - old.length;
+  const end = current.end + delta;
+  // A hole cannot be rubbed out past its own front: that is a Backspace at the
+  // start of it, which is somebody leaving rather than filling.
+  if (end < current.start) return null;
+  if (text.slice(0, current.start) !== old.slice(0, current.start)) return null;
+  if (text.slice(end) !== old.slice(current.end)) return null;
+
+  const moved: Stops = {
+    text,
+    at: stops.at,
+    slots: stops.slots.map((slot, index) => {
+      if (index < stops.at) return slot;
+      if (index === stops.at) return { start: slot.start, end };
+      return { start: slot.start + delta, end: slot.end + delta };
+    }),
+  };
+  if (stops.final === undefined) return moved;
+  // `$0` can sit before the hole as easily as after it, and only what is after
+  // it moved.
+  return { ...moved, final: stops.final >= current.end ? stops.final + delta : stops.final };
+}
+
+/** How many stops Tab has still to take you to, `$0` counted. */
+function stopsLeft(stops: Stops): number {
+  return stops.slots.length - 1 - stops.at + (stops.final === undefined ? 0 : 1);
+}
+
+/** The row under the box while there are holes left in what was expanded. */
+function stopsHint(remaining: number): string {
+  return remaining === 0 ? 'Tab leaves the last slot' : `Tab next slot · ${String(remaining)} left`;
+}
+
+/** The first line of a body, cut to fit the column beside the name. */
+function firstBodyLine(body: string): string {
+  const line = (body.split('\n', 1)[0] ?? '').trim();
+  return line.length > SNIPPET_DETAIL_CHARS ? `${line.slice(0, SNIPPET_DETAIL_CHARS - 1)}…` : line;
 }
 
 /**
@@ -447,8 +615,8 @@ export interface ComposerHandle {
    */
   isCapturing(): boolean;
   /**
-   * True while the composer owns Tab — the slash menu or the `@` popup is
-   * open on a row Tab would fill in.
+   * True while the composer owns Tab — a popup is open on a row Tab would fill
+   * in, or a snippet left holes for it to walk.
    *
    * Asked for the same reason {@link isCapturing} is, about a different key:
    * the app toggles the focus with Tab, the composer completes with it, and
@@ -457,6 +625,16 @@ export interface ComposerHandle {
    * finished it in.
    */
   hasPopup(): boolean;
+  /**
+   * Expand the named snippet over the whole draft, its slots filled from
+   * `words`, and leave the cursor in the first hole that is left. False when
+   * there is no snippet of that name, which is `/snip`'s to report.
+   *
+   * Here rather than in the app for the reason {@link setText} is: what comes
+   * back from an expansion is a buffer, a cursor and a list of stops, and only
+   * this component has anywhere to put the last two.
+   */
+  expandSnippet(name: string, words: readonly string[]): boolean;
 }
 
 /**
@@ -527,6 +705,11 @@ export interface ComposerProps {
   readonly onArrowOverflow?: (direction: 'up' | 'down') => void;
   /** What `@` completes against. Without it `@` is an ordinary character. */
   readonly fileIndex?: FileIndex;
+  /**
+   * What `;;` offers and what `/snip` expands. Without it `;;` is two
+   * semicolons and {@link ComposerHandle.expandSnippet} finds nothing.
+   */
+  readonly snippets?: SnippetLookup;
   /** What ↑ and Ctrl+R read. Without it neither key does anything new. */
   readonly history?: HistoryLookup;
   /** The slices ↑ prefers and Ctrl+S cycles, best first. */
@@ -576,6 +759,7 @@ export function Composer({
   isActive = true,
   onArrowOverflow,
   fileIndex,
+  snippets,
   history,
   historyScopes = DEFAULT_SCOPES,
   onTakeBackQueued,
@@ -726,6 +910,78 @@ export function Composer({
   const mentions = useMemo(() => mentionsIn(value, known), [value, known]);
 
   /*
+   * `;;`, and the snippets it could mean.
+   *
+   * Asked last of the three: the slash menu has already claimed a word that
+   * starts with one, and `@` a token that starts with one. Nothing to defer
+   * loading here — a dozen templates are already in memory, which is the whole
+   * difference between this list and the repository the `@` popup lists.
+   */
+  const snippetToken =
+    snippets === undefined || typingCommand || shell || search !== null || mention !== null
+      ? null
+      : snippetAt(value, buffer.cursor);
+  const snippetQuery = snippetToken === null ? null : snippetToken.name;
+  /*
+   * The picker's own matching rather than the `@` popup's: `fuzzyMatch` is
+   * shaped for paths — a basename bonus, a bonus for landing after a slash, a
+   * frecency table to break ties — and a snippet's name is one lower-case word
+   * with none of that in it. `filterItems` is the plain subsequence, it hands
+   * back the offsets `Completions` draws bold, and with nothing typed yet it
+   * gives the whole list in the order it arrived. The body's first line is
+   * attached after matching rather than passed in as a detail, so what the
+   * rows answer to is the name, as the trigger promises.
+   */
+  const snippetRows = useMemo<readonly CompletionItem[]>(() => {
+    if (snippets === undefined || snippetQuery === null) return [];
+    const saved = snippets.list();
+    const bodies = new Map(saved.map((snippet) => [snippet.name, snippet.body]));
+    return filterItems(saved.map((snippet) => ({ key: snippet.name, label: snippet.name })), snippetQuery)
+      .slice(0, SNIPPET_ROWS)
+      .map((match) => ({
+        key: match.item.key,
+        label: match.item.label,
+        detail: firstBodyLine(bodies.get(match.item.key) ?? ''),
+        indices: match.indices,
+      }));
+  }, [snippets, snippetQuery]);
+  /** The highlighted row, on the same terms as `pickedPath`: stale means the first row. */
+  const [pickedSnippet, setPickedSnippet] = useState<{ readonly token: string; readonly index: number } | null>(null);
+  const snippetTokenKey = snippetToken === null ? '' : `${String(snippetToken.start)} ${snippetToken.name}`;
+  const snippetSelected =
+    snippetRows.length === 0
+      ? null
+      : pickedSnippet !== null && pickedSnippet.token === snippetTokenKey
+        ? Math.max(0, Math.min(pickedSnippet.index, snippetRows.length - 1))
+        : 0;
+  const snippetChoice = snippetSelected === null ? undefined : snippetRows[snippetSelected];
+
+  /*
+   * The holes the last expansion left, as they were when they were counted,
+   * and where they are now. Derived for the reason `walking` is: an edit that
+   * has nothing to do with them must end them, and noticing that in one place
+   * is a rule, where clearing them in every branch that touches the buffer is
+   * twenty chances to forget. Undo brings them back with the text, which is
+   * what undo is for.
+   */
+  const [tabStops, setTabStops] = useState<Stops | null>(null);
+  const stops = tabStops === null ? null : stopsIn(tabStops, value);
+  const stop = stops === null ? undefined : stops.slots[stops.at];
+  /**
+   * The default still standing under the cursor, if there is one.
+   *
+   * Pending means nothing has happened here yet: the text is the text the stop
+   * was counted in and the cursor is still where Tab put it, at the front of
+   * the hole. Then the next character replaces the whole default, which is
+   * what the editor's missing selection would have done. One move of the
+   * cursor — a Left, a Ctrl+A — and it is an ordinary place in the line again,
+   * because somebody who has gone to look at the default is somebody who means
+   * to keep it.
+   */
+  const landed = tabStops?.text === value && buffer.cursor === stop?.start;
+  const pending = landed && stop !== undefined && stop.end > stop.start ? stop : null;
+
+  /*
    * Read by the app, on the same keystroke the composer is answering, so it
    * cannot be state: state is a render away. It is raised as the search opens
    * and lowered only after the render that closed it, which is what keeps the
@@ -746,7 +1002,8 @@ export function Composer({
    * a flag lowered as the menu closed would already read as lowered when the
    * app looked at it.
    */
-  const popupOpen = highlighted !== undefined || mentionChoice !== undefined;
+  const popupOpen =
+    highlighted !== undefined || mentionChoice !== undefined || snippetChoice !== undefined || stops !== null;
   const popup = useRef(false);
   useEffect(() => {
     popup.current = isActive && popupOpen;
@@ -770,8 +1027,19 @@ export function Composer({
       getText: () => buffer.text,
       isCapturing: () => capturing.current,
       hasPopup: () => popup.current,
+      expandSnippet: (name: string, words: readonly string[]) => {
+        const body = snippets?.get(name)?.body;
+        if (body === undefined) return false;
+        // The whole draft, because `/snip` was typed into an empty box or over
+        // something the person has finished with — and undoably, so the box
+        // they had is one press away either way.
+        const expansion = expandTemplate(body, words);
+        setBuffer((current) => replaceLeavingCursor(current, expansion.text, expansion.cursor));
+        setTabStops(stopsFrom(expansion, expansion.text));
+        return true;
+      },
     }),
-    [buffer],
+    [buffer, snippets],
   );
 
   /**
@@ -785,6 +1053,67 @@ export function Composer({
     setBuffer((current) => replaceLeavingCursor(current, written.text, written.cursor));
     fileIndex?.frecency.record(path);
     setPickedPath(null);
+  };
+
+  /**
+   * Write the chosen snippet over the `;;token` under the cursor. `snippets.ts`
+   * decides what the text, the cursor and the holes become; nothing is added
+   * after it, because a template is the sentence rather than a word in one.
+   */
+  const acceptSnippet = (name: string): void => {
+    const body = snippets?.get(name)?.body;
+    if (snippetToken === null || body === undefined) return;
+    const written = expandInText(value, snippetToken.start, snippetToken.end, expandTemplate(body));
+    setBuffer((current) => replaceLeavingCursor(current, written.text, written.cursor));
+    setTabStops(stopsFrom(written, written.text));
+    setPickedSnippet(null);
+  };
+
+  /** Put the cursor at the front of `index`'s hole, and count edits from here. */
+  const goToStop = (index: number): void => {
+    if (stops === null) return;
+    const target = stops.slots[index];
+    if (target === undefined) return;
+    setBuffer((current) => cursorAt(current, target.start));
+    setTabStops({ ...stops, at: index });
+  };
+
+  /**
+   * Tab: the next hole, or `$0` once there are none left — and then the stops
+   * are done with, because a template with nothing left to fill is a message.
+   * A body that named no `$0` leaves the cursor at the end of its last hole,
+   * since there is nowhere else it asked for.
+   */
+  const nextStop = (): void => {
+    if (stops === null) return;
+    if (stops.at + 1 < stops.slots.length) {
+      goToStop(stops.at + 1);
+      return;
+    }
+    const rest = stops.final ?? stop?.end;
+    if (rest !== undefined) setBuffer((current) => cursorAt(current, rest));
+    setTabStops(null);
+  };
+
+  /** Shift+Tab: the hole before this one, and nowhere at all from the first. */
+  const previousStop = (): void => {
+    if (stops === null || stops.at === 0) return;
+    goToStop(stops.at - 1);
+  };
+
+  /**
+   * Text going in where the cursor is — and over the whole of a hole's default
+   * when one is still pending, which is what stands in for the selection the
+   * editor has not got. Through `replaceAll`, so the default that was replaced
+   * is one undo away, as a completed path or a rubbed-out chip is.
+   */
+  const typeInto = (input: string): void => {
+    if (pending === null) {
+      setBuffer((current) => insert(current, input));
+      return;
+    }
+    const text = value.slice(0, pending.start) + input + value.slice(pending.end);
+    setBuffer((current) => replaceLeavingCursor(current, text, pending.start + input.length));
   };
 
   /** Put `text` in the box, undoably, and hand back the buffer that makes. */
@@ -889,7 +1218,9 @@ export function Composer({
     // Not at the `$`: a shell command is a line, not a document, so there is
     // nothing a chip could usefully stand for and nowhere for it to be read.
     if (!bracketed || shell || !big) {
-      setBuffer((current) => insert(current, text));
+      // Through the same door a typed character goes through: a path pasted
+      // into `@${1:path/to/file}` is exactly what that hole was asking for.
+      typeInto(text);
       return;
     }
     const number = nextNumber('paste');
@@ -990,12 +1321,21 @@ export function Composer({
     const expanded = expand(text);
     const images = imagesIn(text);
     const named = mentionsIn(expanded, known);
+    /*
+     * Emptied before the message is handed over rather than after.
+     * `/snip` is answered on this very keystroke and answers by putting a
+     * template back in the box, and a clear queued *after* that would throw it
+     * away — so the order here is what makes a command able to reply into the
+     * box it was typed in. Whatever holes were still to fill have gone out
+     * unfilled, which is an answer too.
+     */
+    keepChipsIn(stash?.text ?? '');
+    setBuffer(clear);
+    setTabStops(null);
     // The third argument is left off when there is nothing in it, so the
     // ordinary message is the ordinary two-argument call it has always been.
     if (images.length === 0) onSubmit(expanded, named);
     else onSubmit(expanded, named, images);
-    keepChipsIn(stash?.text ?? '');
-    setBuffer(clear);
   };
 
   /**
@@ -1149,6 +1489,12 @@ export function Composer({
           acceptMention(mentionChoice.path);
           return;
         }
+        // And the snippet popup on the same terms: Enter here means "that
+        // one", and the message goes on the Enter after the holes are filled.
+        if (snippetChoice !== undefined) {
+          acceptSnippet(snippetChoice.key);
+          return;
+        }
         if (endsWithContinuation(buffer)) {
           setBuffer(continueLine);
           return;
@@ -1221,6 +1567,14 @@ export function Composer({
           setPickedPath({ token, index: (mentionSelected + step + suggestions.length) % suggestions.length });
           return;
         }
+        if (snippetSelected !== null) {
+          const step = key.upArrow ? -1 : 1;
+          setPickedSnippet({
+            token: snippetTokenKey,
+            index: (snippetSelected + step + snippetRows.length) % snippetRows.length,
+          });
+          return;
+        }
         if (selected !== null) {
           // The open menu takes a plain arrow ahead of the text and ahead of
           // the app: the text is one word, so it has no second line to move
@@ -1275,6 +1629,8 @@ export function Composer({
             return;
           case 'u':
             setBuffer(killToLineStart);
+            // The line the holes were in has gone; so have they.
+            setTabStops(null);
             return;
           case 'k':
             setBuffer(killToLineEnd);
@@ -1338,11 +1694,22 @@ export function Composer({
           acceptMention(mentionChoice.path);
           return;
         }
+        // Then the snippet the other popup is on, over the `;;token`.
+        if (snippetChoice !== undefined) {
+          acceptSnippet(snippetChoice.key);
+          return;
+        }
         // Fill in the highlighted row — the canonical name, prefix and all,
         // which is what makes a bridged `/plugin:command` typeable. Through
         // the editor, so one undo gets back the letters that were typed.
         if (highlighted !== undefined) {
           setBuffer((current) => replaceAll(current, `${commandWord(highlighted.usage)} `));
+          return;
+        }
+        // With no row to fill in, Tab walks the holes the last expansion left.
+        if (stops !== null) {
+          if (key.shift) previousStop();
+          else nextStop();
         }
         return;
       }
@@ -1374,7 +1741,7 @@ export function Composer({
         paste(input, false);
         return;
       }
-      setBuffer((current) => insert(current, input));
+      typeInto(input);
     },
     { isActive },
   );
@@ -1476,6 +1843,13 @@ export function Composer({
               {'  '}
               {SHELL_HINT}
             </Text>
+          ) : stops !== null ? (
+            /* What Tab is for while a template still has holes in it, which is
+               also the only sign on screen that it has any. */
+            <Text dimColor>
+              {'  '}
+              {stopsHint(stopsLeft(stops))}
+            </Text>
           ) : (
             (rows.length > 1 || row > 0) && (
               <Text dimColor>
@@ -1524,6 +1898,14 @@ export function Composer({
             maxRows={MENTION_ROWS}
             hint={MENTION_HINT}
           />
+        ))}
+      {/* The snippets `;;` could mean. `no match` for the same reason the `@`
+          popup says it: a row Tab could expand is the only thing in the list. */}
+      {snippetToken !== null &&
+        (snippetRows.length === 0 ? (
+          <Text dimColor>{'  no match'}</Text>
+        ) : (
+          <Completions items={snippetRows} selected={snippetSelected} maxRows={SNIPPET_ROWS} hint={SNIPPET_HINT} />
         ))}
       {carried.length > 0 && (
         <Text dimColor>

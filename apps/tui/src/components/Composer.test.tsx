@@ -37,6 +37,7 @@ const ALT_D = '\u001Bd';
 const HOME = '\u001B[H';
 const END = '\u001B[F';
 const TAB = '\t';
+const SHIFT_TAB = '\u001B[Z'; // The one sequence every terminal agrees on for it.
 
 const PLACEHOLDER = 'message, or / for commands';
 
@@ -341,8 +342,12 @@ describe('Composer: the slash menu', () => {
     // ↑ on the first row wraps to the last rather than scrolling the
     // conversation out from under a menu someone is reading.
     expect(onArrowOverflow).not.toHaveBeenCalled();
-    const model = rowWith(lastFrame(), '/model');
-    expect(rowsOf(lastFrame())[model + 1]).toContain('❯');
+    // The last row on offer, found by the hint under it rather than by
+    // counting down from a neighbour: what `/mo` matches is the command
+    // table's business and it grows.
+    expect(lastFrame()).toContain('/model');
+    const hint = rowWith(lastFrame(), '↑↓ move · Tab complete · Enter run');
+    expect(rowsOf(lastFrame())[hint - 1]).toContain('❯');
 
     // A space ends the command word, the menu closes, and the arrow is the
     // app's again.
@@ -1343,5 +1348,238 @@ describe('Composer: a chord the terminal cannot name', () => {
     await tick();
     expect(lastFrame()).toContain('reverse-i-search [folder]: fix ');
     expect(lastFrame()).not.toContain('\u001d');
+  });
+});
+
+/*
+ * `;;` expands a saved prompt.
+ *
+ * The store here is an array of names and bodies, which is all the composer
+ * asks for. `snippets.ts` is tested where it lives, over the template language
+ * and the arithmetic of the offsets; what these are about is which keystroke
+ * opens the popup, what an expansion leaves behind, and where Tab goes next.
+ */
+const SNIPPET_HINT = '\u2191\u2193 move \u00b7 Tab/Enter expand';
+
+/**
+ * `explain` is the one with two holes and a `$0` between them rather than at
+ * the end, so that landing on the last stop is visible in the text: what is
+ * typed there arrives in the middle of the line.
+ */
+const SNIPPETS: readonly { readonly name: string; readonly body: string }[] = [
+  { name: 'explain', body: 'Explain ${1:the file}: what ${2:calls it}$0 and why.' },
+  { name: 'fix-tests', body: '`${1:pnpm test}` fails with:\n$0\nFix the first failure only.' },
+  { name: 'review-diff', body: 'Review the diff against ${1:main}.' },
+];
+
+const fakeSnippets = (saved: readonly { readonly name: string; readonly body: string }[] = SNIPPETS) => ({
+  list: () => saved,
+  get: (name: string) => saved.find((snippet) => snippet.name === name),
+});
+
+describe('Composer: expanding a snippet', () => {
+  it('offers the snippets a `;;` token could mean, the body beside the name', async () => {
+    const { lastFrame, stdin } = composer({ snippets: fakeSnippets() });
+    await tick();
+    await press(stdin, ';;fi');
+
+    const row = rowWith(lastFrame(), 'fix-tests');
+    expect(row).toBeGreaterThan(0);
+    expect(rowsOf(lastFrame())[row]).toContain('\u276f');
+    // The body's first line stands beside it, which is how a half-remembered
+    // name is recognised by what it stood for.
+    expect(rowsOf(lastFrame())[row]).toContain('fails with:');
+    // The names `fi` is not a subsequence of are not in the list.
+    expect(lastFrame()).not.toContain('review-diff');
+    expect(lastFrame()).toContain(SNIPPET_HINT);
+  });
+
+  it('Tab expands the row it is on and leaves the cursor in the first hole', async () => {
+    const { lastFrame, stdin } = composer({ snippets: fakeSnippets() });
+    await tick();
+    await press(stdin, ';;fi', TAB);
+
+    expect(lastFrame()).toContain('`pnpm test` fails with:');
+    expect(lastFrame()).not.toContain(';;fi');
+    expect(lastFrame()).not.toContain(SNIPPET_HINT);
+    expect(lastFrame()).toContain('Tab next slot \u00b7 1 left');
+
+    // The default is pending rather than typed: the first character takes the
+    // whole of it, which is what the editor's missing selection would do.
+    await press(stdin, 'v', 'itest');
+    expect(lastFrame()).toContain('`vitest` fails with:');
+  });
+
+  it('typing into a hole moves the ones after it, and Tab walks to the next', async () => {
+    const { lastFrame, stdin } = composer({ snippets: fakeSnippets() });
+    await tick();
+    await press(stdin, ';;ex', TAB);
+    expect(lastFrame()).toContain('Explain the file: what calls it and why.');
+    expect(lastFrame()).toContain('Tab next slot \u00b7 2 left');
+
+    await press(stdin, 'Composer.tsx');
+    expect(lastFrame()).toContain('Explain Composer.tsx: what calls it and why.');
+
+    // The second hole is four characters further along than it was counted at,
+    // and Tab still lands on the whole of it.
+    await press(stdin, TAB);
+    expect(lastFrame()).toContain('Tab next slot \u00b7 1 left');
+    await press(stdin, 'the app');
+    expect(lastFrame()).toContain('Explain Composer.tsx: what the app and why.');
+  });
+
+  it('Shift+Tab goes back to the hole before', async () => {
+    const { lastFrame, stdin } = composer({ snippets: fakeSnippets() });
+    await tick();
+    await press(stdin, ';;ex', TAB, 'Composer.tsx', TAB, 'the app', SHIFT_TAB);
+    expect(lastFrame()).toContain('Tab next slot \u00b7 2 left');
+
+    // Back on the first hole, whose default is now what was typed over it, and
+    // pending again: one character replaces the lot.
+    await press(stdin, 'the tests');
+    expect(lastFrame()).toContain('Explain the tests: what the app and why.');
+  });
+
+  it('the Tab after the last hole lands on `$0` and puts the stops away', async () => {
+    const ref = createRef<ComposerHandle>();
+    const { lastFrame, stdin } = composer({ ref, snippets: fakeSnippets() });
+    await tick();
+    await press(stdin, ';;ex', TAB, TAB);
+    expect(lastFrame()).toContain('Tab next slot \u00b7 1 left');
+    // Tab through a hole leaves its default alone: wiping them on the way past
+    // is the one thing a default is there to prevent.
+    expect(ref.current?.hasPopup()).toBe(true);
+
+    await press(stdin, TAB);
+    expect(lastFrame()).not.toContain('Tab next slot');
+    // And Tab is the app's again, now there is nothing here for it to do.
+    expect(ref.current?.hasPopup()).toBe(false);
+
+    // `$0` is in the middle of this one, so where the cursor came to rest shows.
+    await press(stdin, '!');
+    expect(lastFrame()).toContain('Explain the file: what calls it! and why.');
+  });
+
+  it('a template with no `$0` says the last Tab is a way out of it', async () => {
+    const { lastFrame, stdin } = composer({ snippets: fakeSnippets() });
+    await tick();
+    await press(stdin, ';;re', TAB);
+    expect(lastFrame()).toContain('Review the diff against main.');
+    expect(lastFrame()).toContain('Tab leaves the last slot');
+
+    // Nowhere else was asked for, so Tab leaves the cursor at the end of the
+    // hole it was in rather than jumping somewhere nobody named.
+    await press(stdin, TAB, '!');
+    expect(lastFrame()).not.toContain('Tab leaves the last slot');
+    expect(lastFrame()).toContain('Review the diff against main!.');
+  });
+
+  it('sending, and Ctrl+U, take the holes away with the line they were in', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit, snippets: fakeSnippets() });
+    await tick();
+    await press(stdin, ';;ex', TAB, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('Explain the file: what calls it and why.', []);
+    expect(lastFrame()).not.toContain('Tab next slot');
+
+    await press(stdin, ';;ex', TAB, CTRL_U);
+    expect(lastFrame()).not.toContain('Tab next slot');
+  });
+
+  it('the handle expands a snippet by name, its holes filled from the words', async () => {
+    const ref = createRef<ComposerHandle>();
+    const { lastFrame } = composer({ ref, snippets: fakeSnippets() });
+    await tick();
+
+    // One word for two holes: the second keeps its default and is a stop.
+    expect(ref.current?.expandSnippet('explain', ['apps/tui/src/app.tsx'])).toBe(true);
+    await tick();
+    expect(lastFrame()).toContain('Explain apps/tui/src/app.tsx: what calls it and why.');
+    expect(lastFrame()).toContain('Tab next slot \u00b7 1 left');
+
+    // Enough words for both, and the last hole takes the rest of them: nothing
+    // is left to fill, so there is nothing for Tab to walk.
+    expect(ref.current?.expandSnippet('explain', ['app.tsx', 'the', 'router'])).toBe(true);
+    await tick();
+    expect(lastFrame()).toContain('Explain app.tsx: what the router and why.');
+    expect(lastFrame()).not.toContain('Tab next slot');
+
+    expect(ref.current?.expandSnippet('no-such-thing', [])).toBe(false);
+    await tick();
+    expect(lastFrame()).toContain('Explain app.tsx: what the router and why.');
+  });
+
+  it('a command answered on the Enter that sent it expands into the emptied box', async () => {
+    const ref = createRef<ComposerHandle>();
+    // Exactly what the app does with `/snip name words…`: the command arrives
+    // through `onSubmit` and answers by putting a template back where it was
+    // typed, which only works if the box was emptied before the hand-over.
+    const onSubmit = vi.fn(() => {
+      ref.current?.expandSnippet('explain', ['app.tsx']);
+    });
+    const { lastFrame, stdin } = composer({ ref, onSubmit, snippets: fakeSnippets() });
+    await tick();
+    await press(stdin, '/snip explain app.tsx', ENTER);
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(lastFrame()).toContain('Explain app.tsx: what calls it and why.');
+    expect(lastFrame()).toContain('Tab next slot \u00b7 1 left');
+    expect(lastFrame()).not.toContain('/snip');
+  });
+
+  it('is the third popup asked, and never on screen beside the other two', async () => {
+    const { index } = fakeIndex();
+    const { lastFrame, stdin } = composer({ snippets: fakeSnippets(), fileIndex: index, onShell: vi.fn() });
+    await tick();
+
+    // A single word beginning with a slash is a command, whatever is in it.
+    await press(stdin, '/mod');
+    expect(lastFrame()).toContain('/model');
+    expect(lastFrame()).not.toContain(SNIPPET_HINT);
+
+    // With the cursor in an `@` the file popup has it, the `;;` earlier in the
+    // line notwithstanding.
+    await press(stdin, CTRL_U, ';;fi @comp');
+    expect(lastFrame()).toContain(COMPOSER_PATH);
+    expect(lastFrame()).toContain(MENTION_HINT);
+    expect(lastFrame()).not.toContain(SNIPPET_HINT);
+
+    // Back inside the `;;` token, and it is the snippet popup again.
+    await press(stdin, LEFT, LEFT, LEFT, LEFT, LEFT, LEFT);
+    expect(lastFrame()).toContain(SNIPPET_HINT);
+    expect(lastFrame()).not.toContain(MENTION_HINT);
+
+    // And at the shell prompt a `;;` is two semicolons, as a slash is a path.
+    await press(stdin, CTRL_U, '!', ';;fi');
+    expect(lastFrame()).toContain(';;fi');
+    expect(lastFrame()).not.toContain(SNIPPET_HINT);
+  });
+
+  it('keeps the holes when what is typed into one could as well have been typed after it', async () => {
+    const { lastFrame, stdin } = composer({
+      snippets: fakeSnippets([{ name: 'ping', body: 'Explain ${1}: what calls it.$0' }]),
+    });
+    await tick();
+    await press(stdin, ';;pi', TAB);
+    expect(lastFrame()).toContain('Explain : what calls it.');
+    expect(lastFrame()).toContain('Tab next slot \u00b7 1 left');
+
+    /*
+     * A `:` typed into the empty hole reads, character for character, exactly
+     * like a `:` typed just after it, and a diff has to pick one. So the holes
+     * are kept by asking what is *outside* them instead — which is why this is
+     * still a template with somewhere for Tab to go.
+     */
+    await press(stdin, ':');
+    expect(lastFrame()).toContain('Explain :: what calls it.');
+    expect(lastFrame()).toContain('Tab next slot \u00b7 1 left');
+  });
+
+  it('without a store, `;;` is two semicolons', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, ';;fi');
+    expect(lastFrame()).toContain(';;fi');
+    expect(lastFrame()).not.toContain(SNIPPET_HINT);
   });
 });
