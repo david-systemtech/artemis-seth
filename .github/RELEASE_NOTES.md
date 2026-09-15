@@ -1,6 +1,22 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.15.0
+
+The terminal catches up with the other agent terminals, and goes past them.
+
+**Typing.** The composer takes more than one line, walks the prompts you typed before with Up and searches them with Ctrl+R, names a file with `@` and offers the paths that match, opens the command menu with a cursor that Tab fills in and Enter runs, folds a long paste into a chip that says what it holds, pastes an image from the clipboard, hands the draft to `$EDITOR`, sets a draft aside with Ctrl+S, and runs a shell line with `!` — or `!!` to hand the output to the agent. A saved snippet expands from `;;name` with Tab walking the slots it left empty.
+
+**Reading.** Ctrl+O opens the whole conversation in a pager with search and jumps between turns; a cut result shows its head and its tail; a diff has line numbers where there is room and a tint where the terminal draws one; code is highlighted, tables are tables, links are clickable; `/copy` and `/export` take the reply or the conversation with you; the working line says what the agent is doing and for how long; the agent's checklist sits above the composer under Ctrl+T; and Tab reaches the conversation's own rows, where a key opens the file an edit touched at its line, re-runs a command, copies the row, or shows the whole diff.
+
+**Trust.** Shift+Tab steps the permission mode; a refusal can say why, and a comment beside an approval is sent once the tool has run; a rule can be read, narrowed and scoped before it is saved; a destructive command is previewed on the card — the files a glob would take, what git clean would remove, how many remote commits a forced push would discard — before you answer; Esc Esc goes back to an earlier prompt; `/diff` shows what this conversation changed and `/undo` puts the last change back.
+
+**Away.** The terminal tab says whether Artemis is working or needs you, and a bell or a desktop notice fires when a permission has waited or a turn finished while you were not looking. Ctrl+] steps to the next conversation that needs you, and past one waiting opens a card of every ask, answerable in one list. Come back after a few minutes and one line says what finished and what is waiting. When a plan window is out, the status line offers another account that could take the conversation, and nothing moves until you choose. Each turn is priced as a fraction of the plan beside its tokens and dollars, and `/model` says which model's bucket is refused on this account.
+
+**Around it.** The conversation list filters as you type, previews on Space, renames and pins; the delegated strip's rows open and stop; `/timeline` lists the turns with their cost and files; `/check` runs the project's own tests after the agent edits and offers the failure to the agent on Enter; the follow-ups an agent offers are numbered chips a digit takes; an attached image is drawn inline on kitty, WezTerm, Ghostty and iTerm2; `artemis ls` lists conversations from a script and `--print` can answer in JSON or as a stream of events; `?` draws every key. `apps/tui/README.md` has all of it.
+
+Three things are still out of reach and say so: a running command has no live tail, because the protocol carries no output stream; Esc Esc greys the prompts typed this session until their provider ids arrive on resume; and a tool result cannot carry an image, so a screenshot the agent took reaches the transcript as words.
+
 ## What's new in 2.14.0
 
 Sessions gather into groups you make, routines run on a schedule — on a server or on this machine — and a question the agent asks waits for you.
