@@ -251,6 +251,31 @@ describe('the turn ledger, the card of asks, and the snippets', () => {
     expect(parseCommand('/turns')?.name).toBe('timeline');
     expect(parseCommand('/snippets')?.name).toBe('snip');
   });
+
+  /*
+   * `/snip` is the one command with subcommands, and they are the whole reason
+   * the parser does nothing clever with them: everything after the word is one
+   * string, so `save` can be followed by a template with line breaks in it and
+   * arrive intact.
+   */
+  it('hands /snip its subcommands as words rather than parsing them', () => {
+    expect(parseCommand('/snip')).toEqual({ name: 'snip', args: '' });
+    expect(parseCommand('/snip --examples')).toEqual({ name: 'snip', args: '--examples' });
+    expect(parseCommand('/snip rm fix-tests')).toEqual({ name: 'snip', args: 'rm fix-tests' });
+    // The line breaks in a saved template survive the parse, which is what
+    // makes `$0` on a line of its own a shape somebody can type.
+    expect(parseCommand('/snip save notes first line\nsecond line')).toEqual({
+      name: 'snip',
+      args: 'save notes first line\nsecond line',
+    });
+  });
+
+  it('says in the menu that the name is optional, since the bare command is the list', () => {
+    const spec = COMMANDS.find((candidate) => candidate.name === 'snip');
+    expect(spec?.usage).toBe('/snip [name] [words]');
+    expect(spec?.summary).toContain('save');
+    expect(spec?.summary).toContain('--examples');
+  });
 });
 
 /*

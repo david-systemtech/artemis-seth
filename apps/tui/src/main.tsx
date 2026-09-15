@@ -267,6 +267,10 @@ async function main(): Promise<number> {
     await launched.cache.flush();
     await launched.preferences.flush();
     await launched.history.flush();
+    // Saving a snippet returns before the rename does — see `snippets.ts` — so
+    // a `/snip save` followed immediately by `/quit` is the write this waits
+    // for. Nothing to flush on the `--print` path, where nobody saved one.
+    await launched.snippets.flush();
     await files?.save();
     await launched.host.dispose();
   }

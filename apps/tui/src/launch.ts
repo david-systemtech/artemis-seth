@@ -6,11 +6,11 @@
  * pick the account the conversation opens on, and turn all of that into the
  * settings a `Conversation` starts with.
  *
- * The launch path reads *four files* — `profiles.json`, the cache of last
- * readings, what was last chosen and what was last typed — and spawns
- * nothing. Listing models and probing sign-in state each cost a subprocess
- * per account, so they wait until a picker asks; a person who typed `artemis`
- * should be looking at a prompt, not a progress bar.
+ * The launch path reads *five files* — `profiles.json`, the cache of last
+ * readings, what was last chosen, what was last typed and the templates that
+ * were saved — and spawns nothing. Listing models and probing sign-in state
+ * each cost a subprocess per account, so they wait until a picker asks; a
+ * person who typed `artemis` should be looking at a prompt, not a progress bar.
  *
  * Failures here are sentences, not stacks. There is no window to log into and
  * the person is right there; what they need is the thing to do next.
@@ -24,6 +24,7 @@ import { isPermissionMode, type PermissionMode, type ProviderDescriptor, type Pr
 import { ReadingCache, tuiCacheDir } from './cache.js';
 import { PromptHistory, defaultHistoryPath } from './history.js';
 import { PreferencesStore, tuiStateDir } from './preferences.js';
+import { Snippets, defaultSnippetsPath } from './snippets.js';
 import type { ConversationSettings } from './conversation.js';
 import { createTuiHost, type TuiHost } from './host.js';
 
@@ -51,6 +52,8 @@ export interface Launched {
   readonly preferences: PreferencesStore;
   /** What has been typed here before, for the composer to walk back through and to append to. */
   readonly history: PromptHistory;
+  /** The saved templates `;;` offers and `/snip` expands, and the file they are kept in. */
+  readonly snippets: Snippets;
   /** What the status bar calls the working directory. */
   readonly workspace: string;
   readonly descriptors: ReadonlyMap<ProviderId, ProviderDescriptor>;
@@ -186,8 +189,18 @@ export async function launch(options: LaunchOptions): Promise<LaunchResult> {
    *
    * An unreadable file is an empty history, not a failed launch; see the
    * header there.
+   *
+   * The saved templates come with it, by the same trick and for the same
+   * reason: `;;` offers them while somebody is typing and `/snip` expands one
+   * on a keystroke, and a popup that arrived a tick after the second semicolon
+   * would appear over the next word instead. Two small files in one directory,
+   * neither needing the other, so the launch waits for them once rather than
+   * twice — and an unreadable one is no snippets, not a failed launch.
    */
-  const history = await PromptHistory.load(defaultHistoryPath({ env: { ARTEMIS_TUI_STATE_DIR: stateDir } }));
+  const [history, snippets] = await Promise.all([
+    PromptHistory.load(defaultHistoryPath({ env: { ARTEMIS_TUI_STATE_DIR: stateDir } })),
+    Snippets.load(defaultSnippetsPath({ env: { ARTEMIS_TUI_STATE_DIR: stateDir } })),
+  ]);
 
   return {
     ok: true,
@@ -197,6 +210,7 @@ export async function launch(options: LaunchOptions): Promise<LaunchResult> {
       cache: new ReadingCache(options.cacheDir ?? tuiCacheDir()),
       preferences,
       history,
+      snippets,
       workspace: basename(cwd) || cwd,
       descriptors,
       ...(options.resume === undefined ? {} : { resume: options.resume }),

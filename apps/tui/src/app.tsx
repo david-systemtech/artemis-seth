@@ -42,12 +42,16 @@
  *
  * Two keys are *shared* with the composer rather than taken from it, because
  * Ink has no stop-propagation and both handlers see every press: Esc, which
- * the composer's reverse search owns while it is open, and Tab, which its
- * slash menu and `@` popup own while one of them is. Both are asked about —
- * `isCapturing()`, `hasPopup()` — rather than guessed at. `?` runs the other
- * way: the composer answers it at an empty box, and this file only supplies
- * what it opens, because a `?` acted on here would have been typed into the
- * box on the same keystroke.
+ * the composer's reverse search owns while it is open, and Tab, which the slash
+ * menu, the `@` popup, the `;;` popup and the holes a snippet left behind own
+ * whenever one of them is there. Both are asked about — `isCapturing()`,
+ * `hasPopup()` — rather than guessed at, and the Tab question is asked before
+ * the Shift branch so that Shift+Tab stands down too: it walks a template's
+ * slots backwards, and stepping the permission mode instead would be a key with
+ * two owners in the one state that has a use for it. `?` runs the other way:
+ * the composer answers it at an empty box, and this file only supplies what it
+ * opens, because a `?` acted on here would have been typed into the box on the
+ * same keystroke.
  *
  * Shift+Tab steps the permission mode on through the provider's own list —
  * the one `/mode` draws, in its order — and steps over bypass until bypass
@@ -74,6 +78,11 @@
  *    end a conversation, confirmed first.
  *  - `/model`   — the account's own model list, then an effort picker if the
  *    model has levels, then a speed picker if it offers fast mode or ultracode.
+ *    Each row carries what this account's plan says about that model — refused,
+ *    under pressure, or nothing at all — which is `modelFacts.ts`'s join and
+ *    not a second opinion about any of it. A refused row keeps its place with
+ *    the reason in words and cannot be chosen; the only row with no facts is
+ *    `Provider default`, because no model has been named on it.
  *  - `/mode`    — the provider's permission modes, no more. Bypass is red and
  *    asks twice.
  *  - `/resume`  — the account's stored conversations in this directory. The
@@ -107,7 +116,10 @@
  *  - `/diff`    — two questions, one list. `git` answers what is different
  *    from the last commit, whoever changed it; the ledger answers what *this
  *    conversation* did, which is the one that can be answered in a directory
- *    that is not a repository. Either opens into `TextView`.
+ *    that is not a repository. Either opens into `TextView`, and git's answer
+ *    goes through the person's own diff tool first when they have one — as a
+ *    filter, never as a pager, which is the distinction `externalTools.ts` is
+ *    built around.
  *  - `/undo`    — the last file change, taken back, and refused rather than
  *    guessed at whenever the file has moved since.
  *  - `/pin`     — held at the top of its folder, remembered in the
@@ -120,6 +132,15 @@
  * files it touched — and Enter on a row opens the pager at that turn, which is
  * the way back into an afternoon's work that scrolling is not. `timeline.ts`
  * is the reduction; what is here is the list and where Enter lands.
+ *
+ * `/snip` is the one command about what has not been said yet. `snippets.ts`
+ * owns the file, the template language and the arithmetic of an expansion, and
+ * the composer owns the `;;` trigger and the slots Tab walks; what is here is
+ * the four things a command can do that a trigger cannot — the list, for the
+ * snippet somebody wrote in March and cannot name, and `save`, `rm` and
+ * `--examples`. The expansion itself goes through the composer's handle either
+ * way, because what comes back from one is a buffer, a cursor and a list of
+ * holes, and only the box has anywhere to put the last two.
  *
  * One more key belongs to neither the conversation nor the pool but to the
  * *account*. When the provider stops serving this one — a window rejected, or
@@ -145,6 +166,13 @@
  * conversations parked and working, that is most of the time. `terminal.ts`
  * owns the bytes, `attention.ts` the reduction, and the effects under "The
  * window, from outside" the policy.
+ *
+ * Which terminal this actually is gets asked once more, at the viewport: a
+ * picture somebody attached is drawn where the terminal can draw one and is a
+ * chip with its size everywhere else. `render/images.ts` answers that from the
+ * environment and never by asking the terminal, so it is a constant for the
+ * session, and it is read here because this is the file that knows what Artemis
+ * was started in — the viewport only hands it down.
  *
  * Two of those channels point inwards rather than out, and they are under
  * "Who needs you, and what you missed". Ctrl+] goes to the next conversation
@@ -207,11 +235,15 @@ import {
   type FailoverCandidate,
 } from './failover.js';
 import { editInExternalEditor, splitCommand, type ExternalEditResult } from './externalEditor.js';
+import { externalDiffTool, pipeThrough } from './externalTools.js';
 import { listFiles, type Frecency } from './fileIndex.js';
 import type { HistoryScope } from './history.js';
 import type { Launched } from './launch.js';
+import { modelRowFacts } from './modelFacts.js';
 import type { ModelListing } from './host.js';
 import { renderDiff } from './render/diff.js';
+import { imageProtocol } from './render/images.js';
+import { EXAMPLE_SNIPPETS, toSnippetName } from './snippets.js';
 import {
   rowCommand,
   rowDiff,
@@ -535,6 +567,19 @@ const isNextNeedy = (input: string, key: { readonly ctrl: boolean }): boolean =>
 
 const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
+/**
+ * A command's arguments as their first word and everything after it.
+ *
+ * The remainder is kept *verbatim* past the whitespace that separated them,
+ * because `/snip save fix-tests` is followed by a template and a template's
+ * line breaks are part of it. Splitting on whitespace and rejoining would save
+ * a paragraph as one long line. `['', '']` for nothing at all.
+ */
+const firstWord = (args: string): readonly [string, string] => {
+  const match = /^(\S+)\s*([\s\S]*)$/.exec(args);
+  return match === null ? ['', ''] : [match[1] ?? '', match[2] ?? ''];
+};
+
 /** `3 lines`, for a row of `/copy`'s list. */
 const countOfLines = (text: string): string => {
   const lines = text.split('\n').length;
@@ -542,7 +587,7 @@ const countOfLines = (text: string): string => {
 };
 
 export function App({ launched, files }: AppProps): React.JSX.Element {
-  const { host, descriptors, cache, preferences, history } = launched;
+  const { host, descriptors, cache, preferences, history, snippets } = launched;
   const { exit, suspendTerminal } = useApp();
   const { columns, rows } = useTerminalSize();
   /*
@@ -1767,12 +1812,36 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     const token = ++pickerToken.current;
     const present = (listing: ModelListing): Omit<PickerModal, 'kind'> => {
       const items: PickerItem[] = [
+        /*
+         * No facts on this row, and it is the one row that must not have any:
+         * it is a decision to let the CLI choose, so there is no model to ask
+         * the plan about, and a row saying `fable 92%` under "whatever the CLI
+         * would pick" would be a claim about a model nobody has named.
+         */
         { key: '', label: 'Provider default', detail: 'whatever the CLI would pick' },
-        ...listing.models.map((model) => ({
-          key: model.id,
-          label: model.label,
-          detail: model.displayName !== undefined && model.displayName !== model.label ? model.displayName : model.note,
-        })),
+        ...listing.models.map((model) => {
+          /*
+           * What this account's plan has to say about this model — exhausted,
+           * under pressure, or nothing at all. `modelFacts.ts` does the join
+           * and borrows every judgement in it from somewhere that has already
+           * made one, so the picker and the meter under the composer cannot
+           * come to disagree about the same window.
+           *
+           * The catalogue's own text is the fallback rather than the
+           * replacement: a plan with nothing metered leaves `detail` empty and
+           * the row reads exactly as it did before any of this existed.
+           */
+          const facts = modelRowFacts(model, state.planUsage);
+          const catalogue = model.displayName !== undefined && model.displayName !== model.label ? model.displayName : model.note;
+          return {
+            key: model.id,
+            label: model.label,
+            detail: facts.detail === '' ? catalogue : facts.detail,
+            disabled: facts.disabled,
+            ...(facts.reason === undefined ? {} : { reason: facts.reason }),
+            ...(facts.note === undefined ? {} : { note: facts.note }),
+          };
+        }),
       ];
       return {
         title: listing.live ? 'Models' : 'Models (built-in list — the account did not confirm it)',
@@ -1780,6 +1849,11 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         initialKey: state.settings.model ?? '',
         token,
         onSelect: (item) => {
+          // A row the provider is refusing on this account is shown with the
+          // reason and is not choosable. The picker already declines to select
+          // one; this is the second half of the same rule, because a refresh
+          // can disable the row under a cursor that was already on it.
+          if (item.disabled === true) return;
           setModal(null);
           if (item.key === '') {
             conversation.updateSettings({ model: undefined, modelLabel: undefined, effort: undefined, fastMode: undefined, ultracode: undefined });
@@ -1809,7 +1883,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         );
       }
     }
-  }, [cache, readModels, state.settings.profileId, state.settings.model, openPicker, conversation, openEffortPicker, say]);
+  }, [cache, readModels, state.settings.profileId, state.settings.model, state.planUsage, openPicker, conversation, openEffortPicker, say]);
 
   const applyMode = useCallback(
     (mode: PermissionMode) => {
@@ -2177,6 +2251,25 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
    * Waited on first. The ledger is fed from an event handler that cannot wait
    * for a disk read, so a `/diff` typed the instant a turn ends would
    * otherwise be missing that turn's last edit — see `changesSettled`.
+   *
+   * ## The working tree goes through the user's own diff tool
+   *
+   * Somebody who has spent an afternoon on their `delta` theme should see that
+   * theme here. `git` has already answered with unified text, which is exactly
+   * what `delta`, `diff-so-fancy` and `bat` read on standard input, so the tool
+   * is a *filter*: the text goes in, the ANSI comes back, and `TextView`
+   * scrolls it with the terminal still Ink's — see `externalTools.ts` on why
+   * that is a different thing from handing the terminal to a pager. The width
+   * is the box's rather than the terminal's, or `delta` would lay the diff out
+   * for columns the reader does not have.
+   *
+   * Nothing is lost when it goes wrong. `null` means the person has no such
+   * tool and has always seen Artemis's own rendering; a tool that fails says so
+   * on the status line and the rendering is the same one. What is *not* done is
+   * running it over the per-file rows: those come from the ledger as `FileEdit`
+   * rows — already diffed, numbered against both files and collapsed in the
+   * middle — and rebuilding unified text with honest hunk headers out of a
+   * capped row list is a new diff, not a pipe. They keep `renderDiff`.
    */
   const openDiff = useCallback(() => {
     void (async () => {
@@ -2187,16 +2280,28 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       const workingTree = async (): Promise<void> => {
         setModal({ kind: 'loading', title: 'Working tree — asking git…' });
         const result = await gitDiff(conversation.getState().settings.cwd);
-        setModal(null);
         if (!result.ok) {
+          setModal(null);
           showFlash(result.reason);
           return;
         }
         if (result.text.trim().length === 0) {
+          setModal(null);
           showFlash('nothing changed');
           return;
         }
-        setModal({ kind: 'text', title: `Working tree · ${workspace}`, lines: result.text.split('\n') });
+        const title = `Working tree · ${workspace}`;
+        const tool = externalDiffTool({ columns });
+        if (tool !== null) {
+          setModal({ kind: 'loading', title: `Working tree — through ${tool.label}…` });
+          const piped = await pipeThrough(tool.argv, result.text);
+          if (piped.ok) {
+            setModal({ kind: 'text', title: `${title} · via ${tool.label}`, lines: piped.text.split('\n') });
+            return;
+          }
+          showFlash(piped.reason);
+        }
+        setModal({ kind: 'text', title, lines: result.text.split('\n') });
       };
 
       // Nothing recorded means there is only one row to offer, and a picker of
@@ -2536,6 +2641,132 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     setModal({ kind: 'asks' });
   }, [showFlash]);
 
+  /* ---------------------------------------------------------------------- */
+  /* Snippets                                                                */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * `/snip` with no name — the saved templates, as a list.
+   *
+   * The command's other form needs the name, which is fine for the three
+   * somebody wrote this morning and no use at all for the one they wrote in
+   * March. So the bare command is the list, typed at for the reason `/timeline`
+   * is: the reason to open it is that you have more of them than you remember.
+   *
+   * Enter goes through the composer's handle rather than writing the text
+   * itself. What comes back from an expansion is a buffer, a cursor and a list
+   * of holes for Tab to walk, and only the box has anywhere to put the last
+   * two — see {@link ComposerHandle.expandSnippet}.
+   */
+  const openSnippetPicker = useCallback(() => {
+    const saved = snippets.list();
+    if (saved.length === 0) {
+      showFlash('no snippets yet · /snip save <name> <text>, or /snip --examples');
+      return;
+    }
+    openPicker({
+      title: 'Snippets',
+      // The body as one line, which is how a name is recognised again: nobody
+      // remembers what `explain` says, and the first few words are enough.
+      items: saved.map((snippet) => ({ key: snippet.name, label: snippet.name, detail: oneLine(snippet.body, Math.max(20, mainWidth - 24)) })),
+      filterable: true,
+      hint: `Enter expands it into the composer · ${PICKER_KEYS}`,
+      onSelect: (item) => {
+        setModal(null);
+        composerRef.current?.expandSnippet(item.key, []);
+      },
+    });
+  }, [snippets, mainWidth, openPicker, showFlash]);
+
+  /**
+   * `/snip` — expand one, list them, or keep the list.
+   *
+   * ```
+   * /snip                     the list; Enter expands the row
+   * /snip fix-tests pnpm -w   expand it, its words filling the slots
+   * /snip save fix-tests …    write one, under the name it can be typed as
+   * /snip rm fix-tests        forget it
+   * /snip --examples          copy in three to edit
+   * ```
+   *
+   * The three subcommands outrank a snippet of the same name, which is the only
+   * ambiguity here and the one every tool resolves this way. A snippet called
+   * `save` is reachable from the list and from `;;save`, which is where anybody
+   * who managed to save one under that name is going to look for it.
+   *
+   * Saving takes the rest of the line *verbatim* rather than its words
+   * rejoined: a template's line breaks are part of the template, and `$0` on a
+   * line of its own is the common shape. Which means the name is the *first*
+   * word and only the first word — everything after it is the body, so there is
+   * nowhere for a name with a space in it to live — and it goes through
+   * `toSnippetName` on the way in: `Fix_Tests!` is `fix-tests`, because saving
+   * is the one moment somebody types a name rather than picks one and refusing
+   * a capital letter there is pedantry. What is stored is still one lower-case
+   * word, so the trigger stays one token.
+   */
+  const runSnip = useCallback(
+    (args: string) => {
+      const [word, rest] = firstWord(args);
+
+      if (word === '') {
+        openSnippetPicker();
+        return;
+      }
+
+      if (word === '--examples') {
+        for (const example of EXAMPLE_SNIPPETS) snippets.set(example.name, example.body);
+        showFlash(`${String(EXAMPLE_SNIPPETS.length)} examples saved · /snip lists them`);
+        return;
+      }
+
+      if (word === 'save') {
+        const [typedName, body] = firstWord(rest);
+        if (body.trim().length === 0) {
+          setNotice('/snip save <name> <the template> — with the text to save after the name.');
+          return;
+        }
+        const name = toSnippetName(typedName);
+        if (name === null) {
+          setNotice(`"${typedName}" leaves nothing that can be a snippet name; letters, digits and dashes survive.`);
+          return;
+        }
+        const replaced = snippets.get(name) !== undefined;
+        snippets.set(name, body);
+        showFlash(`${replaced ? 'replaced' : 'saved'} ;;${name}`);
+        return;
+      }
+
+      if (word === 'rm') {
+        const [typedName] = firstWord(rest);
+        // Through the same door saving used, so that `rm Fix_Tests` forgets
+        // exactly what `save Fix_Tests …` wrote, rather than reporting that
+        // there is no snippet by a name nobody could have stored.
+        const name = toSnippetName(typedName);
+        if (name === null) {
+          setNotice('/snip rm <name> — which snippet to forget.');
+          return;
+        }
+        if (!snippets.remove(name)) {
+          setNotice(`No snippet called ${name}.`);
+          return;
+        }
+        showFlash(`removed ;;${name}`);
+        return;
+      }
+
+      /*
+       * A name, and the words after it filling its slots in order — the last
+       * slot taking whatever is left, which is why `/snip explain the whole
+       * launch path` explains the phrase rather than the word "the".
+       */
+      const words = rest.split(/\s+/).filter((part) => part.length > 0);
+      if (composerRef.current?.expandSnippet(word, words) !== true) {
+        setNotice(`No snippet called ${word}. /snip lists them; /snip save ${word} <text> writes one.`);
+      }
+    },
+    [snippets, openSnippetPicker, showFlash],
+  );
+
   /**
    * The hand-off list, opened from a command that is answered before it.
    *
@@ -2644,6 +2875,9 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         case 'timeline':
           openTimelinePicker();
           return;
+        case 'snip':
+          runSnip(command.args);
+          return;
         case 'handoff':
           // The same list Alt+H opens, because there is one hand-off and two
           // ways to ask for it. See `openFailoverPicker`.
@@ -2677,6 +2911,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       showUsage,
       openAsksCard,
       openTimelinePicker,
+      runSnip,
       confirm,
       applyMode,
     ],
@@ -4058,11 +4293,18 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
 
     if (key.tab) {
       /*
-       * Tab had two owners and this is where they are told apart. While the
-       * slash menu or the `@` popup is open the press belongs to the box — it
-       * is finishing a word that is already highlighted — and a reverse search
-       * owns the keyboard outright. Otherwise Shift+Tab steps the permission
-       * mode on, and a bare Tab moves the focus.
+       * Tab had two owners and this is where they are told apart. The press
+       * belongs to the box while it has something for Tab to do — the slash
+       * menu, the `@` popup or the `;;` popup with a row highlighted, or the
+       * holes a snippet left behind for Tab to walk — and a reverse search owns
+       * the keyboard outright. Otherwise Shift+Tab steps the permission mode
+       * on, and a bare Tab moves the focus.
+       *
+       * The question is asked above the Shift branch on purpose, so it stands
+       * *both* of them down: a snippet's slots are walked forwards with Tab and
+       * backwards with Shift+Tab, and a Shift+Tab that stepped the permission
+       * mode while somebody was walking back through the holes of a template
+       * would be a key with two owners in the one state that has a use for it.
        */
       if (composerActive && (composerRef.current?.hasPopup() === true || composerRef.current?.isCapturing() === true)) return;
       if (key.shift) {
@@ -4497,6 +4739,15 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
             cursor={focus === 'transcript' ? cursorId : null}
             onCursorRows={setCursorRows}
             expandedRows={expanded}
+            /*
+             * Whether an attached picture is drawn or described. Read here
+             * because this is the file that knows which terminal Artemis was
+             * started in; `render/images.ts` reads the environment and asks
+             * the terminal nothing, so it is a constant for the session and
+             * the viewport only hands it down. `'none'` is a chip with the
+             * size, which is what most terminals will go on getting.
+             */
+            imageProtocol={imageProtocol()}
           />
 
           {/*
@@ -4548,6 +4799,17 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
               <PermissionCard
                 key={pendingRequest.id}
                 request={pendingRequest}
+                /*
+                 * Where a relative path in the command would land, so the card
+                 * can say what a destructive one would actually touch. The
+                 * conversation's directory and not this process's: `/cwd` moves
+                 * one and not the other, and a preview resolved against the
+                 * wrong root is a preview of somebody else's files. The width
+                 * is the pane's, less the card's own padding, because the block
+                 * of paths is clipped to fit rather than wrapped.
+                 */
+                cwd={state.settings.cwd}
+                columns={mainWidth - 2}
                 /*
                  * A comment typed under the answer travels as an ordinary
                  * message, and only once the decision itself has landed: the
@@ -4683,6 +4945,14 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
               history={history}
               historyScopes={historyScopes}
               {...(fileIndex === undefined ? {} : { fileIndex })}
+              /*
+               * `;;` — what the trigger offers, and what `/snip` expands. The
+               * store is the one thing both doors share, and handing it over
+               * rather than a callback is what lets the composer keep the whole
+               * of the trigger: it filters the list as the name is typed, and it
+               * is the only place the holes a template left behind can live.
+               */
+              snippets={snippets}
               /*
                * ↑ on an empty box. The composer knows it is empty and the
                * conversation knows whether anything is waiting, so the

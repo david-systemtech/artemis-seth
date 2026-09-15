@@ -118,6 +118,29 @@ describe('KEYMAP: the keys the terminal grew', () => {
     expect(composer.get('Backspace')).toContain('paste chip');
   });
 
+  /*
+   * The third sigil. `/` and `@` announce themselves — one keystroke and a list
+   * appears — and `;;` does too, but only once you know it is there, so it is
+   * the one of the three that is unusable unless it is written down.
+   */
+  it('writes down the snippet trigger, and that Tab walks what it leaves behind', () => {
+    const composer = inContext('composer');
+    expect(composer.get(';;')).toContain('snippet');
+    expect(composer.get(';;')).toContain('slots');
+    // Tab fills in a highlighted row and steps to the next hole, which is two
+    // things one row has to say — the rule Ctrl+S is the other example of.
+    expect(composer.get('Tab')).toContain('slot');
+    /*
+     * Shift+Tab is the one key the map gives two readings of in two contexts:
+     * it steps the permission mode anywhere, and steps back through a
+     * template's holes while the composer still has some. Both rows have to be
+     * there, because a map that only had the first would be describing a key
+     * the composer takes away at exactly the moment somebody needs the second.
+     */
+    expect(composer.get('Shift+Tab')).toContain('slot');
+    expect(inContext('anywhere').get('Shift+Tab')).toContain('permission mode');
+  });
+
   it('gives a key that does two things one row that says both', () => {
     // Two rows for one key in one context is what the clash test forbids, and
     // rightly — but Ctrl+S really does two things, and a row naming only one

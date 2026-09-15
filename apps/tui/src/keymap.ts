@@ -199,7 +199,24 @@ const GROUPS: readonly KeyGroup[] = [
       { keys: ['↑', '↓'], does: 'The text, then the queue, then history' },
       { keys: ['/'], does: 'Start a command, and see the menu' },
       { keys: ['@'], does: 'Name a file, and see the paths' },
-      { keys: ['Tab'], does: 'Fill in the highlighted row' },
+      /*
+       * The third sigil, and the only one that is two characters. It is on the
+       * map next to `/` and `@` because that is what it is — a trigger that
+       * offers a list under the box — and because a saved prompt nobody can
+       * find the trigger for is a notes file with extra steps.
+       */
+      { keys: [';;'], does: 'Expand a saved snippet; Tab walks its slots' },
+      // Two things, one row, for the reason Ctrl+S has one: a row naming only
+      // the completion would be the map quietly lying about the other.
+      { keys: ['Tab'], does: 'Fill in the highlighted row, or the next slot' },
+      /*
+       * The one key whose meaning here is not the meaning it has in `anywhere`.
+       * While a template's holes are still open the composer owns Tab and
+       * Shift+Tab both, and the app's mode switch stands down — see the note on
+       * the Tab branch in `app.tsx`. Two rows in two contexts rather than one,
+       * because they are two different keys to the person pressing them.
+       */
+      { keys: ['Shift+Tab'], does: 'Back to the slot before, in a snippet' },
       { keys: ['!'], does: 'Run a shell command; !! sends the output' },
       { keys: ['Ctrl+V'], does: 'Paste an image, or the text there' },
       { keys: ['Ctrl+G'], does: 'Edit the draft in $EDITOR' },

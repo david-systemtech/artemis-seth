@@ -70,7 +70,13 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: 'title', usage: '/title <name>', summary: 'Name this conversation' },
   { name: 'asks', usage: '/asks', summary: 'Every conversation waiting on a permission, answerable in one list' },
   { name: 'timeline', usage: '/timeline', summary: 'One line per turn: when, what, how long, what it cost, what it touched' },
-  { name: 'snip', usage: '/snip <name> [words]', summary: 'Expand a saved snippet into the composer, cursor on its first slot' },
+  /*
+   * The one command with subcommands, and the usage says so with a bracket
+   * rather than by listing them: `/snip` alone is the list, which is how
+   * somebody finds `save`, `rm` and `--examples` without the menu row having to
+   * carry all three in a column two words wide.
+   */
+  { name: 'snip', usage: '/snip [name] [words]', summary: 'Expand a saved snippet, or list them; save, rm and --examples keep them' },
   { name: 'tasks', usage: '/tasks', summary: 'Background work: what is running, and what a delegated agent did' },
   { name: 'usage', usage: '/usage', summary: "The account's plan windows and how full they are" },
   { name: 'handoff', usage: '/handoff', summary: 'Move this conversation to another account, or start it fresh there' },
