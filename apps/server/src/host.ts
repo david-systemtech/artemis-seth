@@ -110,7 +110,31 @@ export interface HeadlessHost {
 }
 
 export function createHeadlessHost(dataDir: string): HeadlessHost {
-  const providers = createDefaultProviderRegistry({});
+  const providers = createDefaultProviderRegistry({
+    claude: {
+      /*
+       * The provider started a turn nobody asked for — register it.
+       *
+       * It does that when background work settles, and a subagent that outlived
+       * its turn can park on a permission prompt the same way. Without this the
+       * adapter has nowhere to report the turn and drops it — so a served client
+       * watched its subagent spin for ever after it had finished, and never got
+       * the agent's sentence about the result. `runs` is declared below and
+       * captured, not called, until a process is live. Same wiring as the
+       * desktop's `engine.ts` and the terminal's `host.ts`, and swallowed for
+       * the same reason: this runs inside the adapter's own event pump.
+       */
+      onContinuation: (run, context) => {
+        try {
+          runs.adopt(run, context);
+        } catch (error) {
+          process.stderr.write(
+            `Could not adopt the provider's own turn on run ${run.runId}: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        }
+      },
+    },
+  });
   const managed = [...new Set(providers.list().flatMap((adapter) => managedEnvKeys(adapter.credentials)))];
 
   const profiles = new ProfileStore({

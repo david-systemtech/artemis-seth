@@ -1,6 +1,12 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.13.1
+
+The terminal — and a server — now hear the agent when a subagent finishes.
+
+**A subagent that outlived its turn is seen to finish.** Reported from the terminal a release after subagents stopped being killed: they showed up on the delegated strip, never settled, and the conversation never said a word about what they found. Reproduced with the SDK replaced by a scripted transport under the real host, registry, adapter and conversation — the row stayed `running` for ever. When background work settles the CLI takes a turn of its own about it: init, the task notification, a sentence, result. The adapter reports that turn upward as a run of its own, and only the desktop was listening. The terminal's host and the server's built their provider registry with nothing to report it to, so the turn was discarded whole, along with the flush that marks the row settled; and the terminal's conversation routes by run id and dropped every event of a run it had not started. Both hosts now adopt the provider's turn, and the conversation takes it as its own when it names this session and nothing else is running. When the next prompt is already typed and the CLI answers the notification first, the continuation is kept beside the waiting prompt instead — allowed to settle the row and show what was said, never to touch the prompt's own turn. Pinned by a full-chain test on each host and three at the conversation seam, all written red before the fix.
+
 ## What's new in 2.13.0
 
 The terminal stops killing its own subagents, and shows you the ones that are running.
