@@ -237,4 +237,69 @@ describe('the pager', () => {
     // Every item, not every row: a call folded into a count still happened.
     expect(text).toContain('notes.txt: a kumquat, ripe');
   });
+
+  /**
+   * The rows the turns open at, which is what `/timeline` hands over. Read off
+   * the model rather than written down, because the point of the prop is that
+   * a user item's id *is* its row id — nothing translates it.
+   */
+  function turnRows(model: TranscriptModel): readonly string[] {
+    return model.getRowsSnapshot().filter((id) => model.getItem(id)?.kind === 'user');
+  }
+
+  it('opens on the row it was given, a line of context above it', async () => {
+    const transcript = conversation();
+    const second = turnRows(transcript)[1];
+    const { lastFrame } = open({ transcript, initialRowId: second });
+    await tick();
+    const lines = (lastFrame() ?? '').split('\n');
+
+    // Line 0 is the title, so the body starts at 1 — and the turn is not on
+    // it. The tail of the row above, the card that closed the first run, is
+    // the line of context that says the conversation did not start here.
+    expect(lines[1] ?? '').toContain('900ms');
+    expect(lines.findIndex((line) => line.includes('Second question about bananas'))).toBeGreaterThan(1);
+    // Opened at that turn, which is not where it would have opened alone.
+    expect(lines.join('\n')).not.toContain('Banana note 20.');
+  });
+
+  it('opens at the end when the row it was given is in no row', async () => {
+    const { lastFrame } = open({ initialRowId: 'u:nowhere' });
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(frame).toContain('Banana note 20.');
+    expect(frame).toContain('100%');
+  });
+
+  it('counts the position it opened at in the foot, not the end', async () => {
+    const transcript = conversation();
+    const second = turnRows(transcript)[1];
+    const { lastFrame } = open({ transcript, initialRowId: second });
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    const percent = Number(/(\d+)%/.exec(frame)?.[1] ?? '-1');
+    expect(percent).toBeGreaterThan(0);
+    expect(percent).toBeLessThan(100);
+  });
+
+  it('opens with a phrase already in the search row, and does not run it', async () => {
+    const { lastFrame, stdin } = open({ initialQuery: 'kumquat' });
+    await tick();
+    let frame = lastFrame() ?? '';
+
+    // Typed, not searched: the row shows it, the foot has no count, and the
+    // view is still at the end where the pager opens.
+    expect(frame).toContain('/kumquat');
+    expect(frame).not.toContain('1/3');
+    expect(frame).toContain('Banana note 20.');
+
+    // Enter runs it, as it would for anything typed by hand.
+    stdin.write('\r');
+    await tick();
+    frame = lastFrame() ?? '';
+    expect(frame).toContain('kumquat  1/3');
+    expect(frame).toContain('A kumquat is smaller.');
+  });
 });

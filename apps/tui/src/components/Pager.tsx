@@ -49,6 +49,23 @@
  * than on the call itself: a group is one row and one offset. Unfolded, that
  * group is a summary line with its calls under it, so the call is usually on
  * screen; in a run of forty it may not be.
+ *
+ * ## Where it opens
+ *
+ * At the end, because the thing someone pressed Ctrl+O to see the whole of is
+ * the thing that just went past — unless the caller names a row. `/timeline`
+ * does: the reader has already picked a turn out of the ledger, and being put
+ * back at the foot of the conversation would undo the choice. A named row
+ * lands a line below the top edge, by the same rule and for the same reason a
+ * search hit does.
+ *
+ * The id a turn carries (`Turn.userItemId`, in `src/timeline.ts`) is the id of
+ * the user item that opened it, and that is also the item's row id, so nothing
+ * has to translate between the two: only `kind: 'tool'` items count as
+ * machinery in `rebuildRows` (`packages/transcript/src/transcript.ts`), and
+ * everything else — a user message included — is pushed as a row of itself. A
+ * user row is therefore never folded into a `g:` group, and an id from the
+ * ledger can be looked up in `tops` as it stands.
  */
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
@@ -99,9 +116,37 @@ export interface PagerProps {
   readonly onOpenInEditor?: (markdown: string) => void;
   /** Off while something in front of the pager owns the keyboard. */
   readonly isActive?: boolean;
+  /**
+   * The row to open on, instead of the end — the turn a reader picked in
+   * `/timeline`. See "Where it opens" above for why a turn's id needs no
+   * translating, and why the view lands a line below the row's top.
+   *
+   * An id that is in no row — a turn from a conversation that has since been
+   * reset, say — opens at the end, which is where the pager opens anyway.
+   */
+  readonly initialRowId?: string;
+  /**
+   * A phrase to open the search row with, already typed.
+   *
+   * Typed, not run: `Enter` runs it, exactly as for a phrase entered by hand,
+   * and `Esc` throws the row away without the view having moved. Running it on
+   * the way in would jump to the first match — somewhere nobody chose, and not
+   * where {@link initialRowId} asked to be — and would leave no chance to
+   * finish or correct a phrase the caller could only guess at.
+   */
+  readonly initialQuery?: string;
 }
 
-export function Pager({ transcript, columns, rows, onClose, onOpenInEditor, isActive = true }: PagerProps): React.JSX.Element {
+export function Pager({
+  transcript,
+  columns,
+  rows,
+  onClose,
+  onOpenInEditor,
+  isActive = true,
+  initialRowId,
+  initialQuery,
+}: PagerProps): React.JSX.Element {
   const rowIds = useSyncExternalStore(transcript.subscribeList, transcript.getRowsSnapshot);
   const shown = useMemo(() => inOrderOfStart(rowIds, transcript), [rowIds, transcript]);
   const view = useMemo<RowView>(() => ({ expanded: true, columns: rowContentColumns(columns) }), [columns]);
@@ -109,8 +154,11 @@ export function Pager({ transcript, columns, rows, onClose, onOpenInEditor, isAc
   const [line, setLine] = useState(0);
   const [measured, setMeasured] = useState<Measured>(UNMEASURED);
 
-  const [searching, setSearching] = useState(false);
-  const [draft, setDraft] = useState('');
+  // A caller's phrase arrives in the row as though it had just been typed, so
+  // the state it lands in is the state typing leaves behind: row open, draft
+  // filled, nothing searched yet.
+  const [searching, setSearching] = useState(initialQuery !== undefined && initialQuery !== '');
+  const [draft, setDraft] = useState(initialQuery ?? '');
   const [query, setQuery] = useState('');
   const [matches, setMatches] = useState<readonly TranscriptMatch[]>([]);
   const [at, setAt] = useState(0);
@@ -161,11 +209,18 @@ export function Pager({ transcript, columns, rows, onClose, onOpenInEditor, isAc
     setMeasured((current) => (current.height === height && sameNumbers(current.tops, tops) ? current : { tops, height }));
     /*
      * Opened at the end, the way every one of these opens: the thing someone
-     * pressed Ctrl+O to see the whole of is the thing that just went past.
+     * pressed Ctrl+O to see the whole of is the thing that just went past —
+     * unless a row was named, in which case that row, a line down from the top
+     * edge. The offsets used are the ones measured a few lines up rather than
+     * the ones in state: state is still the previous frame's, and on this,
+     * the first frame with any heights at all, it is empty.
      */
     if (!anchored.current && height > 0) {
       anchored.current = true;
-      setLine(Math.max(0, height - bodyRows));
+      const end = Math.max(0, height - bodyRows);
+      const index = initialRowId === undefined ? -1 : shown.indexOf(initialRowId);
+      const start = index === -1 ? undefined : tops[index];
+      setLine(start === undefined ? end : Math.max(0, Math.min(start - CONTEXT, end)));
     }
   });
 
