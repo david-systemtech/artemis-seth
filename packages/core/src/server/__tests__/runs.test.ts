@@ -601,3 +601,61 @@ describe('a client that comes back', () => {
     expect(directory.owns('conn-1', 'run-1' as never)).toBe(false);
   });
 });
+
+describe('a question waits for the person it was asked of', () => {
+  const asked = {
+    type: 'permission.request',
+    requestId: 'ask-1',
+    request: {},
+  } as Partial<AgentEvent>;
+
+  it('is never answered on their behalf while they are attached, however long they take', async () => {
+    // The fifteen-minute deadline this replaces did exactly that: a person at
+    // the machine, busy in another window, came back to a conversation that
+    // had answered its own question in prose and stopped. A client that opted
+    // into remote permissions is a person at a machine, and the server does
+    // not decide for them. No `permissionParkMs` here: this is the default.
+    const engine = fakeEngine();
+    let clock = 1_000;
+    const directory = createRunDirectory({
+      runs: engine.source,
+      detachedRunTtlMs: 60_000,
+      now: () => clock,
+      sweepIntervalMs: 0,
+    });
+    directories.push(directory);
+    directory.claim({ runId: 'run-1', connectionId: CONNECTION.id, permissions: true });
+    engine.emit(asked);
+
+    clock += 24 * 60 * 60 * 1000;
+    await directory.sweep();
+    clock += 7 * 24 * 60 * 60 * 1000;
+    await directory.sweep();
+
+    expect(engine.calls).toEqual([]);
+  });
+
+  it('still honours a deadline a deployment configured', async () => {
+    // The override is for clients that are unattended scripts asking for
+    // prompts they will never answer; it is opt-in, and it still works.
+    const engine = fakeEngine();
+    let clock = 1_000;
+    const directory = createRunDirectory({
+      runs: engine.source,
+      detachedRunTtlMs: 60_000,
+      permissionParkMs: 5_000,
+      now: () => clock,
+      sweepIntervalMs: 0,
+    });
+    directories.push(directory);
+    directory.claim({ runId: 'run-1', connectionId: CONNECTION.id, permissions: true });
+    engine.emit(asked);
+
+    clock += 6_000;
+    await directory.sweep();
+    expect(engine.calls.at(-1)).toEqual({
+      name: 'respondToPermission',
+      args: ['run-1', 'ask-1', { behavior: 'deny', message: UNATTENDED_PERMISSION_MESSAGE }],
+    });
+  });
+});
