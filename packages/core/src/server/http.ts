@@ -116,6 +116,7 @@ import type { RemoteAccessEvent } from '../sessions/lifecycleLog.js';
 import type { PushFeed } from './feed.js';
 import type { RemoteRunGuard } from './guard.js';
 import { workspaceKeyFor, type LedgerScope, type SessionLedger } from './ledger.js';
+import { resolveResumeModel, type RouteRedirect } from './sessionHome.js';
 import { handleRemoteRequest, isRemotePath, type RemoteStreamOptions } from './remote.js';
 import { CORS_HEADERS, JSON_HEADERS, fail, ok } from './replies.js';
 import { createRunDirectory, reviewPermissionDecision, type RunDirectory } from './runs.js';
@@ -2388,43 +2389,96 @@ async function describeScopedSessions(
     group.ids.add(entry.sessionId);
   }
 
-  const described = new Map<string, SessionSummary>();
-  for (const group of groups.values()) {
-    const profile = bySlug.get(group.profileId);
-    if (profile === undefined) continue;
+  /*
+   * One read per (profile × directory), kept, so the second pass below can
+   * consult a store the first pass already opened without opening it again.
+   */
+  const pages = new Map<string, readonly SessionSummary[]>();
+  const pageFor = async (
+    profile: ServerProfile,
+    cwd: string,
+  ): Promise<readonly SessionSummary[]> => {
+    const key = `${String(profile.id)}\u0000${cwd}`;
+    const cached = pages.get(key);
+    if (cached !== undefined) return cached;
+    let page: readonly SessionSummary[] = [];
     try {
-      const page = await sessions.list({
-        providerId: String(profile.provider.id),
-        profileId: group.profileId,
-        cwd: group.cwd,
-        limit: 200,
-      });
-      for (const summary of page.sessions) {
-        if (group.ids.has(String(summary.id))) described.set(String(summary.id), summary);
-      }
+      page = (
+        await sessions.list({
+          providerId: String(profile.provider.id),
+          profileId: String(profile.id),
+          cwd,
+          limit: 200,
+        })
+      ).sessions;
     } catch {
       // One unreadable store must not fail the listing — the other groups'
       // conversations are still real. The missing ones simply do not appear,
       // which is also what a store mid-rotation looks like.
     }
+    pages.set(key, page);
+    return page;
+  };
+
+  /** Each conversation a store could describe, and whose store it was in. */
+  const described = new Map<string, { summary: SessionSummary; profileId: string }>();
+  for (const group of groups.values()) {
+    const profile = bySlug.get(group.profileId);
+    if (profile === undefined) continue;
+    for (const summary of await pageFor(profile, group.cwd)) {
+      const id = String(summary.id);
+      if (group.ids.has(id)) described.set(id, { summary, profileId: group.profileId });
+    }
+  }
+
+  /*
+   * The second pass: entries whose transcript the ledger's own account does
+   * not hold.
+   *
+   * Dropping them was what made a conversation vanish with its transcript
+   * intact. The ledger is last-writer-wins and is written the moment a resume
+   * is accepted — before the provider has looked for the file — so a resume
+   * sent on the wrong account re-recorded the session against that account,
+   * and every listing after that looked in the wrong store. The transcript
+   * was in another visible store the whole time. So the other stores are
+   * asked for that directory, the row is reported under the account that
+   * actually holds it, and the ledger is corrected so the next listing needs
+   * no second pass. Only an entry no visible store can describe is dropped,
+   * and that one really is gone.
+   */
+  for (const entry of entries) {
+    if (described.has(entry.sessionId)) continue;
+    for (const profile of profiles) {
+      if (String(profile.id) === entry.profileId) continue;
+      const summary = (await pageFor(profile, entry.cwd)).find(
+        (candidate) => String(candidate.id) === entry.sessionId,
+      );
+      if (summary === undefined) continue;
+      described.set(entry.sessionId, { summary, profileId: String(profile.id) });
+      ledger.reattribute(entry.sessionId, String(profile.id));
+      break;
+    }
   }
 
   const rows: ServerSessionSummary[] = [];
   for (const entry of entries) {
-    const summary = described.get(entry.sessionId);
-    if (summary === undefined) continue;
-    const profile = bySlug.get(entry.profileId);
+    const found = described.get(entry.sessionId);
+    if (found === undefined) continue;
+    const { summary } = found;
+    const profile = bySlug.get(found.profileId);
     rows.push({
       id: entry.sessionId,
       title: summary.title,
       ...(summary.firstPrompt === undefined ? {} : { firstPrompt: summary.firstPrompt }),
       updatedAt: summary.updatedAt,
-      profileSlug: profile?.slug ?? entry.profileId,
+      profileSlug: profile?.slug ?? found.profileId,
       // The ledger's account, not the store's: `SessionSummary.profileId` is a
       // pick when several profiles reach one store (see `profileIsUnknown`),
-      // and the ledger *knows* which connection ran this one. The provider is
-      // the account's own, which is the only one it could have been.
-      profileId: entry.profileId,
+      // and the ledger *knows* which connection ran this one — corrected
+      // above where the store it named turned out not to hold the file. The
+      // provider is the account's own, which is the only one it could have
+      // been.
+      profileId: found.profileId,
       providerId: String(profile?.provider.id ?? summary.providerId),
       // The store's own tag, so a client can tell an archived conversation
       // from a live one. The tag route writes this; dropping it here made
@@ -2514,10 +2568,47 @@ async function handleChatCompletions(
   // The route is resolved against what *this connection* may see, so a model
   // outside its allowance is indistinguishable from one that does not exist.
   const profiles = visibleToConnection(connection, await context.catalogue.read({}));
-  const model = findModel(profiles, chat.model);
-  if (model === undefined) {
+  const requested = findModel(profiles, chat.model);
+  if (requested === undefined) {
     return attribute(modelNotFound(chat.model));
   }
+
+  /*
+   * The resume gate. A `sessionId` names a stored conversation, and the only
+   * conversations a token may re-enter are the ones its own scope created —
+   * the serving user's desktop history lives in the same store and must be
+   * unreachable, and another connection's conversations are another
+   * principal's. Same 404 as the session routes, for the same reason: a
+   * refusal that distinguished "not there" from "not yours" would let a
+   * caller enumerate which ids exist.
+   */
+  if (extensions.sessionId !== undefined && context.ledger !== undefined) {
+    const scope = scopeFor(connection, profiles);
+    if (!context.ledger.mayAccess(scope, extensions.sessionId)) {
+      return attribute(unknownSession());
+    }
+  }
+
+  /*
+   * The account that holds the conversation continues it.
+   *
+   * A transcript lives in one account's store and the provider looks nowhere
+   * else, so a resume on any other route fails before its first token — and
+   * used to take the conversation with it, because the ownership record below
+   * was written first. The route is corrected here instead, and the reply says
+   * so. Nothing is read on the ordinary path: see `sessionHome.ts`.
+   */
+  const resumed: { readonly model: ServerModel; readonly redirected?: RouteRedirect } =
+    extensions.sessionId === undefined
+      ? { model: requested }
+      : await resolveResumeModel({
+          sessions: context.sessions,
+          ledger: context.ledger,
+          profiles,
+          requested,
+          sessionId: extensions.sessionId,
+        });
+  const { model, redirected } = resumed;
 
   /*
    * Standing instructions reach the run only where the serving account's
@@ -2540,22 +2631,6 @@ async function handleChatCompletions(
   const ignored: readonly string[] = dropSystemPrompt
     ? [...review.ignored, 'artemis.systemPrompt']
     : review.ignored;
-
-  /*
-   * The resume gate. A `sessionId` names a stored conversation, and the only
-   * conversations a token may re-enter are the ones its own scope created —
-   * the serving user's desktop history lives in the same store and must be
-   * unreachable, and another connection's conversations are another
-   * principal's. Same 404 as the session routes, for the same reason: a
-   * refusal that distinguished "not there" from "not yours" would let a
-   * caller enumerate which ids exist.
-   */
-  if (extensions.sessionId !== undefined && context.ledger !== undefined) {
-    const scope = scopeFor(connection, profiles);
-    if (!context.ledger.mayAccess(scope, extensions.sessionId)) {
-      return attribute(unknownSession());
-    }
-  }
 
   let workspace;
   try {
@@ -2610,6 +2685,7 @@ async function handleChatCompletions(
     request: chat,
     extensions: applied,
     ignored,
+    ...(redirected === undefined ? {} : { redirected }),
     ...(request.signal === undefined ? {} : { signal: request.signal }),
     // Absent when this build has no directory: with nothing to hold the
     // deadline, a detach would be an abandonment, so the turn keeps its old
@@ -2696,6 +2772,7 @@ async function handleChatCompletions(
       created,
       result,
       ignored,
+      ...(redirected === undefined ? {} : { redirected }),
       ...(model.resolvedModel === undefined ? {} : { resolvedModel: model.resolvedModel }),
     }),
   });
@@ -2946,13 +3023,22 @@ async function* streamTurn(input: {
   // What was accepted and not applied rides the role chunk — first, so a
   // client learns before the first token that something it sent was set
   // aside. The whole-response shape carries the same list on its `artemis`
-  // block; a streaming client had no way to see it at all until now.
-  const { ignored } = input.turn;
+  // block; a streaming client had no way to see it at all until now. A resume
+  // moved to the account holding the conversation rides the same chunk, for
+  // the same reason.
+  const { ignored, redirected } = input.turn;
   yield sseEvent(
     chatChunk({
       ...frame,
       delta: { role: 'assistant' },
-      ...(ignored.length === 0 ? {} : { artemis: { ignored } }),
+      ...(ignored.length === 0 && redirected === undefined
+        ? {}
+        : {
+            artemis: {
+              ...(ignored.length === 0 ? {} : { ignored }),
+              ...(redirected === undefined ? {} : { redirected }),
+            },
+          }),
     }),
   );
 

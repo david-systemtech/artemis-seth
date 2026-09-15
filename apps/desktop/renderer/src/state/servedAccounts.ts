@@ -222,3 +222,58 @@ export function scopedToServedAccount(
   const scoped = catalogue.filter((model) => servedAccountSlug(model) === slug);
   return scoped.length > 0 ? scoped : catalogue;
 }
+
+/**
+ * The model a served conversation resumes on, given the account that holds it.
+ *
+ * A transcript lives in exactly one of the server's accounts, and the server
+ * resumes it nowhere else — so a served row that names its account (see
+ * `SessionSummary.accountSlug`) has to land on a route of that account, not
+ * on whatever route the column was left showing. That was how a resume went
+ * out on the wrong account, failed with "no conversation found", and took the
+ * conversation with it.
+ *
+ * `preferred` is what the column would otherwise use: the conversation's
+ * remembered choice, or the column's current model. It stands when it is
+ * already on the holding account. Otherwise the pick is, in order, the same
+ * model on the holding account, that account's first model, and — when the
+ * catalogue has not arrived — the route composed from the slug and the
+ * preferred model's own name, which the server resolves the same way. `null`
+ * only when nothing here can name a route at all, and the server's own
+ * redirect is then what saves the resume.
+ */
+export function servedResumeModel(
+  models: readonly ProviderModelOption[],
+  accountSlug: string,
+  preferred: string | null,
+): string | null {
+  const preferredOption = preferred === null ? undefined : models.find((m) => m.id === preferred);
+  const preferredSlug =
+    preferredOption !== undefined ? servedAccountSlug(preferredOption) : routeSlug(preferred);
+  if (preferredSlug === accountSlug) return preferred;
+
+  const onAccount = models.filter((m) => servedAccountSlug(m) === accountSlug);
+  const tail = routeTail(preferred);
+  if (tail !== null) {
+    const same = onAccount.find((m) => routeTail(m.id) === tail);
+    if (same !== undefined) return same.id;
+  }
+  const first = onAccount[0];
+  if (first !== undefined) return first.id;
+  return tail === null ? null : `${accountSlug}/${tail}`;
+}
+
+/** The account half of a route id, or null for a bare model id. */
+function routeSlug(route: string | null): string | null {
+  if (route === null) return null;
+  const slash = route.indexOf('/');
+  return slash > 0 ? route.slice(0, slash) : null;
+}
+
+/** The model half of a route id — the whole id when it carries no account. */
+function routeTail(route: string | null): string | null {
+  if (route === null || route.length === 0) return null;
+  const slash = route.indexOf('/');
+  const tail = slash > 0 ? route.slice(slash + 1) : route;
+  return tail.length === 0 ? null : tail;
+}

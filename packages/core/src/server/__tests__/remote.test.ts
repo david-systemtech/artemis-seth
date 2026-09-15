@@ -772,3 +772,195 @@ describe('GET /api/v0/events', () => {
     await stream.close();
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* A bridge resume on the wrong account                                       */
+/* -------------------------------------------------------------------------- */
+
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach } from 'vitest';
+
+import { createSessionLedger, type SessionLedger } from '../ledger.js';
+import type { SessionSource } from '../http.js';
+
+function servedProfile(id: string, slug: string, models: readonly string[]): ServerProfile {
+  return {
+    id: id as ServerProfile['id'],
+    slug,
+    label: slug,
+    provider: { id: 'claude', label: 'Claude', kind: 'hosted' },
+    available: true,
+    disabled: false,
+    live: true,
+    capabilities: NO_CAPABILITIES,
+    models: models.map((model) => ({
+      route: `${slug}/${model}`,
+      id: model,
+      label: model,
+      note: '.',
+      profileId: id as ServerProfile['id'],
+      profileSlug: slug,
+      profileLabel: slug,
+      providerId: 'claude',
+      thinkingLevels: [],
+      adaptiveThinking: false,
+      fastMode: false,
+      ultracode: false,
+    })),
+  };
+}
+
+const twoAccounts: Catalogue = {
+  read: async () => [servedProfile('prof-a', 'work', ['opus', 'sonnet']), servedProfile('prof-b', 'other', ['opus'])],
+  invalidate: () => undefined,
+};
+
+/** prof-b's store holds sess-3 under the pin; prof-a's holds nothing. */
+const storeOfB: SessionSource = {
+  list: async (query) => ({
+    sessions:
+      query.profileId === 'prof-b' && query.cwd === '/w'
+        ? [
+            {
+              id: 'sess-3' as never,
+              providerId: 'claude' as never,
+              profileId: 'prof-b' as never,
+              cwd: '/w',
+              title: 'Held by other',
+              updatedAt: 3,
+            },
+          ]
+        : [],
+    hasMore: false,
+  }),
+  messages: async () => ({ events: [], hasMore: false }),
+};
+
+const ledgerCleanups: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  while (ledgerCleanups.length > 0) await ledgerCleanups.pop()?.();
+});
+
+async function ledgerSaying(profileId: string): Promise<SessionLedger> {
+  const dir = await mkdtemp(join(tmpdir(), 'artemis-bridge-ledger-'));
+  const ledger = createSessionLedger(dir);
+  ledgerCleanups.push(async () => {
+    await ledger.flush();
+    await rm(dir, { recursive: true, force: true });
+  });
+  await ledger.load();
+  ledger.record({
+    sessionId: 'sess-3',
+    connectionId: CONNECTION.id,
+    profileId,
+    workspaceKey: 'dir:/w',
+    cwd: '/w',
+    origin: 'bridge',
+  });
+  return ledger;
+}
+
+function recording(): { source: RunSource; started: RunInput[] } {
+  const started: RunInput[] = [];
+  const source: RunSource = {
+    ...observableRuns,
+    startUserRun: async (input) => {
+      started.push(input);
+      return runHandle('run-new', String(input.profileId));
+    },
+  };
+  return { source, started };
+}
+
+async function resumeOn(
+  ledger: SessionLedger,
+  source: RunSource,
+  input: Record<string, unknown>,
+): ReturnType<typeof handleServerRequest> {
+  return handleServerRequest(
+    {
+      method: 'POST',
+      url: REMOTE_RUNS_PATH,
+      headers: { host: '127.0.0.1:6472', authorization: `Bearer ${TOKEN}` },
+      body: { input: { providerId: 'claude', cwd: '/w', prompt: 'go on', resumeSessionId: 'sess-3', ...input } },
+    },
+    {
+      connections: [CONNECTION, NARROW],
+      version: '1',
+      catalogue: twoAccounts,
+      startedAt: 0,
+      runs: source,
+      ledger,
+      sessions: storeOfB,
+    },
+  );
+}
+
+describe('a bridge resume on the wrong account', () => {
+  it('starts the run on the account holding the conversation, keeping a model it offers', async () => {
+    const ledger = await ledgerSaying('prof-b');
+    const { source, started } = recording();
+    const reply = await resumeOn(ledger, source, { profileId: 'prof-a', model: 'opus' });
+    expect(reply.status).toBe(200);
+    expect(started[0]).toMatchObject({ profileId: 'prof-b', model: 'opus', resumeSessionId: 'sess-3' });
+    // The handle names the account the run is really on.
+    expect((reply.body as { run: { profileId: string } }).run.profileId).toBe('prof-b');
+  });
+
+  it('drops a model the holding account does not offer', async () => {
+    const ledger = await ledgerSaying('prof-b');
+    const { source, started } = recording();
+    const reply = await resumeOn(ledger, source, { profileId: 'prof-a', model: 'sonnet' });
+    expect(reply.status).toBe(200);
+    expect(started[0]?.profileId).toBe('prof-b');
+    expect(started[0]?.model).toBeUndefined();
+  });
+
+  it('does not second-guess a resume the ledger agrees with', async () => {
+    const ledger = await ledgerSaying('prof-a');
+    const { source, started } = recording();
+    let reads = 0;
+    const counting: SessionSource = {
+      ...storeOfB,
+      list: async (query) => {
+        reads += 1;
+        return storeOfB.list(query);
+      },
+    };
+    const reply = await handleServerRequest(
+      {
+        method: 'POST',
+        url: REMOTE_RUNS_PATH,
+        headers: { host: '127.0.0.1:6472', authorization: `Bearer ${TOKEN}` },
+        body: {
+          input: { providerId: 'claude', profileId: 'prof-a', cwd: '/w', prompt: 'go on', resumeSessionId: 'sess-3' },
+        },
+      },
+      {
+        connections: [CONNECTION, NARROW],
+        version: '1',
+        catalogue: twoAccounts,
+        startedAt: 0,
+        runs: source,
+        ledger,
+        sessions: counting,
+      },
+    );
+    expect(reply.status).toBe(200);
+    // The ordinary path: ledger and request agree, so no store is opened and
+    // the request stands. A ledger that is itself wrong is corrected by the
+    // listing, which is where every row a client resumes from comes from.
+    expect(started[0]?.profileId).toBe('prof-a');
+    expect(reads).toBe(0);
+  });
+
+  it('leaves a resume alone when the requested account is the ledger’s', async () => {
+    const ledger = await ledgerSaying('prof-b');
+    const { source, started } = recording();
+    const reply = await resumeOn(ledger, source, { profileId: 'prof-b', model: 'opus' });
+    expect(reply.status).toBe(200);
+    expect(started[0]).toMatchObject({ profileId: 'prof-b', model: 'opus' });
+  });
+});

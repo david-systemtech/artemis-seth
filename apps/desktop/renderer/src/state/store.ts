@@ -107,6 +107,7 @@ import {
   handoffCandidates,
   handoffTargetBlock,
 } from './handoffTargets';
+import { servedAccountLabel, servedResumeModel } from './servedAccounts';
 import { call, resolveBridge, type BridgeMode } from '../lib/bridge';
 import {
   describeWorkspace,
@@ -10791,6 +10792,38 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
 
   const switchedProfile = state.activeProfileId !== resumeProfileId;
   const switchedCwd = state.cwd !== session.cwd;
+  const providerChanged = state.activeProviderId !== session.providerId;
+
+  /*
+   * A served conversation continues on the account that holds it.
+   *
+   * The profile switch above is only half of a served resume: an Artemis
+   * Server profile wears every account the server offers, and the transcript
+   * lives in exactly one of their stores. The route this column was left on
+   * says nothing about which — so with no correction here the resume went out
+   * on whatever account the picker showed, the server's provider looked in
+   * that account's store, and the conversation failed to open and then, worse,
+   * disappeared from the list. The row names its account (`accountSlug`),
+   * and the model is moved onto it: the conversation's own remembered choice
+   * where that is already there, the same model on that account otherwise.
+   * The catalogue consulted is this column's only while it stays on the same
+   * profile; across a switch it belongs to another server.
+   */
+  const remembered = providerDefaultChoice(session.id, providerChanged);
+  const preferredModel = remembered.model === undefined ? state.model : remembered.model;
+  const servedModel =
+    session.accountSlug === undefined
+      ? null
+      : servedResumeModel(
+          switchedProfile || providerChanged ? [] : activeModels(state),
+          session.accountSlug,
+          preferredModel,
+        );
+  const switchedAccount = servedModel !== null && servedModel !== preferredModel;
+  const servedAccountName =
+    servedAccountLabel(activeModels(state).find((m) => m.id === servedModel)) ??
+    session.accountSlug ??
+    '';
 
   // Whatever this column was working on moves aside rather than being killed —
   // the same rule as `newSession`, for the same reason. `target` is the pane
@@ -10824,14 +10857,20 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
     // Same rule as `setProvider`: a catalogue belongs to a provider, so
     // landing on a different one has to drop it rather than show the previous
     // provider's models under the new one's name.
-    ...(state.activeProviderId === session.providerId ? {} : { models: [], modelsError: null }),
+    ...(providerChanged ? { models: [], modelsError: null } : {}),
     // The model this conversation was last being run on, where it has ever said.
     // Spread last so it wins, and spread as a whole or not at all: half a choice
     // is a combination nobody picked. No entry leaves the column on what it was
     // using — *unless* the provider changed under it, in which case what it was
     // using names nothing here. See `providerDefaultChoice`.
-    ...providerDefaultChoice(session.id, state.activeProviderId !== session.providerId),
+    ...remembered,
+    // Except the account, which a served conversation does not get to choose:
+    // the model moves onto the one holding the transcript. See above.
+    ...(switchedAccount ? { model: servedModel } : {}),
   });
+  // The corrected choice is this conversation's from now on, so the next
+  // resume finds it already on the right account and moves nothing.
+  if (switchedAccount) rememberModelChoice(target);
   // Opening a session is a deliberate act on one column, so that column takes
   // the focus — which is what makes ⌘K, the run inspector and settings point
   // at what the user just opened rather than at whatever they last clicked.
@@ -10851,6 +10890,7 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
 
   const moved = [
     switchedProfile ? `profile → ${profile.label}` : '',
+    switchedAccount ? `account → ${servedAccountName}` : '',
     switchedCwd ? `directory → ${session.cwd}` : '',
   ].filter(Boolean);
 
@@ -10862,7 +10902,9 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
      * reason and it is the same sentence the sidebar's badge is making. An
      * unattributed one moved only because the account in use cannot read the
      * store at all — nothing recorded who ran it, so claiming otherwise here
-     * would be the guess the whole attribution path exists to refuse.
+     * would be the guess the whole attribution path exists to refuse. A
+     * served one moved because the server keeps the transcript under exactly
+     * one of its accounts, and that account is the only one that can open it.
      */
     const because = [
       switchedProfile
@@ -10870,6 +10912,7 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
           ? 'under the account it last ran on'
           : 'under a profile that can reach it'
         : '',
+      switchedAccount ? 'on the server account that holds it' : '',
       switchedCwd ? 'in the directory it was created in' : '',
     ]
       .filter(Boolean)
