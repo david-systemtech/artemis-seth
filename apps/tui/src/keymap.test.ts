@@ -12,7 +12,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { COMMANDS } from './commands.js';
-import { KEYMAP, SLASH_GROUP_TITLE, nextFocus, type KeyContext } from './keymap.js';
+import { KEYMAP, SLASH_GROUP_TITLE, nextFocus, stepCursor, type KeyContext } from './keymap.js';
 
 describe('KEYMAP', () => {
   it('gives every group a title and something to put under it', () => {
@@ -102,7 +102,12 @@ describe('KEYMAP: the keys the terminal grew', () => {
     // The offer at the moment a plan runs out. It is on the map whether or
     // not the status line is showing one, because a key you can only find
     // once you are already stuck is a key nobody presses.
-    expect(anywhere.get('Ctrl+H')).toContain('another account');
+    //
+    // Alt and not Ctrl: Ctrl+H is the byte Backspace sends on a terminal that
+    // has not negotiated the kitty protocol, so the old binding was one Ink
+    // could not tell from a rub-out.
+    expect(anywhere.get('Alt+H')).toContain('another account');
+    expect(anywhere.get('Ctrl+H')).toBeUndefined();
   });
 
   it('writes down the composer keys that only its own header used to mention', () => {
@@ -161,12 +166,35 @@ describe('KEYMAP: the keys the terminal grew', () => {
     expect(delegated.get('←')).toContain('Fold');
     expect(delegated.get('Esc')).toContain('composer');
   });
+
+  /*
+   * The conversation is a place the keyboard can be now, and its rows answer
+   * six keys. Every one of them is offered per row by `rowVerbs.ts` and printed
+   * under the cursor, so the map is where somebody learns the set exists at all.
+   */
+  it('writes down what a row of the conversation answers to', () => {
+    const transcript = inContext('transcript');
+    expect(transcript.get('o')).toContain('file');
+    expect(transcript.get('r')).toContain('composer');
+    expect(transcript.get('y')).toContain('Copy');
+    expect(transcript.get('d')).toContain('diff');
+    expect(transcript.get('Enter')).toContain('Unfold');
+    expect(transcript.get('x')).toContain('Stop');
+    expect(transcript.get('Esc')).toContain('composer');
+    // The arrows are one row for two readings, as Ctrl+S is: they step the
+    // cursor here and scroll a line from the box.
+    expect(transcript.get('↑')).toContain('cursor');
+  });
+
+  it('says Tab reaches the conversation, since it is the stop that is always there', () => {
+    expect(inContext('anywhere').get('Tab')).toContain('rows');
+  });
 });
 
 /*
  * The ring Tab walks.
  *
- * Two of its three stops come and go — the rail is dropped on a narrow terminal
+ * Two of its four stops come and go — the rail is dropped on a narrow terminal
  * and the delegated strip exists only while something is running — so what is
  * worth checking is that Tab never lands on a surface that is not drawn, and
  * that it can always get back to the composer from wherever it is.
@@ -174,33 +202,78 @@ describe('KEYMAP: the keys the terminal grew', () => {
 describe('nextFocus', () => {
   const both = { sidebar: true, delegated: true };
 
-  it('walks composer → list → strip → composer', () => {
+  it('walks composer → list → strip → conversation → composer', () => {
     expect(nextFocus('composer', both)).toBe('sidebar');
     expect(nextFocus('sidebar', both)).toBe('delegated');
-    expect(nextFocus('delegated', both)).toBe('composer');
+    expect(nextFocus('delegated', both)).toBe('transcript');
+    expect(nextFocus('transcript', both)).toBe('composer');
   });
 
   it('steps over a rail the terminal is too narrow to draw', () => {
     const stops = { sidebar: false, delegated: true };
     expect(nextFocus('composer', stops)).toBe('delegated');
-    expect(nextFocus('delegated', stops)).toBe('composer');
+    expect(nextFocus('delegated', stops)).toBe('transcript');
   });
 
   it('steps over a strip with nothing in it', () => {
     const stops = { sidebar: true, delegated: false };
     expect(nextFocus('composer', stops)).toBe('sidebar');
-    expect(nextFocus('sidebar', stops)).toBe('composer');
+    expect(nextFocus('sidebar', stops)).toBe('transcript');
   });
 
-  it('leaves Tab doing nothing when the composer is all there is', () => {
+  it('keeps the conversation on the ring when it is the only other stop', () => {
+    // Narrow terminal, nothing running: Tab is still two places rather than
+    // one, because the transcript is always drawn and its rows always answer.
     const stops = { sidebar: false, delegated: false };
-    expect(nextFocus('composer', stops)).toBe('composer');
+    expect(nextFocus('composer', stops)).toBe('transcript');
+    expect(nextFocus('transcript', stops)).toBe('composer');
   });
 
   it('leads out of a surface that has just gone', () => {
     // The last task settled while the strip had the keys, or the terminal was
     // narrowed while the rail did.
+    // Off the ring entirely, so the step lands on the first stop rather than
+    // on whatever happened to follow the surface that went.
     expect(nextFocus('delegated', { sidebar: true, delegated: false })).toBe('composer');
     expect(nextFocus('sidebar', { sidebar: false, delegated: true })).toBe('composer');
+  });
+});
+
+/*
+ * Stepping the cursor through the rows the viewport is drawing.
+ *
+ * Three rules, and each of them is a thing that reads wrong if it is the other
+ * way: clamping rather than wrapping, arriving at the end rather than the top,
+ * and surviving a row list that has moved under the cursor — which it does on
+ * every flush of a live conversation.
+ */
+describe('stepCursor', () => {
+  const rows = ['a', 'b', 'c'];
+
+  it('moves one row at a time', () => {
+    expect(stepCursor(rows, 'a', 1)).toBe('b');
+    expect(stepCursor(rows, 'c', -1)).toBe('b');
+  });
+
+  it('clamps at both ends rather than wrapping round', () => {
+    // A conversation has a beginning and an end; a cursor that leapt from the
+    // last row to the first would be the transcript folding over on itself.
+    expect(stepCursor(rows, 'a', -1)).toBe('a');
+    expect(stepCursor(rows, 'c', 1)).toBe('c');
+  });
+
+  it('arrives at the end of the conversation, whichever arrow was pressed', () => {
+    // The viewport is anchored to the bottom, so that is where the eye is.
+    expect(stepCursor(rows, null, -1)).toBe('c');
+    expect(stepCursor(rows, null, 1)).toBe('c');
+  });
+
+  it('starts again at the end when the row it was on is no longer drawn', () => {
+    expect(stepCursor(rows, 'gone', -1)).toBe('c');
+  });
+
+  it('has nothing to point at in an empty conversation', () => {
+    expect(stepCursor([], null, -1)).toBeNull();
+    expect(stepCursor([], 'a', 1)).toBeNull();
   });
 });

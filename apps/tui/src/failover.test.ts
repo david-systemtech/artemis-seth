@@ -130,7 +130,7 @@ describe('failoverLine', () => {
 
   it('is the whole offer in one line, with the key that answers it', () => {
     expect(failoverLine(out!, candidate(), NOW)).toBe(
-      '5hr window out · resets 14:30 · hand off to work (12%) · Ctrl+H',
+      '5hr window out · resets 14:30 · hand off to work (12%) · Alt+H or /handoff',
     );
   });
 
@@ -138,7 +138,7 @@ describe('failoverLine', () => {
     // A dead-ended offer is worse than none; this at least names something a
     // person can act on by signing an account in.
     expect(failoverLine(out!, null, NOW)).toBe(
-      '5hr window out · resets 14:30 · no other account can take this · Ctrl+H',
+      '5hr window out · resets 14:30 · no other account can take this · Alt+H or /handoff',
     );
   });
 
@@ -147,7 +147,7 @@ describe('failoverLine', () => {
     // nothing is being waited for yet, and the picker's title carries it
     // anyway — one keystroke from here.
     const near = failoverReason(usage([fiveHour(94, { resetsAt: HALF_TWO })]), NOW);
-    expect(failoverLine(near!, candidate(), NOW)).toBe('5hr window at 94% · hand off to work (12%) · Ctrl+H');
+    expect(failoverLine(near!, candidate(), NOW)).toBe('5hr window at 94% · hand off to work (12%) · Alt+H or /handoff');
   });
 
   it('drops a reset that has already gone by', () => {
@@ -155,12 +155,12 @@ describe('failoverLine', () => {
     // said rather than what it would say now; `resets 14:30` read at three
     // o'clock is the sort of wrong that costs a line its credibility.
     const past = failoverReason(usage([fiveHour(100, { status: 'rejected', resetsAt: NOW - 60_000 })]), NOW);
-    expect(failoverLine(past!, null, NOW)).toBe('5hr window out · no other account can take this · Ctrl+H');
+    expect(failoverLine(past!, null, NOW)).toBe('5hr window out · no other account can take this · Alt+H or /handoff');
   });
 
   it('names an account with no reading without inventing a number for it', () => {
     const noNumber = candidate({ label: 'metered', load: undefined });
-    expect(failoverLine(out!, noNumber, NOW)).toContain('hand off to metered · Ctrl+H');
+    expect(failoverLine(out!, noNumber, NOW)).toContain('hand off to metered · Alt+H or /handoff');
   });
 });
 

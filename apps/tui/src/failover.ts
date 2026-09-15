@@ -349,9 +349,9 @@ export function bestFailoverCandidate(
 /**
  * The offer, as one line.
  *
- *     5hr window out · resets 14:30 · hand off to work (12%) · Ctrl+H
- *     5hr window out · resets 14:30 · no other account can take this · Ctrl+H
- *     5hr window at 94% · hand off to work (12%) · Ctrl+H
+ *     5hr window out · resets 14:30 · hand off to work (12%) · Alt+H or /handoff
+ *     5hr window out · resets 14:30 · no other account can take this · Alt+H or /handoff
+ *     5hr window at 94% · hand off to work (12%) · Alt+H or /handoff
  *
  * Three decisions are visible in those three lines. The reset is printed for a
  * window that is *out* and not for one that is merely full, because on the
@@ -368,6 +368,11 @@ export function bestFailoverCandidate(
  * window has rolled and the verdict on the line is the last thing the provider
  * said rather than what it would say now — and `resets 14:30` read at three
  * o'clock is the sort of wrong that costs a surface its credibility.
+ *
+ * The line names both ways in, and that is not belt-and-braces. Alt is a
+ * modifier a terminal may eat, remap to its own menu, or send as something the
+ * app cannot tell from Escape; `/handoff` is the door no terminal can take
+ * away. The key is first because it is one press.
  */
 export function failoverLine(
   reason: FailoverReason,
@@ -389,7 +394,7 @@ export function failoverLine(
       ? 'no other account can take this'
       : `hand off to ${best.label}${best.load === undefined ? '' : ` (${percent(best.load)})`}`,
   );
-  parts.push('Ctrl+H');
+  parts.push('Alt+H or /handoff');
   return parts.join(' · ');
 }
 

@@ -22,7 +22,7 @@
  * has stopped serving — or is about to — and no turn is running, the left half
  * turns yellow and reads as an offer rather than a status:
  *
- *     5hr window out · resets 14:30 · hand off to work (12%) · Ctrl+H
+ *     5hr window out · resets 14:30 · hand off to work (12%) · Alt+H or /handoff
  *
  * That is the only place in the app where a limit being reached is mentioned
  * at all, and a line and a key is deliberately the whole of it: ADR 0003 makes

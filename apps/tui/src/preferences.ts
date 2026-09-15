@@ -27,6 +27,15 @@
  * none — and they are the user's own words about their own work, which is the
  * same promise the rest of this file makes and not the one `cache.ts` makes.
  *
+ * Unsent drafts are here for that last reason and no other. What is in the
+ * composer is something somebody wrote and has not sent, which makes it the
+ * most obviously *theirs* of everything this file holds; losing it to a quit is
+ * losing work, not losing a convenience. They are kept against the session id
+ * for the same reason pins are — a title moves and a directory is shared, and
+ * the id is what a conversation is — and a conversation that has never been
+ * sent in has no id to file one under, so its draft lives only as long as the
+ * process does.
+ *
  * One JSON file, rewritten whole, atomically, and unreadable-means-empty: a
  * launch is never something a preferences file gets to fail.
  */
@@ -95,13 +104,46 @@ export interface Preferences {
    * duration of an account being logged out.
    */
   readonly pinned?: readonly string[];
+  /**
+   * What was in the composer of each conversation, oldest first.
+   *
+   * A list rather than a map keyed by session id, though it is read by session
+   * id: the order is what {@link MAX_DRAFTS} is a bound on, and an object's key
+   * order is a thing JSON happens to preserve rather than a thing it promises.
+   * Written as a list, the bound is visible in the file.
+   */
+  readonly drafts?: readonly StoredDraft[];
+}
+
+/** One conversation's unsent composer text. */
+export interface StoredDraft {
+  readonly sessionId: string;
+  readonly text: string;
 }
 
 const FILE_VERSION = 1;
 const FILE_NAME = 'preferences.json';
 
+/**
+ * How many conversations' drafts are kept.
+ *
+ * A bound rather than none, because this file is rewritten whole on every save
+ * and an unbounded list of prompts would make that write grow without limit for
+ * the sake of conversations nobody has looked at in months. Twenty is more than
+ * the pool ever holds at once, so the draft of anything reachable by Tab or by
+ * the rail's recent rows is always there; the oldest fall off the front.
+ */
+const MAX_DRAFTS = 20;
+
 /** Shared, so that "nothing pinned" is one array and the memo below holds. */
 const NO_PINS: readonly string[] = [];
+
+/** A file edited by hand can hold anything at all under `drafts`. */
+function isStoredDraft(value: unknown): value is StoredDraft {
+  if (typeof value !== 'object' || value === null) return false;
+  const row = value as Partial<StoredDraft>;
+  return typeof row.sessionId === 'string' && typeof row.text === 'string';
+}
 
 interface FileShape {
   readonly version: number;
@@ -201,6 +243,35 @@ export class PreferencesStore {
       : [...this.pinnedSet(), sessionId];
     this.save({ pinned: next });
     return !pinned;
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Drafts                                                                  */
+  /* ---------------------------------------------------------------------- */
+
+  /** What was left in this conversation's composer, if anything was. */
+  draftFor(sessionId: string): string | undefined {
+    return this.#drafts().find((draft) => draft.sessionId === sessionId)?.text;
+  }
+
+  /**
+   * Remember what is in a conversation's composer, or forget it.
+   *
+   * Blank forgets rather than storing an empty string, because "nothing typed"
+   * is the state every conversation starts in and a row saying so is a row
+   * spending one of the twenty on no information at all. A draft that is
+   * written again goes to the back of the list: what has just been typed at is
+   * the last thing that should fall off the front of it.
+   */
+  setDraft(sessionId: string, text: string): void {
+    const others = this.#drafts().filter((draft) => draft.sessionId !== sessionId);
+    const next = text.trim().length === 0 ? others : [...others, { sessionId, text }];
+    this.save({ drafts: next.slice(-MAX_DRAFTS) });
+  }
+
+  #drafts(): readonly StoredDraft[] {
+    const stored: unknown = this.#value.drafts;
+    return Array.isArray(stored) ? stored.filter(isStoredDraft) : [];
   }
 
   async #write(snapshot: FileShape): Promise<void> {

@@ -44,12 +44,13 @@
  *
  * ## Where Tab goes
  *
- * One key in the map is not a description of behaviour but the behaviour
- * itself: {@link nextFocus} is the ring Tab walks. It is here rather than in
- * `app.tsx` for the reason the rest of this file exists — the row that says
- * "Tab: round the composer, the list and the strip" and the code that makes
- * that true are one edit apart, so the map cannot go on promising a stop the
- * ring has dropped.
+ * Two things in the map are not descriptions of behaviour but the behaviour
+ * itself: {@link nextFocus} is the ring Tab walks, and {@link stepCursor} is
+ * what ↑ and ↓ do to the cursor once that ring has reached the transcript.
+ * Both are here rather than in `app.tsx` for the reason the rest of this file
+ * exists — the row that says "Tab: round the composer, the list, the strip and
+ * the conversation" and the code that makes it true are one edit apart, so the
+ * map cannot go on promising a stop the ring has dropped.
  */
 
 import { COMMANDS } from './commands.js';
@@ -70,8 +71,8 @@ export type KeyContext =
   | 'pager'
   | 'anywhere';
 
-/** The three places the keyboard can be, in the order Tab walks them. */
-export type Focus = 'composer' | 'sidebar' | 'delegated';
+/** The four places the keyboard can be, in the order Tab walks them. */
+export type Focus = 'composer' | 'sidebar' | 'delegated' | 'transcript';
 
 /** Which stops on the ring exist right now. The composer is always one. */
 export interface FocusStops {
@@ -84,7 +85,7 @@ export interface FocusStops {
 /**
  * The next stop after `current`, skipping the ones that are not there.
  *
- * A ring rather than a toggle, because there are three stops now and two of
+ * A ring rather than a toggle, because there are four stops now and two of
  * them come and go: the rail disappears on a narrow terminal and the delegated
  * strip exists only while something is running. Tab must therefore never land
  * on a surface that is not on the screen — a cursor nobody can see, answering
@@ -92,16 +93,48 @@ export interface FocusStops {
  * composer, which is the one stop that is always there. Both of those are what
  * make this worth a function and a test rather than a chain of ternaries at the
  * keystroke.
+ *
+ * The conversation is last, and it has no flag: it is the one surface that is
+ * always drawn, and a transcript with nothing in it is a stop whose only keys
+ * are Esc and the arrows that find no row — which is a dead end somebody can
+ * see, rather than one Tab quietly skipped. It comes after the strip because
+ * the order of the ring is the order of the screen read bottom-up: the box you
+ * type in, the list beside it, the work above it, then what was said.
  */
 export function nextFocus(current: Focus, stops: FocusStops): Focus {
   const ring: Focus[] = ['composer'];
   if (stops.sidebar) ring.push('sidebar');
   if (stops.delegated) ring.push('delegated');
+  ring.push('transcript');
   // A focus whose stop has just gone — the last task settled while the strip
   // had the keys — is not on the ring, so `indexOf` is -1 and the step lands on
   // the composer. Tab always leads out of a surface that is no longer there.
   const at = ring.indexOf(current);
   return ring[(at + 1) % ring.length] ?? 'composer';
+}
+
+/**
+ * Where ↑ or ↓ takes the transcript's cursor, given the rows on screen.
+ *
+ * Clamped rather than wrapped, which is the opposite of what the rail does and
+ * deliberately: the rail is a list of a few dozen rows somebody is hunting
+ * through, and a conversation is a thing with a beginning and an end that the
+ * reader has a mental picture of. A cursor that leapt from the last row to the
+ * first would be the transcript folding round on itself.
+ *
+ * A cursor that is nowhere — `null`, or on a row the window no longer draws —
+ * lands on the *last* row whichever arrow was pressed. That is where the eye
+ * already is: the viewport is anchored to the bottom, so arriving in the
+ * conversation means arriving at the end of it.
+ *
+ * `null` back only when there are no rows at all, which is an empty
+ * conversation and nothing to point at.
+ */
+export function stepCursor(rows: readonly string[], current: string | null, delta: number): string | null {
+  if (rows.length === 0) return null;
+  const at = current === null ? -1 : rows.indexOf(current);
+  if (at === -1) return rows[rows.length - 1] ?? null;
+  return rows[Math.max(0, Math.min(rows.length - 1, at + delta))] ?? null;
 }
 
 export interface KeyBinding {
@@ -131,7 +164,7 @@ const GROUPS: readonly KeyGroup[] = [
     title: 'Anywhere',
     context: 'anywhere',
     keys: [
-      { keys: ['Tab'], does: 'Round the composer, the list and the strip' },
+      { keys: ['Tab'], does: 'Round the composer, the list, the strip and the rows' },
       { keys: ['Shift+Tab'], does: 'Step the permission mode on' },
       { keys: ['Esc'], does: 'Interrupt; or follow the end again' },
       { keys: ['Esc Esc'], does: 'Go back to an earlier prompt' },
@@ -144,14 +177,15 @@ const GROUPS: readonly KeyGroup[] = [
        * the line under the composer is showing one: a key nobody can find
        * until the moment they are already stuck is a key nobody presses.
        *
-       * Ink reports the bare C0 byte this chord has sent since ASCII as
-       * `backspace`, which is the same thing the Backspace key sends on a
-       * terminal that has not negotiated the kitty keyboard protocol — so on
-       * those terminals the press is indistinguishable from a rub-out and
-       * this key is not reachable. Not marked `planned`, because it is wired
-       * and does work; see the note over the handler in `app.tsx`.
+       * Alt and not Ctrl, which is what this was first bound to. Ctrl+H sends
+       * the bare C0 byte `\x08` on any terminal that has not negotiated the
+       * kitty keyboard protocol, and Ink reports that as `backspace` — the
+       * same thing the Backspace key sends. A key the app cannot tell from a
+       * rub-out is a key that either does nothing or eats the rub-out, and
+       * neither is a binding worth keeping. `/handoff` is the door for a
+       * terminal that eats Alt as well.
        */
-      { keys: ['Ctrl+H'], does: 'Hand this conversation to another account' },
+      { keys: ['Alt+H'], does: 'Hand this conversation to another account' },
       { keys: ['?'], does: 'Open this map, from an empty composer' },
     ],
   },
@@ -204,8 +238,29 @@ const GROUPS: readonly KeyGroup[] = [
     keys: [
       { keys: ['PgUp', 'Shift+↑', 'Ctrl+↑'], does: 'Half a screen back' },
       { keys: ['PgDn', 'Shift+↓', 'Ctrl+↓'], does: 'Half a screen on' },
-      { keys: ['↑', '↓'], does: 'A line, with focus off the composer' },
+      { keys: ['↑', '↓'], does: 'The cursor’s row here; a line, from the box' },
       { keys: ['End'], does: 'Back to the end, and follow it' },
+    ],
+  },
+  /*
+   * What a row answers to once Tab has reached the conversation. Every one of
+   * these is offered by `rowVerbs.ts` per row and printed under the cursor as
+   * it moves, so this group is the *whole* set and no row shows all of it: `o`
+   * needs a file, `r` needs a command, `d` needs a diff, `x` needs something
+   * still running. The hint under the cursor is what says which of them this
+   * row has.
+   */
+  {
+    title: 'A row of the conversation',
+    context: 'transcript',
+    keys: [
+      { keys: ['o'], does: 'Open the file it touched, at the line' },
+      { keys: ['r'], does: 'Put the command it ran back in the composer' },
+      { keys: ['y'], does: 'Copy the row — a diff as a diff' },
+      { keys: ['d'], does: 'The whole diff it wrote' },
+      { keys: ['Enter'], does: 'Unfold what the row is holding back' },
+      { keys: ['x'], does: 'Stop the call that is still running' },
+      { keys: ['Esc'], does: 'Put the cursor away, back to the composer' },
     ],
   },
   {

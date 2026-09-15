@@ -37,7 +37,9 @@ describe('parseCommand', () => {
 describe('completeCommand', () => {
   it('lists everything for an empty prefix and narrows by name', () => {
     expect(completeCommand('')).toHaveLength(COMMANDS.length);
-    expect(completeCommand('/mo').map((command) => command.name)).toEqual(['model', 'mode']);
+    // `model` and `mode` by name, then `/handoff` by its `move` alias: a row
+    // found by an alias sorts behind every row found by its own name.
+    expect(completeCommand('/mo').map((command) => command.name)).toEqual(['model', 'mode', 'handoff']);
     expect(completeCommand('zzz')).toEqual([]);
   });
 });
@@ -248,5 +250,27 @@ describe('the turn ledger, the card of asks, and the snippets', () => {
     expect(parseCommand('/waiting')?.name).toBe('asks');
     expect(parseCommand('/turns')?.name).toBe('timeline');
     expect(parseCommand('/snippets')?.name).toBe('snip');
+  });
+});
+
+/*
+ * The hand-off, typed.
+ *
+ * Its key is Alt+H, and Alt is a modifier plenty of terminals eat, remap or
+ * send as something else. A command is the way in that no terminal can take
+ * away, which is the whole reason this one exists rather than the key standing
+ * on its own.
+ */
+describe('/handoff', () => {
+  it('parses, and answers to the word for what it does', () => {
+    expect(parseCommand('/handoff')).toEqual({ name: 'handoff', args: '' });
+    expect(parseCommand('/move')?.name).toBe('handoff');
+  });
+
+  it('is in the menu, saying what it moves and where to', () => {
+    const spec = COMMANDS.find((candidate) => candidate.name === 'handoff');
+    expect(spec?.usage).toBe('/handoff');
+    expect(spec?.summary).toContain('another account');
+    expect(completeCommand('/hand').map((command) => command.name)).toEqual(['handoff']);
   });
 });

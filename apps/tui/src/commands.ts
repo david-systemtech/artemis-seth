@@ -37,6 +37,7 @@ export type CommandName =
   | 'snip'
   | 'tasks'
   | 'usage'
+  | 'handoff'
   | 'cwd'
   | 'new'
   | 'help'
@@ -72,6 +73,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: 'snip', usage: '/snip <name> [words]', summary: 'Expand a saved snippet into the composer, cursor on its first slot' },
   { name: 'tasks', usage: '/tasks', summary: 'Background work: what is running, and what a delegated agent did' },
   { name: 'usage', usage: '/usage', summary: "The account's plan windows and how full they are" },
+  { name: 'handoff', usage: '/handoff', summary: 'Move this conversation to another account, or start it fresh there' },
   { name: 'cwd', usage: '/cwd', summary: 'Choose where to work: a folder you have used, or browse for one' },
   { name: 'new', usage: '/new', summary: 'Start a fresh conversation on the same account' },
   { name: 'help', usage: '/help', summary: 'List these commands' },
@@ -115,6 +117,10 @@ const ALIASES: Readonly<Record<string, CommandName>> = {
   turns: 'timeline',
   snippet: 'snip',
   snippets: 'snip',
+  // The hand-off has a key of its own, and a key that half the terminals in
+  // use cannot deliver needs a word as well. `move` is what somebody asks for
+  // when they have not learned its name yet.
+  move: 'handoff',
 };
 
 /**

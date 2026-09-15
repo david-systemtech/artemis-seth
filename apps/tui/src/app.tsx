@@ -15,12 +15,22 @@
  *
  * Who has the keys is decided in exactly one place, here. A modal or a
  * permission card, when open, has them; otherwise focus is the composer, the
- * sidebar or the delegated strip, and Tab walks the ring — `nextFocus` in
- * `keymap.ts`, which skips the two stops that come and go: the rail is dropped
- * on a narrow terminal and the strip exists only while something is running.
- * Every child takes an `isActive` prop and touches nothing when it is false, so
- * two components never answer the same keystroke. Esc, Ctrl+C and the scrolling
- * arrows are handled globally only when no modal owns them.
+ * sidebar, the delegated strip or the conversation itself, and Tab walks the
+ * ring — `nextFocus` in `keymap.ts`, which skips the two stops that come and
+ * go: the rail is dropped on a narrow terminal and the strip exists only while
+ * something is running. Every child takes an `isActive` prop and touches
+ * nothing when it is false, so two components never answer the same keystroke.
+ * Esc, Ctrl+C and the scrolling arrows are handled globally only when no modal
+ * owns them.
+ *
+ * The conversation is the newest stop and the only one whose keys are *per
+ * row*. A cursor walks the rows the viewport is drawing — the ids come back
+ * from the viewport, because only it knows which rows exist and in what order
+ * — and each row says for itself what it answers to: `rowVerbs.ts` offers `o`,
+ * `r`, `y`, `d`, `Enter` and `x` exactly when it can also produce what each of
+ * them acts on, and the line under the composer prints the same list. So the
+ * hint and the handler are one decision, and a key cannot go on being
+ * advertised on a row that stopped offering it.
  *
  * The rail can be typed at, which moves three of its keys. A printable
  * character with the focus in the rail is a query, so `a`, `d` and `p` — the
@@ -105,11 +115,17 @@
  *  - `/title`   — a name, written into the provider's own store through the
  *    same door the automatic namer uses. A provider without that field says so.
  *
+ * Two more read the conversation back rather than change it. `/timeline` is
+ * every turn as one line — when, what was asked, how long, what it cost, which
+ * files it touched — and Enter on a row opens the pager at that turn, which is
+ * the way back into an afternoon's work that scrolling is not. `timeline.ts`
+ * is the reduction; what is here is the list and where Enter lands.
+ *
  * One more key belongs to neither the conversation nor the pool but to the
  * *account*. When the provider stops serving this one — a window rejected, or
  * near enough to it that the next turn may not finish — the left half of the
- * status line turns yellow and becomes an offer, and Ctrl+H opens it: the
- * accounts that could take this conversation, each with its live plan
+ * status line turns yellow and becomes an offer, and Alt+H or `/handoff` opens
+ * it: the accounts that could take this conversation, each with its live plan
  * readings, the ones that could not with the sentence saying why, and a row
  * that stays put. Nothing moves until a row is chosen; there is no countdown
  * and no setting that would make one. That is ADR 0003, and the reasoning is
@@ -117,6 +133,12 @@
  * spent and which account counts as able. An account sharing the provider's
  * session store opens this very conversation; one that cannot read it is
  * offered a new conversation with a hand-over already in the composer.
+ *
+ * What somebody is part-way through typing follows the conversation it was
+ * typed in, rather than the screen. Switching parks the draft against the
+ * conversation being left and puts the target's back in the box; a conversation
+ * the provider has filed keeps it between launches, in `preferences.ts`, which
+ * is where the things that are the user's own live.
  *
  * Last, the window itself. The title, the taskbar light and the bell are the
  * only channel to somebody who has tabbed away — and with several
@@ -132,6 +154,14 @@
  * that ends three minutes of stillness is a return rather than a press, so it
  * brings one longer-lived flash with it saying what changed while nobody was
  * here. Both are `pool.ts` and `attention.ts` deciding; this file times them.
+ *
+ * The tour is the right answer for one conversation and the wrong one for
+ * four: each press replaces the screen with a transcript nobody came to read.
+ * So when more than one is stuck on a permission the same key opens the card
+ * of asks instead — every one of them on a line, `y` and `n` answerable where
+ * they are parked, Enter to go to the one worth reading. `/asks` opens it for
+ * a single one as well, which is the difference between a key you press
+ * because you are lost and a command you type because you want the list.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
@@ -152,7 +182,7 @@ import {
   type SessionId,
   type SessionSummary,
 } from '@rx-artemis/protocol';
-import { formatDuration, formatRelative, formatUntil, oneLine } from '@rx-artemis/transcript';
+import { formatDuration, formatRelative, formatUntil, isGroupId, oneLine, type TranscriptItem } from '@rx-artemis/transcript';
 import { isArchived } from '@rx-artemis/protocol';
 
 import { browseRowLabel, browseRows, browseStart, recentDirectories, shortenPath } from './directories.js';
@@ -176,17 +206,30 @@ import {
   handoverBrief,
   type FailoverCandidate,
 } from './failover.js';
-import { editInExternalEditor, type ExternalEditResult } from './externalEditor.js';
+import { editInExternalEditor, splitCommand, type ExternalEditResult } from './externalEditor.js';
 import { listFiles, type Frecency } from './fileIndex.js';
 import type { HistoryScope } from './history.js';
 import type { Launched } from './launch.js';
 import type { ModelListing } from './host.js';
 import { renderDiff } from './render/diff.js';
+import {
+  rowCommand,
+  rowDiff,
+  rowTarget,
+  rowVerbHint,
+  rowVerbs,
+  rowYankText,
+  type Row,
+  type RowTarget,
+  type RowVerbKind,
+} from './rowVerbs.js';
 import { runShell } from './shell.js';
+import { timelineLines, timelineSummary, turnsOf } from './timeline.js';
 import { AttentionTimer, notify, progressState, setTitle, titleFor } from './terminal.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
 import { ACCENT } from './theme.js';
-import { nextFocus, type Focus } from './keymap.js';
+import { nextFocus, stepCursor, type Focus } from './keymap.js';
+import { AsksCard, type Ask } from './components/AsksCard.js';
 import { Composer, type ComposerHandle, type FileIndex, type PastedImage } from './components/Composer.js';
 import { DelegatedStrip, delegatedRows, type DelegatedRow } from './components/Delegated.js';
 import { Header } from './components/Header.js';
@@ -201,6 +244,7 @@ import { Sidebar, railRows, type RailRow } from './components/Sidebar.js';
 import { TodoStrip } from './components/TodoStrip.js';
 import { basename, isAbsolute, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { readdir, rename, stat, writeFile } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import { describeWorkspace } from '@rx-artemis/core';
@@ -285,13 +329,33 @@ interface ReplayModal {
 /**
  * The whole conversation, unfolded.
  *
- * It carries nothing: the pager reads the same transcript this file is already
- * holding. Mounted *instead of* the layout rather than inside it, because it
- * draws the terminal — see `components/Pager.tsx` — and because everything
- * behind a full-screen reader should be unmounted rather than merely quiet.
+ * It carries almost nothing: the pager reads the same transcript this file is
+ * already holding. Mounted *instead of* the layout rather than inside it,
+ * because it draws the terminal — see `components/Pager.tsx` — and because
+ * everything behind a full-screen reader should be unmounted rather than
+ * merely quiet.
  */
 interface PagerModal {
   readonly kind: 'pager';
+  /**
+   * The row to open on, instead of the end: the turn somebody picked out of
+   * `/timeline`. A turn's id *is* a row id — the ledger keys each turn by the
+   * user row it opens at — so nothing is translated on the way through.
+   */
+  readonly initialRowId?: string;
+}
+
+/**
+ * Everyone who is waiting on a permission, in one list.
+ *
+ * No payload at all, and deliberately: the asks are rebuilt from the pool on
+ * every render, so a conversation that answers its own question while the card
+ * is up loses its row on the next frame. A list captured when the key was
+ * pressed would go on offering `y` for a request that had already been
+ * withdrawn. See `components/AsksCard.tsx`.
+ */
+interface AsksModal {
+  readonly kind: 'asks';
 }
 
 /** The key map, drawn over the conversation. `keymap.ts` is what it says. */
@@ -314,7 +378,7 @@ interface TextModal {
   readonly lines: readonly string[];
 }
 
-type Modal = PickerModal | PromptModal | LoadingModal | ReplayModal | PagerModal | HelpModal | TextModal;
+type Modal = PickerModal | PromptModal | LoadingModal | ReplayModal | PagerModal | AsksModal | HelpModal | TextModal;
 
 /** The row that leaves the recents list for the filesystem. Not a path, so it cannot be one. */
 const BROWSE_KEY = '\u0000browse';
@@ -591,6 +655,35 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   /** When each stopped to ask. Stale, harmlessly, once the question is answered. */
   const askedAt = useRef(new Map<string, number>());
 
+  /*
+   * The composer's own handle, which is how anything here reaches into the box
+   * — and, at the keys, how Esc is asked after rather than taken. See
+   * `Composer`. It is declared this far up because {@link switchTo} needs it:
+   * the draft in the box belongs to the conversation being left.
+   */
+  const composerRef = useRef<ComposerHandle>(null);
+
+  /**
+   * What was in each pooled conversation's composer when it left the screen.
+   *
+   * A `WeakMap` on the conversation rather than a map keyed by session id, for
+   * the reason `conversationKeys` is: a conversation nothing has been sent in
+   * has no session id and is exactly the one somebody is most likely to be
+   * part-way through typing in. The store beside it — `preferences.ts`, keyed
+   * by session id — is what carries a draft between launches, and only a
+   * conversation the provider has filed can have a row there.
+   */
+  const drafts = useRef(new WeakMap<Conversation, string>());
+
+  /**
+   * Every conversation stopped on a permission, as of the last render.
+   *
+   * Filled in beside the memo that builds it, far below; declared here because
+   * both the key and `/asks` are answered above that, and because a list read
+   * at the moment of the keystroke is the only honest one — see the memo.
+   */
+  const asksNow = useRef<readonly Ask[]>([]);
+
   useEffect(
     () => () => {
       for (const alive of poolRef.current) alive.dispose();
@@ -601,9 +694,24 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   const switchTo = useCallback(
     (next: Conversation) => {
       if (next === conversationRef.current) return;
+      const leaving = conversationRef.current;
       // The moment it stopped being looked at, which is what "finished since
       // you last looked at it" is measured against.
-      seenAt.current.set(keyFor(conversationRef.current), Date.now());
+      seenAt.current.set(keyFor(leaving), Date.now());
+      /*
+       * The draft goes with the conversation it was typed in.
+       *
+       * A half-written message is about *this* conversation, so leaving it in
+       * the box while the transcript behind it changes is the one arrangement
+       * that is certainly wrong — it reads as the app losing track of which
+       * question you were asking. Parked here and restored below; written to
+       * the preferences as well whenever there is a session id to file it
+       * under, which is what makes it survive a quit.
+       */
+      const draft = composerRef.current?.getText() ?? '';
+      drafts.current.set(leaving, draft);
+      const leavingSession = leaving.getState().sessionId;
+      if (leavingSession !== undefined) preferences.setDraft(leavingSession, draft);
       // Decided by `prunePool`, disposed here: the rule is pure and tested, and
       // a state updater with side effects is a thing React may run twice.
       const { kept, dropped } = prunePool(poolRef.current, next, (parked) => parked.isLive);
@@ -613,8 +721,16 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       conversationRef.current = next;
       setConversation(next);
       setScroll(0);
+      // The cursor and the unfolded rows name rows of the transcript being
+      // left, and mean nothing in the one arriving.
+      setCursorId(null);
+      setExpanded(new Set());
+      const arrivingSession = next.getState().sessionId;
+      composerRef.current?.setText(
+        drafts.current.get(next) ?? (arrivingSession === undefined ? undefined : preferences.draftFor(arrivingSession)) ?? '',
+      );
     },
-    [keyFor],
+    [keyFor, preferences],
   );
 
   const state = useSyncExternalStore(conversation.subscribe, conversation.getState);
@@ -666,6 +782,28 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   const [scroll, setScroll] = useState(0);
   /** The agent's checklist, opened into its rows with Ctrl+T; one line otherwise. */
   const [todoExpanded, setTodoExpanded] = useState(false);
+  /**
+   * The row the transcript's cursor is on, by id; `null` for nowhere yet.
+   *
+   * Held here rather than in the viewport because this file is the one that
+   * reads the keys, and because the verbs a row answers are carried out with
+   * things only this file has — a terminal to lend out, a clipboard, a
+   * composer to write into. The viewport is handed the id back and draws the
+   * caret; see {@link cursorRows} for the other half of the arrangement.
+   */
+  const [cursorId, setCursorId] = useState<string | null>(null);
+  /**
+   * The rows the viewport is drawing, in the order it draws them.
+   *
+   * It has to come from there: the model's list is ordered by when a row was
+   * filed and holds far more than the window draws, so stepping the cursor is
+   * an index into what is *on the screen* and nothing here can work that out.
+   * Reported only when the list changes, which is why holding it as state
+   * costs a render rather than a hundred a second.
+   */
+  const [cursorRows, setCursorRows] = useState<readonly string[]>([]);
+  /** Rows unfolded one at a time by Enter, in an otherwise folded viewport. */
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   /** How far back the viewport can go, as it last measured itself. */
   const scrollExtent = useRef({ maxOffset: 0, viewportLines: 0 });
   const onScrollExtent = useCallback((extent: { readonly maxOffset: number; readonly viewportLines: number }) => {
@@ -1112,7 +1250,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
 
   /*
    * When this account's plan stops serving, the line under the composer turns
-   * into an offer and Ctrl+H opens the list it belongs to. ADR 0003 is the
+   * into an offer and Alt+H opens the list it belongs to. ADR 0003 is the
    * whole design: a hand off is a chosen act, so nothing here moves anything —
    * `failover.ts` works out whether there is something worth offering and who
    * could take it, this file draws it and answers the key, and the move
@@ -2332,6 +2470,82 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     });
   }, [sessions, state.settings.cwd, moveToDirectory, openBrowser]);
 
+  /**
+   * `/timeline` — every turn as one line, and a way back into any of them.
+   *
+   * The ledger's own question, asked of a conversation that has got long: what
+   * has this actually cost, and where was the turn where it went wrong. Both
+   * are answered by the same list — `timeline.ts` reduces the transcript to
+   * turns and formats them, the title carries the totals, and Enter opens the
+   * pager at the turn rather than scrolling somebody towards it.
+   *
+   * Typed at, because the reason to open it is usually that the conversation is
+   * too long to scroll, and a list that is too long to scroll is the same
+   * problem one surface further out. The rows are built at `mainWidth - 4`: the
+   * pane, less the picker's own padding and its cursor gutter.
+   *
+   * The cursor opens on the *last* turn, which is where the transcript already
+   * is — arriving at the top of a forty-turn ledger would be forty presses from
+   * the thing that just happened. `note` is what the turn touched, because a
+   * turn is remembered by its files long after its prompt has blurred, and the
+   * error when there was one, which is the row somebody is looking for.
+   */
+  const openTimelinePicker = useCallback(() => {
+    const turns = turnsOf(transcript);
+    if (turns.length === 0) {
+      showFlash('no turns yet');
+      return;
+    }
+    const lines = timelineLines(turns, mainWidth - 4);
+    const last = turns[turns.length - 1];
+    openPicker({
+      title: `Timeline — ${timelineSummary(turns)}`,
+      items: lines.map((line, index) => {
+        const turn = turns[index];
+        const touched = (turn?.files ?? []).map((path) => basename(path)).join(', ');
+        const note = [touched, turn?.error].filter((part): part is string => part !== undefined && part.length > 0).join(' · ');
+        return {
+          key: line.id,
+          label: line.text,
+          detail: line.detail,
+          ...(note.length === 0 ? {} : { note }),
+        };
+      }),
+      filterable: true,
+      ...(last === undefined ? {} : { initialKey: last.userItemId }),
+      hint: `Enter opens the whole conversation at that turn · ${PICKER_KEYS}`,
+      onSelect: (item) => {
+        setModal({ kind: 'pager', initialRowId: item.key });
+      },
+    });
+  }, [transcript, mainWidth, openPicker, showFlash]);
+
+  /**
+   * `/asks` — the card, for however many are waiting.
+   *
+   * The command opens it for one, which the key does not: Ctrl+] pressed with a
+   * single conversation waiting means "take me there", and putting a card of one
+   * row in front of that would be a keystroke asking a question with one answer.
+   * Somebody who *types* `/asks` has asked for the list.
+   */
+  const openAsksCard = useCallback(() => {
+    if (asksNow.current.length === 0) {
+      showFlash('nothing needs you');
+      return;
+    }
+    setModal({ kind: 'asks' });
+  }, [showFlash]);
+
+  /**
+   * The hand-off list, opened from a command that is answered before it.
+   *
+   * A ref for `resumeAgain`'s reason turned round: `openFailoverPicker` is
+   * built out of half a dozen things that only exist further down this file,
+   * and `/handoff` is parsed up here. One indirection rather than either a list
+   * of hooks moved for the sake of an ordering or two ways into one picker.
+   */
+  const handOffAgain = useRef<() => void>(() => undefined);
+
   const runCommand = useCallback(
     (command: Command) => {
       switch (command.name) {
@@ -2424,6 +2638,17 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         case 'usage':
           void showUsage();
           return;
+        case 'asks':
+          openAsksCard();
+          return;
+        case 'timeline':
+          openTimelinePicker();
+          return;
+        case 'handoff':
+          // The same list Alt+H opens, because there is one hand-off and two
+          // ways to ask for it. See `openFailoverPicker`.
+          handOffAgain.current();
+          return;
         default:
           return;
       }
@@ -2450,6 +2675,8 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       renameConversation,
       openTasksPicker,
       showUsage,
+      openAsksCard,
+      openTimelinePicker,
       confirm,
       applyMode,
     ],
@@ -2581,6 +2808,69 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       return result.text;
     },
     [suspendTerminal],
+  );
+
+  /**
+   * `o` on a row: the file it touched, opened where it touched it.
+   *
+   * The same handover as Ctrl+G and for the same reason — two programs cannot
+   * own one terminal — but not the same call. `editInExternalEditor` is about
+   * a draft: it writes a temp file, waits, reads it back, and throws the text
+   * away on a non-zero exit. Here there is no text to carry either way. The
+   * file is the user's own, on disk, and what they do to it is between them and
+   * their editor; this only has to put them in front of it and take the screen
+   * back afterwards.
+   *
+   * `+<line>` is the argument vi, vim, nano, emacs and `less` have all agreed
+   * on for "start here", so it is the one worth spending. An editor that does
+   * not know it — VS Code wants `--goto file:line` — opens the file anyway and
+   * ignores an argument it reads as a filename it cannot find, which is a
+   * cursor in the wrong place rather than a key that does nothing.
+   */
+  const openInEditorAt = useCallback(
+    async (target: RowTarget): Promise<void> => {
+      const configured = (process.env['VISUAL'] ?? '').trim() || (process.env['EDITOR'] ?? '').trim();
+      if (configured.length === 0) {
+        showFlash('neither VISUAL nor EDITOR is set');
+        return;
+      }
+      const argv = splitCommand(configured);
+      const file = argv[0];
+      if (file === undefined || file.length === 0) {
+        showFlash('the editor command is empty');
+        return;
+      }
+      const args = [...argv.slice(1), `+${String(target.line ?? 1)}`, target.path];
+      let failed: string | undefined;
+      try {
+        await suspendTerminal(async () => {
+          failed = await new Promise<string | undefined>((settle) => {
+            let done = false;
+            const finish = (reason?: string): void => {
+              if (done) return;
+              done = true;
+              settle(reason);
+            };
+            try {
+              const child = spawn(file, args, { stdio: 'inherit' });
+              // A failed spawn emits `error` and then `exit` with a null code,
+              // so the first of the two to speak is the answer.
+              child.on('error', (error: Error) => finish(`could not run ${file}: ${error.message}`));
+              // Any exit status at all: `:cq` means "forget it" for a draft
+              // being read back, and there is nothing here to forget.
+              child.on('exit', () => finish());
+            } catch (error) {
+              finish(`could not run ${file}: ${describeError(error)}`);
+            }
+          });
+        });
+      } catch (error) {
+        setNotice(`Could not hand over the terminal: ${describeError(error)}`);
+        return;
+      }
+      if (failed !== undefined) showFlash(failed);
+    },
+    [suspendTerminal, showFlash],
   );
 
   /**
@@ -2957,6 +3247,61 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   needingNow.current = needing;
 
   /**
+   * Every conversation stopped on a permission, as a row of the card.
+   *
+   * Rebuilt on every render rather than held, which is the arrangement
+   * `AsksCard` asks for: a request answered from anywhere — the full card
+   * behind this one, another window, the agent withdrawing it — has to be able
+   * to take its row off the list, and a list captured at the keystroke could
+   * not. The card keeps its own note of what *it* has answered, because that
+   * round trip is a few frames long and a row that lingered could be allowed
+   * twice.
+   *
+   * In the rail's order, like {@link needing} and for the same reason: two
+   * surfaces about the same set of conversations should walk them in the order
+   * the eye does. The conversation on screen is in the list and says so — the
+   * count on the status line includes it, and a card headed "3 conversations
+   * are waiting on you" that lists two is a card whose count you stop
+   * trusting.
+   */
+  const asks = useMemo<readonly Ask[]>(() => {
+    const ranked = [...pool].sort(
+      (a, b) =>
+        (railOrder.get(a.getState().sessionId ?? '') ?? Number.MAX_SAFE_INTEGER) -
+        (railOrder.get(b.getState().sessionId ?? '') ?? Number.MAX_SAFE_INTEGER),
+    );
+    return ranked.flatMap((parked) => {
+      const parkedState = parked.getState();
+      const request = parkedState.pendingPermissions[0];
+      if (request === undefined) return [];
+      const named = parkedState.sessionId === undefined ? undefined : sessions.find((row) => row.id === parkedState.sessionId)?.title;
+      return [
+        {
+          key: keyFor(parked),
+          // The folder when the provider has not filed it under a name yet,
+          // which is what the rail shows for such a row too.
+          title: named ?? (basename(parkedState.settings.cwd) || parkedState.settings.cwd),
+          request,
+          decide: (decision) => {
+            void parked.respondToPermission(request.id, decision);
+          },
+          open: () => {
+            switchTo(parked);
+          },
+          ...(parked === conversation ? { current: true } : {}),
+        } satisfies Ask,
+      ];
+    });
+    // The same two signals the rail's activity map watches — `parkedTick` for
+    // a parked conversation, `state` for the one on screen.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pool, parkedTick, state, conversation, sessions, railOrder, keyFor, switchTo]);
+
+  // Read at the moment the key is pressed, as `needing` is; the ref itself is
+  // declared with the others, above, because `/asks` is answered before this.
+  asksNow.current = asks;
+
+  /**
    * Ctrl+]: go to whoever is waiting.
    *
    * The step is always to the one *after* the current conversation in the
@@ -3061,10 +3406,41 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   const composerActive = focus === 'composer' && !modalOpen;
 
   /*
-   * The composer's own handle, which is how anything here reaches into the box
-   * — and, below, how Esc is asked after rather than taken. See `Composer`.
+   * No count to gate on, unlike the two above: the transcript is always drawn,
+   * and a conversation with nothing in it is a stop whose arrows find no row
+   * and whose Esc leads back to the composer — which is a dead end somebody can
+   * see rather than one Tab quietly skipped.
    */
-  const composerRef = useRef<ComposerHandle>(null);
+  const transcriptActive = focus === 'transcript' && !modalOpen;
+
+  /**
+   * The row an id names, whichever of the two kinds it is.
+   *
+   * A group is a run's finished calls folded into one row and lives in its own
+   * table; `isGroupId` is the model's own way of telling the two apart. Read
+   * afresh wherever it is wanted rather than held, because a row's status moves
+   * under the cursor — a call finishes, a group stops running — and what `x`
+   * may do to a row is a question about the row *now*.
+   */
+  const rowAt = useCallback(
+    (id: string | null): Row | undefined => {
+      if (id === null) return undefined;
+      return isGroupId(id) ? transcript.getGroup(id) : transcript.getItem(id);
+    },
+    [transcript],
+  );
+
+  /** A group's calls, which live in the model rather than on the group. */
+  const membersOf = useCallback(
+    (id: string): readonly TranscriptItem[] =>
+      (transcript.getGroup(id)?.ids ?? [])
+        .map((memberId) => transcript.getItem(memberId))
+        .filter((member): member is TranscriptItem => member !== undefined),
+    [transcript],
+  );
+
+  /** The row the hint under the composer is about; nothing, with focus away. */
+  const cursorRow = transcriptActive ? rowAt(cursorId) : undefined;
 
   /*
    * Which prompts ↑ offers, and what Ctrl+R cycles through: this folder first,
@@ -3250,7 +3626,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
    * screen, which `loadSession` correctly treats as nothing to do.
    *
    * The interrupt is first and is usually a no-op — the offer is only made
-   * while nothing is running — but Ctrl+H is answerable at any time, and a
+   * while nothing is running — but Alt+H is answerable at any time, and a
    * turn left running on the account being left would go on spending the
    * quota that caused the move.
    */
@@ -3333,8 +3709,9 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   /**
    * The offer: what happened, who could take it, and what each row would do.
    *
-   * Opened by Ctrl+H and by nothing else — no timer, no setting, no
-   * countdown. ADR 0003 rejected the standing auto-move outright, and the
+   * Opened by Alt+H, or by `/handoff` on a terminal that swallows Alt, and by
+   * nothing else — no timer, no setting, no countdown. ADR 0003 rejected the
+   * standing auto-move outright, and the
    * reason is worth keeping in view here: the ranking that would justify one
    * does not exist yet (`bindingWindow` is workload-blind, `drain-v1` is
    * unimplemented), and a conversation moved on its own to an account that
@@ -3472,6 +3849,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     handOffTo,
     startFreshOn,
   ]);
+  handOffAgain.current = openFailoverPicker;
 
   /**
    * Go back to an earlier prompt: the list, and what picking one does.
@@ -3598,7 +3976,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     }
 
     /*
-     * Ctrl+] goes to the next conversation that needs you.
+     * Ctrl+] goes to whoever needs you: one conversation, or the list of them.
      *
      * Above the modal guard on purpose, because the commonest reason to press
      * it is that *this* conversation has stopped to ask — and a permission
@@ -3610,10 +3988,21 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
      * about the conversation being left, and a picker whose subject was
      * swapped underneath it is a picker about nothing. A reverse search is
      * holding the box's text, for the same reason Ctrl+O declines to.
+     *
+     * Past one conversation waiting, the press opens the card instead of
+     * taking the tour. Four asks answered one switch at a time is four
+     * transcripts nobody came to read and four ways back; the card answers the
+     * three that are only a yes where they stand and goes to the fourth. At
+     * exactly one the jump is still right — there is nowhere else to be, and a
+     * card of one row is a keystroke asking a question with one answer.
      */
     if (isNextNeedy(input, key)) {
       if (modal !== null) return;
       if (composerActive && composerRef.current?.isCapturing() === true) return;
+      if (asksNow.current.length > 1) {
+        setModal({ kind: 'asks' });
+        return;
+      }
       goToNeedy();
       return;
     }
@@ -3648,21 +4037,21 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     }
 
     /*
-     * Ctrl+H opens the hand-off offer. Below the modal guard, because the list
+     * Alt+H opens the hand-off offer. Below the modal guard, because the list
      * it opens is a modal itself and a key that could open a second one over
      * the first is a key with two owners.
      *
-     * A caveat worth knowing before changing this line: on a terminal that has
-     * not negotiated the kitty keyboard protocol, Ctrl+H sends the C0 byte
-     * `\x08` and Ink reports it as `backspace` — indistinguishable from the
-     * Backspace key, which sends `\x7f`. So the press only arrives here as
-     * `ctrl`+`h` on a terminal that reports modifiers, and reading
-     * `key.backspace` instead would cost the composer its rub-out everywhere.
-     * The status line advertises the key because it is the right key; making
-     * it answer on every terminal is a render option away (`kittyKeyboard`,
-     * in `main.tsx`) and is not this feature's to turn on.
+     * This was Ctrl+H, and Ctrl+H cannot be delivered. On any terminal that has
+     * not negotiated the kitty keyboard protocol the chord sends the C0 byte
+     * `\x08`, which Ink reports as `backspace` — the same thing the Backspace
+     * key sends — so the app could either ignore the press or take the
+     * composer's rub-out away everywhere, and a binding whose two outcomes are
+     * "does nothing" and "breaks Backspace" is not a binding. Alt+H arrives as
+     * an Escape-prefixed `h`, which Ink hands over as `meta` plus the letter,
+     * and which no other surface claims. `/handoff` is there for the terminal
+     * that swallows Alt as well — see `commands.ts`.
      */
-    if (key.ctrl && input === 'h') {
+    if (key.meta && input === 'h') {
       openFailoverPicker();
       return;
     }
@@ -3704,6 +4093,100 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       setModal({ kind: 'help' });
       return;
     }
+
+    /*
+     * The conversation's own rows, once Tab has reached them.
+     *
+     * Above the scrolling block and not beside the rail's, because two of
+     * these keys are ones the block below would otherwise answer first: a
+     * plain arrow, which here moves the cursor rather than the screen, and Esc,
+     * which here puts the cursor away. What is *not* answered here falls
+     * through on purpose — PgUp, PgDn, End and the modified arrows are about
+     * the screen rather than about a row, and they go on working from the
+     * transcript exactly as they do from anywhere else.
+     *
+     * Every verb is a lookup on the row under the cursor, the way the
+     * delegated strip's keys are a lookup on the row the strip reported: what
+     * a row answers to is `rowVerbs`' decision, taken once, printed as the
+     * hint, and consulted again here. A key pressed on a row that does not
+     * offer it does nothing rather than guessing — the hint has already said
+     * so, and a verb that half-worked on the rows it was not offered on is
+     * exactly what having the list in one place is meant to prevent.
+     */
+    if (transcriptActive) {
+      const bigStep = key.shift || key.ctrl;
+      if (key.escape) {
+        setCursorId(null);
+        setFocus('composer');
+        return;
+      }
+      if (!bigStep && (key.upArrow || key.downArrow)) {
+        setCursorId((current) => stepCursor(cursorRows, current, key.upArrow ? -1 : 1));
+        return;
+      }
+      const row = rowAt(cursorId);
+      if (cursorId !== null && row !== undefined && !key.ctrl && !key.meta) {
+        const offers = (kind: RowVerbKind): boolean => rowVerbs(row).some((verb) => verb.kind === kind);
+        // Only an item has arguments to read a path, a command or a diff out
+        // of; a group is a count of calls and answers the three that do not.
+        const item = isGroupId(cursorId) ? undefined : transcript.getItem(cursorId);
+        if (key.return) {
+          if (!offers('unfold')) return;
+          const id = cursorId;
+          setExpanded((current) => {
+            const next = new Set(current);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+          });
+          return;
+        }
+        if (input === 'o') {
+          const target = item === undefined ? null : rowTarget(item);
+          if (target !== null) void openInEditorAt(target);
+          return;
+        }
+        if (input === 'r') {
+          const command = item === undefined ? null : rowCommand(item);
+          if (command === null) return;
+          // A `!` in front, because that is what the box does with a command:
+          // the line is put up to be read and edited, and Enter is what runs
+          // it. Re-running something the agent did without being asked again
+          // would be this file deciding on somebody's behalf.
+          composerRef.current?.setText(`!${command}`);
+          setCursorId(null);
+          setFocus('composer');
+          return;
+        }
+        if (input === 'y') {
+          void putOnClipboard(rowYankText(row, isGroupId(cursorId) ? membersOf(cursorId) : []));
+          return;
+        }
+        if (input === 'd') {
+          const edit = item === undefined ? null : rowDiff(item);
+          if (edit === null) return;
+          setModal({
+            kind: 'text',
+            title: edit.path,
+            // Every row of it, at the width the reader has for its content —
+            // the same two numbers `/diff` builds its lines to, because this is
+            // the same view of the same kind of thing.
+            lines: renderDiff(edit, edit.rows.length, { columns: Math.max(20, mainWidth - TEXT_VIEW_CHROME), numbers: 'on' }),
+          });
+          return;
+        }
+        if (input === 'x') {
+          // The turn, not the call: a provider has no way to stop one tool
+          // call and leave the rest of a run going, so `x` on a running row is
+          // the interrupt Esc and Ctrl+C are — reached from the row that shows
+          // what is taking the time.
+          if (!offers('stop')) return;
+          void conversation.interrupt();
+          return;
+        }
+      }
+    }
+
     /*
      * Scrolling the conversation. Arrows, because a laptop has no Page keys
      * and because a terminal on the alternate screen turns the mouse wheel
@@ -3954,6 +4437,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         transcript={transcript}
         columns={columns}
         rows={rows}
+        {...(modal.initialRowId === undefined ? {} : { initialRowId: modal.initialRowId })}
         onClose={() => setModal(null)}
         /*
          * `v`. The same handover as Ctrl+G — `editExternally` is the only
@@ -3992,7 +4476,28 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         <Box flexDirection="column" width={mainWidth} height={bodyRows}>
           {/* The pane's width, not the terminal's: what a diff has room for is
               decided on the columns the conversation actually has. */}
-          <TranscriptViewport transcript={transcript} live={live} offset={scroll} onExtent={onScrollExtent} columns={mainWidth} />
+          <TranscriptViewport
+            transcript={transcript}
+            live={live}
+            offset={scroll}
+            onExtent={onScrollExtent}
+            columns={mainWidth}
+            /* What each finished turn took out of the plan, for the run-end
+               rows that print it. A row cannot reach the conversation and the
+               transcript model has nowhere to keep the reading, so it arrives
+               as a lookup. */
+            planDeltaFor={conversation.planDeltaForRow}
+            /*
+             * `null` rather than absent whenever the focus is elsewhere, and
+             * the difference is the layout's: the column the caret goes in is
+             * reserved as soon as the prop is *present*, so passing it always
+             * is what stops the whole conversation shifting one column
+             * sideways as Tab arrives and leaves.
+             */
+            cursor={focus === 'transcript' ? cursorId : null}
+            onCursorRows={setCursorRows}
+            expandedRows={expanded}
+          />
 
           {/*
            * Above the card and the pickers rather than directly over the
@@ -4110,6 +4615,17 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
               />
             </Box>
           )}
+          {modal?.kind === 'asks' && (
+            <Box paddingX={1} flexShrink={0}>
+              {/*
+               * The rows are rebuilt on every render, so a request answered
+               * anywhere loses its row here on the next frame — and the card
+               * closes itself when the last one goes, which is why nothing
+               * below has to notice that the list has drained.
+               */}
+              <AsksCard asks={asks} columns={mainWidth - 2} onClose={() => setModal(null)} />
+            </Box>
+          )}
           {/*
            * Under whatever opened it. Space in the rail and Space in the
            * conversation list put the same box in the same place — see the
@@ -4223,9 +4739,22 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
                       // no more; this is where the words for them go.
                       { hint: 'filtering: Ctrl+A archive · Ctrl+D delete · Ctrl+P pin · Esc clears' }
                     : { hint: 'sidebar: ↑↓ Enter · a archive · d delete · p pin · Space preview · / filter' }
-                  : scroll > 0
-                    ? { hint: 'scrolled · Esc to follow' }
-                    : {})}
+                  : transcriptActive
+                    ? /*
+                       * What *this* row answers to, not what rows in general
+                       * do. `rowVerbs` is the same list the keys above consult,
+                       * so a verb is advertised exactly while it would work —
+                       * which is the whole reason the verbs are data.
+                       */
+                      {
+                        hint:
+                          cursorRow === undefined
+                            ? '↑↓ pick a row · Esc back to the composer'
+                            : `${rowVerbHint(rowVerbs(cursorRow))} · Esc back`,
+                      }
+                    : scroll > 0
+                      ? { hint: 'scrolled · Esc to follow' }
+                      : {})}
             />
           </Box>
         </Box>
