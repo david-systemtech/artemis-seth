@@ -364,7 +364,10 @@ describe('isOnPath', () => {
     await writeFile(join(bin, 'delta.cmd'), 'echo', 'utf8');
   });
 
-  it('finds an executable on one of the path entries', () => {
+  // A POSIX PATH is joined with colons, and a Windows temp directory carries
+  // a drive letter with a colon in it, so the two cannot be put in one
+  // string on that host; the win32 branch has its own test below.
+  it.skipIf(process.platform === 'win32')('finds an executable on one of the path entries', () => {
     expect(isOnPath('delta', { PATH: [empty, bin].join(':') }, 'linux')).toBe(true);
     expect(isOnPath('delta', { PATH: empty }, 'linux')).toBe(false);
     expect(isOnPath('bat', { PATH: bin }, 'linux')).toBe(false);

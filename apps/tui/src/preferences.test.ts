@@ -294,21 +294,33 @@ describe('PreferencesStore after-edit checks', () => {
   let dir: string;
   const work = sep === '\\' ? 'C:\\work\\artemis' : '/work/artemis';
   const other = sep === '\\' ? 'C:\\work\\notes' : '/work/notes';
+  /*
+   * Every store opened here is flushed before its directory goes: a write
+   * still in flight when the directory is removed is a race a Windows runner
+   * loses with ENOTEMPTY, and the removal itself retries for the same reason.
+   */
+  const stores: PreferencesStore[] = [];
+  const opened = (): PreferencesStore => {
+    const store = new PreferencesStore(dir);
+    stores.push(store);
+    return store;
+  };
   beforeEach(async () => {
     dir = join(await mkdtemp(join(tmpdir(), 'artemis-tui-checks-')), 'nested');
   });
   afterEach(async () => {
-    await rm(join(dir, '..'), { recursive: true, force: true });
+    await Promise.all(stores.splice(0).map((store) => store.flush()));
+    await rm(join(dir, '..'), { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 
   it('reads a directory’s command back, and answers nothing for one nobody has set', async () => {
-    const store = new PreferencesStore(dir);
+    const store = opened();
     expect(store.afterEditFor(work)).toBeUndefined();
     store.setAfterEdit(work, 'pnpm -s test');
     store.setAfterEdit(other, 'cargo clippy');
     await store.flush();
 
-    const reopened = new PreferencesStore(dir);
+    const reopened = opened();
     expect(reopened.afterEditFor(work)).toBe('pnpm -s test');
     expect(reopened.afterEditFor(other)).toBe('cargo clippy');
     expect(reopened.afterEditFor(sep === '\\' ? 'C:\\elsewhere' : '/elsewhere')).toBeUndefined();
@@ -317,7 +329,7 @@ describe('PreferencesStore after-edit checks', () => {
   it('is one setting however the directory was spelled', () => {
     // The path somebody typed at `/check` and the one the app is running in
     // must not be two settings that disagree.
-    const store = new PreferencesStore(dir);
+    const store = opened();
     store.setAfterEdit(`${work}${sep}`, 'pnpm test');
     expect(store.afterEditFor(work)).toBe('pnpm test');
     expect(store.afterEditFor(join(work, 'src', '..'))).toBe('pnpm test');
@@ -325,7 +337,7 @@ describe('PreferencesStore after-edit checks', () => {
   });
 
   it('clears the command on nothing, and on a command of spaces', async () => {
-    const store = new PreferencesStore(dir);
+    const store = opened();
     store.setAfterEdit(work, 'pnpm test');
     store.setAfterEdit(other, 'cargo clippy');
     store.setAfterEdit(work, undefined);
@@ -337,17 +349,17 @@ describe('PreferencesStore after-edit checks', () => {
     expect(store.afterEditFor(other)).toBeUndefined();
     expect(store.get().afterEdit).toEqual({});
     await store.flush();
-    expect(new PreferencesStore(dir).afterEditFor(work)).toBeUndefined();
+    expect(opened().afterEditFor(work)).toBeUndefined();
   });
 
   it('trims the command it was given, so a pasted line is the command', () => {
-    const store = new PreferencesStore(dir);
+    const store = opened();
     store.setAfterEdit(work, '  pnpm -s typecheck  ');
     expect(store.afterEditFor(work)).toBe('pnpm -s typecheck');
   });
 
   it('keeps the fifty most recently set, and a directory set again goes to the back', async () => {
-    const store = new PreferencesStore(dir);
+    const store = opened();
     for (let n = 0; n < 55; n += 1) store.setAfterEdit(`${work}-${String(n)}`, `check ${String(n)}`);
     expect(Object.keys(store.get().afterEdit ?? {})).toHaveLength(50);
     expect(store.afterEditFor(`${work}-4`)).toBeUndefined();
@@ -363,14 +375,14 @@ describe('PreferencesStore after-edit checks', () => {
   });
 
   it('keeps the check through the other settings, and opens on none when the file says something else', async () => {
-    const store = new PreferencesStore(dir);
+    const store = opened();
     store.save({ profileId: 'prof_work' });
     store.setAfterEdit(work, 'pnpm test');
     store.togglePin('s-1');
     store.setDraft('s-1', 'a draft');
     await store.flush();
 
-    const reopened = new PreferencesStore(dir);
+    const reopened = opened();
     expect(reopened.afterEditFor(work)).toBe('pnpm test');
     expect(reopened.isPinned('s-1')).toBe(true);
     expect(reopened.draftFor('s-1')).toBe('a draft');
@@ -383,12 +395,12 @@ describe('PreferencesStore after-edit checks', () => {
       JSON.stringify({ version: 1, preferences: { afterEdit: { [work]: 7, [other]: 'cargo test' } } }),
       'utf8',
     );
-    const salvaged = new PreferencesStore(dir);
+    const salvaged = opened();
     expect(salvaged.afterEditFor(work)).toBeUndefined();
     expect(salvaged.afterEditFor(other)).toBe('cargo test');
 
     await writeFile(join(dir, 'preferences.json'), JSON.stringify({ version: 1, preferences: { afterEdit: 'pnpm test' } }), 'utf8');
-    const nonsense = new PreferencesStore(dir);
+    const nonsense = opened();
     expect(nonsense.afterEditFor(work)).toBeUndefined();
     // And it can still be set from there, over whatever the file held.
     nonsense.setAfterEdit(work, 'pnpm test');
