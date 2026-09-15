@@ -160,7 +160,36 @@ export interface TuiHostOptions {
 }
 
 export function createTuiHost(dataDir: string, options: TuiHostOptions = {}): TuiHost {
-  const providers = createDefaultProviderRegistry({});
+  /** For a failure the registry cannot hear about because it happens on the way in. */
+  const reportError =
+    options.onError ??
+    ((error: unknown, context: { readonly runId: string; readonly phase: string }): void => {
+      process.stderr.write(`Run ${context.runId} (${context.phase}): ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+
+  const providers = createDefaultProviderRegistry({
+    claude: {
+      /*
+       * The provider started a turn nobody asked for — register it.
+       *
+       * It does that when background work settles, and a subagent that outlived
+       * its turn can park on a permission prompt the same way. Without this the
+       * adapter has nowhere to report the turn and drops it, which is how a
+       * subagent came to spin for ever on the delegated strip after it had
+       * finished. `runs` is declared below and captured, not called, until a
+       * process is live — which is long after both exist. Same wiring as the
+       * desktop's `engine.ts`, and swallowed for the same reason: this runs
+       * inside the adapter's own event pump.
+       */
+      onContinuation: (run, context) => {
+        try {
+          runs.adopt(run, context);
+        } catch (error) {
+          reportError(error, { runId: run.runId, phase: 'adopt' });
+        }
+      },
+    },
+  });
   const managed = [...new Set(providers.list().flatMap((adapter) => managedEnvKeys(adapter.credentials)))];
 
   const profiles = new ProfileStore({

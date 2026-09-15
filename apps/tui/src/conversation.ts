@@ -156,6 +156,8 @@ export class Conversation {
   #slashCommandsFromRun = false;
   /** The run that most recently ended; background work it started is stopped through it. */
   #lastRunId: RunId | undefined;
+  /** Provider-started turns on this session that arrived while a turn of ours was open. See `#fromSibling`. */
+  readonly #siblings = new Set<RunId>();
   #snapshot: ConversationState;
 
   constructor(options: ConversationOptions) {
@@ -466,7 +468,11 @@ export class Conversation {
   /* ---------------------------------------------------------------------- */
 
   #onEvent(event: AgentEvent): void {
-    if (event.runId !== this.#runId) return;
+    if (event.runId !== this.#runId && !this.#adopt(event)) {
+      if (!this.#fromSibling(event)) return;
+      this.#onSiblingEvent(event);
+      return;
+    }
     this.transcript.apply(event);
 
     switch (event.type) {
@@ -546,6 +552,65 @@ export class Conversation {
         break;
     }
 
+    this.#notify();
+    for (const listener of this.#eventListeners) listener(event);
+  }
+
+  /**
+   * Take on a turn the provider started by itself, when it is this conversation's.
+   *
+   * The CLI speaks unprompted: told that background work settled it answers,
+   * and a subagent that outlived its turn can park on a permission prompt. Those
+   * turns are real runs, adopted by the registry (`host.ts`) under an id nothing
+   * here minted — and routing is by run id, so without this every one of them
+   * was dropped. What that looked like from the chair: the delegated strip
+   * spinning on a subagent that had finished, and the agent's own sentence
+   * about the result never arriving.
+   *
+   * The run's first event is the one that names the conversation, and the
+   * session id is the whole test: this session, and not another conversation's
+   * run on the same registry. Only while idle — a turn this conversation is
+   * already running keeps its stream, as the desktop's pane does.
+   */
+  #adopt(event: AgentEvent): boolean {
+    if (event.type !== 'session.started') return false;
+    if (this.#runId !== undefined || this.#sessionId === undefined || event.sessionId !== this.#sessionId) return false;
+    this.#runId = event.runId;
+    this.#status = 'running';
+    this.#pending = [];
+    this.#queued = 0;
+    return true;
+  }
+
+  /**
+   * Is this an event of a sibling — a provider-started turn on this session
+   * that could not be adopted because a turn of ours was already open?
+   *
+   * The one window {@link #adopt} cannot cover: the next prompt is typed, the
+   * CLI takes its settle turn first, and two runs of one session are alive at
+   * once while `#runId` can hold only the prompt's. The sibling's first event
+   * names the session, which is enough to remember it by; everything after is
+   * matched on the id.
+   */
+  #fromSibling(event: AgentEvent): boolean {
+    if (this.#siblings.has(event.runId)) return true;
+    if (event.type !== 'session.started' || this.#sessionId === undefined || event.sessionId !== this.#sessionId) return false;
+    this.#siblings.add(event.runId);
+    return true;
+  }
+
+  /**
+   * What a sibling's turn is allowed to change: the transcript, and the rows.
+   *
+   * Not the run lifecycle — status, permissions, the queue all describe the
+   * prompt's own turn — and not its end: a sibling finishing says nothing
+   * about ours. The CLI runs the two in series, so what the sibling says lands
+   * before the prompt's answer, which is the order it actually happened in.
+   */
+  #onSiblingEvent(event: AgentEvent): void {
+    this.transcript.apply(event);
+    if (event.type === 'background.tasks') this.#tasks = event.tasks;
+    if (event.type === 'run.end') this.#siblings.delete(event.runId);
     this.#notify();
     for (const listener of this.#eventListeners) listener(event);
   }
