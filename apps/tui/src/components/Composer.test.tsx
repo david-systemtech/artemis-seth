@@ -50,6 +50,19 @@ const composer = (props: Partial<Parameters<typeof Composer>[0]> = {}) =>
   render(<Composer onSubmit={() => undefined} live={false} locked={false} {...props} />);
 
 /** Keystrokes in order, a tick apart, as Ink delivers them. */
+/**
+ * Wait for something the composer settles into rather than for a fixed number
+ * of ticks. The `@` popup opens after the fake index resolves and an effect
+ * raises the handle's flag — two turns of the loop that a loaded CI runner
+ * can stretch past one 30 ms tick, which is how a test that passes on every
+ * laptop failed there once. Polls up to a second, then lets the assertion say
+ * what it saw.
+ */
+const waitFor = async (condition: () => boolean, ms = 1_000): Promise<void> => {
+  const until = Date.now() + ms;
+  while (!condition() && Date.now() < until) await tick();
+};
+
 const press = async (stdin: { write: (data: string) => void }, ...keys: readonly string[]): Promise<void> => {
   for (const key of keys) {
     stdin.write(key);
@@ -1233,6 +1246,7 @@ describe('Composer: the keys it shares with the app', () => {
     expect(ref.current?.hasPopup()).toBe(false);
 
     await press(stdin, '/mod');
+    await waitFor(() => ref.current?.hasPopup() === true);
     expect(ref.current?.hasPopup()).toBe(true);
 
     // The press the app must not also act on: this one fills the row in, and
@@ -1250,9 +1264,11 @@ describe('Composer: the keys it shares with the app', () => {
     expect(ref.current?.hasPopup()).toBe(false);
 
     await press(stdin, 'look at @comp');
+    await waitFor(() => ref.current?.hasPopup() === true);
     expect(ref.current?.hasPopup()).toBe(true);
 
     await press(stdin, TAB);
+    await waitFor(() => ref.current?.hasPopup() === false);
     expect(ref.current?.hasPopup()).toBe(false);
   });
 
