@@ -67,6 +67,27 @@
  * when the row is clipped — see {@link TranscriptViewport}, which also says
  * what happens to a row that is taller than the screen.
  *
+ * ## Pictures, and the one row that has any
+ *
+ * Images live on a *user* item and nowhere else. `UserItem.attachments` holds
+ * the prompt's attachments whole — the same base64 that was sent to the model,
+ * kept for as long as the transcript keeps the turn — so a turn with a
+ * screenshot in it draws one {@link ImageRow} per image attachment under its
+ * text, and everything about how those bytes reach the terminal is that
+ * component's problem and `render/images.ts`'s. What is this file's problem is
+ * only that the base64 is decoded once per attachment rather than once per
+ * render, and that the protocol arrives as {@link RowView.images} — `'none'` by
+ * default, which is a chip, so every surface that has not been told what the
+ * terminal speaks reads exactly as it did before.
+ *
+ * Nothing else in the transcript has a picture to draw, and that is a shape of
+ * the model rather than a decision taken here: a `ToolItem` carries `result`,
+ * `resultText` and `error` — JSON, text and a message — and has no field for
+ * the bytes of an image. So a browser screenshot the agent took arrives as
+ * whatever the tool said about it in words. Drawing it would mean a field on
+ * the item first, and a mapper filling it; until that exists there is nothing
+ * here to render, which is why this file draws images on one row kind only.
+ *
  * The rows are drawn in the shape of the provider CLIs' own transcripts — a
  * marker in the gutter, content hanging under it, results on a connector —
  * because that is the shape their users already read fluently. See the note
@@ -76,7 +97,8 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Box, Text, measureElement, type DOMElement } from 'ink';
 
-import type { AgentError, AgentEvent } from '@rx-artemis/protocol';
+import type { AgentError, AgentEvent, Attachment, ImageAttachment } from '@rx-artemis/protocol';
+import { isImageAttachment } from '@rx-artemis/protocol';
 import {
   TranscriptModel,
   classifyTool,
@@ -100,8 +122,10 @@ import type { PlanDelta } from '../conversation.js';
 import { useNow } from '../hooks/useNow.js';
 import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import { renderDiff } from '../render/diff.js';
+import type { ImageProtocol } from '../render/images.js';
 import { renderMarkdownLines } from '../render/markdown.js';
 import { EDIT_LINES, RESULT_HEAD, RESULT_TAIL, WRITE_LINES, resultPreviewLines } from '../rowVerbs.js';
+import { ImageRow } from './ImageRow.js';
 
 /* -------------------------------------------------------------------------- */
 /* Settling                                                                   */
@@ -210,6 +234,15 @@ export interface RowView {
    * its marker in the accent. Set by the viewport on exactly one row.
    */
   readonly cursor?: boolean;
+  /**
+   * What this terminal can draw a picture with, from `imageProtocol()`.
+   *
+   * `'none'` — the default, and what every surface that does not set it gets —
+   * is a row of chips rather than pictures, which is the right answer for most
+   * terminals and for every place a transcript is drawn that is not the live
+   * viewport. Nothing but a user row with image attachments reads it.
+   */
+  readonly images?: ImageProtocol;
 }
 
 const COLLAPSED: RowView = {};
@@ -224,6 +257,45 @@ const COLLAPSED: RowView = {};
  */
 export function rowContentColumns(pane: number): number {
   return Math.max(20, pane - 2 - 5);
+}
+
+/**
+ * What a picture gets when the surface never said how wide a row is.
+ *
+ * Only a caller that renders a row outside the viewport and the pager leaves
+ * {@link RowView.columns} unset, and a picture has to be given *some* box: it
+ * is scaled to whatever it is handed rather than drawn at a natural size that
+ * no number of pixels here could work out. Narrow on purpose — too small is a
+ * picture someone squints at, too wide is one that has overwritten the rest of
+ * the conversation.
+ */
+const UNMEASURED_IMAGE_COLUMNS = 40;
+
+/**
+ * The attachment's bytes, decoded once and kept for as long as the turn is.
+ *
+ * The transcript holds an image as the base64 it was sent as, and a row that
+ * called `Buffer.from` on every render would turn a two-megabyte screenshot
+ * into a megabyte and a half of garbage per token that arrives in the
+ * conversation below it. Keyed on the attachment object, which the model
+ * carries through its own updates unchanged, and weak so that the bytes are
+ * collected when the turn holding them is.
+ */
+const decodedBytes = new WeakMap<ImageAttachment, Uint8Array>();
+
+function imageBytes(attachment: ImageAttachment): Uint8Array {
+  const known = decodedBytes.get(attachment);
+  if (known !== undefined) return known;
+  // A `Buffer` is a `Uint8Array`; copying it into a plain one would double the
+  // memory for a screenshot to no end.
+  const bytes = Buffer.from(attachment.data, 'base64');
+  decodedBytes.set(attachment, bytes);
+  return bytes;
+}
+
+/** The images among a turn's attachments; a PDF or a CSV is not one. */
+function imagesAmong(attachments: readonly Attachment[] | undefined): readonly ImageAttachment[] {
+  return attachments === undefined ? [] : attachments.filter(isImageAttachment);
 }
 
 /** `hh:mm`, local, for the right of a row once the pager has unfolded it. */
@@ -505,14 +577,30 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
    */
   const stamp = view.expanded === true ? clock(item.ts) : undefined;
   switch (item.kind) {
-    case 'user':
+    case 'user': {
+      /*
+       * Under the words, because the words are what was asked and the picture
+       * is what it was asked about — and because a caption belongs under the
+       * thing it captions, which is the shape `ImageRow` draws.
+       */
+      const images = imagesAmong(item.attachments);
       return (
         <Block marker="▌" color={ACCENT} right={stamp} view={view}>
           <Text bold dimColor={item.pending}>
             {item.text}
           </Text>
+          {images.map((image) => (
+            <ImageRow
+              key={image.id}
+              png={imageBytes(image)}
+              columns={view.columns ?? UNMEASURED_IMAGE_COLUMNS}
+              protocol={view.images ?? 'none'}
+              {...(image.name === undefined ? {} : { name: image.name })}
+            />
+          ))}
         </Block>
       );
+    }
     case 'assistant':
       if (item.text.length === 0) return null;
       return (
@@ -845,6 +933,17 @@ export interface TranscriptViewportProps {
    * not have the first close behind them.
    */
   readonly expandedRows?: ReadonlySet<string>;
+  /**
+   * What this terminal can draw a picture with — `imageProtocol()` from
+   * `render/images.ts`, which reads the environment and never asks the
+   * terminal anything.
+   *
+   * Left off, a turn's images are chips, which is what they have always been
+   * and what most terminals will go on getting. The app passes it because the
+   * app is what knows which terminal it was started in; the viewport only
+   * hands it down. See {@link RowView.images}.
+   */
+  readonly imageProtocol?: ImageProtocol;
 }
 
 /** Where the cursor row sits in the content column, in lines from its top. */
@@ -943,6 +1042,7 @@ export function TranscriptViewport({
   cursor,
   onCursorRows,
   expandedRows,
+  imageProtocol,
 }: TranscriptViewportProps): React.JSX.Element {
   const rows = useSyncExternalStore(transcript.subscribeList, transcript.getRowsSnapshot);
   const terminal = useTerminalSize();
@@ -957,8 +1057,9 @@ export function TranscriptViewport({
       columns: rowContentColumns((columns ?? terminal.columns) - (gutter ? 1 : 0)),
       planDeltaFor,
       gutter,
+      images: imageProtocol ?? 'none',
     }),
-    [expanded, live, columns, terminal.columns, planDeltaFor, gutter],
+    [expanded, live, columns, terminal.columns, planDeltaFor, gutter, imageProtocol],
   );
   /*
    * Four views for a viewport, not one per row: a row is either under the

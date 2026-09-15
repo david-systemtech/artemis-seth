@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { render } from 'ink-testing-library';
-import { SUGGESTED_TASK_TOOL, type AgentEvent, type RunId } from '@rx-artemis/protocol';
+import { SUGGESTED_TASK_TOOL, type AgentEvent, type Attachment, type RunId } from '@rx-artemis/protocol';
 import { TranscriptModel, syncScheduler } from '@rx-artemis/transcript';
 
 import { ReplayRows, TOOL_STUCK_MS, TranscriptViewport, inOrderOfStart, offsetShowing } from './Transcript.js';
@@ -623,5 +623,110 @@ describe('the offset that shows a row', () => {
     // chasing the foot it can never show — which is what stops the two
     // corrections taking turns to undo one another.
     expect(offsetShowing(tall, measured, 30)).toBe(30);
+  });
+});
+
+/**
+ * A turn that came with a picture.
+ *
+ * Images live on the user item and nowhere else — `attachments`, the same
+ * base64 that went to the model — so this is the one row kind with anything to
+ * draw. What reaches the terminal is `ImageRow`'s business and is tested
+ * there; what is tested here is that the row finds the images, that a file
+ * riding along with them is not mistaken for one, and that the protocol the
+ * app was given is the protocol the row uses.
+ */
+describe('a turn with an image in it', () => {
+  const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+  /** How an image write starts: save the cursor, then move it. Nothing else here does. */
+  const IMAGE_PREFIX = '\u001b7\u001b[';
+
+  /** A file that begins with a readable PNG header and is `bytes` long. */
+  function png(width: number, height: number, bytes: number): Buffer {
+    const file = Buffer.alloc(Math.max(33, bytes));
+    file.set(PNG_SIGNATURE, 0);
+    file.writeUInt32BE(13, 8);
+    file.write('IHDR', 12, 'ascii');
+    file.writeUInt32BE(width, 16);
+    file.writeUInt32BE(height, 20);
+    return file;
+  }
+
+  const shot: Attachment = {
+    kind: 'image',
+    id: 'a1',
+    mediaType: 'image/png',
+    name: 'shot.png',
+    data: png(640, 400, 8 * 1024).toString('base64'),
+  };
+
+  const notes: Attachment = { kind: 'file', id: 'a2', name: 'notes.pdf', mediaType: 'application/pdf', data: 'JVBER' };
+
+  /** The model as the app builds it: the prompt is pushed before it is answered. */
+  function asked(...attachments: readonly Attachment[]): TranscriptModel {
+    const transcript = new TranscriptModel(syncScheduler);
+    transcript.pushUserMessage('what is this?', attachments);
+    transcript.flush();
+    return transcript;
+  }
+
+  /** The last frame Ink drew, ignoring any image sequence written over the top of it. */
+  const lastDrawn = (frames: readonly string[]): string => frames.filter((frame) => frame.includes('▌')).at(-1) ?? '';
+
+  it('says what it is carrying when the terminal cannot draw it', async () => {
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={asked(shot)} live={false} offset={0} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    // Which is most terminals, and the default for every surface that has not
+    // been told otherwise. The size is there so a reader can decide whether it
+    // is worth opening in something that draws pictures.
+    expect(frame).toContain('what is this?');
+    expect(frame).toContain('[image shot.png 640×400 · 8 KB]');
+  });
+
+  it('reserves the lines and captions them when the terminal speaks a protocol', async () => {
+    const { frames, unmount } = render(
+      <TranscriptViewport transcript={asked(shot)} live={false} offset={0} imageProtocol="kitty" />,
+    );
+    await tick();
+    const frame = lastDrawn(frames);
+    unmount();
+
+    // The picture itself cannot be asserted from here — see `ImageRow.test.tsx`
+    // — but the caption under it can, and the caption is what is left on a
+    // terminal that claims the protocol and does not implement it.
+    expect(frame).toContain('shot.png · 640×400');
+    expect(frame).not.toContain('[image shot.png');
+
+    // And the sequence did leave. The viewport is an `overflow: hidden` box
+    // with the conversation scrolled inside it, and a row the clip has cut off
+    // writes nothing at all — so a wiring that quietly vetoed every row would
+    // look exactly like this test passing on the caption alone.
+    expect(frames.some((written) => written.startsWith(`${IMAGE_PREFIX}`))).toBe(true);
+  });
+
+  it('draws one row per image and leaves the other attachments alone', async () => {
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={asked(notes, shot)} live={false} offset={0} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    // A PDF is something the agent will read, not something to draw: an image
+    // row for it would be a chip reporting a size nothing could ever show.
+    expect(frame.split('[image').length - 1).toBe(1);
+    expect(frame).not.toContain('notes.pdf');
+  });
+
+  it('leaves a turn with no attachments exactly as it was', async () => {
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={asked()} live={false} offset={0} imageProtocol="kitty" />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    expect(frame).toContain('what is this?');
+    expect(frame).not.toContain('[image');
   });
 });
