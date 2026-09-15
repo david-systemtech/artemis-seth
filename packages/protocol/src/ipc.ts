@@ -489,12 +489,13 @@ export const IPC = {
   memoryBankSync: 'artemis:memory-banks:sync',
   memoryBankRetire: 'artemis:memory-banks:retire',
   /**
-   * Wire one bank on or off — the machine's wiring, not Artemis's gate.
+   * Switch one bank on or off — this bank, not Artemis's master gate.
    *
-   * Runs the CLI's per-bank `enable`/`disable`: the profile block and install
-   * namespace for that bank come or go, and the CLI records the flag in its
-   * own config, where the SessionStart hook (stock Claude Code's path) reads
-   * it too. One switch per bank, honoured everywhere.
+   * On installs the bank into every project it reaches and describes it to
+   * runs; off removes those copies and stops describing it. The flag is
+   * recorded in Artemis's registry and mirrored into the CLI's config, where
+   * the SessionStart hook (stock Claude Code's path) reads it too, so one
+   * switch per bank is honoured on both paths.
    */
   memoryBankSetEnabled: 'artemis:memory-banks:set-enabled',
   /**
@@ -3587,13 +3588,14 @@ export interface ArtemisBridge {
   };
 
   /**
-   * The memory banks, through the banks' own CLI.
+   * The memory banks.
    *
    * Reads and actions — and none of them lets the renderer name a path, a
-   * binary, or an arbitrary git remote outside `add`. Main resolves each
-   * bank's repo and the CLI to drive it; the banks' own validation and PR
-   * gates decide what actually lands. See the channel comments in {@link IPC}
-   * for why the write channels answer with a message rather than data.
+   * binary, or an arbitrary git remote outside `add`. Main owns each bank's
+   * location and reads the bank itself; what a write actually lands is decided
+   * by the bank's own schema and its review path. See the channel comments in
+   * {@link IPC} for why the write channels answer with a message rather than
+   * data.
    */
   readonly memoryBanks: {
     /** Every configured bank's condition. `banks: []` is an answer, not an error. */
@@ -3616,8 +3618,10 @@ export interface ArtemisBridge {
     sync(request: MemoryBankSyncRequest): Promise<IpcResult<MemoryBankSyncResponse>>;
     /** Remove a memory through the same gates. */
     retire(request: MemoryBankRetireRequest): Promise<IpcResult<MemoryBankRetireResponse>>;
-    /** Wire one bank on or off (profile blocks + CLI config flag). */
+    /** Switch one bank on or off (the registry flag, and its installs). */
     setEnabled(request: MemoryBankSetEnabledRequest): Promise<IpcResult<MemoryBankSetEnabledResponse>>;
+    /** Attach one bank to every profile, or to a chosen set. Installs follow. */
+    setProfiles(request: MemoryBankSetProfilesRequest): Promise<IpcResult<MemoryBankSetProfilesResponse>>;
     /** Unwire, uninstall, and forget one bank. The repo stays on disk. */
     forget(request: MemoryBankForgetRequest): Promise<IpcResult<MemoryBankForgetResponse>>;
     /** Artemis's master gate: prompt injection + run-start syncs. */

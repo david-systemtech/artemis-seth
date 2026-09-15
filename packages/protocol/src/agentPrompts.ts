@@ -726,6 +726,12 @@ function parsePrompt(value: unknown): AgentPrompt | undefined {
       builtIn !== undefined
         ? BUILT_IN_AGENT_PROMPTS[builtIn].name
         : (cleanString(value['name'], AGENT_PROMPT_LIMITS.name) ?? 'Untitled prompt'),
+    // The memory-banks prompt reaches every profile, and which banks it speaks
+    // of is decided per bank, in the banks' own registry. A scope stored for
+    // it by an older build — which offered a picker — would narrow delivery on
+    // top of that attachment, from a control the pane no longer shows, so it
+    // reads as `all` and is written back that way.
+    scope: builtIn === 'builtin:cerebro' ? { kind: 'all' } : scope,
     // A built-in that the user has not taken over carries no stored text —
     // theirs ships with Artemis — so anything found here for one is discarded
     // rather than becoming a shadow copy that disagrees with the version the
@@ -735,7 +741,6 @@ function parsePrompt(value: unknown): AgentPrompt | undefined {
         ? ''
         : (cleanString(value['markdown'], AGENT_PROMPT_LIMITS.markdown) ?? ''),
     enabled: value['enabled'] !== false,
-    scope,
     ...(builtIn === undefined ? {} : { builtIn }),
     ...(overridden ? { overridden: true } : {}),
   };
