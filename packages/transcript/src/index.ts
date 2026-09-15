@@ -20,6 +20,8 @@
  * ├── diff ───────────────────────────────────────────────────────────────┤
  * │ detectFileEdit    a tool call's arguments → the file edit it makes,   │
  * │                   diffed line- and character-wise under a cost cap    │
+ * │ detectFileEdits   …and every file, for the calls that edit several:   │
+ * │                   a multi-edit, or a patch across the whole tree      │
  * ├── format ─────────────────────────────────────────────────────────────┤
  * │ summarizeToolInput, formatTokens, formatUsd, formatDuration, …        │
  * └───────────────────────────────────────────────────────────────────────┘
