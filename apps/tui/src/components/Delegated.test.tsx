@@ -407,7 +407,7 @@ describe('DelegatedStrip · the cursor', () => {
 
     const lit = render(<DelegatedStrip tasks={two} focused />);
     await tick();
-    expect(lit.lastFrame()).toContain('↑↓ · Enter open · x stop · → unfold · Esc back');
+    expect(lit.lastFrame()).toContain('↑↓ · Enter open · x stop · → unfold · ← fold · Esc back');
   });
 
   it('hands the app the row under the cursor, clamped to the rows that exist', async () => {

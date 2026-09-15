@@ -478,7 +478,7 @@ export function summarizePhases(agents: readonly WorkflowAgent[] | undefined): s
 }
 
 /** What the strip says it can do, while it has the focus. */
-const HINT = '↑↓ · Enter open · x stop · → unfold · Esc back';
+const HINT = '↑↓ · Enter open · x stop · → unfold · ← fold · Esc back';
 
 export interface DelegatedStripProps {
   readonly tasks: readonly BackgroundTask[];
