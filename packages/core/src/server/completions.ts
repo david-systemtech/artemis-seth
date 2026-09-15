@@ -516,9 +516,37 @@ export type TurnEvent = TurnEventBody & { readonly seq?: number };
  * standing denial of a permission prompt on an unattended turn, it hands back
  * as `deny` for the caller to send.
  */
+/**
+ * The block a text event belongs to.
+ *
+ * `blockIndex` is optional on a completed block and absent on the events some
+ * adapters emit, so an absent index is spelled out rather than left to
+ * `String(undefined)` — two blocks that both lack one are the *same* key, which
+ * is the conservative reading: a delta and a completion with no index at all
+ * are one block, exactly as they were before blocks were told apart.
+ */
+function blockKey(messageId: string, blockIndex: number | undefined): string {
+  return `${messageId}:${blockIndex === undefined ? '-' : String(blockIndex)}`;
+}
+
 class TurnTranslator {
   text = '';
   thinking = '';
+  /**
+   * The text blocks whose deltas already crossed, by block.
+   *
+   * What lets a completed block be told apart from a streamed one *per block*
+   * rather than per turn. The check used to be "has any text been sent yet",
+   * which took the first block of a turn and dropped every later one that
+   * arrived whole — and the block that arrives whole is routinely the last:
+   * the agent's own summary after its tool calls, the one message a person
+   * reads. Seen on a served session on 2026-09-15: every word of reasoning
+   * came through, the opening sentence came through, and the bolded summary
+   * at the end never did, while the transcript on the server had it.
+   */
+  readonly #streamedBlocks = new Set<string>();
+  /** The text block the last fragment belonged to, for the break between two. */
+  #textBlock: string | undefined;
   /** The reasoning block being relayed, so a new one is set off from the last. */
   #thinkingBlock: string | undefined;
   /*
@@ -558,6 +586,27 @@ class TurnTranslator {
   }
 
   /** Announce a session id learned outside the event stream — the run handle's. */
+  /**
+   * Put a fragment of answer on the wire, and into the whole reply.
+   *
+   * Two blocks of answer — one before a tool call and one after, say — are
+   * two paragraphs, and on a flat stream the only way to keep the last word
+   * of one off the first word of the next is a paragraph break between them:
+   * the rule the reasoning field already follows. A client that draws each
+   * block as its own row drops the break at the head of a fresh row.
+   */
+  #appendText(key: string, text: string, out: TurnEvent[], seq: number, streamed: boolean): void {
+    if (text === '') return;
+    const fragment =
+      this.#textBlock !== undefined && this.#textBlock !== key && this.text.length > 0
+        ? `\n\n${text}`
+        : text;
+    this.#textBlock = key;
+    if (streamed) this.#streamedBlocks.add(key);
+    this.text += fragment;
+    out.push({ kind: 'text', text: fragment, seq });
+  }
+
   announce(sessionId: string | undefined): readonly TurnEvent[] {
     if (sessionId !== undefined) this.sessionId = sessionId;
     if (this.sessionId === undefined || this.sessionId === this.#announced) return [];
@@ -598,8 +647,7 @@ class TurnTranslator {
          * two voices.
          */
         if (event.agentId !== undefined) break;
-        this.text += event.text;
-        out.push({ kind: 'text', text: event.text, seq });
+        this.#appendText(blockKey(event.messageId, event.blockIndex), event.text, out, seq, true);
         break;
 
       case 'text.complete':
@@ -617,10 +665,12 @@ class TurnTranslator {
          * this turn's. Same rule for a subagent's block as for its deltas.
          */
         if (event.agentId !== undefined || event.replay === true) break;
-        if (event.role === 'assistant' && this.text.length === 0) {
-          this.text += event.text;
-          out.push({ kind: 'text', text: event.text, seq });
-        }
+        if (event.role !== 'assistant') break;
+        // This block's own deltas already carried it; the whole text now would
+        // be the same answer twice. Any *other* block that arrives whole is new
+        // — see `#streamedBlocks` for the turn-wide check this replaces.
+        if (this.#streamedBlocks.has(blockKey(event.messageId, event.blockIndex))) break;
+        this.#appendText(blockKey(event.messageId, event.blockIndex), event.text, out, seq, false);
         break;
 
       case 'thinking.delta': {

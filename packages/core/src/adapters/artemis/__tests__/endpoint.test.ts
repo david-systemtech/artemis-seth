@@ -1613,3 +1613,45 @@ describe('forking, rewinding and reading a queued message now', () => {
     expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'interrupted' });
   });
 });
+
+/**
+ * The paragraph break the server puts between two answer blocks.
+ *
+ * On its flat stream the server parts two blocks of answer with a paragraph
+ * break, exactly as it parts two reasoning blocks. When a stretch of reasoning
+ * sat between them this adapter opens a fresh row for the second block anyway,
+ * and the break at its head would stand as blank lines; when nothing sat
+ * between them the break is what keeps the two paragraphs apart in one row.
+ */
+describe('two answer blocks on one stream', () => {
+  it('drops the break at the head of a fresh row, keeps it inside a continuing one', async () => {
+    const { origin } = await serve((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      response.write(sse(chunk({ role: 'assistant' })));
+      response.write(sse(chunk({ content: 'Starting the probe.' })));
+      // Reasoning between: the adapter opens a new answer row after it.
+      response.write(sse(chunk({ reasoning_content: 'ran it' })));
+      response.write(sse(chunk({ content: '\n\n**Probe complete.**' })));
+      // No reasoning between: same row, so the break is the paragraph.
+      response.write(sse(chunk({ content: '\n\nAnd a footnote.' })));
+      response.write(
+        sse(chunk({}, { finish_reason: 'stop', artemis: { sessionId: 's-1', endReason: 'completed' } })),
+      );
+      response.write(sse('[DONE]'));
+      response.end();
+    });
+
+    const events = await drive(origin);
+    const texts = events
+      .filter((event) => event.type === 'text.delta')
+      .map((event) => ({
+        blockIndex: (event as { blockIndex: number }).blockIndex,
+        text: (event as { text: string }).text,
+      }));
+    expect(texts).toEqual([
+      { blockIndex: 0, text: 'Starting the probe.' },
+      { blockIndex: 2, text: '**Probe complete.**' },
+      { blockIndex: 2, text: '\n\nAnd a footnote.' },
+    ]);
+  });
+});
