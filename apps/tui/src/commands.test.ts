@@ -236,3 +236,17 @@ describe('the conversation commands', () => {
     expect(parseCommand('/copycat')).toBeNull();
   });
 });
+
+describe('the turn ledger, the card of asks, and the snippets', () => {
+  it('parses each of them, with their words', () => {
+    expect(parseCommand('/asks')).toEqual({ name: 'asks', args: '' });
+    expect(parseCommand('/timeline')).toEqual({ name: 'timeline', args: '' });
+    expect(parseCommand('/snip fix-tests apps/tui')).toEqual({ name: 'snip', args: 'fix-tests apps/tui' });
+  });
+
+  it('answers to the words people reach for', () => {
+    expect(parseCommand('/waiting')?.name).toBe('asks');
+    expect(parseCommand('/turns')?.name).toBe('timeline');
+    expect(parseCommand('/snippets')?.name).toBe('snip');
+  });
+});

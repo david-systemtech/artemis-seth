@@ -32,6 +32,9 @@ export type CommandName =
   | 'undo'
   | 'pin'
   | 'title'
+  | 'asks'
+  | 'timeline'
+  | 'snip'
   | 'tasks'
   | 'usage'
   | 'cwd'
@@ -64,6 +67,9 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: 'undo', usage: '/undo', summary: 'Take back the last file change the agent made' },
   { name: 'pin', usage: '/pin', summary: 'Keep this conversation at the top of its folder' },
   { name: 'title', usage: '/title <name>', summary: 'Name this conversation' },
+  { name: 'asks', usage: '/asks', summary: 'Every conversation waiting on a permission, answerable in one list' },
+  { name: 'timeline', usage: '/timeline', summary: 'One line per turn: when, what, how long, what it cost, what it touched' },
+  { name: 'snip', usage: '/snip <name> [words]', summary: 'Expand a saved snippet into the composer, cursor on its first slot' },
   { name: 'tasks', usage: '/tasks', summary: 'Background work: what is running, and what a delegated agent did' },
   { name: 'usage', usage: '/usage', summary: "The account's plan windows and how full they are" },
   { name: 'cwd', usage: '/cwd', summary: 'Choose where to work: a folder you have used, or browse for one' },
@@ -103,6 +109,12 @@ const ALIASES: Readonly<Record<string, CommandName>> = {
   revert: 'undo',
   rename: 'title',
   name: 'title',
+  // The three that landed with the ledger of turns, the card of asks, and the
+  // snippets: the plural, the noun, and the word for what the list is.
+  waiting: 'asks',
+  turns: 'timeline',
+  snippet: 'snip',
+  snippets: 'snip',
 };
 
 /**
