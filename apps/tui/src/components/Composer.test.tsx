@@ -26,6 +26,7 @@ const ALT_B = '\u001Bb';
 const ALT_D = '\u001Bd';
 const HOME = '\u001B[H';
 const END = '\u001B[F';
+const TAB = '\t';
 
 const PLACEHOLDER = 'message, or / for commands';
 
@@ -228,5 +229,123 @@ describe('Composer', () => {
     await press(stdin, 'ignored', ENTER);
     expect(onSubmit).not.toHaveBeenCalled();
     expect(lastFrame()).toContain(PLACEHOLDER);
+  });
+});
+
+/*
+ * The slash menu.
+ *
+ * The rule these tests hold to is the one people already know from Claude Code:
+ * a row is highlighted only when what was typed really is the start of a
+ * command's name, an alias, or a word inside one — and Enter runs the
+ * highlighted row. When nothing is highlighted Enter means what it has always
+ * meant, so a mistyped command reaches the agent as the text it is.
+ */
+describe('Composer: the slash menu', () => {
+  const MENU_HINT = '↑↓ move · Tab complete · Enter run';
+  const marked = (frame: string | undefined): readonly string[] =>
+    rowsOf(frame).filter((line) => line.includes('❯'));
+
+  it('offers what a half-typed command could mean, the first row highlighted', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, '/mo');
+    const model = rowWith(lastFrame(), '/model');
+    expect(model).toBeGreaterThan(0);
+    expect(rowsOf(lastFrame())[model]).toContain('❯');
+    expect(rowsOf(lastFrame())[model + 1]).toContain('/mode');
+    expect(rowsOf(lastFrame())[model + 1]).not.toContain('❯');
+    expect(lastFrame()).toContain(MENU_HINT);
+  });
+
+  it('↓ moves the highlight, and Tab fills in the row it is on', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, '/mo', DOWN);
+    const model = rowWith(lastFrame(), '/model');
+    expect(rowsOf(lastFrame())[model]).not.toContain('❯');
+    expect(rowsOf(lastFrame())[model + 1]).toContain('❯');
+
+    await press(stdin, TAB);
+    // Completed, with the space that ends the command word — so the menu has
+    // closed and what is left is a command waiting for its arguments.
+    expect(lastFrame()).toContain('/mode');
+    expect(lastFrame()).not.toContain('/model');
+    expect(lastFrame()).not.toContain(MENU_HINT);
+  });
+
+  it('Enter runs the highlighted row, as if its name had been typed out', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, '/mo', DOWN, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('/mode');
+    expect(lastFrame()).toContain(PLACEHOLDER);
+  });
+
+  it('highlights nothing for a typo, and sends it as typed', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, '/mdoel');
+    // The only `❯` in the frame is the composer's own prompt.
+    expect(marked(lastFrame())).toHaveLength(1);
+    expect(lastFrame()).not.toContain(MENU_HINT);
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('/mdoel');
+  });
+
+  it('finds a command by an alias and runs it under its real name', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, '/exit');
+    const quit = rowWith(lastFrame(), '/quit');
+    expect(quit).toBeGreaterThan(0);
+    expect(rowsOf(lastFrame())[quit]).toContain('❯');
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('/quit');
+  });
+
+  it('offers a bridged skill by the word someone would look for', async () => {
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({
+      onSubmit,
+      providerCommands: ['artemis-skills:code-review', 'compact'],
+    });
+    await tick();
+    await press(stdin, '/review');
+    expect(lastFrame()).toContain('/artemis-skills:code-review');
+    expect(lastFrame()).toContain('skill');
+    expect(lastFrame()).not.toContain('/compact');
+    // Fully qualified, which is the only form the provider will answer to.
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('/artemis-skills:code-review');
+  });
+
+  it('keeps ↑ while the menu is open, and hands it back once it closes', async () => {
+    const onArrowOverflow = vi.fn();
+    const { lastFrame, stdin } = composer({ onArrowOverflow });
+    await tick();
+    await press(stdin, '/mo', UP);
+    // ↑ on the first row wraps to the last rather than scrolling the
+    // conversation out from under a menu someone is reading.
+    expect(onArrowOverflow).not.toHaveBeenCalled();
+    const model = rowWith(lastFrame(), '/model');
+    expect(rowsOf(lastFrame())[model + 1]).toContain('❯');
+
+    // A space ends the command word, the menu closes, and the arrow is the
+    // app's again.
+    await press(stdin, ' ', UP);
+    expect(onArrowOverflow).toHaveBeenCalledWith('up');
+  });
+
+  it('a lone slash is the whole menu, clipped and counted', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, '/');
+    const profile = rowWith(lastFrame(), '/profile');
+    expect(rowsOf(lastFrame())[profile]).toContain('❯');
+    expect(lastFrame()).toContain('↓ 3 more');
   });
 });

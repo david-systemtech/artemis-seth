@@ -25,7 +25,18 @@
  * that run off the first and last line are handed back through
  * `onArrowOverflow`, which is how an arrow still has exactly one owner (see
  * app.tsx's "Who has the keys"): the composer moves the cursor, or the app
- * scrolls, never both on one keystroke.
+ * scrolls, never both on one keystroke. While the slash menu is open the arrows
+ * are its, ahead of both — the text is one word, so there is no second line for
+ * them to reach, and a menu you cannot walk is a list.
+ *
+ * That menu is the other thing `/` does. While the text is a single word
+ * beginning with a slash, the rows under the box are the commands it could
+ * mean, the first of them highlighted; Tab fills the highlighted one in and
+ * Enter runs it, as if its name had been typed out in full. Nothing is
+ * highlighted when nothing matched, which is what keeps a typo — `/mdoel` — a
+ * message to the agent rather than a command someone else guessed at. Esc is
+ * deliberately not bound: Esc interrupts the turn, and a popup that swallowed
+ * it would fight the app for the one key that has to work.
  *
  * It owns no state of the conversation. It reports a submission and shows what
  * it is told: whether the agent is working (so Enter means "steer" rather than
@@ -36,7 +47,7 @@
 import { useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 
-import { completeCommand, completeProviderCommand } from '../commands.js';
+import { matchCommands } from '../commands.js';
 import {
   EMPTY_EDITOR,
   backspace,
@@ -71,6 +82,7 @@ import {
   yank,
 } from '../editor.js';
 import { ACCENT } from '../theme.js';
+import { Completions } from './Completions.js';
 
 /** Lines drawn at once before the box scrolls instead of growing. */
 const MAX_ROWS = 8;
@@ -79,6 +91,11 @@ const MAX_ROWS = 8;
 const UNDO_INPUT = '\u001F';
 
 const NEWLINE_HINT = 'Shift+Enter or Ctrl+J for a newline · Enter sends';
+
+/** What a row is typed as: `/attach <path>` is run by sending `/attach`. */
+function commandWord(usage: string): string {
+  return usage.split(' ')[0] ?? usage;
+}
 
 export interface ComposerProps {
   readonly onSubmit: (text: string) => void;
@@ -108,24 +125,25 @@ export function Composer({
   onArrowOverflow,
 }: ComposerProps): React.JSX.Element {
   const [buffer, setBuffer] = useState(EMPTY_EDITOR);
+  /*
+   * The highlighted row, remembered against the text it was chosen on. Any edit
+   * to the text makes it stale, and a stale index over a fresh list is exactly
+   * how Enter runs a command nobody chose — so it is thrown away rather than
+   * kept in step, and the menu falls back to its first row.
+   */
+  const [picked, setPicked] = useState<{ readonly text: string; readonly index: number } | null>(null);
   const value = buffer.text;
 
-  const typed = value.startsWith('/') && !value.includes(' ') ? value.slice(1).toLowerCase() : null;
-  const completions =
-    typed === null
-      ? []
-      : [
-          ...completeCommand(value),
-          ...completeProviderCommand(value, providerCommands).map((name) => ({
-            name,
-            usage: `/${name}`,
-            // The plugin's name is already the front half of the row; saying
-            // it again in the description column is noise. What the column is
-            // for is the distinction the name does not carry — whether this
-            // came from the user's own skills or from the provider itself.
-            summary: name.includes(':') ? 'skill' : 'provider command',
-          })),
-        ].slice(0, 10);
+  // A single word beginning with a slash is a command being typed. Whitespace
+  // of any kind ends that: what follows is arguments, or a second line.
+  const menu = value.startsWith('/') && !/\s/u.test(value) ? matchCommands(value, providerCommands) : [];
+  const selected =
+    menu.length === 0
+      ? null
+      : picked !== null && picked.text === value
+        ? Math.max(0, Math.min(picked.index, menu.length - 1))
+        : 0;
+  const highlighted = selected === null ? undefined : menu[selected];
 
   useInput(
     (input, key) => {
@@ -144,6 +162,17 @@ export function Composer({
       if (key.return) {
         if (endsWithContinuation(buffer)) {
           setBuffer(continueLine);
+          return;
+        }
+        /*
+         * Enter on a highlighted row runs it — by submitting the words someone
+         * would have typed to run it themselves. Everything downstream, the
+         * parser above all, sees exactly what it always saw, and the composer
+         * still knows nothing about what any command does.
+         */
+        if (highlighted !== undefined) {
+          onSubmit(commandWord(highlighted.usage));
+          setBuffer(clear);
           return;
         }
         if (value.trim().length === 0 && attachments.length === 0) return;
@@ -170,6 +199,16 @@ export function Composer({
       if (key.upArrow || key.downArrow) {
         // A modified arrow is the app's half-screen scroll, never the text's.
         if (key.shift || key.ctrl || key.meta) return;
+        if (selected !== null) {
+          // The open menu takes a plain arrow ahead of the text and ahead of
+          // the app: the text is one word, so it has no second line to move
+          // to, and scrolling the conversation out from under a menu someone
+          // is reading is not what they asked for. Walking off either end
+          // comes back round, as it does in the picker.
+          const step = key.upArrow ? -1 : 1;
+          setPicked({ text: value, index: (selected + step + menu.length) % menu.length });
+          return;
+        }
         if (key.upArrow) {
           if (onFirstLine(buffer)) onArrowOverflow?.('up');
           else setBuffer(up);
@@ -238,11 +277,11 @@ export function Composer({
         }
       }
       if (key.tab) {
-        // Complete to the first match — the canonical name, prefix and all,
-        // which is what makes a bridged `/plugin:command` typeable.
-        const first = completions[0];
-        if (first !== undefined) {
-          setBuffer((current) => replaceAll(current, `${first.usage.split(' ')[0] ?? first.usage} `));
+        // Fill in the highlighted row — the canonical name, prefix and all,
+        // which is what makes a bridged `/plugin:command` typeable. Through
+        // the editor, so one undo gets back the letters that were typed.
+        if (highlighted !== undefined) {
+          setBuffer((current) => replaceAll(current, `${commandWord(highlighted.usage)} `));
         }
         return;
       }
@@ -258,11 +297,6 @@ export function Composer({
     },
     { isActive },
   );
-
-  // Wide enough for the longest row on offer, so the descriptions line up:
-  // a bridged `/marketplace:command` is far longer than `/help`, and a fixed
-  // column put the two halves of those rows flush against each other.
-  const nameColumn = completions.reduce((widest, command) => Math.max(widest, command.usage.length), 0) + 1;
 
   const rows = lines(buffer);
   const { row, col } = cursorPosition(buffer);
@@ -321,15 +355,15 @@ export function Composer({
           {NEWLINE_HINT}
         </Text>
       )}
-      {completions.length > 0 && (
-        <Box flexDirection="column" paddingLeft={2}>
-          {completions.map((command) => (
-            <Text key={command.usage} dimColor>
-              {command.usage.padEnd(nameColumn)} {command.summary}
-            </Text>
-          ))}
-        </Box>
-      )}
+      <Completions
+        items={menu.map((match) => ({
+          key: match.key,
+          label: match.usage,
+          detail: match.summary,
+          indices: match.indices,
+        }))}
+        selected={selected}
+      />
       {attachments.length > 0 && (
         <Text dimColor>
           {'  ⎘ '}
