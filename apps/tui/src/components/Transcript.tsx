@@ -15,6 +15,28 @@
  * separate live component, and drawing the request twice would be worse than
  * either once.
  *
+ * ## The fold has an unfold
+ *
+ * A row is a preview: a tool result is cut to three lines, an edit to twenty,
+ * a written file to six, and a run's finished calls collapse into one count.
+ * That is right for a stream someone is watching go past and wrong the moment
+ * they want the line that was cut — and until now the terminal had no way to
+ * ask for it, which is why the thinking row carries a note about a fold with
+ * nothing behind it.
+ *
+ * So every row takes a {@link RowView}. `expanded` is the same rows with
+ * nothing held back — every result line, every diff line, each call in a group
+ * as its own row under a dim summary, a permission's note in full, and the
+ * clock time at the right of what was said — and it is what `Pager.tsx` draws
+ * over the whole conversation when Ctrl+O is pressed. `columns` is how wide a
+ * row's content is, which only the diff renderer needs: it earns a line-number
+ * gutter from {@link NUMBER_COLUMNS} up, and a renderer that is not told the
+ * width cannot know whether it has the room.
+ *
+ * Collapsed is unchanged but for one thing: a cut result now shows its head
+ * *and* its tail. The end of a command's output is where the error is, and
+ * three lines from the top of a stack trace is three lines of nothing.
+ *
  * The rows are drawn in the shape of the provider CLIs' own transcripts — a
  * marker in the gutter, content hanging under it, results on a connector —
  * because that is the shape their users already read fluently. See the note
@@ -44,6 +66,7 @@ import {
 } from '@rx-artemis/transcript';
 
 import { ACCENT } from '../theme.js';
+import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import { renderDiff } from '../render/diff.js';
 import { renderMarkdownLines } from '../render/markdown.js';
 
@@ -97,6 +120,53 @@ function rowSettled(id: string, transcript: TranscriptModel): boolean {
 
 
 /* -------------------------------------------------------------------------- */
+/* How much of a row to draw                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The one thing every row is told about the surface it is being drawn on.
+ *
+ * Passed down rather than read from a context: there are four levels between
+ * the viewport and a diff line, the value is two fields wide, and a prop that
+ * appears in every signature is a prop a reader can follow.
+ */
+export interface RowView {
+  /**
+   * Nothing is folded. Every line a call returned, every line of a diff, each
+   * call in a run as its own row under its summary, a permission's note whole,
+   * and `hh:mm` at the right of what was said. The pager's view.
+   */
+  readonly expanded?: boolean;
+  /**
+   * Columns a row's *content* has — the pane less the padding and the gutter,
+   * see {@link rowContentColumns}. Only the diff renderer uses it, and only to
+   * decide whether there is room for line numbers. Undefined means "not
+   * measured", which is the old, gutterless rendering.
+   */
+  readonly columns?: number;
+}
+
+const COLLAPSED: RowView = {};
+
+/**
+ * The columns left for a row's content inside a pane that wide.
+ *
+ * A row is a two-column marker with content hanging off it, and what a call
+ * returned hangs off a three-column connector under that; the viewport pads a
+ * column either side. Five columns of furniture plus two of padding is what
+ * the content does not have.
+ */
+export function rowContentColumns(pane: number): number {
+  return Math.max(20, pane - 2 - 5);
+}
+
+/** `hh:mm`, local, for the right of a row once the pager has unfolded it. */
+function clock(ts: number): string {
+  const at = new Date(ts);
+  return `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Rows                                                                       */
 /* -------------------------------------------------------------------------- */
 
@@ -140,6 +210,7 @@ function Block({
   color,
   dim,
   spaced = true,
+  right,
   children,
 }: {
   readonly marker: string;
@@ -147,6 +218,12 @@ function Block({
   readonly dim?: boolean;
   /** A blank line above. Off for a line that belongs to the block before it. */
   readonly spaced?: boolean;
+  /**
+   * Dim text pushed to the right edge, level with the block's first line —
+   * the clock time, and only in the pager. It is a sibling of the content
+   * column rather than part of it so that it never joins the wrap.
+   */
+  readonly right?: string;
   readonly children: React.ReactNode;
 }): React.JSX.Element {
   return (
@@ -159,6 +236,11 @@ function Block({
       <Box flexDirection="column" flexGrow={1} flexShrink={1}>
         {children}
       </Box>
+      {right !== undefined && (
+        <Box flexShrink={0} marginLeft={1}>
+          <Text dimColor>{right}</Text>
+        </Box>
+      )}
     </Box>
   );
 }
@@ -196,8 +278,17 @@ const TOOL_MARK: Record<string, { color?: string; dim?: boolean }> = {
   cancelled: { dim: true },
 };
 
-/** How many lines of a result are shown before "… +n lines". */
-const RESULT_LINES = 3;
+/**
+ * How much of what a call returned is shown, and how it is split.
+ *
+ * Three lines, as before, but head *and* tail rather than head alone. The head
+ * says which call this was; the tail is where the error is — a build that
+ * fails prints two hundred lines and the one that matters is the last of them
+ * — so a preview that is all head is a preview of the half nobody needs. The
+ * count between them says how much is missing and which key shows it.
+ */
+const RESULT_HEAD = 2;
+const RESULT_TAIL = 1;
 /*
  * What a call returned is a preview, and a preview is one line per line: a
  * diff row or a result line longer than the screen is cut, not wrapped,
@@ -212,7 +303,13 @@ const RESULT_LINES = 3;
 const EDIT_LINES = 20;
 const WRITE_LINES = 6;
 
-function ToolRow({ item }: { readonly item: Extract<TranscriptItem, { kind: 'tool' }> }): React.JSX.Element {
+function ToolRow({
+  item,
+  view = COLLAPSED,
+}: {
+  readonly item: Extract<TranscriptItem, { kind: 'tool' }>;
+  readonly view?: RowView;
+}): React.JSX.Element {
   const mark = TOOL_MARK[item.status] ?? TOOL_MARK['ok'];
   const summary = summarizeToolInput(item.input);
   const edit = detectFileEdit(item.name, item.input);
@@ -220,7 +317,18 @@ function ToolRow({ item }: { readonly item: Extract<TranscriptItem, { kind: 'too
     edit === null && item.status === 'ok' && item.resultText !== undefined
       ? item.resultText.split('\n').filter((line) => line.trim().length > 0)
       : [];
-  const hidden = Math.max(0, resultLines.length - RESULT_LINES);
+  /*
+   * Head, count, tail — or, unfolded, the whole of it and no count.
+   *
+   * Cut only where cutting pays for itself: two lines, a count and a last line
+   * is four rows, so a four-line result folds into exactly as much space as it
+   * occupied, with one line replaced by a note about that line. Below the
+   * threshold the lines are simply shown.
+   */
+  const cut = view.expanded !== true && resultLines.length > RESULT_HEAD + RESULT_TAIL + 1;
+  const head = cut ? resultLines.slice(0, RESULT_HEAD) : resultLines;
+  const tail = cut ? resultLines.slice(-RESULT_TAIL) : [];
+  const hidden = cut ? resultLines.length - RESULT_HEAD - RESULT_TAIL : 0;
   return (
     <Block marker={TOOL_MARKER} color={mark?.color} dim={mark?.dim}>
       <Text>
@@ -236,7 +344,11 @@ function ToolRow({ item }: { readonly item: Extract<TranscriptItem, { kind: 'too
       </Text>
       {edit !== null && (
         <Returned>
-          {renderDiff(edit, edit.removed === 0 ? WRITE_LINES : EDIT_LINES).map((line, i) => (
+          {renderDiff(
+            edit,
+            view.expanded === true ? edit.rows.length : edit.removed === 0 ? WRITE_LINES : EDIT_LINES,
+            { columns: view.columns },
+          ).map((line, i) => (
             <Text key={i} wrap="truncate">
               {line}
             </Text>
@@ -245,12 +357,17 @@ function ToolRow({ item }: { readonly item: Extract<TranscriptItem, { kind: 'too
       )}
       {resultLines.length > 0 && (
         <Returned>
-          {resultLines.slice(0, RESULT_LINES).map((line, i) => (
-            <Text key={i} dimColor wrap="truncate">
+          {head.map((line, i) => (
+            <Text key={`head-${String(i)}`} dimColor wrap="truncate">
               {oneLine(line, 160)}
             </Text>
           ))}
-          {hidden > 0 && <Text dimColor>{`… +${String(hidden)} line${hidden === 1 ? '' : 's'}`}</Text>}
+          {hidden > 0 && <Text dimColor>{`… +${String(hidden)} line${hidden === 1 ? '' : 's'} · Ctrl+O`}</Text>}
+          {tail.map((line, i) => (
+            <Text key={`tail-${String(i)}`} dimColor wrap="truncate">
+              {oneLine(line, 160)}
+            </Text>
+          ))}
         </Returned>
       )}
       {item.status === 'denied' && (
@@ -272,11 +389,18 @@ function ToolRow({ item }: { readonly item: Extract<TranscriptItem, { kind: 'too
   );
 }
 
-function ItemRow({ item }: { readonly item: TranscriptItem }): React.JSX.Element | null {
+function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; readonly view?: RowView }): React.JSX.Element | null {
+  /*
+   * The clock, and only on the two rows that are a *turn*. Every item carries
+   * a `ts`, so this could go on all of them; what that produces is a column of
+   * times down the side of a burst of tool calls, which is noise around the
+   * two questions a time answers — when did I ask, when did it answer.
+   */
+  const stamp = view.expanded === true ? clock(item.ts) : undefined;
   switch (item.kind) {
     case 'user':
       return (
-        <Block marker="▌" color={ACCENT}>
+        <Block marker="▌" color={ACCENT} right={stamp}>
           <Text bold dimColor={item.pending}>
             {item.text}
           </Text>
@@ -285,7 +409,7 @@ function ItemRow({ item }: { readonly item: TranscriptItem }): React.JSX.Element
     case 'assistant':
       if (item.text.length === 0) return null;
       return (
-        <Block marker={SPEECH_MARKER}>
+        <Block marker={SPEECH_MARKER} right={stamp}>
           {renderMarkdownLines(item.text).map((line, i) =>
             line.hang === 0 ? (
               // An empty Text has no height; a blank line needs one space to be a line.
@@ -324,17 +448,28 @@ function ItemRow({ item }: { readonly item: TranscriptItem }): React.JSX.Element
         </Block>
       );
     case 'tool':
-      return <ToolRow item={item} />;
-    case 'permission':
+      return <ToolRow item={item} view={view} />;
+    case 'permission': {
       if (item.state === 'pending') return null;
+      // The note is the reason someone gave for the answer, and a reason cut
+      // at 120 columns is half a reason; unfolded it keeps its own lines.
+      const note = item.note;
+      const wholeNote = view.expanded === true && note !== undefined && note.length > 0;
       return (
         <Block marker="⚿" dim spaced={false}>
           <Text dimColor>
             {item.request.toolName} — {item.state}
-            {item.note !== undefined ? `: ${oneLine(item.note, 120)}` : ''}
+            {note !== undefined && !wholeNote ? `: ${oneLine(note, 120)}` : ''}
           </Text>
+          {wholeNote &&
+            note.split('\n').map((line, i) => (
+              <Text key={i} dimColor>
+                {line.length === 0 ? ' ' : line}
+              </Text>
+            ))}
         </Block>
       );
+    }
     case 'notice': {
       const color = item.level === 'error' ? 'red' : item.level === 'warn' ? 'yellow' : undefined;
       return (
@@ -412,11 +547,24 @@ type ToolRowItem = Extract<TranscriptItem, { kind: 'tool' }>;
  * failed or was refused stays out, in full, with its error: the desktop's
  * rule too, because the one call worth reading in a burst of forty is the
  * one that went wrong.
+ *
+ * Unfolded, the count is what it has always been — a sentence naming what the
+ * run did — but it goes dim and every call it stands for is drawn under it in
+ * order. The summary stays because forty rows with no heading is a list
+ * nobody can hold in their head.
  */
-function GroupRow({ members }: { readonly group: ActivityGroup; readonly members: readonly TranscriptItem[] }): React.JSX.Element {
+function GroupRow({
+  members,
+  view = COLLAPSED,
+}: {
+  readonly group: ActivityGroup;
+  readonly members: readonly TranscriptItem[];
+  readonly view?: RowView;
+}): React.JSX.Element {
   const calls = members.filter((member): member is ToolRowItem => member.kind === 'tool');
+  const expanded = view.expanded === true;
   const folded = calls.filter((call) => call.status === 'ok' || call.status === 'cancelled');
-  const shown = calls.filter((call) => call.status !== 'ok' && call.status !== 'cancelled');
+  const shown = expanded ? calls : calls.filter((call) => call.status !== 'ok' && call.status !== 'cancelled');
   const counts: Partial<Record<ToolCategory, number>> = {};
   for (const call of folded) {
     const category = classifyTool(call.name);
@@ -426,25 +574,39 @@ function GroupRow({ members }: { readonly group: ActivityGroup; readonly members
   return (
     <Box flexDirection="column" flexShrink={0}>
       {summary.length > 0 && (
-        <Block marker={TOOL_MARKER} color="green">
-          <Text>{summary}</Text>
+        <Block marker={TOOL_MARKER} color={expanded ? undefined : 'green'} dim={expanded}>
+          <Text dimColor={expanded}>{summary}</Text>
         </Block>
       )}
       {shown.map((call) => (
-        <ToolRow key={call.id} item={call} />
+        <ToolRow key={call.id} item={call} view={view} />
       ))}
     </Box>
   );
 }
 
-function RowContent({ snapshot }: { readonly snapshot: Snapshot }): React.JSX.Element | null {
-  if (snapshot.group !== undefined) return <GroupRow group={snapshot.group} members={snapshot.members ?? []} />;
-  if (snapshot.item !== undefined) return <ItemRow item={snapshot.item} />;
+function RowContent({ snapshot, view = COLLAPSED }: { readonly snapshot: Snapshot; readonly view?: RowView }): React.JSX.Element | null {
+  if (snapshot.group !== undefined) return <GroupRow group={snapshot.group} members={snapshot.members ?? []} view={view} />;
+  if (snapshot.item !== undefined) return <ItemRow item={snapshot.item} view={view} />;
   return null;
 }
 
-/** A row still subject to change: subscribed to its own id, redrawn on flush. */
-function LiveRow({ id, transcript }: { readonly id: string; readonly transcript: TranscriptModel }): React.JSX.Element | null {
+/**
+ * A row still subject to change: subscribed to its own id, redrawn on flush.
+ *
+ * Exported for the pager, which draws the same rows with `expanded` set and
+ * wants them live for the same reason the viewport does — a conversation can
+ * still be streaming while someone is reading back through it.
+ */
+export function LiveRow({
+  id,
+  transcript,
+  view = COLLAPSED,
+}: {
+  readonly id: string;
+  readonly transcript: TranscriptModel;
+  readonly view?: RowView;
+}): React.JSX.Element | null {
   const group = isGroupId(id);
   const snapshot = useSyncExternalStore(
     (onChange) => (group ? transcript.subscribeGroup(id, onChange) : transcript.subscribeItem(id, onChange)),
@@ -452,7 +614,7 @@ function LiveRow({ id, transcript }: { readonly id: string; readonly transcript:
   );
   if (snapshot === undefined) return null;
   const built = snapshotRow(id, transcript, id);
-  return built === null ? null : <RowContent snapshot={built} />;
+  return built === null ? null : <RowContent snapshot={built} view={view} />;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -470,8 +632,11 @@ function LiveRow({ id, transcript }: { readonly id: string; readonly transcript:
  * led to it, before the text that came of it — with what is running now
  * directly under the count. A stable sort, so rows that began together keep
  * the model's order.
+ *
+ * Exported because the pager draws the same rows in the same order, and two
+ * orderings of one conversation would be two conversations.
  */
-function inOrderOfStart(ids: readonly string[], transcript: TranscriptModel): readonly string[] {
+export function inOrderOfStart(ids: readonly string[], transcript: TranscriptModel): readonly string[] {
   const startOf = (id: string): number => (isGroupId(id) ? transcript.getGroup(id)?.ts : transcript.getItem(id)?.ts) ?? 0;
   return ids
     .map((id, index) => ({ id, index, ts: startOf(id) }))
@@ -498,6 +663,20 @@ export interface TranscriptViewportProps {
   readonly offset: number;
   /** How far back it is possible to scroll, in lines, as of the last layout. */
   readonly onExtent?: (extent: { readonly maxOffset: number; readonly viewportLines: number }) => void;
+  /**
+   * The width of the pane this viewport is in, which is the terminal less the
+   * sidebar when there is one. Defaults to the terminal width, which is right
+   * when the conversation has the screen to itself and generous by the width
+   * of the rail when it does not — the cost of being wrong is a diff that
+   * earns a line-number gutter slightly before it has the room for it.
+   */
+  readonly columns?: number;
+  /**
+   * Draw the rows with nothing folded. The viewport itself has no key for
+   * this; the pager sets it. Kept here so that one flag is the difference
+   * between the two views rather than two renderers being kept in step.
+   */
+  readonly expanded?: boolean;
 }
 
 /**
@@ -519,8 +698,13 @@ export interface TranscriptViewportProps {
  * far up there is to go. Rows beyond the rendered window are brought in as
  * the offset approaches the top of what is drawn.
  */
-export function TranscriptViewport({ transcript, live, offset, onExtent }: TranscriptViewportProps): React.JSX.Element {
+export function TranscriptViewport({ transcript, live, offset, onExtent, columns, expanded }: TranscriptViewportProps): React.JSX.Element {
   const rows = useSyncExternalStore(transcript.subscribeList, transcript.getRowsSnapshot);
+  const terminal = useTerminalSize();
+  const view = useMemo<RowView>(
+    () => ({ expanded: expanded === true, columns: rowContentColumns(columns ?? terminal.columns) }),
+    [expanded, columns, terminal.columns],
+  );
   const [windowRows, setWindowRows] = useState(WINDOW_ROWS);
   const viewportRef = useRef<DOMElement>(null);
   const contentRef = useRef<DOMElement>(null);
@@ -585,7 +769,7 @@ export function TranscriptViewport({ transcript, live, offset, onExtent }: Trans
           )}
           {shown.map((id) => (
             <Box key={id} flexDirection="column" flexShrink={0}>
-              <LiveRow id={id} transcript={transcript} />
+              <LiveRow id={id} transcript={transcript} view={view} />
             </Box>
           ))}
         </Box>
@@ -608,6 +792,10 @@ export interface ReplayRowsProps {
   readonly events: readonly AgentEvent[];
   /** Rows to show from the end; the rest is summarised in one line. */
   readonly maxRows?: number;
+  /** The pane's width; see {@link TranscriptViewportProps.columns}. */
+  readonly columns?: number;
+  /** Nothing folded; see {@link RowView}. */
+  readonly expanded?: boolean;
 }
 
 /**
@@ -615,7 +803,12 @@ export interface ReplayRowsProps {
  * through the same reducer as the live transcript and drawn from the tail.
  * Synchronous scheduler, so the rows exist by the time this returns.
  */
-export function ReplayRows({ events, maxRows = 60 }: ReplayRowsProps): React.JSX.Element {
+export function ReplayRows({ events, maxRows = 60, columns, expanded }: ReplayRowsProps): React.JSX.Element {
+  const terminal = useTerminalSize();
+  const view = useMemo<RowView>(
+    () => ({ expanded: expanded === true, columns: rowContentColumns(columns ?? terminal.columns) }),
+    [expanded, columns, terminal.columns],
+  );
   const snapshots = useMemo(() => {
     const model = new TranscriptModel(syncScheduler);
     for (const event of events) model.apply(event);
@@ -632,7 +825,7 @@ export function ReplayRows({ events, maxRows = 60 }: ReplayRowsProps): React.JSX
         <Text dimColor>⋯ {String(snapshots.length - shown.length)} earlier rows not shown</Text>
       )}
       {shown.map((snapshot) => (
-        <RowContent key={snapshot.key} snapshot={snapshot} />
+        <RowContent key={snapshot.key} snapshot={snapshot} view={view} />
       ))}
     </Box>
   );

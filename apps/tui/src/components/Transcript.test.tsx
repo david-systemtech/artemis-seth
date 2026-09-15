@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { render } from 'ink-testing-library';
-import type { AgentEvent } from '@rx-artemis/protocol';
+import { SUGGESTED_TASK_TOOL, type AgentEvent } from '@rx-artemis/protocol';
 
 import { ReplayRows } from './Transcript.js';
 
@@ -158,5 +158,171 @@ describe('a silent run', () => {
     await tick();
 
     expect(lastFrame() ?? '').not.toMatch(/no reply/i);
+  });
+});
+
+/**
+ * The fold has an unfold.
+ *
+ * Collapsed is a preview and stays one; what changed is *which* lines a
+ * preview keeps, and that there is now a view with nothing held back for the
+ * pager to draw. The rows are the same components either way, which is the
+ * point: two renderers for one conversation would disagree within a week.
+ */
+describe('a cut result', () => {
+  /*
+   * A finished call is normally a number in "Ran 3 commands" and has no
+   * preview to cut — an `ok` call stands as its own row only when it is an
+   * offer of follow-up work or an artifact. A suggested task is the one of
+   * those a bare model recognises, so it is what these are written against.
+   */
+  const offer = (result: string): AgentEvent[] =>
+    stream(
+      { type: 'tool.start', toolCallId: 's1', name: SUGGESTED_TASK_TOOL, input: { title: 'Follow up' } },
+      { type: 'tool.end', toolCallId: 's1', status: 'ok', resultText: result },
+    );
+
+  const SIX = 'one\ntwo\nthree\nfour\nfive\nsix';
+
+  it('keeps the head and the tail, and says how much is between them', async () => {
+    // The end of a command's output is where the error is; three lines from
+    // the top of a stack trace is three lines of nothing.
+    const { lastFrame } = render(<ReplayRows events={offer(SIX)} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(frame).toContain('one');
+    expect(frame).toContain('two');
+    expect(frame).toContain('… +3 lines · Ctrl+O');
+    expect(frame).toContain('six');
+    expect(frame).not.toContain('three');
+    expect(frame).not.toContain('four');
+    expect(frame).not.toContain('five');
+
+    // And the count sits between the two halves, not after both.
+    const at = (text: string): number => frame.indexOf(text);
+    expect(at('two')).toBeLessThan(at('… +3 lines'));
+    expect(at('… +3 lines')).toBeLessThan(at('six'));
+  });
+
+  it('shows every line of it once nothing is folded', async () => {
+    const { lastFrame } = render(<ReplayRows events={offer(SIX)} expanded />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    for (const line of ['one', 'two', 'three', 'four', 'five', 'six']) expect(frame).toContain(line);
+    expect(frame).not.toContain('… +');
+  });
+
+  it('leaves a result that fits alone', async () => {
+    const { lastFrame } = render(<ReplayRows events={offer('one\ntwo\nthree')} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(frame).toContain('three');
+    expect(frame).not.toContain('… +');
+  });
+});
+
+describe('an unfolded run', () => {
+  const run = stream(
+    { type: 'tool.start', toolCallId: 'c1', name: 'Bash', input: { command: 'ls' } },
+    { type: 'tool.end', toolCallId: 'c1', status: 'ok', resultText: 'README.md' },
+    { type: 'tool.start', toolCallId: 'c2', name: 'Read', input: { file_path: 'README.md' } },
+    { type: 'tool.end', toolCallId: 'c2', status: 'ok', resultText: '# Artemis' },
+  );
+
+  it('draws every call as its own row, under the summary it folded into', async () => {
+    const { lastFrame } = render(<ReplayRows events={run} expanded />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(frame).toContain('Ran a command, read a file');
+    expect(frame).toContain('Bash(ls)');
+    expect(frame).toContain('README.md');
+    expect(frame).toContain('# Artemis');
+
+    // The summary is still the heading: forty rows with nothing over them is a
+    // list nobody can hold in their head.
+    const at = (text: string): number => frame.indexOf(text);
+    expect(at('Ran a command')).toBeLessThan(at('Bash(ls)'));
+    expect(at('Bash(ls)')).toBeLessThan(at('Read(README.md)'));
+  });
+
+  it('still folds them when it is not asked not to', async () => {
+    const { lastFrame } = render(<ReplayRows events={run} />);
+    await tick();
+
+    expect(lastFrame() ?? '').not.toContain('Bash(ls)');
+  });
+});
+
+/**
+ * When it was said.
+ *
+ * Only on the two rows that are a *turn*, and only unfolded: a column of times
+ * down the side of a burst of tool calls is noise around the two questions a
+ * time answers, and a live viewport has no room to spend on either.
+ */
+describe('the clock', () => {
+  const said = stream(
+    { type: 'text.complete', messageId: 'u1', role: 'user', text: 'Count to three.' },
+    { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'One, two, three.' },
+  );
+
+  const lineWith = (frame: string, text: string): string =>
+    frame.split('\n').find((candidate) => candidate.includes(text)) ?? '';
+
+  it('is at the right of what was said, unfolded', async () => {
+    const { lastFrame } = render(<ReplayRows events={said} expanded />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    // The events are stamped at epoch + 1s; the row shows that in local time.
+    const shown = new Date(1000);
+    const hhmm = `${String(shown.getHours()).padStart(2, '0')}:${String(shown.getMinutes()).padStart(2, '0')}`;
+    expect(lineWith(frame, 'Count to three.').trimEnd().endsWith(hhmm)).toBe(true);
+    expect(lineWith(frame, 'One, two, three.').trimEnd().endsWith(hhmm)).toBe(true);
+  });
+
+  it('is nowhere on a folded row', async () => {
+    const { lastFrame } = render(<ReplayRows events={said} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(lineWith(frame, 'Count to three.')).not.toMatch(/\d\d:\d\d/);
+    expect(lineWith(frame, 'One, two, three.')).not.toMatch(/\d\d:\d\d/);
+  });
+});
+
+/**
+ * A diff knows how wide the pane is.
+ *
+ * `renderDiff` will only put line numbers in the gutter when it is told there
+ * is room for them — a call that does not say how wide the terminal is gets
+ * the old, gutterless shape — and a row that never measured could never say.
+ * Now the viewport passes the width it has, less its padding and the two
+ * gutters the content already hangs off.
+ */
+describe('the width a row is drawn in', () => {
+  const write = stream({
+    type: 'tool.start',
+    toolCallId: 'w1',
+    name: 'Write',
+    input: { file_path: 'notes.ts', content: 'const a = 1;\nconst b = 2;\n' },
+  });
+
+  it('earns the diff a line-number gutter on a wide pane', async () => {
+    const { lastFrame } = render(<ReplayRows events={write} columns={140} />);
+    await tick();
+
+    expect(lastFrame() ?? '').toContain('1 +const a = 1;');
+  });
+
+  it('and leaves it plain on a narrow one, where the code wants the columns', async () => {
+    const { lastFrame } = render(<ReplayRows events={write} columns={60} />);
+    await tick();
+
+    expect(lastFrame() ?? '').toContain('+ const a = 1;');
   });
 });
