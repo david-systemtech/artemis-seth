@@ -9,10 +9,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Capabilities } from '@rx-artemis/protocol';
-import { NO_CAPABILITIES } from '@rx-artemis/protocol';
+import { NO_CAPABILITIES, PERMISSION_MODES } from '@rx-artemis/protocol';
 
 import type { ConversationState } from '../conversation.js';
-import { elapsedClock, meterBar, meterCells, meterTone, workingLine } from './StatusBar.js';
+import { ACCENT } from '../theme.js';
+import { elapsedClock, meterBar, meterCells, meterTone, modeBadge, workingLine } from './StatusBar.js';
 
 describe('meterBar', () => {
   it('fills in proportion', () => {
@@ -224,5 +225,52 @@ describe('workingLine', () => {
   it('says nothing is happening when nothing is', () => {
     expect(workingLine(running({ status: 'idle' }), 1_000)).toEqual({ activity: 'ready', details: [], stalled: false });
     expect(workingLine(running({ status: 'idle', sessionId: 's1' as never }), 1_000).activity).toBe('idle');
+  });
+});
+
+/*
+ * The mode, as a badge.
+ *
+ * The word on its own left the one reading on this line that is a *warning*
+ * looking like the ones that are merely settings, and made "will this ask me
+ * first" a thing to read rather than a thing to see. The glyph answers that
+ * before the word is read: `⏵⏵` goes through, `⏸` stops. So what is tested is
+ * the pairing and the paint, which is the whole of what the component does
+ * with this.
+ */
+describe('modeBadge', () => {
+  it('says whether anything stops before it says which mode it is', () => {
+    expect(modeBadge('default').text).toBe('⏸ ask');
+    expect(modeBadge('plan').text).toBe('⏸ plan');
+    // The provider decides, and asks when it judges the risk real — which is a
+    // mode that stops, whatever it usually does.
+    expect(modeBadge('auto').text).toBe('⏸ auto');
+    expect(modeBadge('acceptEdits').text).toBe('⏵⏵ accept edits');
+    expect(modeBadge('dontAsk').text).toBe("⏵⏵ don't ask");
+    // Its shout, not its tail: six characters survive a narrow terminal.
+    expect(modeBadge('bypassPermissions').text).toBe('⏵⏵ BYPASS');
+  });
+
+  it('leaves ask plain, paints plan in the accent and the two that do not ask green', () => {
+    expect(modeBadge('default').color).toBeUndefined();
+    expect(modeBadge('plan').color).toBe(ACCENT);
+    expect(modeBadge('acceptEdits').color).toBe('green');
+    expect(modeBadge('dontAsk').color).toBe('green');
+  });
+
+  it('keeps bypass red and bold, and nothing else bold', () => {
+    // The one mode where this line is a warning, and it must never be able to
+    // be mistaken for the others.
+    expect(modeBadge('bypassPermissions').color).toBe('red');
+    expect(modeBadge('bypassPermissions').bold).toBe(true);
+    for (const mode of PERMISSION_MODES) {
+      if (mode !== 'bypassPermissions') expect(modeBadge(mode).bold).not.toBe(true);
+    }
+  });
+
+  it('has a badge for every mode the protocol knows', () => {
+    // A mode added to the protocol and not to this record would draw nothing
+    // at all where the line says what the next turn goes out as.
+    for (const mode of PERMISSION_MODES) expect(modeBadge(mode).text.trim()).not.toBe('');
   });
 });

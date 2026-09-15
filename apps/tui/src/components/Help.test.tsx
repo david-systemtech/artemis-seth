@@ -71,11 +71,10 @@ describe('Help', () => {
     expect(beyond(headingIn(await frameAt(80, WHOLE)))).toBe('');
   });
 
-  it('marks a binding that is decided but not yet wired', async () => {
+  it('marks nothing as still to come, now that every listed binding is wired', async () => {
     const frame = await frameAt(80, WHOLE);
-    const line = rowsOf(frame).find((row) => row.includes('Shift+Tab')) ?? '';
-    expect(line).toContain('(soon)');
-    expect(rowsOf(frame).find((row) => row.includes('Ctrl+T ')) ?? '').not.toContain('(soon)');
+    expect(rowsOf(frame).find((row) => row.includes('Shift+Tab')) ?? '').not.toContain('(soon)');
+    expect(frame).not.toContain('(soon)');
   });
 
   it('scrolls when the map is taller than the terminal, and says how much is left', async () => {
@@ -158,9 +157,8 @@ describe('helpLines', () => {
     expect(narrow.some((line) => line.does.endsWith('…'))).toBe(true);
   });
 
-  it('carries the planned flag through', () => {
-    const planned = helpLines(80).filter((line) => line.planned === true);
-    expect(planned.map((line) => line.key)).toEqual(['Shift+Tab', 'Ctrl+O']);
+  it('carries no planned flag once the map has nothing planned', () => {
+    expect(helpLines(80).filter((line) => line.planned === true)).toEqual([]);
   });
 
   it('is pure', () => {

@@ -2,6 +2,7 @@ import { createRef } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { render } from 'ink-testing-library';
 
+import { COMMANDS } from '../commands.js';
 import type { HistoryScope } from '../history.js';
 import {
   Composer,
@@ -355,7 +356,8 @@ describe('Composer: the slash menu', () => {
     await press(stdin, '/');
     const profile = rowWith(lastFrame(), '/profile');
     expect(rowsOf(lastFrame())[profile]).toContain('❯');
-    expect(lastFrame()).toContain('↓ 3 more');
+    // The menu shows eight rows; whatever the command table grows to, the rest is counted.
+    expect(lastFrame()).toContain(`↓ ${String(COMMANDS.length - 8)} more`);
   });
 });
 
@@ -1205,5 +1207,74 @@ describe('Composer: ! is a shell', () => {
     await press(stdin, '!');
     expect(lastFrame()).toContain('!');
     expect(lastFrame()).not.toContain('shell command');
+  });
+});
+
+/*
+ * The two keys the app and the box both have a use for.
+ *
+ * Ink has no stop-propagation: every active handler sees every press, so the
+ * one that must not act is the one that asks. Esc is tested above, where the
+ * reverse search is; these are the other two. Tab is asked about — the app
+ * stands down while a row is highlighted — and `?` is answered here outright,
+ * because the app cannot stop the box taking the character on the press it
+ * acted on.
+ */
+describe('Composer: the keys it shares with the app', () => {
+  it('says through its handle when Tab belongs to the slash menu', async () => {
+    const ref = createRef<ComposerHandle>();
+    const { lastFrame, stdin } = composer({ ref });
+    await tick();
+    expect(ref.current?.hasPopup()).toBe(false);
+
+    await press(stdin, '/mod');
+    expect(ref.current?.hasPopup()).toBe(true);
+
+    // The press the app must not also act on: this one fills the row in, and
+    // only the Tab after it is the one that moves the focus.
+    await press(stdin, TAB);
+    expect(lastFrame()).toContain('/model');
+    expect(ref.current?.hasPopup()).toBe(false);
+  });
+
+  it('says the same about the popup under an @', async () => {
+    const ref = createRef<ComposerHandle>();
+    const { index } = fakeIndex();
+    const { stdin } = composer({ ref, fileIndex: index });
+    await tick();
+    expect(ref.current?.hasPopup()).toBe(false);
+
+    await press(stdin, 'look at @comp');
+    expect(ref.current?.hasPopup()).toBe(true);
+
+    await press(stdin, TAB);
+    expect(ref.current?.hasPopup()).toBe(false);
+  });
+
+  it('? at an empty box opens the key map and leaves the box empty', async () => {
+    const onHelp = vi.fn();
+    const { lastFrame, stdin } = composer({ onHelp });
+    await tick();
+    await press(stdin, '?');
+    expect(onHelp).toHaveBeenCalledTimes(1);
+    // Otherwise the overlay goes up over a box with a stray `?` waiting in it.
+    expect(lastFrame()).toContain(PLACEHOLDER);
+  });
+
+  it('? anywhere else in a message is punctuation', async () => {
+    const onHelp = vi.fn();
+    const { lastFrame, stdin } = composer({ onHelp });
+    await tick();
+    await press(stdin, 'why', '?');
+    expect(onHelp).not.toHaveBeenCalled();
+    expect(lastFrame()).toContain('why?');
+  });
+
+  it('with nothing to open, ? is a character like any other', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, '?');
+    expect(lastFrame()).not.toContain(PLACEHOLDER);
+    expect(lastFrame()).toContain('?');
   });
 });

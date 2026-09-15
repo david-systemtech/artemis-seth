@@ -81,12 +81,13 @@ const GROUPS: readonly KeyGroup[] = [
     context: 'anywhere',
     keys: [
       { keys: ['Tab'], does: 'Between the composer and the list' },
+      { keys: ['Shift+Tab'], does: 'Step the permission mode on' },
       { keys: ['Esc'], does: 'Interrupt; or follow the end again' },
+      { keys: ['Esc Esc'], does: 'Go back to an earlier prompt' },
       { keys: ['Ctrl+C'], does: 'Interrupt; again in a moment to quit' },
+      { keys: ['Ctrl+O'], does: 'Unfold the whole transcript' },
       { keys: ['Ctrl+T'], does: 'Show or hide the checklist' },
       { keys: ['?'], does: 'Open this map, from an empty composer' },
-      { keys: ['Shift+Tab'], does: 'Step the permission mode on', planned: true },
-      { keys: ['Ctrl+O'], does: 'Unfold the whole transcript', planned: true },
     ],
   },
   {
@@ -100,6 +101,9 @@ const GROUPS: readonly KeyGroup[] = [
       { keys: ['/'], does: 'Start a command, and see the menu' },
       { keys: ['@'], does: 'Name a file, and see the paths' },
       { keys: ['Tab'], does: 'Fill in the highlighted row' },
+      { keys: ['!'], does: 'Run a shell command; !! sends the output' },
+      { keys: ['Ctrl+V'], does: 'Paste an image, or the text there' },
+      { keys: ['Ctrl+G'], does: 'Edit the draft in $EDITOR' },
     ],
   },
   {
@@ -118,6 +122,7 @@ const GROUPS: readonly KeyGroup[] = [
       { keys: ['Ctrl+K'], does: 'Cut on to the end of it' },
       { keys: ['Ctrl+Y'], does: 'Put back the last thing cut' },
       { keys: ['Ctrl+_'], does: 'Undo' },
+      { keys: ['Backspace'], does: 'A whole paste chip; or the search query' },
     ],
   },
   {
@@ -125,8 +130,7 @@ const GROUPS: readonly KeyGroup[] = [
     context: 'composer',
     keys: [
       { keys: ['Ctrl+R'], does: 'Search back through past prompts' },
-      { keys: ['Ctrl+S'], does: 'Change what the search looks at' },
-      { keys: ['Backspace'], does: 'Rub the query out; empty, it closes' },
+      { keys: ['Ctrl+S'], does: 'What the search looks at; outside one, stash the draft' },
     ],
   },
   {

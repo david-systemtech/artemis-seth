@@ -20,6 +20,22 @@
  * same keystroke. Esc, Ctrl+C and the scrolling arrows are handled globally
  * only when no modal owns them.
  *
+ * Two keys are *shared* with the composer rather than taken from it, because
+ * Ink has no stop-propagation and both handlers see every press: Esc, which
+ * the composer's reverse search owns while it is open, and Tab, which its
+ * slash menu and `@` popup own while one of them is. Both are asked about —
+ * `isCapturing()`, `hasPopup()` — rather than guessed at. `?` runs the other
+ * way: the composer answers it at an empty box, and this file only supplies
+ * what it opens, because a `?` acted on here would have been typed into the
+ * box on the same keystroke.
+ *
+ * Shift+Tab steps the permission mode on through the provider's own list —
+ * the one `/mode` draws, in its order — and steps over bypass until bypass
+ * has been agreed to once. Ctrl+O replaces the layout entirely with the
+ * pager, the one view in which nothing is folded. Esc twice at an empty box
+ * opens the prompts already sent and goes back to one of them, which is the
+ * only move in here that takes rows off the screen.
+ *
  * Three of the composer's keys need something only this file has, so they
  * arrive as props and the composer stays a box of text. Ctrl+G hands the whole
  * terminal to `$EDITOR` and takes it back, which is Ink's instance and nobody
@@ -83,7 +99,7 @@ import { prunePool, railActivityFor } from './pool.js';
 import { attachmentFromBytes, readAttachment } from './attachments.js';
 import { CATALOGUE_KEY, commandsKey, modelsKey, usageKey } from './cache.js';
 import { checkForUpdate, currentVersion, installRoot } from './update.js';
-import { COMMANDS, parseCommand, type Command } from './commands.js';
+import { parseCommand, type Command } from './commands.js';
 import { Conversation, type ConversationSettings } from './conversation.js';
 import { editInExternalEditor, type ExternalEditResult } from './externalEditor.js';
 import { listFiles, type Frecency } from './fileIndex.js';
@@ -96,6 +112,8 @@ import { ACCENT } from './theme.js';
 import { Composer, type ComposerHandle, type FileIndex, type PastedImage } from './components/Composer.js';
 import { DelegatedStrip } from './components/Delegated.js';
 import { Header } from './components/Header.js';
+import { Help, helpLines } from './components/Help.js';
+import { Pager } from './components/Pager.js';
 import { PermissionCard } from './components/PermissionCard.js';
 import { Picker, type PickerItem } from './components/Picker.js';
 import { QueuedStrip } from './components/QueuedStrip.js';
@@ -127,6 +145,11 @@ interface PickerModal {
   readonly hint?: string;
   readonly onSelect: (item: PickerItem) => void;
   /**
+   * What Esc does besides taking the picker down, for a list that changed
+   * something on the way in. Without it Esc simply closes.
+   */
+  readonly onCancel?: () => void;
+  /**
    * Which opening this is. A picker that opened on a cached answer is
    * refreshed in place when the fresh one lands — but only if it is still
    * the picker on screen, which the token is how the refresh can tell.
@@ -145,7 +168,24 @@ interface ReplayModal {
   readonly events: readonly AgentEvent[];
 }
 
-type Modal = PickerModal | LoadingModal | ReplayModal;
+/**
+ * The whole conversation, unfolded.
+ *
+ * It carries nothing: the pager reads the same transcript this file is already
+ * holding. Mounted *instead of* the layout rather than inside it, because it
+ * draws the terminal — see `components/Pager.tsx` — and because everything
+ * behind a full-screen reader should be unmounted rather than merely quiet.
+ */
+interface PagerModal {
+  readonly kind: 'pager';
+}
+
+/** The key map, drawn over the conversation. `keymap.ts` is what it says. */
+interface HelpModal {
+  readonly kind: 'help';
+}
+
+type Modal = PickerModal | LoadingModal | ReplayModal | PagerModal | HelpModal;
 type Focus = 'composer' | 'sidebar';
 
 /** The row that leaves the recents list for the filesystem. Not a path, so it cannot be one. */
@@ -170,6 +210,14 @@ const MODE_DETAIL: Readonly<Record<PermissionMode, string>> = {
 };
 
 const QUIT_WINDOW_MS = 2_000;
+/**
+ * How long the first Esc waits for the second.
+ *
+ * Long enough for two deliberate presses and short enough that an Esc pressed
+ * to stop something, and another half a second later to make sure, is not read
+ * as a request to go back through the conversation.
+ */
+const ESC_ESC_WINDOW_MS = 600;
 /** A plan-usage read is a CLI call; one a minute is the desktop's own tolerance. */
 const PLAN_USAGE_MIN_INTERVAL_MS = 60_000;
 /** A cached plan reading older than this is not shown while the fresh one is read: the windows will have moved. */
@@ -204,6 +252,14 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   const { host, descriptors, cache, preferences, history } = launched;
   const { exit, suspendTerminal } = useApp();
   const { columns, rows } = useTerminalSize();
+  /*
+   * How wide the conversation's own pane is: the terminal, less the rail when
+   * there is one. Worked out here rather than down in the layout because
+   * three things that are not layout need it — the rows `/help` prints, and
+   * the width the transcript and a replayed agent decide a diff gutter on.
+   */
+  const showSidebar = columns >= SIDEBAR_MIN_COLUMNS;
+  const mainWidth = showSidebar ? columns - SIDEBAR_WIDTH : columns;
 
   /**
    * A conversation, ready to be shown.
@@ -342,8 +398,21 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   }, []);
   const [pendingAttachments, setPendingAttachments] = useState<readonly { name: string; attachment: Attachment }[]>([]);
   const quitArmed = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** The first Esc of a possible Esc, Esc; see {@link ESC_ESC_WINDOW_MS}. */
+  const escArmed = useRef<ReturnType<typeof setTimeout> | null>(null);
   const planFetchedAt = useRef(0);
   const pickerToken = useRef(0);
+  /**
+   * Whether bypass has been agreed to, once, in this session.
+   *
+   * Shift+Tab steps over `bypassPermissions` until it has: a key that can be
+   * hit by accident must not be able to turn every prompt off, and the
+   * picker's two-step is where that decision belongs. Once it has been taken
+   * the cycle includes bypass — leaving it out for the rest of the session
+   * would mean the one mode you have to go to the picker to *leave* by
+   * keyboard, which is a worse trap than the one being avoided.
+   */
+  const bypassConfirmed = useRef(false);
 
   const pendingRequest = state.pendingPermissions[0];
   const workspace = basename(state.settings.cwd) || state.settings.cwd;
@@ -949,13 +1018,48 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         setModal(null);
         const mode = item.key as PermissionMode;
         if (mode === 'bypassPermissions') {
-          confirm('Approve every tool call without asking?', 'Yes — bypass all permission prompts', true, () => applyMode(mode));
+          confirm('Approve every tool call without asking?', 'Yes — bypass all permission prompts', true, () => {
+            bypassConfirmed.current = true;
+            applyMode(mode);
+          });
         } else {
           applyMode(mode);
         }
       },
     });
   }, [openPicker, state.capabilities.permissionModes, state.settings.providerLabel, state.settings.permissionMode, confirm, applyMode]);
+
+  /**
+   * Shift+Tab: the next mode the provider has, wrapping round.
+   *
+   * The same list the picker builds, in the same order, applied by the same
+   * function — the key is another door to `/mode`, not a second opinion about
+   * what a mode change is. What it does not do is walk into
+   * `bypassPermissions`: that one is reached by agreeing to it, and only once
+   * that has happened does the cycle include it. See `bypassConfirmed`.
+   *
+   * The flash is the whole feedback the keystroke needs. A mode stepped past
+   * on the way to another is still a mode the transcript records — `applyMode`
+   * writes the line — because what the agent was allowed to do when is part of
+   * what happened.
+   */
+  const cycleMode = useCallback(() => {
+    const available = PERMISSION_MODES.filter(
+      (mode) =>
+        state.capabilities.permissionModes.includes(mode) && (mode !== 'bypassPermissions' || bypassConfirmed.current),
+    );
+    if (available.length < 2) {
+      showFlash(`${state.settings.providerLabel} has one permission mode; /mode says which.`);
+      return;
+    }
+    // A mode the cycle skips — bypass, before it has been agreed to — is not
+    // in the list, so `indexOf` is -1 and the step lands on the first: Shift+Tab
+    // always leads *out* of it, whatever it cannot lead into.
+    const next = available[(available.indexOf(state.settings.permissionMode) + 1) % available.length];
+    if (next === undefined || next === state.settings.permissionMode) return;
+    applyMode(next);
+    showFlash(`permission mode: ${MODE_LABEL[next]}`);
+  }, [state.capabilities.permissionModes, state.settings.permissionMode, state.settings.providerLabel, applyMode, showFlash]);
 
   /* ---------------------------------------------------------------------- */
   /* Tasks and usage                                                         */
@@ -1228,9 +1332,24 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   const runCommand = useCallback(
     (command: Command) => {
       switch (command.name) {
-        case 'help':
-          say('info', 'Commands', COMMANDS.map((spec) => `${spec.usage.padEnd(16)} ${spec.summary}`).join('\n'));
+        case 'help': {
+          /*
+           * The whole map, grouped, rather than the slash commands alone. The
+           * overlay and this print the same rows from the same function, so
+           * what `/help` says and what `?` draws cannot drift apart — which is
+           * the divergence `keymap.ts` exists to end. The commands are still
+           * here; they are the last group, as they are in the map.
+           */
+          const lines = helpLines(mainWidth);
+          const width = lines.reduce((widest, line) => Math.max(widest, line.key.length), 0);
+          const printed: string[] = [];
+          for (const line of lines) {
+            if (line.group !== undefined) printed.push(printed.length === 0 ? line.group : `\n${line.group}`);
+            printed.push(`  ${line.key.padEnd(width)}  ${line.does}${line.planned === true ? ' (soon)' : ''}`);
+          }
+          say('info', 'Keys', printed.join('\n'));
           return;
+        }
         case 'cwd':
           openDirectoryPicker();
           return;
@@ -1259,7 +1378,10 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
             } else if (!state.capabilities.permissionModes.includes(wanted)) {
               setNotice(`${state.settings.providerLabel} does not have a "${wanted}" mode.`);
             } else if (wanted === 'bypassPermissions') {
-              confirm('Approve every tool call without asking?', 'Yes — bypass all permission prompts', true, () => applyMode(wanted));
+              confirm('Approve every tool call without asking?', 'Yes — bypass all permission prompts', true, () => {
+                bypassConfirmed.current = true;
+                applyMode(wanted);
+              });
             } else {
               applyMode(wanted);
             }
@@ -1287,6 +1409,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     },
     [
       say,
+      mainWidth,
       state.settings,
       state.capabilities.permissionModes,
       exit,
@@ -1490,7 +1613,6 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   /* Keys                                                                    */
   /* ---------------------------------------------------------------------- */
 
-  const showSidebar = columns >= SIDEBAR_MIN_COLUMNS;
   const modalOpen = modal !== null || pendingRequest !== undefined;
   const sidebarActive = focus === 'sidebar' && showSidebar && !modalOpen;
   const composerActive = focus === 'composer' && !modalOpen;
@@ -1676,6 +1798,85 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     [startNew, openDirectoryPicker, state.sessionId, state.settings.cwd, state.settings.profileId, accounts, descriptors, conversation, loadSession],
   );
 
+  /**
+   * Go back to an earlier prompt: the list, and what picking one does.
+   *
+   * Newest first, because "that came out wrong" is why anybody opens this.
+   * Every prompt is listed, the ones that cannot be gone back to included —
+   * a list with holes in it is a list nobody can account for — and those say
+   * why rather than offering a move that would be refused. Nothing is sent
+   * here: picking arms the rewind, cuts the screen back to that prompt and
+   * puts the words in the box, and the next Enter is what carries the
+   * truncation to the provider. See {@link Conversation.armRewind}.
+   *
+   * A prompt typed in *this* window has no provider id to point at — neither
+   * Claude nor Codex echoes a live prompt back on the stream — so its row is
+   * greyed with the reason rather than offered. Resolving those by re-reading
+   * the stored session and matching the row by its position from the end is
+   * what the desktop does, on use rather than up front (see the comment over
+   * `UserRow` in `apps/desktop/renderer/src/components/Transcript.tsx`, and
+   * `resolveRewindPoint` in `packages/core/src/adapters/history.ts`). That is
+   * a provider read, and it is the follow-up to this: nothing here makes one
+   * behind a keystroke.
+   */
+  const openRewindPicker = useCallback(() => {
+    const plan = conversation.canRewind();
+    if (!plan.ok) {
+      showFlash(plan.reason);
+      return;
+    }
+    const turns = [...conversation.userTurns()].reverse();
+    if (turns.length === 0) {
+      showFlash('Nothing has been sent in this conversation yet.');
+      return;
+    }
+    const items: PickerItem[] = turns.map((turn) => {
+      const forThis = turn.messageId === undefined ? undefined : conversation.canRewind(turn.messageId);
+      const hint =
+        forThis === undefined
+          ? 'typed this session'
+          : forThis.ok
+            ? forThis.fork
+              ? 'branch here'
+              : 'rewind here'
+            : forThis.reason;
+      return {
+        key: turn.id,
+        label: oneLine(turn.text, 70),
+        detail: `${formatRelative(turn.ts)} · ${hint}`,
+        ...(forThis?.ok === true ? {} : { disabled: true, reason: hint }),
+      };
+    });
+    openPicker({
+      title: 'Go back to an earlier prompt',
+      items,
+      hint: `the screen is cut back now; nothing is sent until you press Enter · ${PICKER_KEYS}`,
+      // Cancelling puts back whatever an earlier arm took away. Nothing is
+      // armed on the way in, so this is a no-op except for the second
+      // opening — arming twice cuts further back, and Esc out of the second
+      // list should leave the conversation as the first one left it.
+      onCancel: () => {
+        conversation.disarmRewind();
+      },
+      onSelect: (item) => {
+        setModal(null);
+        const turn = turns.find((candidate) => candidate.id === item.key);
+        if (turn?.messageId === undefined) return;
+        const armed = conversation.armRewind(turn.messageId);
+        if (!armed.ok) {
+          setNotice(armed.reason);
+          return;
+        }
+        // The prompt comes back to be edited, which is the whole point of
+        // going back to it. `setText` goes in through the editor's own undo,
+        // so whatever was in the box is one Ctrl+_ away.
+        composerRef.current?.setText(turn.text);
+        setFocus('composer');
+        setScroll(0);
+      },
+    });
+  }, [conversation, openPicker, showFlash]);
+
   useInput((input, key) => {
     if (key.ctrl && input === 'c') {
       if (quitArmed.current !== null) {
@@ -1715,8 +1916,44 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     }
     if (modalOpen) return;
 
+    /*
+     * Ctrl+O unfolds the whole conversation. The pager draws the terminal and
+     * answers every key while it is up — the Ctrl+O that closes it included —
+     * so nothing below needs to know about it: it is a modal, and `modalOpen`
+     * above is what stands the rest of this down. Not out from under a reverse
+     * search, which is holding the box's text and would lose it.
+     */
+    if (key.ctrl && input === 'o') {
+      if (composerActive && composerRef.current?.isCapturing() === true) return;
+      setModal({ kind: 'pager' });
+      return;
+    }
+
     if (key.tab) {
+      /*
+       * Tab had two owners and this is where they are told apart. While the
+       * slash menu or the `@` popup is open the press belongs to the box — it
+       * is finishing a word that is already highlighted — and a reverse search
+       * owns the keyboard outright. Otherwise Shift+Tab steps the permission
+       * mode on, and a bare Tab moves the focus.
+       */
+      if (composerActive && (composerRef.current?.hasPopup() === true || composerRef.current?.isCapturing() === true)) return;
+      if (key.shift) {
+        cycleMode();
+        return;
+      }
       if (showSidebar) setFocus((current) => (current === 'composer' ? 'sidebar' : 'composer'));
+      return;
+    }
+
+    /*
+     * `?` opens the key map. The composer answers it while it has the keys —
+     * it is the one that knows the box is empty, and the one that would
+     * otherwise insert the character on the same press — so what is left here
+     * is the `?` pressed with the focus in the rail.
+     */
+    if (input === '?' && !composerActive) {
+      setModal({ kind: 'help' });
       return;
     }
     /*
@@ -1772,7 +2009,45 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
       return;
     }
 
-    if (key.escape && conversation.isLive) void conversation.interrupt();
+    if (!key.escape) return;
+    if (conversation.isLive) {
+      void conversation.interrupt();
+      return;
+    }
+
+    /*
+     * Esc, Esc goes back to an earlier prompt.
+     *
+     * A chord because the single Esc is spoken for four times over — it
+     * interrupts, it leaves the rail, it follows the end of a conversation
+     * that was scrolled back, and the composer takes it for its own search —
+     * and because the move it opens takes rows off the screen. All four of
+     * those have been answered above by the time the press arrives here, so
+     * what is left is an Esc at an empty box with nothing running, which
+     * means nothing else at all.
+     *
+     * While a rewind is armed the same key cancels it, from whatever is in
+     * the box: the status line is promising exactly that, and the box is not
+     * empty at that point — arming put the old prompt in it to be edited.
+     */
+    if (!composerActive) return;
+    if (state.rewindArmed !== undefined) {
+      conversation.disarmRewind();
+      showFlash('back where you were');
+      return;
+    }
+    if (composerRef.current?.getText() !== '') return;
+    if (escArmed.current !== null) {
+      clearTimeout(escArmed.current);
+      escArmed.current = null;
+      openRewindPicker();
+      return;
+    }
+    showFlash('Esc again to go back to an earlier prompt');
+    escArmed.current = setTimeout(() => {
+      escArmed.current = null;
+    }, ESC_ESC_WINDOW_MS);
+    escArmed.current.unref?.();
   });
 
   /* ---------------------------------------------------------------------- */
@@ -1782,7 +2057,33 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   const tallHeader = rows >= TALL_HEADER_MIN_ROWS;
   const headerRows = tallHeader ? 3 : 2;
   const bodyRows = Math.max(6, rows - headerRows);
-  const mainWidth = showSidebar ? columns - SIDEBAR_WIDTH : columns;
+
+  /*
+   * The pager is the whole terminal, so it is mounted instead of the layout
+   * rather than over it: Ink has no z-index, and a full-screen box drawn as a
+   * sibling would push the conversation off the top of the screen instead of
+   * covering it. Everything behind it is unmounted, which is the other half of
+   * why nothing behind it can answer a key.
+   */
+  if (modal?.kind === 'pager') {
+    return (
+      <Pager
+        transcript={transcript}
+        columns={columns}
+        rows={rows}
+        onClose={() => setModal(null)}
+        /*
+         * `v`. The same handover as Ctrl+G — `editExternally` is the only
+         * thing in here that may take the terminal — and whatever comes back
+         * is dropped: this is a copy to read in an editor, not a draft being
+         * written.
+         */
+        onOpenInEditor={(markdown) => {
+          void editExternally(markdown);
+        }}
+      />
+    );
+  }
 
   return (
     <Box flexDirection="column" width={columns} height={rows}>
@@ -1804,7 +2105,9 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         )}
 
         <Box flexDirection="column" width={mainWidth} height={bodyRows}>
-          <TranscriptViewport transcript={transcript} live={live} offset={scroll} onExtent={onScrollExtent} />
+          {/* The pane's width, not the terminal's: what a diff has room for is
+              decided on the columns the conversation actually has. */}
+          <TranscriptViewport transcript={transcript} live={live} offset={scroll} onExtent={onScrollExtent} columns={mainWidth} />
 
           {/*
            * Above the card and the pickers rather than directly over the
@@ -1838,7 +2141,20 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
               <PermissionCard
                 key={pendingRequest.id}
                 request={pendingRequest}
-                onDecision={(decision) => void conversation.respondToPermission(pendingRequest.id, decision)}
+                /*
+                 * A comment typed under the answer travels as an ordinary
+                 * message, and only once the decision itself has landed: the
+                 * tool call is waiting on the response, and a steer sent
+                 * first would be a message the provider has nowhere to put.
+                 */
+                onDecision={(decision, followUp) => {
+                  void conversation.respondToPermission(pendingRequest.id, decision).then(
+                    () => {
+                      if (followUp !== undefined) submit(followUp);
+                    },
+                    () => undefined,
+                  );
+                }}
               />
             </Box>
           )}
@@ -1867,8 +2183,19 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
                 {...(modal.initialKey === undefined ? {} : { initialKey: modal.initialKey })}
                 {...(modal.hint === undefined ? {} : { hint: modal.hint })}
                 onSelect={modal.onSelect}
-                onCancel={() => setModal(null)}
+                onCancel={() => {
+                  setModal(null);
+                  modal.onCancel?.();
+                }}
               />
+            </Box>
+          )}
+          {modal?.kind === 'help' && (
+            <Box paddingX={1} flexShrink={0}>
+              {/* Sized to the pane it sits in rather than the screen, like
+                  everything else in this column; the overlay decides for
+                  itself whether that is wide enough for two columns of keys. */}
+              <Help columns={mainWidth - 2} rows={Math.max(8, bodyRows - 8)} onClose={() => setModal(null)} />
             </Box>
           )}
           {modal?.kind === 'replay' && (
@@ -1877,7 +2204,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
                 <Text color={ACCENT} bold>
                   Agent · {modal.title}
                 </Text>
-                <ReplayRows events={modal.events} maxRows={Math.max(6, bodyRows - 8)} />
+                <ReplayRows events={modal.events} maxRows={Math.max(6, bodyRows - 8)} columns={mainWidth} />
                 <Text dimColor>Esc closes</Text>
               </Box>
             </Box>
@@ -1916,6 +2243,10 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
               // other a command and a flag.
               onExternalEdit={editExternally}
               onShell={runShellLine}
+              // `?` at an empty box. The composer owns the key — it is what
+              // knows the box is empty, and what would otherwise put the
+              // character in it — and this is what the key opens.
+              onHelp={() => setModal({ kind: 'help' })}
               {...(notice === undefined ? {} : { notice })}
             />
             <StatusBar
@@ -1923,7 +2254,21 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
               columns={mainWidth}
               {...(flash === undefined ? {} : { flash })}
               {...(update === undefined ? {} : { update })}
-              {...(sidebarActive ? { hint: 'sidebar: ↑↓ Enter · a archive · d delete · Esc back' } : scroll > 0 ? { hint: 'scrolled · Esc to follow' } : {})}
+              /*
+               * An armed rewind outranks the other two: it is a state the next
+               * Enter behaves differently in, and the only place a person is
+               * told that the message they are about to send will land
+               * somewhere other than the end of the conversation.
+               */
+              {...(state.rewindArmed !== undefined
+                ? {
+                    hint: `${state.rewindArmed.fork ? 'branching from' : 'rewinding to'} an earlier prompt · Esc cancels`,
+                  }
+                : sidebarActive
+                  ? { hint: 'sidebar: ↑↓ Enter · a archive · d delete · Esc back' }
+                  : scroll > 0
+                    ? { hint: 'scrolled · Esc to follow' }
+                    : {})}
             />
           </Box>
         </Box>

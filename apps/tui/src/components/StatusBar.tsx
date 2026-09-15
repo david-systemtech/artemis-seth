@@ -43,14 +43,49 @@ import { useNow } from '../hooks/useNow.js';
 import { useSpinner } from '../hooks/useSpinner.js';
 import { ACCENT } from '../theme.js';
 
-const MODE_LABEL: Readonly<Record<PermissionMode, string>> = {
-  default: 'ask',
-  acceptEdits: 'accept edits',
-  plan: 'plan',
-  auto: 'auto',
-  dontAsk: "don't ask",
-  bypassPermissions: 'BYPASS PERMISSIONS',
+/**
+ * The mode, as a badge: a glyph that says whether things go through, then the
+ * word.
+ *
+ * The word alone was the whole of it, and the word alone is the one thing on
+ * this line that has to be readable without being read — the difference
+ * between "everything you asked for is happening" and "you will be asked
+ * first" is worth a glyph of its own. `⏵⏵` is the modes that do not stop,
+ * `⏸` the modes that do, which is the same pair Claude Code puts under its
+ * composer and the same shape a person already knows from every transport
+ * control they have ever used.
+ *
+ * `auto` pauses: the provider asks when it judges the risk real, so it is not
+ * a mode that promises to go through. Bypass keeps its shout — it is the one
+ * reading here that is a warning rather than a setting — but not its tail:
+ * `BYPASS` in red, bold, says it in six characters on a narrow terminal.
+ */
+const MODE_BADGE: Readonly<Record<PermissionMode, ModeBadge>> = {
+  default: { text: '⏸ ask' },
+  acceptEdits: { text: '⏵⏵ accept edits', color: 'green' },
+  plan: { text: '⏸ plan', color: ACCENT },
+  auto: { text: '⏸ auto' },
+  dontAsk: { text: "⏵⏵ don't ask", color: 'green' },
+  bypassPermissions: { text: '⏵⏵ BYPASS', color: 'red', bold: true },
 };
+
+/** A mode drawn: the badge's words, and how they are painted. */
+export interface ModeBadge {
+  readonly text: string;
+  /** The terminal's own colour name, or the accent; undefined is the default foreground. */
+  readonly color?: string;
+  readonly bold?: boolean;
+}
+
+/**
+ * How the permission mode reads on the settings line.
+ *
+ * Pure and exported for the same reason {@link workingLine} is: this is the
+ * meaning, and the component is colours and boxes.
+ */
+export function modeBadge(mode: PermissionMode): ModeBadge {
+  return MODE_BADGE[mode];
+}
 
 export interface StatusBarProps {
   readonly state: ConversationState;
@@ -252,7 +287,7 @@ export function workingLine(state: ConversationState, now = Date.now()): Working
 
 export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBarProps): React.JSX.Element {
   const { settings, usage } = state;
-  const mode = settings.permissionMode;
+  const badge = modeBadge(settings.permissionMode);
   const tokens = totalInputTokens(usage?.tokens);
   const ratio = contextRatio(usage);
   const cost = usage?.costUsd;
@@ -282,8 +317,8 @@ export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBar
           <Text>{model}</Text>
           {details.length > 0 && <Text dimColor>{` ${details.join(' ')}`}</Text>}
           <Text dimColor>{' · '}</Text>
-          <Text color={mode === 'bypassPermissions' ? 'red' : mode === 'plan' ? ACCENT : undefined} bold={mode === 'bypassPermissions'}>
-            {MODE_LABEL[mode]}
+          <Text color={badge.color} bold={badge.bold === true}>
+            {badge.text}
           </Text>
         </Text>
         </Box>

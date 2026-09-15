@@ -99,6 +99,14 @@
  * closes would already read as lowered when the app looks, and the Esc that
  * closed the search would interrupt the turn as well.
  *
+ * Tab is the same bargain the other way about. The app moves the focus with
+ * it and this fills in the highlighted row with it, so the app asks
+ * `hasPopup()` and stands down while either popup is open — otherwise one
+ * press finished the word and moved the keyboard off the box that had just
+ * finished it. `?` needs no such bargain: with nothing typed it is the key
+ * map, answered here, because the app cannot stop this inserting the
+ * character on the press it acted on.
+ *
  * ## `@` names a file
  *
  * An `@` after whitespace opens the same kind of popup the slash menu uses,
@@ -419,6 +427,17 @@ export interface ComposerHandle {
    * shell prompt with nothing typed at it.
    */
   isCapturing(): boolean;
+  /**
+   * True while the composer owns Tab — the slash menu or the `@` popup is
+   * open on a row Tab would fill in.
+   *
+   * Asked for the same reason {@link isCapturing} is, about a different key:
+   * the app toggles the focus with Tab, the composer completes with it, and
+   * Ink hands the press to both. Two owners for one keystroke was a Tab that
+   * finished the word *and* moved the keyboard off the box it had just
+   * finished it in.
+   */
+  hasPopup(): boolean;
 }
 
 /**
@@ -501,6 +520,16 @@ export interface ComposerProps {
    * give the output to the agent. Without this prop `!` is a character.
    */
   readonly onShell?: (command: string, options: { readonly send: boolean }) => void;
+  /**
+   * `?` on an empty box: the key map, which the app draws over everything.
+   *
+   * The composer's rather than the app's because only the composer knows the
+   * box is empty, and because Ink has no stop-propagation — a `?` the app
+   * acted on would be a `?` this inserted on the same press. Without this
+   * prop `?` is punctuation everywhere, as it is anywhere but the first
+   * column.
+   */
+  readonly onHelp?: () => void;
   /** React 19 passes this through as a prop; see {@link ComposerHandle}. */
   readonly ref?: React.Ref<ComposerHandle>;
 }
@@ -521,6 +550,7 @@ export function Composer({
   clipboard = REAL_CLIPBOARD,
   onExternalEdit,
   onShell,
+  onHelp,
   ref,
 }: ComposerProps): React.JSX.Element {
   const [buffer, setBuffer] = useState(EMPTY_EDITOR);
@@ -677,6 +707,19 @@ export function Composer({
     capturing.current = isActive && (search !== null || (shell && value.length === 0));
   }, [isActive, search, shell, value]);
 
+  /*
+   * Tab's own flag, read by the app on the press it is deciding about — and
+   * lowered in an effect rather than in the handler, exactly as `capturing`
+   * is: the Tab that fills in the last row must not also move the focus, and
+   * a flag lowered as the menu closed would already read as lowered when the
+   * app looked at it.
+   */
+  const popupOpen = highlighted !== undefined || mentionChoice !== undefined;
+  const popup = useRef(false);
+  useEffect(() => {
+    popup.current = isActive && popupOpen;
+  }, [isActive, popupOpen]);
+
   // Focus moving away ends a search rather than leaving a row on screen that
   // no key can reach: the composer stops answering keys entirely when it is
   // not the focus.
@@ -694,6 +737,7 @@ export function Composer({
       },
       getText: () => buffer.text,
       isCapturing: () => capturing.current,
+      hasPopup: () => popup.current,
     }),
     [buffer],
   );
@@ -1267,6 +1311,16 @@ export function Composer({
        */
       if (input === SHELL_PREFIX && !shell && value.length === 0 && onShell !== undefined) {
         setShell(true);
+        return;
+      }
+      /*
+       * `?` with nothing typed opens the key map, on the same terms as `!` and
+       * for the same reason it is answered here rather than in the app: the
+       * box would otherwise take the character on the very press the overlay
+       * went up, and there would be a `?` waiting under it on the way back.
+       */
+      if (input === '?' && !shell && value.length === 0 && onHelp !== undefined) {
+        onHelp();
         return;
       }
       // More than one character at once, from a terminal that did not say it
