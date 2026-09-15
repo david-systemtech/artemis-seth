@@ -43,18 +43,14 @@
  * `apply_patch` uses, and a plain unified diff, which is what a per-file diff
  * arrives as.
  *
- * Today it is usually not given the text. The adapter builds that tool input in
- * `toolDescriptor`'s `case 'fileChange'` in
- * `packages/core/src/adapters/codexMapper.ts` (line 789): it maps `changes[]`
- * down to `changes[].path` and drops `changes[].kind` and `changes[].diff` —
- * the per-file diff the protocol already declares on `CodexFileUpdateChange`
- * (`packages/core/src/adapters/codexProtocol.ts`, line 334). So a paths-only
- * call yields one {@link FileEdit} per path marked {@link FileEdit.summaryOnly}
- * with no rows, because naming the files a run touched is worth more than
- * silence, and `added`/`removed` are zero because zero is what is *known*, not
- * a claim that nothing changed. Passing `changes` through verbatim in that one
- * mapper case is the whole of the follow-up: the entries are read here already,
- * `kind` and diff text and all.
+ * The Codex adapter passes the patch's `changes` through as they arrive — one
+ * entry per file with `path`, `kind` and the per-file `diff` the protocol
+ * declares on `CodexFileUpdateChange` — so a patch now yields one
+ * {@link FileEdit} per file with rows. The paths-only shape is kept for any
+ * caller that still sends one: it yields one edit per path marked
+ * {@link FileEdit.summaryOnly} with no rows, because naming the files a run
+ * touched is worth more than silence, and `added`/`removed` are zero because
+ * zero is what is *known*, not a claim that nothing changed.
  *
  * ## Cost
  *
@@ -766,9 +762,10 @@ function toFileEdit(draft: Draft): FileEdit {
  * Files a call names without saying what it did to them.
  *
  * The last resort, and the only branch that produces a {@link FileEdit} with no
- * diff in it. See the header: a Codex `ApplyPatch` arrives as a list of paths
- * because the adapter drops everything else, and a change ledger that lists the
- * files a run touched is still worth having when the diffs are missing.
+ * diff in it. A list of paths is what an adapter sends when it has nothing
+ * more, and a change ledger that lists the files a run touched is still worth
+ * having when the diffs are missing. An entry that carries a diff beside its
+ * path is read in full, which is how a Codex patch arrives today.
  */
 function detectNamedFiles(toolName: string, input: JsonObject): readonly FileEdit[] {
   if (!MUTATION_NAME.test(toolName)) return [];

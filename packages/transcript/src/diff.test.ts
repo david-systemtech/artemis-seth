@@ -633,8 +633,7 @@ describe('files named without a diff', () => {
   });
 
   it('parses a per-file diff carried beside its path', () => {
-    // Nothing emits this yet; it is the shape the adapter would produce by
-    // passing `changes` through instead of mapping it down to paths.
+    // The shape the Codex adapter emits: `changes` passed through whole.
     const [file] = detectFileEdits('ApplyPatch', {
       changes: [{ path: 'src/a.ts', kind: 'update', diff: '@@ -1,1 +1,1 @@\n-a\n+b\n' }],
     });
