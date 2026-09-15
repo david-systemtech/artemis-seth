@@ -1410,6 +1410,33 @@ export interface ArtemisChatExtensions {
    * prompts.
    */
   readonly systemPrompt?: string;
+  /**
+   * Branch the conversation named by {@link sessionId} into a new session,
+   * leaving the original whole. The reply announces the branch's own id.
+   *
+   * Needs {@link sessionId}: there is nothing to fork otherwise, and the
+   * server refuses the request rather than starting a fresh conversation
+   * that a caller would mistake for a branch. Honoured only where the serving
+   * account's provider can fork — `ServerProfile.capabilities.forkSession` —
+   * and refused elsewhere, never dropped: a fork that was quietly set aside
+   * would append the next turn to the very conversation the caller meant to
+   * leave untouched.
+   */
+  readonly forkSession?: boolean;
+  /**
+   * Cut the conversation named by {@link sessionId} back to just before this
+   * stored message before continuing.
+   *
+   * The id is the serving provider's own, as its stored transcript names it
+   * — read back through `GET /api/v0/sessions/{id}/messages`, which is where a
+   * client learns it. Needs {@link sessionId}, and is refused rather than
+   * dropped where the account cannot rewind (`capabilities.rewind`), for the
+   * same reason as {@link forkSession}: a cut that silently did not happen
+   * leaves the caller continuing a conversation they believe they shortened.
+   * With {@link forkSession} the cut lands in the branch and the original is
+   * left whole.
+   */
+  readonly rewindToMessageId?: string;
 }
 
 /**
@@ -1552,6 +1579,13 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
       : {}),
     ...(typeof extensions['systemPrompt'] === 'string' && extensions['systemPrompt'].length > 0
       ? { systemPrompt: extensions['systemPrompt'] as string }
+      : {}),
+    // `true` only: a fork is asked for or it is not, and `false` sent
+    // explicitly means the same as absent.
+    ...(extensions['forkSession'] === true ? { forkSession: true } : {}),
+    ...(typeof extensions['rewindToMessageId'] === 'string' &&
+    extensions['rewindToMessageId'].length > 0
+      ? { rewindToMessageId: extensions['rewindToMessageId'] as string }
       : {}),
     ...readRemoteOptions(extensions['remote']),
   };

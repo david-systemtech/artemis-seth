@@ -2624,6 +2624,48 @@ async function handleChatCompletions(
    * `artemis.ignored` beside any lenient parameter, and a client can say so.
    */
   const account = profiles.find((profile) => String(profile.id) === String(model.profileId));
+
+  /*
+   * Forking and rewinding, refused rather than dropped.
+   *
+   * Both reshape the conversation the caller is continuing — a fork writes the
+   * next turn to a new session, a rewind cuts the stored one before it — and
+   * a request for either that was quietly set aside would produce the worst
+   * kind of wrong answer: a turn appended to the conversation the caller
+   * believed they had branched from or wound back. So each needs the session
+   * it acts on, and the serving account's provider has to be able to honour
+   * it; the catalogue publishes both flags per account for exactly this
+   * check, and the registry behind the run would refuse anyway, only later
+   * and with less to say.
+   */
+  if (extensions.forkSession === true || extensions.rewindToMessageId !== undefined) {
+    const wanted = extensions.forkSession === true ? 'artemis.forkSession' : 'artemis.rewindToMessageId';
+    if (extensions.sessionId === undefined) {
+      return attribute(
+        fail(
+          400,
+          'invalid_request_error',
+          'invalid_body',
+          `\`${wanted}\` needs \`artemis.sessionId\`: there is no conversation to ${extensions.forkSession === true ? 'fork' : 'rewind'}.`,
+        ),
+      );
+    }
+    const capable =
+      extensions.forkSession === true
+        ? account?.capabilities.forkSession === true
+        : account?.capabilities.rewind === true;
+    if (!capable) {
+      return attribute(
+        fail(
+          400,
+          'invalid_request_error',
+          'unsupported_parameter',
+          `The account behind ${model.route} cannot ${extensions.forkSession === true ? 'fork' : 'rewind'} a conversation, so \`${wanted}\` cannot be honoured.`,
+        ),
+      );
+    }
+  }
+
   const { systemPrompt, ...withoutSystemPrompt } = extensions;
   const dropSystemPrompt =
     systemPrompt !== undefined && account?.capabilities.systemPromptAppend !== true;

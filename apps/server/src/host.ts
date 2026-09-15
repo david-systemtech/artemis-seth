@@ -410,6 +410,12 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
         ...(input.resumeSessionId === undefined
           ? {}
           : { resumeSessionId: input.resumeSessionId as never }),
+        // The caller's own conversation being reshaped — see the completions
+        // route, which has already checked the account can honour them.
+        ...(input.forkSession === undefined ? {} : { forkSession: input.forkSession }),
+        ...(input.rewindToMessageId === undefined
+          ? {}
+          : { rewindToMessageId: input.rewindToMessageId as never }),
         ...(permissionMode === undefined ? {} : { permissionMode: permissionMode as never }),
         ...(instructions === undefined
           ? {}

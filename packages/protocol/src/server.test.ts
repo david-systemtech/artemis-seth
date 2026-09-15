@@ -171,3 +171,26 @@ describe('isValidServerPort', () => {
     expect(isValidServerPort(Number.NaN)).toBe(false);
   });
 });
+
+describe('readChatExtensions: forking and rewinding', () => {
+  it('reads a fork and a rewind anchor beside the session id', () => {
+    expect(
+      readChatExtensions({
+        artemis: { sessionId: 'sess-1', forkSession: true, rewindToMessageId: 'msg-7' },
+      }),
+    ).toEqual({ sessionId: 'sess-1', forkSession: true, rewindToMessageId: 'msg-7' });
+  });
+
+  it('treats an explicit false, an empty anchor and a wrong type as absent', () => {
+    // `false` means the same as not asking, so it is not carried; an empty or
+    // non-string anchor names nothing and is dropped rather than passed on.
+    expect(
+      readChatExtensions({
+        artemis: { sessionId: 'sess-1', forkSession: false, rewindToMessageId: '' },
+      }),
+    ).toEqual({ sessionId: 'sess-1' });
+    expect(readChatExtensions({ artemis: { forkSession: 'yes', rewindToMessageId: 7 } })).toEqual(
+      {},
+    );
+  });
+});
