@@ -76,11 +76,12 @@ import { CATALOGUE_KEY, commandsKey, modelsKey, usageKey } from './cache.js';
 import { checkForUpdate, currentVersion, installRoot } from './update.js';
 import { COMMANDS, parseCommand, type Command } from './commands.js';
 import { Conversation, type ConversationSettings } from './conversation.js';
+import type { HistoryScope } from './history.js';
 import type { Launched } from './launch.js';
 import type { ModelListing } from './host.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
 import { ACCENT } from './theme.js';
-import { Composer } from './components/Composer.js';
+import { Composer, type ComposerHandle } from './components/Composer.js';
 import { DelegatedStrip } from './components/Delegated.js';
 import { Header } from './components/Header.js';
 import { PermissionCard } from './components/PermissionCard.js';
@@ -1321,6 +1322,29 @@ export function App({ launched }: AppProps): React.JSX.Element {
   const sidebarActive = focus === 'sidebar' && showSidebar && !modalOpen;
   const composerActive = focus === 'composer' && !modalOpen;
 
+  /*
+   * The composer's own handle, which is how anything here reaches into the box
+   * — and, below, how Esc is asked after rather than taken. See `Composer`.
+   */
+  const composerRef = useRef<ComposerHandle>(null);
+
+  /*
+   * Which prompts ↑ offers, and what Ctrl+R cycles through: this folder first,
+   * because "what did I type" nearly always means "here", then everything, and
+   * this conversation last — it is the narrowest, and the one someone asks for
+   * deliberately rather than by default. `recent` falls through the list until
+   * something has entries, so a folder nobody has typed in is not an ↑ that
+   * does nothing.
+   */
+  const historyScopes = useMemo<readonly HistoryScope[]>(
+    () => [
+      { kind: 'folder', cwd: state.settings.cwd },
+      { kind: 'all' },
+      ...(state.sessionId === undefined ? [] : [{ kind: 'session', sessionId: state.sessionId } as const]),
+    ],
+    [state.settings.cwd, state.sessionId],
+  );
+
   /**
    * Put a conversation away, or take it back out.
    *
@@ -1470,6 +1494,16 @@ export function App({ launched }: AppProps): React.JSX.Element {
       quitArmed.current.unref?.();
       return;
     }
+
+    /*
+     * Esc belongs to the composer while it is capturing one — its reverse
+     * search is open — and to nothing else. Ink has no stop-propagation, so
+     * both handlers see the press whatever order they run in; the one that
+     * must not act is the one that asks. Interrupting the turn on the Esc that
+     * closed a search, or unfollowing the transcript with it, is the bug this
+     * is here to prevent.
+     */
+    if (key.escape && composerActive && composerRef.current?.isCapturing() === true) return;
 
     if (modal?.kind === 'replay') {
       if (key.escape) setModal(null);
@@ -1640,15 +1674,28 @@ export function App({ launched }: AppProps): React.JSX.Element {
 
           <Box flexDirection="column" flexShrink={0} paddingX={1}>
             <Composer
+              ref={composerRef}
               onSubmit={submit}
               live={live}
               locked={locked}
               isActive={composerActive}
               attachments={pendingAttachments.map((entry) => entry.name)}
               providerCommands={state.slashCommands}
-              // An arrow the text had no use for — ↑ on its first line, ↓ on
-              // its last — scrolls the conversation, which is what a plain
-              // arrow has always done here.
+              history={history}
+              historyScopes={historyScopes}
+              /*
+               * ↑ on an empty box. The composer knows it is empty and the
+               * conversation knows whether anything is waiting, so the
+               * composer asks and this answers: the words of the newest
+               * queued message, or nothing at all, which leaves ↑ to the
+               * history. Taking it back here is what the strip's header
+               * promises — see `Conversation.takeBackQueued`.
+               */
+              onTakeBackQueued={() => conversation.takeBackQueued()}
+              // An arrow the text and the history both had no use for — ↑ on
+              // the first line with nothing left to recall, ↓ on the last —
+              // scrolls the conversation, which is what a plain arrow has
+              // always done here.
               onArrowOverflow={(direction) => {
                 scrollBy(direction === 'up' ? SCROLL_STEP : -SCROLL_STEP);
               }}

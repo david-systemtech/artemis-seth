@@ -42,14 +42,71 @@
  * it is told: whether the agent is working (so Enter means "steer" rather than
  * "start"), whether the provider can even take a message right now, and any
  * one-line reason the last submission was refused.
+ *
+ * ## What was typed comes back
+ *
+ * Three things put words into the box that the keystroke itself did not type,
+ * and all three lean on one channel.
+ *
+ * **The channel is a handle**, not a controlled `value` prop and not a seed
+ * paired with a nonce: `ref` gives the app `setText`, `getText` and
+ * `isCapturing`. The buffer is not a string — it is text, a cursor, a kill
+ * ring and an undo stack — so a prop that could only push a string would
+ * either flatten all of that or need a counter to fake an event out of a
+ * value, and the app would still have no way to *read* it. Reading is half of
+ * what is wanted: whether the box is empty, and what is in it to hand to an
+ * external editor. `setText` goes in through `replaceAll`, so whatever it
+ * replaced is one undo away.
+ *
+ * **↑ and ↓ walk the history** once the text has no line left to offer them.
+ * The walk lives here rather than in app.tsx because every question it has to
+ * answer is one only the composer can: whether the slash menu is open, whether
+ * the buffer is empty, and — the one that matters — whether the text has been
+ * edited since the last press. That last is not tracked but noticed, the same
+ * way the menu notices a stale highlight: the walk remembers the text it put
+ * in the box, and a buffer that is not that text ends it, so the next ↑ starts
+ * a fresh walk with whatever is now typed as its draft. No bookkeeping spread
+ * through twenty key branches, and nothing to forget to clear.
+ *
+ * The history arrives as a prop — `recent` and `search`, the two methods of
+ * `PromptHistory` that reading needs — so the composer neither opens a file
+ * nor knows where one lives, and a test can hand it two arrays. Its scopes
+ * come with it, best first, which is how ↑ prefers the prompts typed in this
+ * folder and falls through to everything when there are none.
+ *
+ * **↑ on an empty box takes a queued message back** first, when there is one
+ * to take. The composer cannot know that — the queue is the conversation's —
+ * so it asks, and `onTakeBackQueued` answers with the words or with nothing;
+ * nothing means carry on into the history. Asking rather than being told is
+ * what keeps one keystroke with one owner: emptiness and the menu are known
+ * here, the queue is known there, and the answer settles it in one place.
+ *
+ * **Ctrl+R is the reverse search**, bash's, drawn as a row under the box: the
+ * query on the left and the match in the box itself, where the cursor already
+ * is, with the draft set aside whole — the editor state, not the string — so
+ * Esc puts back the buffer that was there, undo stack and all. Ctrl+R again
+ * steps to an older match, Ctrl+S cycles the scope, Tab and → keep the match
+ * to edit, Enter sends exactly what the box is showing, and Backspace past the
+ * start of the query cancels, because a search with nothing in it is not a
+ * search.
+ *
+ * Esc is the one key this has to take back from the app, which interrupts the
+ * turn with it. Ink has no stop-propagation — every active `useInput` sees
+ * every keystroke — so the app asks the handle whether the composer is
+ * capturing Esc before acting on it. That flag is a ref rather than state, and
+ * it is lowered in an effect rather than in the key handler: both handlers run
+ * inside one dispatch, before any render, so a flag lowered as the search
+ * closes would already read as lowered when the app looks, and the Esc that
+ * closed the search would interrupt the turn as well.
  */
 
-import { useState } from 'react';
+import { useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 
 import { matchCommands } from '../commands.js';
 import {
   EMPTY_EDITOR,
+  type EditorState,
   backspace,
   bufferEnd,
   bufferStart,
@@ -81,6 +138,7 @@ import {
   wordRight,
   yank,
 } from '../editor.js';
+import { HistoryCursor, type HistoryMatch, type HistoryScope } from '../history.js';
 import { ACCENT } from '../theme.js';
 import { Completions } from './Completions.js';
 
@@ -92,9 +150,63 @@ const UNDO_INPUT = '\u001F';
 
 const NEWLINE_HINT = 'Shift+Enter or Ctrl+J for a newline · Enter sends';
 
+const SEARCH_HINT = 'Ctrl+R older · Ctrl+S scope · Tab edits · Enter sends · Esc cancels';
+
+/** Everything: both the last resort and the only sensible default. */
+const ALL_SCOPE: HistoryScope = { kind: 'all' };
+const DEFAULT_SCOPES: readonly HistoryScope[] = [ALL_SCOPE];
+
 /** What a row is typed as: `/attach <path>` is run by sending `/attach`. */
 function commandWord(usage: string): string {
   return usage.split(' ')[0] ?? usage;
+}
+
+/**
+ * The reading half of `PromptHistory`, which is all the composer wants.
+ *
+ * An interface rather than the class, so nothing here depends on a file being
+ * on disk: `PromptHistory` satisfies it as it stands, and a test hands over
+ * two arrays.
+ */
+export interface HistoryLookup {
+  recent(scope: HistoryScope): readonly string[];
+  search(query: string, scope: HistoryScope, limit?: number): readonly HistoryMatch[];
+}
+
+/** What the app can do to the box from outside a keystroke. */
+export interface ComposerHandle {
+  /** Replace the text, undoably, with the cursor at its end. */
+  setText(text: string): void;
+  /** What is in the box right now. */
+  getText(): string;
+  /** True while the composer owns Esc — its reverse search is open. */
+  isCapturing(): boolean;
+}
+
+/**
+ * A walk through the history, alive for exactly as long as the text it put in
+ * the box is still the text in the box.
+ */
+interface Walk {
+  /** What this walk last wrote. Any other buffer means someone has edited. */
+  readonly text: string;
+  readonly cursor: HistoryCursor;
+  /** How many entries there are to walk, for the hint. */
+  readonly total: number;
+  /** `-1` is the draft, `0` the newest entry — the cursor's own numbering. */
+  readonly position: number;
+}
+
+/** An open reverse search: the query, where it is looking, what it displaced. */
+interface Search {
+  readonly query: string;
+  /** Into the scopes the composer was given; Ctrl+S moves it on. */
+  readonly scopeIndex: number;
+  /** The buffer as it was when the search opened, so Esc is lossless. */
+  readonly draft: EditorState;
+  readonly matches: readonly HistoryMatch[];
+  /** Which match is showing; Ctrl+R steps it towards the older ones. */
+  readonly at: number;
 }
 
 export interface ComposerProps {
@@ -110,8 +222,22 @@ export interface ComposerProps {
   /** The provider's own slash commands, offered beside the TUI's. */
   readonly providerCommands?: readonly string[];
   readonly isActive?: boolean;
-  /** ↑ on the first line, ↓ on the last: the app's to do something with. */
+  /**
+   * ↑ on the first line, ↓ on the last, once the history has had its say:
+   * the app's to do something with.
+   */
   readonly onArrowOverflow?: (direction: 'up' | 'down') => void;
+  /** What ↑ and Ctrl+R read. Without it neither key does anything new. */
+  readonly history?: HistoryLookup;
+  /** The slices ↑ prefers and Ctrl+S cycles, best first. */
+  readonly historyScopes?: readonly HistoryScope[];
+  /**
+   * ↑ on an empty box asks for the newest queued message back. The words, or
+   * nothing at all when there is no queue — which means "carry on".
+   */
+  readonly onTakeBackQueued?: () => string | undefined;
+  /** React 19 passes this through as a prop; see {@link ComposerHandle}. */
+  readonly ref?: React.Ref<ComposerHandle>;
 }
 
 export function Composer({
@@ -123,6 +249,10 @@ export function Composer({
   providerCommands = [],
   isActive = true,
   onArrowOverflow,
+  history,
+  historyScopes = DEFAULT_SCOPES,
+  onTakeBackQueued,
+  ref,
 }: ComposerProps): React.JSX.Element {
   const [buffer, setBuffer] = useState(EMPTY_EDITOR);
   /*
@@ -145,8 +275,182 @@ export function Composer({
         : 0;
   const highlighted = selected === null ? undefined : menu[selected];
 
+  /*
+   * A walk, and the walk that is still live. Remembered against the text it
+   * wrote for the same reason `picked` is: an edit must end it, and noticing
+   * that here is one line, where clearing it in every branch that touches the
+   * buffer is twenty and one of them would be forgotten.
+   */
+  const [walk, setWalk] = useState<Walk | null>(null);
+  const walking = walk !== null && walk.text === value ? walk : null;
+
+  const [search, setSearch] = useState<Search | null>(null);
+
+  /*
+   * Read by the app, on the same keystroke the composer is answering, so it
+   * cannot be state: state is a render away. It is raised as the search opens
+   * and lowered only after the render that closed it, which is what keeps the
+   * Esc that closed a search from also interrupting the turn.
+   */
+  const capturing = useRef(false);
+  useEffect(() => {
+    capturing.current = isActive && search !== null;
+  }, [isActive, search]);
+
+  // Focus moving away ends a search rather than leaving a row on screen that
+  // no key can reach: the composer stops answering keys entirely when it is
+  // not the focus.
+  useEffect(() => {
+    if (isActive || search === null) return;
+    setBuffer(search.draft);
+    setSearch(null);
+  }, [isActive, search]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      setText: (text: string) => {
+        setBuffer((current) => replaceAll(current, text));
+      },
+      getText: () => buffer.text,
+      isCapturing: () => capturing.current,
+    }),
+    [buffer],
+  );
+
+  /** Put `text` in the box, undoably, and hand back the buffer that makes. */
+  const put = (text: string): EditorState => {
+    const next = replaceAll(buffer, text);
+    setBuffer(next);
+    return next;
+  };
+
+  /** The best scope that has anything in it: this folder, then everything. */
+  const recentTexts = (): readonly string[] => {
+    if (history === undefined) return [];
+    for (const scope of historyScopes) {
+      const texts = history.recent(scope);
+      if (texts.length > 0) return texts;
+    }
+    return [];
+  };
+
+  /**
+   * ↑ that the text had no line left for. True when it was spent here, which
+   * is what stops the app scrolling the conversation on the same press.
+   */
+  const recallOlder = (): boolean => {
+    if (walking !== null) {
+      const next = put(walking.cursor.up());
+      setWalk({ ...walking, text: next.text, position: Math.min(walking.position + 1, walking.total - 1) });
+      return true;
+    }
+    if (value.length === 0) {
+      // Empty box first, and only empty: with anything typed, ↑ is history,
+      // so the two never compete for the same press.
+      const back = onTakeBackQueued?.();
+      if (back !== undefined) {
+        put(back);
+        return true;
+      }
+    }
+    const texts = recentTexts();
+    if (texts.length === 0) return false;
+    // Whatever is typed becomes the draft, which is what walking back down
+    // past the newest entry returns to.
+    const cursor = new HistoryCursor(texts, value);
+    const next = put(cursor.up());
+    setWalk({ text: next.text, cursor, total: texts.length, position: 0 });
+    return true;
+  };
+
+  /** ↓ likewise, and only a walk in progress has anything to do with it. */
+  const recallNewer = (): boolean => {
+    if (walking === null) return false;
+    const next = put(walking.cursor.down());
+    setWalk({ ...walking, text: next.text, position: Math.max(walking.position - 1, -1) });
+    return true;
+  };
+
+  /**
+   * Run a query and show what it found — which is every key the search row
+   * answers, since opening, typing, rubbing out, stepping older and changing
+   * scope all come down to "look again, then put the match in the box".
+   */
+  const searchFor = (query: string, scopeIndex: number, wanted: number, draft: EditorState): void => {
+    const count = historyScopes.length;
+    const index = count === 0 ? 0 : ((scopeIndex % count) + count) % count;
+    const scope = historyScopes[index] ?? ALL_SCOPE;
+    const matches = history === undefined ? [] : history.search(query, scope);
+    const at = matches.length === 0 ? 0 : Math.min(Math.max(wanted, 0), matches.length - 1);
+    setSearch({ query, scopeIndex: index, draft, matches, at });
+    const match = matches[at];
+    // A query that matches nothing leaves the last good match on screen, as
+    // bash does: the row says `no match`, and nothing that was found is lost.
+    if (match !== undefined) put(match.text);
+  };
+
   useInput(
     (input, key) => {
+      /*
+       * An open reverse search has the keyboard, ahead of everything — the
+       * newline keys included, because inside a search every one of them
+       * means something else.
+       */
+      if (search !== null) {
+        if (key.escape) {
+          setBuffer(search.draft);
+          setSearch(null);
+          return;
+        }
+        if (key.return) {
+          /*
+           * What the box is showing is what goes. That is the whole promise of
+           * putting the match in the box rather than beside it, and it is also
+           * the honest answer when the last keystroke matched nothing: the
+           * words on screen are the words sent.
+           */
+          setSearch(null);
+          if (value.trim().length === 0) {
+            setBuffer(search.draft);
+            return;
+          }
+          onSubmit(value);
+          setBuffer(clear);
+          return;
+        }
+        if (key.tab || key.rightArrow) {
+          // Accept and stay. The match is already the buffer, so closing the
+          // row is all there is to do, and the cursor is at its end.
+          setSearch(null);
+          return;
+        }
+        if (key.ctrl && input === 'r') {
+          searchFor(search.query, search.scopeIndex, search.at + 1, search.draft);
+          return;
+        }
+        if (key.ctrl && input === 's') {
+          searchFor(search.query, search.scopeIndex + 1, 0, search.draft);
+          return;
+        }
+        if (key.backspace || key.delete) {
+          // Rubbing out the last of the query is a cancel, because a search
+          // with nothing in it is not a search.
+          if (search.query.length === 0) {
+            setBuffer(search.draft);
+            setSearch(null);
+            return;
+          }
+          searchFor(search.query.slice(0, -1), search.scopeIndex, 0, search.draft);
+          return;
+        }
+        if (key.ctrl || key.meta || key.upArrow || key.downArrow || key.leftArrow) return;
+        if (input.length === 0 || input === '\n') return;
+        // A pasted query is still a query; its line breaks would be a row the
+        // search cannot draw, so they become spaces.
+        searchFor(search.query + input.replace(/[\r\n]+/gu, ' '), search.scopeIndex, 0, search.draft);
+        return;
+      }
       /*
        * The newline keys come first, because each of them is a Return that
        * must not be read as "send". Shift+Enter and Option+Enter only arrive
@@ -209,13 +513,28 @@ export function Composer({
           setPicked({ text: value, index: (selected + step + menu.length) % menu.length });
           return;
         }
+        /*
+         * Off the end of the text, the press is offered to the history and
+         * only then to the app: ↑ means "what did I type" far more often than
+         * it means "scroll one line", and a recalled prompt is a keystroke
+         * that scrolling would have thrown away. Shift or Ctrl with an arrow
+         * still moves the conversation half a screen, from anywhere.
+         */
         if (key.upArrow) {
-          if (onFirstLine(buffer)) onArrowOverflow?.('up');
-          else setBuffer(up);
+          if (!onFirstLine(buffer)) {
+            setBuffer(up);
+            return;
+          }
+          if (recallOlder()) return;
+          onArrowOverflow?.('up');
           return;
         }
-        if (onLastLine(buffer)) onArrowOverflow?.('down');
-        else setBuffer(down);
+        if (!onLastLine(buffer)) {
+          setBuffer(down);
+          return;
+        }
+        if (recallNewer()) return;
+        onArrowOverflow?.('down');
         return;
       }
       if (key.home) {
@@ -247,6 +566,11 @@ export function Composer({
             return;
           case 'w':
             setBuffer(deleteWordLeft);
+            return;
+          case 'r':
+            // Reverse search, over the buffer that is there — which Esc will
+            // put back exactly as it is now, undo stack and all.
+            if (history !== undefined) searchFor('', 0, 0, buffer);
             return;
           case '_':
             setBuffer(undo);
@@ -349,11 +673,40 @@ export function Composer({
         )}
         {hiddenBelow > 0 && <Text dimColor>{`  ↓ ${String(hiddenBelow)} more`}</Text>}
       </Box>
-      {(rows.length > 1 || row > 0) && (
-        <Text dimColor>
-          {'  '}
-          {NEWLINE_HINT}
-        </Text>
+      {/*
+       * One line under the box for whatever the arrows are doing: the search
+       * and its keys while it is open, where a walk has got to while one is
+       * running, and otherwise the newline hint that was always here. They are
+       * never wanted at once — the search *is* the arrows' owner while it is
+       * open — so they share the row rather than stacking up under the box.
+       */}
+      {search !== null ? (
+        <>
+          <Text dimColor>
+            {`  reverse-i-search [${historyScopes[search.scopeIndex]?.kind ?? ALL_SCOPE.kind}]: ${search.query}`}
+            {search.matches.length === 0
+              ? ' · no match'
+              : ` · ${String(search.at + 1)}/${String(search.matches.length)}`}
+          </Text>
+          <Text dimColor>
+            {'  '}
+            {SEARCH_HINT}
+          </Text>
+        </>
+      ) : (
+        <>
+          {walking !== null && walking.position >= 0 && (
+            <Text dimColor>
+              {`  history ${String(walking.position + 1)}/${String(walking.total)} · ↓ back to draft`}
+            </Text>
+          )}
+          {(rows.length > 1 || row > 0) && (
+            <Text dimColor>
+              {'  '}
+              {NEWLINE_HINT}
+            </Text>
+          )}
+        </>
       )}
       <Completions
         items={menu.map((match) => ({
