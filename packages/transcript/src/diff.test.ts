@@ -108,6 +108,56 @@ describe('the diff itself', () => {
     expect(tail).toMatchObject({ text: 'c', oldNo: 2, newNo: 3 });
   });
 
+  /**
+   * A write has no original to count against, so the only number any row can
+   * carry is the new one — and it has to start at 1. Numbering from the first
+   * line is what lets a renderer put a gutter beside a `Write` at all; blank
+   * numbers there would make new files the one case with no way to navigate.
+   */
+  it('numbers a written file from its first line', () => {
+    const rows = detectFileEdit('Write', { file_path: 'new.md', content: 'a\nb\nc' })?.rows ?? [];
+    expect(rows.map((r) => [r.kind, r.oldNo, r.newNo])).toEqual([
+      ['add', undefined, 1],
+      ['add', undefined, 2],
+      ['add', undefined, 3],
+    ]);
+  });
+
+  it('gives a deleted line its number in the old file and none in the new', () => {
+    const rows = detectFileEdit('Edit', {
+      file_path: 'a.txt',
+      old_string: 'a\nb\nc',
+      new_string: 'a\nc',
+    })?.rows ?? [];
+    expect(rows.find((r) => r.kind === 'del')).toMatchObject({ text: 'b', oldNo: 2 });
+    expect(rows.find((r) => r.kind === 'del')?.newNo).toBeUndefined();
+    // The line after the deletion sits on different numbers on the two sides.
+    expect(rows.at(-1)).toMatchObject({ kind: 'ctx', text: 'c', oldNo: 3, newNo: 2 });
+  });
+
+  it('leaves a gap unnumbered but keeps the count it stands for', () => {
+    const body = Array.from({ length: 60 }, (_, i) => `line ${i}`).join('\n');
+    const gap = detectFileEdit('Edit', {
+      file_path: 'a.txt',
+      old_string: `${body}\nlast`,
+      new_string: `${body}\nLAST`,
+    })?.rows.find((r) => r.kind === 'gap');
+    // A gap is not a line of the file, so no number belongs to it; `skipped` is
+    // the only thing a renderer can say about it.
+    expect(gap?.oldNo).toBeUndefined();
+    expect(gap?.newNo).toBeUndefined();
+    expect(gap?.skipped).toBeGreaterThan(0);
+  });
+
+  it('still numbers the rows it shows when the payload was too large to diff', () => {
+    const huge = Array.from({ length: 21_000 }, (_, i) => `l${i}`).join('\n');
+    const adds = detectFileEdit('Write', { file_path: 'huge.log', content: huge })?.rows.filter(
+      (r) => r.kind === 'add',
+    );
+    expect(adds?.[0]?.newNo).toBe(1);
+    expect(adds?.at(-1)?.newNo).toBe(adds?.length);
+  });
+
   it('picks out the characters that changed within a modified line', () => {
     const edit = detectFileEdit('Edit', {
       file_path: 'a.ts',

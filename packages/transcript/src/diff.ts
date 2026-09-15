@@ -33,7 +33,16 @@ import type { JsonObject, JsonValue } from '@rx-artemis/protocol';
 /* Shapes                                                                     */
 /* -------------------------------------------------------------------------- */
 
-/** One rendered line of a diff. */
+/**
+ * One rendered line of a diff.
+ *
+ * Both renderers consume the line numbers, and differently: the desktop has the
+ * width for a two-column gutter, while the terminal shows one column and picks
+ * the number that tells the reader where to put their cursor — `newNo` for
+ * additions and context, `oldNo` for deletions. Both of those only work if a
+ * row that has a number always has the right one, so they are set from the
+ * diff's own indices rather than counted up at render time.
+ */
 export interface DiffRow {
   /** `gap` is a collapsed run of unchanged lines, not a line of the file. */
   readonly kind: 'add' | 'del' | 'ctx' | 'gap';
