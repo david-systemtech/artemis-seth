@@ -21,6 +21,7 @@
  * cannot name anything finer.
  */
 
+import type { PermissionMode } from './permissions.js';
 import type { ProviderId } from './provider.js';
 
 /** Identifies one routine. A short random slug, minted by the main process. */
@@ -58,6 +59,31 @@ export type RoutineSchedule =
   | {
       readonly kind: 'weekly';
       /** Day of week, 0 = Sunday … 6 = Saturday — `Date.getDay`'s numbering. */
+      readonly day: number;
+      /** Local time of day, `"HH:MM"`. */
+      readonly at: string;
+    }
+  | {
+      /**
+       * Some days of the week, one time: Monday, Wednesday and Friday at
+       * 09:00. `weekdays` and `weekly` are both spellings of this, kept as
+       * their own kinds because they are the two people reach for first and a
+       * list picker is the wrong control for "every weekday".
+       */
+      readonly kind: 'days';
+      /** Days of week, `Date.getDay`'s numbering, at least one, no repeats. */
+      readonly days: readonly number[];
+      /** Local time of day, `"HH:MM"`. */
+      readonly at: string;
+    }
+  | {
+      /**
+       * Once a month, on a day of the month. A day a month does not have —
+       * the 31st in April — is skipped that month rather than moved, which is
+       * what cron does and what "on the 31st" means when read literally.
+       */
+      readonly kind: 'monthly';
+      /** Day of month, 1–31. */
       readonly day: number;
       /** Local time of day, `"HH:MM"`. */
       readonly at: string;
@@ -127,10 +153,34 @@ export interface Routine {
   readonly providerId: ProviderId;
   /** Model for the run, as the provider spells it. Omit for the default. */
   readonly model?: string;
+  /** Reasoning effort for the run, as the provider spells it. Omit for the default. */
+  readonly effort?: string;
+  /**
+   * The permission mode each firing opens in.
+   *
+   * A routine fires with nobody in front of it, so the mode is the whole
+   * answer to "what happens when the agent needs to ask": `bypassPermissions`
+   * lets it run unattended, which is what a schedule is for and the default
+   * a new routine gets; any other mode parks the run on its first prompt
+   * until someone answers, which the desktop shows exactly as it shows a
+   * prompt from a turn you typed. Omitted on records written before the
+   * field existed, which the host reads as the provider's own default.
+   */
+  readonly permissionMode?: PermissionMode;
   readonly schedule: RoutineSchedule;
   /** A paused routine keeps its place in the list and fires nothing. */
   readonly paused: boolean;
   readonly createdAt: number;
+  /**
+   * Who may see and change this routine, on a host that serves several
+   * clients: the same `workspaceKey` the server's session ledger scopes
+   * conversations by, so a routine is visible to exactly the tokens that
+   * see the conversations it produces. Absent on the desktop's own routines,
+   * which have one owner.
+   */
+  readonly scope?: string;
+  /** The connection that created it, for the ledger's attribution. Server-only, like {@link scope}. */
+  readonly connectionId?: string;
   /** When the scheduler last acted on it, skip or fire alike. */
   readonly lastFiredAt?: number;
   /** Newest first. Capped at {@link MAX_ROUTINE_HISTORY}. */
@@ -141,10 +191,18 @@ export interface Routine {
 export interface RoutineDraft {
   readonly name: string;
   readonly instructions: string;
-  readonly cwd: string;
+  /**
+   * Absolute directory the run starts in. Required by the desktop's own
+   * host; a server ignores whatever a client sends and pins the routine to
+   * the connection's workspace, which is the only directory a served run may
+   * start in.
+   */
+  readonly cwd?: string;
   readonly profileId: string;
   readonly providerId: ProviderId;
   readonly model?: string;
+  readonly effort?: string;
+  readonly permissionMode?: PermissionMode;
   readonly schedule: RoutineSchedule;
   /** Defaults to false. */
   readonly paused?: boolean;
@@ -161,6 +219,9 @@ export interface RoutinePatch {
   readonly profileId?: string;
   readonly providerId?: ProviderId;
   readonly model?: string;
+  /** `''` clears, like {@link model}. */
+  readonly effort?: string;
+  readonly permissionMode?: PermissionMode;
   readonly schedule?: RoutineSchedule;
   readonly paused?: boolean;
 }
@@ -215,6 +276,21 @@ export function scheduleProblem(schedule: RoutineSchedule): string | null {
     case 'weekly':
       if (!Number.isInteger(schedule.day) || schedule.day < 0 || schedule.day > 6) {
         return 'The day of the week runs from 0 (Sunday) to 6 (Saturday).';
+      }
+      return timeOfDayProblem(schedule.at);
+    case 'days': {
+      if (schedule.days.length === 0) return 'Pick at least one day of the week.';
+      if (schedule.days.some((day) => !Number.isInteger(day) || day < 0 || day > 6)) {
+        return 'The day of the week runs from 0 (Sunday) to 6 (Saturday).';
+      }
+      if (new Set(schedule.days).size !== schedule.days.length) {
+        return 'A day of the week is listed twice.';
+      }
+      return timeOfDayProblem(schedule.at);
+    }
+    case 'monthly':
+      if (!Number.isInteger(schedule.day) || schedule.day < 1 || schedule.day > 31) {
+        return 'The day of the month runs from 1 to 31.';
       }
       return timeOfDayProblem(schedule.at);
     case 'cron':
@@ -353,6 +429,24 @@ export function scheduleMatchesMinute(schedule: RoutineSchedule, date: Date): bo
         date.getMinutes() === at.minute
       );
     }
+    case 'days': {
+      const at = parseTimeOfDay(schedule.at);
+      return (
+        at !== undefined &&
+        schedule.days.includes(date.getDay()) &&
+        date.getHours() === at.hour &&
+        date.getMinutes() === at.minute
+      );
+    }
+    case 'monthly': {
+      const at = parseTimeOfDay(schedule.at);
+      return (
+        at !== undefined &&
+        date.getDate() === schedule.day &&
+        date.getHours() === at.hour &&
+        date.getMinutes() === at.minute
+      );
+    }
     case 'cron': {
       if (cronProblem(schedule.expression) !== null) return false;
       const fields = schedule.expression.trim().split(/\s+/) as [string, string, string, string, string];
@@ -424,6 +518,24 @@ export function lastFireBetween(
   return undefined;
 }
 
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+/** `1st`, `2nd`, `3rd`, `4th` … `21st`, `22nd`, `23rd`, `31st`. */
+function ordinal(day: number): string {
+  const tens = day % 100;
+  if (tens >= 11 && tens <= 13) return `${String(day)}th`;
+  switch (day % 10) {
+    case 1:
+      return `${String(day)}st`;
+    case 2:
+      return `${String(day)}nd`;
+    case 3:
+      return `${String(day)}rd`;
+    default:
+      return `${String(day)}th`;
+  }
+}
+
 /** One line saying when a routine runs, for list rows and tooltips. */
 export function describeSchedule(schedule: RoutineSchedule): string {
   switch (schedule.kind) {
@@ -435,10 +547,20 @@ export function describeSchedule(schedule: RoutineSchedule): string {
       return `Daily at ${schedule.at}`;
     case 'weekdays':
       return `Weekdays at ${schedule.at}`;
-    case 'weekly': {
-      const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-      return `${days[schedule.day] ?? 'Weekly'} at ${schedule.at}`;
+    case 'weekly':
+      return `${DAY_NAMES[schedule.day] ?? 'Weekly'} at ${schedule.at}`;
+    case 'days': {
+      // In week order, whatever order they were picked in, and abbreviated
+      // once there are more than two — "Mon, Wed, Fri at 09:00" reads; a full
+      // name each does not fit a row.
+      const picked = [...schedule.days].sort((a, b) => a - b);
+      const names = picked.map((day) =>
+        picked.length > 2 ? (DAY_NAMES[day] ?? '?').slice(0, 3) : (DAY_NAMES[day] ?? '?'),
+      );
+      return `${names.join(', ')} at ${schedule.at}`;
     }
+    case 'monthly':
+      return `Monthly on the ${ordinal(schedule.day)} at ${schedule.at}`;
     case 'cron':
       return `Cron: ${schedule.expression}`;
     default:
