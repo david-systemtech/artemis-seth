@@ -105,6 +105,19 @@
  *  - `/title`   — a name, written into the provider's own store through the
  *    same door the automatic namer uses. A provider without that field says so.
  *
+ * One more key belongs to neither the conversation nor the pool but to the
+ * *account*. When the provider stops serving this one — a window rejected, or
+ * near enough to it that the next turn may not finish — the left half of the
+ * status line turns yellow and becomes an offer, and Ctrl+H opens it: the
+ * accounts that could take this conversation, each with its live plan
+ * readings, the ones that could not with the sentence saying why, and a row
+ * that stays put. Nothing moves until a row is chosen; there is no countdown
+ * and no setting that would make one. That is ADR 0003, and the reasoning is
+ * in `failover.ts` along with everything that decides which window counts as
+ * spent and which account counts as able. An account sharing the provider's
+ * session store opens this very conversation; one that cannot read it is
+ * offered a new conversation with a hand-over already in the composer.
+ *
  * Last, the window itself. The title, the taskbar light and the bell are the
  * only channel to somebody who has tabbed away — and with several
  * conversations parked and working, that is most of the time. `terminal.ts`
@@ -154,6 +167,15 @@ import { copyText } from './clipboard.js';
 import { parseCommand, type Command } from './commands.js';
 import { Conversation, type ConversationSettings } from './conversation.js';
 import { codeBlocksOf, exportFilename, lastAssistantText, transcriptToMarkdown } from './exportTranscript.js';
+import {
+  bestFailoverCandidate,
+  failoverCandidates,
+  failoverLine,
+  failoverReason,
+  failoverTitle,
+  handoverBrief,
+  type FailoverCandidate,
+} from './failover.js';
 import { editInExternalEditor, type ExternalEditResult } from './externalEditor.js';
 import { listFiles, type Frecency } from './fileIndex.js';
 import type { HistoryScope } from './history.js';
@@ -303,6 +325,20 @@ const BROWSE_KEY = '\u0000browse';
  * are indices, and this must not be able to collide with one.
  */
 const WORKING_TREE_KEY = '\u0000working-tree';
+
+/**
+ * The hand-off list's three kinds of row.
+ *
+ * One account can appear twice in it — as "move the conversation there" and,
+ * when it cannot read the transcript, as "start fresh there" — so a row key
+ * cannot simply be the profile id. These prefixes are what tell the two apart
+ * on the way back out. `stay here` takes the leading NUL `BROWSE_KEY` has, for
+ * the same reason: it is not an account and must not be able to collide with
+ * one.
+ */
+const FAILOVER_MOVE = 'move:';
+const FAILOVER_SEED = 'seed:';
+const FAILOVER_STAY_KEY = '\u0000stay';
 
 const MODE_LABEL: Readonly<Record<PermissionMode, string>> = {
   default: 'Ask',
@@ -1071,8 +1107,177 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   }, [state.status, state.sessionId, refreshPlanUsage]);
 
   /* ---------------------------------------------------------------------- */
+  /* Somewhere else to put the work                                          */
+  /* ---------------------------------------------------------------------- */
+
+  /*
+   * When this account's plan stops serving, the line under the composer turns
+   * into an offer and Ctrl+H opens the list it belongs to. ADR 0003 is the
+   * whole design: a hand off is a chosen act, so nothing here moves anything —
+   * `failover.ts` works out whether there is something worth offering and who
+   * could take it, this file draws it and answers the key, and the move
+   * happens only on a row somebody selected.
+   *
+   * Two axes, as the ADR has it. An account that shares the provider's
+   * `projects/` store can open this very conversation (`owners.ts`: several
+   * profiles reach one transcript, and `SessionSummary.alsoInProfiles` is
+   * where the adapter says which) — that is the live transfer, and it is the
+   * same move the rail already makes when you open somebody else's row. An
+   * account that cannot reach the store is offered a *fresh* conversation with
+   * a hand-over in the box instead, which is the ADR's "degrades to a
+   * continuity note" with the note written by this app rather than by the
+   * agent. Asking the agent for one is a turn of its own and is not this.
+   */
+
+  /** The catalogue the offer's rows are drawn from; the remembered one until a fresh one lands. */
+  const [catalogueRows, setCatalogueRows] = useState<readonly ServerProfile[]>(
+    () => cache.get<readonly ServerProfile[]>(CATALOGUE_KEY)?.value ?? [],
+  );
+  /**
+   * What the *other* accounts' plans read.
+   *
+   * The ordinary poll only ever asks about the account in use, which is right
+   * — every other reading costs a subprocess for a number nobody is looking
+   * at. But an offer to move work to an account is a claim about that
+   * account's room right now, and answering it from a reading taken at launch
+   * would be the stale recommendation `PLAN_USAGE_MAX_AGE_MS` exists to
+   * refuse. So the sweep happens exactly once, at the moment the offer becomes
+   * true, which is the one moment the subprocesses are worth spending.
+   */
+  const [otherUsage, setOtherUsage] = useState<ReadonlyMap<string, PlanUsage | null>>(() => new Map());
+  const failoverProbe = useRef({ at: 0, running: false });
+
+  /**
+   * Whether an account's config directory reaches this conversation.
+   *
+   * Answered from the rail's own listing rather than by asking again: the
+   * adapter already reports every profile that reaches a transcript on the
+   * summary itself, and `[profileId, ...alsoInProfiles]` is documented as the
+   * full set. A conversation the rail has not listed yet is `false` here and
+   * re-asked when the picker opens — see {@link openFailoverPicker}.
+   */
+  const reachesThisConversation = useCallback(
+    (profileId: string): boolean => {
+      const id = state.sessionId;
+      // Nothing has been sent, so there is no transcript for an account to be
+      // out of reach of. Every account can take the work; what the list offers
+      // in that case is a fresh start rather than a move, which is the same
+      // thing when there is nothing to continue.
+      if (id === undefined) return true;
+      const row = sessions.find((session) => session.id === id);
+      if (row === undefined) return false;
+      return row.profileId === profileId || (row.alsoInProfiles ?? []).includes(profileId);
+    },
+    [sessions, state.sessionId],
+  );
+
+  /*
+   * Recomputed on every render rather than memoized, and deliberately: the
+   * answer depends on the clock — a reading ages out of usefulness, a window
+   * resets — so a cache keyed on the inputs would go on offering a hand off
+   * after the thing that justified it had passed. It is a handful of scans
+   * over a handful of windows, and it is only asked while nothing is running.
+   */
+  const failoverWhy = live ? null : failoverReason(state.planUsage);
+  /* A boolean rather than the reason itself, because the reason is a fresh
+     object every render and the sweep below wants to run when the *answer*
+     turns over, not when the object does. */
+  const failoverOffered = failoverWhy !== null;
+  const failoverBest =
+    failoverWhy === null
+      ? null
+      : bestFailoverCandidate(
+          failoverCandidates(catalogueRows, accounts, otherUsage, state.settings.profileId, reachesThisConversation),
+        );
+
+  useEffect(() => {
+    if (!failoverOffered) return;
+    const probe = failoverProbe.current;
+    if (probe.running || Date.now() - probe.at < PLAN_USAGE_MIN_INTERVAL_MS) return;
+    probe.running = true;
+    void (async () => {
+      // The remembered readings first, so the rows carry numbers while the
+      // probes run — the same stale-while-revalidate every other slow answer
+      // in here is shown behind. See `cache.ts`.
+      const remembered = new Map<string, PlanUsage | null>();
+      for (const account of accounts) {
+        const reading = cache.get<PlanUsage>(usageKey(account.id));
+        if (reading !== undefined) remembered.set(account.id, reading.value);
+      }
+      if (remembered.size > 0) setOtherUsage(remembered);
+      try {
+        const catalogue = await host.catalogue.read();
+        cache.set(CATALOGUE_KEY, catalogue);
+        setCatalogueRows(catalogue);
+      } catch {
+        // The remembered rows stand; every one of them still says what it is.
+      }
+      const readings = await Promise.all(
+        accounts.map(async (account) => {
+          try {
+            const usage = await host.fetchPlanUsage(account.id, account.providerId);
+            if (usage !== null && usage.available) cache.set(usageKey(account.id), usage);
+            return [account.id, usage] as const;
+          } catch {
+            // No reading is not a number of its own: the row says "stale
+            // reading" and is not offered, which is the honest answer.
+            return [account.id, null] as const;
+          }
+        }),
+      );
+      setOtherUsage(new Map(readings));
+    })().finally(() => {
+      probe.running = false;
+      probe.at = Date.now();
+    });
+  }, [failoverOffered, accounts, host, cache]);
+
+  /* ---------------------------------------------------------------------- */
   /* Resume                                                                  */
   /* ---------------------------------------------------------------------- */
+
+  /**
+   * Read a stored conversation out of an account's store and put it on screen.
+   *
+   * The half of {@link loadSession} that actually opens something, split out
+   * because one caller must skip the checks in front of it: a hand off opens
+   * the conversation that is *already* on screen, under a different account,
+   * and `loadSession` is right to refuse that as a no-op for everybody else.
+   *
+   * `opening` is a line written into the new conversation's transcript before
+   * it is shown, which is the only place a note about *why* this conversation
+   * has just changed accounts can go — the old conversation is about to be
+   * pruned, and a note on it would be a note nobody sees again.
+   */
+  const openUnder = useCallback(
+    async (
+      sessionId: SessionId,
+      title: string,
+      settings: ConversationSettings,
+      opening?: { readonly level: 'info' | 'warn'; readonly text: string; readonly detail?: string },
+    ): Promise<boolean> => {
+      setModal({ kind: 'loading', title: `Opening ${oneLine(title, 60)}…` });
+      try {
+        const events = await host.sessionMessages(settings.profileId, settings.providerId, sessionId, settings.cwd);
+        setModal(null);
+        const next = makeConversation(settings);
+        const outcome = next.loadHistory(sessionId, events);
+        if (!outcome.ok) {
+          next.dispose();
+          setNotice(outcome.reason);
+          return false;
+        }
+        if (opening !== undefined) next.transcript.note(opening.level, opening.text, opening.detail);
+        switchTo(next);
+        return true;
+      } catch (error) {
+        setModal(null);
+        say('error', `Could not open that conversation: ${describeError(error)}`);
+        return false;
+      }
+    },
+    [host, makeConversation, switchTo, say],
+  );
 
   /**
    * Show a stored conversation, reading it in if it is not already alive.
@@ -1096,25 +1301,9 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         switchTo(parked);
         return;
       }
-      const settings = into ?? current.getState().settings;
-      setModal({ kind: 'loading', title: `Opening ${oneLine(title, 60)}…` });
-      try {
-        const events = await host.sessionMessages(settings.profileId, settings.providerId, sessionId, settings.cwd);
-        setModal(null);
-        const next = makeConversation(settings);
-        const outcome = next.loadHistory(sessionId, events);
-        if (!outcome.ok) {
-          next.dispose();
-          setNotice(outcome.reason);
-          return;
-        }
-        switchTo(next);
-      } catch (error) {
-        setModal(null);
-        say('error', `Could not open that conversation: ${describeError(error)}`);
-      }
+      await openUnder(sessionId, title, into ?? current.getState().settings);
     },
-    [host, pool, makeConversation, switchTo, say],
+    [pool, switchTo, openUnder],
   );
 
   /**
@@ -3026,6 +3215,265 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
   );
 
   /**
+   * The settings this conversation would run under on another account.
+   *
+   * The model and its knobs are dropped rather than carried across, the same
+   * way `switchAccount` and the rail's cross-account open drop them: a model
+   * id is the other account's vocabulary, and an effort level set for a model
+   * this one may not have is a setting that would be refused on the first
+   * turn. What is kept is everything the account has no opinion about — the
+   * directory, the permission mode.
+   */
+  const settingsOn = useCallback(
+    (profile: ProfileMetadata): ConversationSettings => ({
+      ...state.settings,
+      profileId: profile.id,
+      providerId: profile.providerId,
+      profileLabel: profile.label,
+      providerLabel: descriptors.get(profile.providerId)?.label ?? profile.providerId,
+      model: undefined,
+      modelLabel: undefined,
+      effort: undefined,
+      fastMode: undefined,
+      ultracode: undefined,
+    }),
+    [state.settings, descriptors],
+  );
+
+  /**
+   * Move this conversation, whole, onto another account.
+   *
+   * The live transfer, and it is the rail's own move with the row picked for
+   * you: a profile that reaches this transcript can read it out of the shared
+   * store and go on from where it stopped. `openUnder` rather than
+   * `loadSession` because the session being opened is the one already on
+   * screen, which `loadSession` correctly treats as nothing to do.
+   *
+   * The interrupt is first and is usually a no-op — the offer is only made
+   * while nothing is running — but Ctrl+H is answerable at any time, and a
+   * turn left running on the account being left would go on spending the
+   * quota that caused the move.
+   */
+  const handOffTo = useCallback(
+    async (candidate: FailoverCandidate): Promise<void> => {
+      const profile = accounts.find((account) => account.id === candidate.id);
+      const sessionId = state.sessionId;
+      if (profile === undefined || sessionId === undefined) {
+        setNotice('That conversation cannot be moved: it has not been stored yet.');
+        return;
+      }
+      if (conversation.isLive) await conversation.interrupt();
+      const title = sessions.find((session) => session.id === sessionId)?.title ?? workspace;
+      // The conversation being built for it seeds its own plan reading; the
+      // one being left must not hand the next account its gauge.
+      planFetchedAt.current = 0;
+      await openUnder(sessionId, title, settingsOn(profile), {
+        level: 'info',
+        text: `Continued on ${profile.label}`,
+        // Neutral about *which* limit and how close it was: the status line
+        // said that, and the row people find later wants the fact that the
+        // account changed and why, not the percentage it changed at.
+        detail: `Handed over from ${state.settings.profileLabel}, whose plan was running out. This conversation now runs as ${profile.label} (${descriptors.get(profile.providerId)?.label ?? profile.providerId}).`,
+      });
+    },
+    [accounts, state.sessionId, state.settings.profileLabel, conversation, sessions, workspace, openUnder, settingsOn, descriptors],
+  );
+
+  /**
+   * Start again on an account that cannot read this conversation.
+   *
+   * ADR 0003's degraded case. A session id only resolves under a config
+   * directory holding its transcript, so at a provider boundary there is no
+   * live move to make — and the answer is not to stop, it is to carry the
+   * *briefing* instead of the history. The note says plainly that nothing
+   * travelled, because an agent that silently knows nothing about the last
+   * hour is worse than one that says so; the composer gets the hand-over to
+   * send, edit or throw away, so the first act on the new account is still a
+   * chosen one.
+   *
+   * With nothing sent yet there is nothing to carry and nothing to apologise
+   * for, so it is an ordinary account switch and says what `switchAccount`
+   * says. A briefing written from an empty transcript would be a line of
+   * boilerplate dropped over whatever somebody was part-way through typing.
+   */
+  const startFreshOn = useCallback(
+    (candidate: FailoverCandidate): void => {
+      const profile = accounts.find((account) => account.id === candidate.id);
+      if (profile === undefined) {
+        setNotice('That account is no longer configured.');
+        return;
+      }
+      const turns = conversation.userTurns();
+      const carried = turns.length > 0 || lastAssistantText(transcript) !== null;
+      const settings = settingsOn(profile);
+      planFetchedAt.current = 0;
+      const next = makeConversation(settings);
+      if (carried) {
+        next.transcript.note(
+          'warn',
+          `Started fresh on ${profile.label} (${settings.providerLabel}).`,
+          'That account cannot read this one’s transcript, so none of the conversation came with it. What is in the composer is a hand-over written from the last turn — send it, change it, or write your own.',
+        );
+      } else {
+        next.transcript.note('info', `Now running as ${profile.label} (${settings.providerLabel}). New conversation.`);
+      }
+      switchTo(next);
+      if (carried) {
+        composerRef.current?.setText(
+          handoverBrief({
+            lastPrompt: turns[turns.length - 1]?.text ?? null,
+            lastReply: lastAssistantText(transcript),
+          }),
+        );
+      }
+    },
+    [accounts, conversation, transcript, settingsOn, makeConversation, switchTo],
+  );
+
+  /**
+   * The offer: what happened, who could take it, and what each row would do.
+   *
+   * Opened by Ctrl+H and by nothing else — no timer, no setting, no
+   * countdown. ADR 0003 rejected the standing auto-move outright, and the
+   * reason is worth keeping in view here: the ranking that would justify one
+   * does not exist yet (`bindingWindow` is workload-blind, `drain-v1` is
+   * unimplemented), and a conversation moved on its own to an account that
+   * immediately stalls spends the user's trust along with their quota. So this
+   * shows the facts and asks.
+   *
+   * Every account is a row, including the ones that cannot be chosen, each
+   * with the one sentence that says why — the profile picker's rule and the
+   * desktop's. An account that cannot read this conversation gets a second row
+   * under it offering the seeded start instead, because "no" and "not that
+   * way" are different answers and only one of them is a dead end.
+   *
+   * Reachability is asked once, when the list opens. The rail's own listing
+   * usually knows already — the adapter reports every profile that reaches a
+   * transcript — and when it does not, the rows say `checking…` while the
+   * question is put to the provider and fill in when it answers.
+   */
+  const openFailoverPicker = useCallback(() => {
+    const now = Date.now();
+    const why = failoverReason(state.planUsage, now);
+    if (why === null) {
+      showFlash('the plan has room; nothing to hand off');
+      return;
+    }
+    const sessionId = state.sessionId;
+    const token = ++pickerToken.current;
+    const stay: PickerItem = {
+      key: FAILOVER_STAY_KEY,
+      label: 'stay here',
+      detail:
+        why.kind === 'rejected'
+          ? 'and wait for the window to come back'
+          : 'and spend the rest of the window here',
+    };
+
+    const present = (reaches: ((profileId: string) => boolean) | null): Omit<PickerModal, 'kind'> => {
+      const title = failoverTitle(why, now);
+      if (reaches === null) {
+        return {
+          title,
+          items: [
+            ...catalogueRows
+              .filter((row) => row.id !== state.settings.profileId)
+              .map((row) => ({ key: `${FAILOVER_MOVE}${row.id}`, label: row.label, disabled: true, reason: 'checking…' })),
+            stay,
+          ],
+          initialKey: FAILOVER_STAY_KEY,
+          token,
+          hint: `asking which accounts can read this conversation… · ${PICKER_KEYS}`,
+          onSelect: () => {
+            setModal(null);
+          },
+        };
+      }
+      const candidates = failoverCandidates(catalogueRows, accounts, otherUsage, state.settings.profileId, reaches, now);
+      // With nothing sent there is no conversation to continue, so every row is
+      // a fresh start and says so rather than promising a move of nothing.
+      const continuing = sessionId !== undefined;
+      const items: PickerItem[] = [];
+      for (const candidate of candidates) {
+        items.push({
+          key: `${continuing ? FAILOVER_MOVE : FAILOVER_SEED}${candidate.id}`,
+          label: continuing ? candidate.label : `start fresh on ${candidate.label}`,
+          detail: [candidate.providerLabel, candidate.pressure]
+            .filter((part): part is string => part !== undefined)
+            .join(' · '),
+          ...(candidate.block === null ? {} : { disabled: true, reason: candidate.block }),
+        });
+        if (candidate.block === 'cannot reach this conversation') {
+          items.push({
+            key: `${FAILOVER_SEED}${candidate.id}`,
+            label: `start fresh on ${candidate.label}`,
+            detail: 'a new conversation, with a hand-over in the box to send or edit',
+          });
+        }
+      }
+      items.push(stay);
+      return {
+        title,
+        items,
+        // The safe row, so an Enter pressed before the list has been read
+        // changes nothing. The same rule `confirm` is built on.
+        initialKey: FAILOVER_STAY_KEY,
+        token,
+        onSelect: (item) => {
+          setModal(null);
+          const id = item.key.slice(item.key.indexOf(':') + 1);
+          const chosen = candidates.find((candidate) => candidate.id === id);
+          if (chosen === undefined) return;
+          if (item.key.startsWith(FAILOVER_MOVE)) void handOffTo(chosen);
+          else if (item.key.startsWith(FAILOVER_SEED)) startFreshOn(chosen);
+        },
+      };
+    };
+
+    const listed = sessionId !== undefined && sessions.some((session) => session.id === sessionId);
+    if (listed || sessionId === undefined) {
+      openPicker(present(reachesThisConversation));
+      return;
+    }
+    openPicker(present(null));
+    void host
+      .listSessionsAcross(accounts.map((account) => ({ id: account.id, providerId: account.providerId })))
+      .then(
+        (list) => {
+          const row = list.find((session) => session.id === sessionId);
+          const reach = new Set(row === undefined ? [] : [row.profileId, ...(row.alsoInProfiles ?? [])]);
+          const fresh = present((profileId) => reach.has(profileId));
+          setModal((current) =>
+            current?.kind === 'picker' && current.token === token ? { ...current, ...fresh, hint: undefined } : current,
+          );
+        },
+        () => {
+          // Unanswered is not "unreachable": every row keeps its place and the
+          // hint says the question went unanswered rather than implying no.
+          setModal((current) =>
+            current?.kind === 'picker' && current.token === token
+              ? { ...current, hint: `could not ask which accounts can read this · ${PICKER_KEYS}` }
+              : current,
+          );
+        },
+      );
+  }, [
+    state.planUsage,
+    state.sessionId,
+    state.settings.profileId,
+    catalogueRows,
+    accounts,
+    otherUsage,
+    sessions,
+    host,
+    reachesThisConversation,
+    openPicker,
+    showFlash,
+    handOffTo,
+    startFreshOn,
+  ]);
+
+  /**
    * Go back to an earlier prompt: the list, and what picking one does.
    *
    * Newest first, because "that came out wrong" is why anybody opens this.
@@ -3196,6 +3644,26 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     if (key.ctrl && input === 'o') {
       if (composerActive && composerRef.current?.isCapturing() === true) return;
       setModal({ kind: 'pager' });
+      return;
+    }
+
+    /*
+     * Ctrl+H opens the hand-off offer. Below the modal guard, because the list
+     * it opens is a modal itself and a key that could open a second one over
+     * the first is a key with two owners.
+     *
+     * A caveat worth knowing before changing this line: on a terminal that has
+     * not negotiated the kitty keyboard protocol, Ctrl+H sends the C0 byte
+     * `\x08` and Ink reports it as `backspace` — indistinguishable from the
+     * Backspace key, which sends `\x7f`. So the press only arrives here as
+     * `ctrl`+`h` on a terminal that reports modifiers, and reading
+     * `key.backspace` instead would cost the composer its rub-out everywhere.
+     * The status line advertises the key because it is the right key; making
+     * it answer on every terminal is a render option away (`kittyKeyboard`,
+     * in `main.tsx`) and is not this feature's to turn on.
+     */
+    if (key.ctrl && input === 'h') {
+      openFailoverPicker();
       return;
     }
 
@@ -3732,6 +4200,13 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
               needing={needing.length}
               {...(flash === undefined ? {} : { flash })}
               {...(update === undefined ? {} : { update })}
+              {...(/*
+                * The offer, worked out here and handed over as words. The bar
+                * draws it in yellow and knows nothing about plans — see
+                * `failover.ts` for what makes a window count as out, and ADR
+                * 0003 for why this is a line and a key rather than a move.
+                */
+              failoverWhy === null ? {} : { failover: { text: failoverLine(failoverWhy, failoverBest) } })}
               /*
                * An armed rewind outranks the other two: it is a state the next
                * Enter behaves differently in, and the only place a person is

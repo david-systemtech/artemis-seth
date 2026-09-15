@@ -99,6 +99,10 @@ describe('KEYMAP: the keys the terminal grew', () => {
     // in front of you, which is exactly why it has to be written down: nobody
     // guesses at a key for a thing they have not noticed the app can do.
     expect(anywhere.get('Ctrl+]')).toContain('needs you');
+    // The offer at the moment a plan runs out. It is on the map whether or
+    // not the status line is showing one, because a key you can only find
+    // once you are already stuck is a key nobody presses.
+    expect(anywhere.get('Ctrl+H')).toContain('another account');
   });
 
   it('writes down the composer keys that only its own header used to mention', () => {

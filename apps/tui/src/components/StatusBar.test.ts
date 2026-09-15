@@ -13,7 +13,7 @@ import { NO_CAPABILITIES, PERMISSION_MODES } from '@rx-artemis/protocol';
 
 import type { ConversationState } from '../conversation.js';
 import { ACCENT } from '../theme.js';
-import { changedSummary, elapsedClock, meterBar, meterCells, meterTone, modeBadge, needYouLabel, workingLine } from './StatusBar.js';
+import { changedSummary, elapsedClock, leftHalf, meterBar, meterCells, meterTone, modeBadge, needYouLabel, workingLine } from './StatusBar.js';
 
 describe('meterBar', () => {
   it('fills in proportion', () => {
@@ -333,5 +333,38 @@ describe('needYouLabel', () => {
     // `0 need you` is columns spent saying that nothing is wrong.
     expect(needYouLabel(0)).toBeUndefined();
     expect(needYouLabel(-1)).toBeUndefined();
+  });
+});
+
+/*
+ * What owns the second line's left half.
+ *
+ * Three things can want it and only one can have it, so the ranking is by how
+ * long each is true for — shortest on top, because that is the only order in
+ * which nothing is lost: the two-second flash clears and the offer under it is
+ * still there. The offer covering the working line is the one case worth a
+ * test of its own, since the sentence it hides reads `idle`, which is both
+ * true and the least useful thing the bar could be saying at the moment an
+ * account has run out of plan.
+ */
+describe('leftHalf', () => {
+  it('leaves the line to the turn when nothing else claims it', () => {
+    expect(leftHalf(undefined, undefined)).toEqual({ kind: 'working' });
+  });
+
+  it('gives the hand-off offer the line over an idle conversation', () => {
+    expect(leftHalf(undefined, { text: '5hr window out · resets 14:30 · hand off to work (12%) · Ctrl+H' })).toEqual({
+      kind: 'failover',
+      text: '5hr window out · resets 14:30 · hand off to work (12%) · Ctrl+H',
+    });
+  });
+
+  it('lets a flash sit on top of the offer, and the offer come back', () => {
+    // The flash is about the key just pressed and lasts two seconds; the offer
+    // lasts until the window rolls. Ranking them the other way round would
+    // mean "pinned" never appeared on an account that was out of plan.
+    const offer = { text: '5hr window out · no other account can take this · Ctrl+H' };
+    expect(leftHalf('pinned', offer)).toEqual({ kind: 'flash', text: 'pinned' });
+    expect(leftHalf(undefined, offer)).toEqual({ kind: 'failover', text: offer.text });
   });
 });

@@ -139,6 +139,19 @@ const GROUPS: readonly KeyGroup[] = [
       { keys: ['Ctrl+O'], does: 'Unfold the whole transcript' },
       { keys: ['Ctrl+T'], does: 'Show or hide the checklist' },
       { keys: ['Ctrl+]'], does: 'Go to the next conversation that needs you' },
+      /*
+       * The offer, when the plan has run out. The row exists whether or not
+       * the line under the composer is showing one: a key nobody can find
+       * until the moment they are already stuck is a key nobody presses.
+       *
+       * Ink reports the bare C0 byte this chord has sent since ASCII as
+       * `backspace`, which is the same thing the Backspace key sends on a
+       * terminal that has not negotiated the kitty keyboard protocol — so on
+       * those terminals the press is indistinguishable from a rub-out and
+       * this key is not reachable. Not marked `planned`, because it is wired
+       * and does work; see the note over the handler in `app.tsx`.
+       */
+      { keys: ['Ctrl+H'], does: 'Hand this conversation to another account' },
       { keys: ['?'], does: 'Open this map, from an empty composer' },
     ],
   },

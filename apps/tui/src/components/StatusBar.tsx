@@ -18,6 +18,20 @@
  * foreground; the clock, the tokens and the key hints are furniture and stay
  * dim, so the eye lands on the words that change meaning.
  *
+ * The second line has one other thing it can become. When this account's plan
+ * has stopped serving — or is about to — and no turn is running, the left half
+ * turns yellow and reads as an offer rather than a status:
+ *
+ *     5hr window out · resets 14:30 · hand off to work (12%) · Ctrl+H
+ *
+ * That is the only place in the app where a limit being reached is mentioned
+ * at all, and a line and a key is deliberately the whole of it: ADR 0003 makes
+ * a hand off a chosen act, so nothing moves until the key is pressed and the
+ * picker it opens is answered. The words are worked out by `failover.ts` and
+ * arrive as a finished string, for the reason everything else here does — this
+ * file is colours and boxes, and which account has room is not a question a
+ * status bar should be asking.
+ *
  * None of that is computed here. The activity is folded out of the event
  * stream by `Conversation` and arrives in its state; the elapsed time is this
  * bar's own clock ticking against `turnStartedAt`, because an elapsed number
@@ -93,6 +107,15 @@ export interface StatusBarProps {
   readonly flash?: string;
   /** What the keys do right now, e.g. for the sidebar. */
   readonly hint?: string;
+  /**
+   * The hand-off offer, when this account's plan has run out or is about to.
+   *
+   * A finished string rather than the reading it was worked out from: which
+   * windows are spent, which accounts have room and which of them can be
+   * reached are all questions `failover.ts` answers and `app.tsx` asks, and a
+   * bar that took the raw plan readings would end up asking them again.
+   */
+  readonly failover?: { readonly text: string };
   /** A newer release than this copy, when the daily check found one. */
   readonly update?: string;
   /**
@@ -292,6 +315,28 @@ export function workingLine(state: ConversationState, now = Date.now()): Working
   };
 }
 
+/**
+ * Which of the three things that can own the second line's left half has it.
+ *
+ * They are ranked by how long each is true for, shortest first, which is the
+ * only ordering that never loses one of them. A flash lasts two seconds and is
+ * about the key just pressed, so it goes on top and the thing underneath is
+ * still there when it clears. The offer lasts until the window rolls, and
+ * covers the working line rather than the other way round because the working
+ * line in that state reads `idle` — the offer is only ever made while nothing
+ * is running — and "idle" is the least useful true sentence available.
+ */
+export type LeftHalf =
+  | { readonly kind: 'flash'; readonly text: string }
+  | { readonly kind: 'failover'; readonly text: string }
+  | { readonly kind: 'working' };
+
+export function leftHalf(flash: string | undefined, failover: { readonly text: string } | undefined): LeftHalf {
+  if (flash !== undefined) return { kind: 'flash', text: flash };
+  if (failover !== undefined) return { kind: 'failover', text: failover.text };
+  return { kind: 'working' };
+}
+
 /** `3 files`, `+42` and `−7`, kept apart because each is painted differently. */
 export interface ChangedSummary {
   readonly files: string;
@@ -347,7 +392,7 @@ export function changedSummary(changed: ConversationState['filesChanged']): Chan
   };
 }
 
-export function StatusBar({ state, flash, hint, update, needing = 0, columns = 0 }: StatusBarProps): React.JSX.Element {
+export function StatusBar({ state, flash, hint, update, failover, needing = 0, columns = 0 }: StatusBarProps): React.JSX.Element {
   const { settings, usage } = state;
   const badge = modeBadge(settings.permissionMode);
   const tokens = totalInputTokens(usage?.tokens);
@@ -363,6 +408,7 @@ export function StatusBar({ state, flash, hint, update, needing = 0, columns = 0
   // terminal holds no interval at all.
   const now = useNow(busy && state.turnStartedAt !== undefined);
   const working = workingLine(state, now);
+  const left = leftHalf(flash, failover);
   const model = settings.modelLabel ?? settings.model ?? 'default model';
   const details = [
     settings.effort,
@@ -400,8 +446,17 @@ export function StatusBar({ state, flash, hint, update, needing = 0, columns = 0
       <Box justifyContent="space-between">
         <Box flexShrink={1} minWidth={0}>
         <Text wrap="truncate">
-          {flash !== undefined ? (
-            <Text color="yellow">{flash}</Text>
+          {left.kind === 'flash' ? (
+            <Text color="yellow">{left.text}</Text>
+          ) : left.kind === 'failover' ? (
+            /* Yellow, which on this line means "a person is the hold-up" — the
+               same colour a waiting permission paints it. It is the right
+               reading here too: the plan has stopped, and the only thing that
+               can move the conversation on is somebody choosing where. */
+            <>
+              <Text color="yellow">{left.text}</Text>
+              {hint !== undefined && <Text dimColor>{` · ${hint}`}</Text>}
+            </>
           ) : (
             <>
               {busy && <Text color={working.stalled ? 'yellow' : ACCENT}>{spinner} </Text>}
