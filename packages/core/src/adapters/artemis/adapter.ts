@@ -731,9 +731,16 @@ class ArtemisRun implements Run {
         this.#emit({ type: 'thinking.delta', messageId, blockIndex, text: fragment } as never);
       },
       text: (text) => {
+        // The same rule the reasoning handler applies, for the same reason:
+        // the server parts two answer blocks with a paragraph break, and at
+        // the head of a row this run opens itself — the first words after a
+        // stretch of reasoning — the break separates nothing.
+        const fresh = blockKind !== 'text';
+        const fragment = fresh ? text.replace(/^\n+/, '') : text;
+        if (fragment === '') return;
         open('text');
-        blockText += text;
-        this.#emit({ type: 'text.delta', messageId, blockIndex, text } as never);
+        blockText += fragment;
+        this.#emit({ type: 'text.delta', messageId, blockIndex, text: fragment } as never);
       },
       close,
     };
