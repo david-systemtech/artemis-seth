@@ -32,6 +32,12 @@
  * prompt as — `${runId}:prompt:${n}` — which is what lets a later replay merge
  * onto it rather than draw it twice; `pushUserMessage`'s own comment says why.
  *
+ * The state also carries *what the agent is doing right now* — the turn's
+ * start time, a one-line activity, and the tokens it has written since. That
+ * reading belongs here rather than in the status bar because it is a fold over
+ * the event stream, and the stream only passes through this class: the bar
+ * gets a snapshot and a clock of its own. See {@link ConversationActivity}.
+ *
  * Nothing here touches Ink or `process`. The driver is an interface the
  * registry satisfies structurally, so the tests hand in a fake and the
  * behaviour above is checked without spawning anything.
@@ -55,10 +61,18 @@ import type {
   RunId,
   RunInput,
   SessionId,
+  ThinkingDeltaEvent,
+  ToolCallId,
   UsageSnapshot,
 } from '@rx-artemis/protocol';
 import { NO_CAPABILITIES, applyPlanLimit } from '@rx-artemis/protocol';
-import { TranscriptModel, frameScheduler, type Scheduler } from '@rx-artemis/transcript';
+import {
+  TranscriptModel,
+  frameScheduler,
+  oneLine,
+  summarizeToolInput,
+  type Scheduler,
+} from '@rx-artemis/transcript';
 
 /** The slice of `RunRegistry` a conversation needs. Satisfied structurally. */
 export interface RunDriver {
@@ -129,6 +143,28 @@ export interface QueuedMessage {
   readonly ts: number;
 }
 
+/**
+ * What the agent is doing this very moment, in words.
+ *
+ * A turn used to be one undifferentiated `working…` from the first token to
+ * the last, which answers neither of the two questions someone actually has
+ * while they wait — *what* is it doing, and *is it still going*. Every other
+ * terminal agent answers the first by promoting something the model already
+ * said: Codex prints the reasoning header, Gemini the thought subject, Claude
+ * Code the tool. So does this. Nothing here is invented or paraphrased — it is
+ * the model's own first line, or the name of the tool it just reached for.
+ *
+ * `since` is when *this* text took the line, not when the turn began, which is
+ * what makes "the same thought for 45 seconds" a thing the bar can notice.
+ */
+export interface ConversationActivity {
+  readonly kind: 'thinking' | 'tool' | 'writing';
+  /** Already one line and already short enough to print. */
+  readonly text: string;
+  /** Host clock when this text took the line. */
+  readonly since: number;
+}
+
 export interface ConversationState {
   readonly settings: ConversationSettings;
   readonly status: ConversationStatus;
@@ -165,6 +201,29 @@ export interface ConversationState {
    * replacement list; known only once a session has started.
    */
   readonly slashCommands: readonly string[];
+  /**
+   * Host clock when the turn now running started, and absent when none is.
+   *
+   * The clock itself is not here — an elapsed *number* in the store would be a
+   * write per second to move one digit, and every subscriber would re-render
+   * for it. What is here is the fixed point a component's own clock subtracts
+   * from, which is the same trade `DelegatedStrip` makes for its rows.
+   */
+  readonly turnStartedAt?: number;
+  /** What the agent is doing right now. Absent until it has said something. */
+  readonly activity?: ConversationActivity;
+  /**
+   * Output tokens this turn, when the provider has reported any mid-turn.
+   *
+   * Separate from {@link usage}, which accumulates across the whole
+   * conversation and answers "what has this cost". This answers "how much has
+   * it written since I pressed Enter", which is the reading that moves while
+   * someone is watching it. Both Claude and Codex emit `delta` usage during a
+   * turn — per assistant message and per token-count report respectively — so
+   * this is real on both; a provider that reports nothing until `run.end`
+   * leaves it undefined for the whole turn, and the bar simply omits it.
+   */
+  readonly turnTokens?: number;
 }
 
 export type Outcome = { readonly ok: true } | { readonly ok: false; readonly reason: string };
@@ -176,10 +235,45 @@ export interface ConversationOptions {
   readonly capabilitiesFor: (providerId: ProviderId) => Capabilities | undefined;
   readonly scheduler?: Scheduler;
   readonly newRunId?: () => RunId;
+  /** The host clock, injected so a test can pin what "now" was. */
+  readonly now?: () => number;
 }
 
 const describe = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+/**
+ * How much of a thought or a tool call the line keeps.
+ *
+ * The status line shares its row with the elapsed time, the token count and
+ * the key hints, and it is the half that truncates. Sixty characters is about
+ * a reasoning header — "Investigating the rendering code" — and well short of
+ * a sentence, which is the right place to stop: the transcript above has the
+ * sentence.
+ */
+const ACTIVITY_CHARS = 60;
+
+/**
+ * A thinking block's first line, as a heading rather than as markdown.
+ *
+ * Models write their reasoning headers in the syntax they write everything
+ * else in — `**Investigating rendering code**`, `## Checking the mapper` — and
+ * the status line has no markdown renderer and should not grow one for this.
+ * So the marks come off and the words stay. Whatever is left is the model's
+ * own phrasing, never a paraphrase.
+ *
+ * Only the marks that are almost always markup: `*` and a backtick. An
+ * underscore is left where it is, because a header naming `user_service.ts` is
+ * far commoner than one set in italics, and a heading with the underscores
+ * filed out of its filenames would be worse than one with a stray `_`.
+ */
+function heading(line: string): string {
+  const bare = line
+    .replace(/[*`]/g, '')
+    .replace(/^\s*#+\s*/, '')
+    .replace(/^\s*[>-]\s+/, '');
+  return oneLine(bare, ACTIVITY_CHARS);
+}
 
 export class Conversation {
   readonly transcript: TranscriptModel;
@@ -187,6 +281,7 @@ export class Conversation {
   readonly #driver: RunDriver;
   readonly #capabilitiesFor: (providerId: ProviderId) => Capabilities | undefined;
   readonly #newRunId: () => RunId;
+  readonly #now: () => number;
   readonly #listeners = new Set<() => void>();
   readonly #eventListeners = new Set<(event: AgentEvent) => void>();
   readonly #unsubscribe: () => void;
@@ -204,6 +299,28 @@ export class Conversation {
   #slashCommands: readonly string[] = [];
   /** A run has reported its own commands, which outrank every seed. */
   #slashCommandsFromRun = false;
+  #turnStartedAt: number | undefined;
+  #activity: ConversationActivity | undefined;
+  #turnTokens: number | undefined;
+  /**
+   * The heading of the last thinking block this turn opened, kept so that a
+   * tool call can hand the line back to it when it finishes. Dropped the
+   * moment the agent starts writing: by then the thought is spent, and
+   * restoring it after the answer has begun would be the line going backwards.
+   */
+  #thinkingText: string | undefined;
+  /**
+   * The thinking block being read for a heading — its identity, the bytes seen
+   * so far, and whether its first line is already known.
+   *
+   * This is the whole of the "keep it cheap" rule. A thinking block arrives as
+   * hundreds of deltas and only its first line is ever printed, so once that
+   * line is settled every further delta costs one boolean: no concatenation,
+   * no scan, no new object, and therefore no new state snapshot either.
+   */
+  #thinkingBlock: { key: string; text: string; settled: boolean } | undefined;
+  /** The tool call currently holding the line, so a sibling's end cannot take it. */
+  #activeToolCallId: ToolCallId | undefined;
   /** The run that most recently ended; background work it started is stopped through it. */
   #lastRunId: RunId | undefined;
   /** Provider-started turns on this session that arrived while a turn of ours was open. See `#fromSibling`. */
@@ -216,6 +333,7 @@ export class Conversation {
     this.#capabilitiesFor = options.capabilitiesFor;
     this.#capabilities = options.capabilitiesFor(options.settings.providerId) ?? NO_CAPABILITIES;
     this.#newRunId = options.newRunId ?? (() => randomUUID() as RunId);
+    this.#now = options.now ?? Date.now;
     this.transcript = new TranscriptModel(options.scheduler ?? frameScheduler);
     this.#snapshot = this.#buildSnapshot();
     this.#unsubscribe = this.#driver.subscribe((event) => this.#onEvent(event));
@@ -271,6 +389,7 @@ export class Conversation {
     if (changesAccount) {
       this.#sessionId = undefined;
       this.#usage = undefined;
+      this.#endTurn();
       this.#capabilities = this.#capabilitiesFor(this.#settings.providerId) ?? NO_CAPABILITIES;
       this.transcript.reset();
     }
@@ -287,6 +406,7 @@ export class Conversation {
     this.#pending = [];
     this.#queued = [];
     this.#status = 'idle';
+    this.#endTurn();
     this.transcript.reset();
     this.#notify();
     return { ok: true };
@@ -369,6 +489,7 @@ export class Conversation {
     this.#pending = [];
     this.#queued = [];
     this.#status = 'idle';
+    this.#endTurn();
     this.#notify();
     return { ok: true };
   }
@@ -474,6 +595,7 @@ export class Conversation {
     this.#status = 'starting';
     this.#pending = [];
     this.#queued = [];
+    this.#beginTurn();
     this.#notify();
 
     const settings = this.#settings;
@@ -510,6 +632,7 @@ export class Conversation {
       if (this.#runId === runId) {
         this.#runId = undefined;
         this.#status = 'idle';
+        this.#endTurn();
       }
       this.#notify();
       return { ok: false, reason };
@@ -590,8 +713,41 @@ export class Conversation {
       case 'message.delivered':
         this.#deliver(event.messageId);
         break;
+      case 'thinking.delta':
+        this.#onThinking(event);
+        break;
+      case 'text.delta':
+        // Text is the answer being written, whatever came before it. The
+        // thought that led here is spent — see `#thinkingText`.
+        if (event.agentId === undefined && event.text.length > 0) {
+          this.#thinkingBlock = undefined;
+          this.#thinkingText = undefined;
+          this.#setActivity('writing', 'writing');
+        }
+        break;
+      case 'tool.start': {
+        if (event.agentId !== undefined) break;
+        const target = summarizeToolInput(event.input);
+        this.#activeToolCallId = event.toolCallId;
+        this.#setActivity(
+          'tool',
+          oneLine(target.length > 0 ? `${event.name} ${target}` : event.name, ACTIVITY_CHARS),
+        );
+        break;
+      }
+      case 'tool.end':
+        // Only the call that is actually on the line may take itself off it:
+        // tools run in parallel, and the first of three to finish must not
+        // blank a line describing one of the other two.
+        if (event.agentId === undefined && event.toolCallId === this.#activeToolCallId) {
+          this.#activeToolCallId = undefined;
+          if (this.#thinkingText === undefined) this.#activity = undefined;
+          else this.#setActivity('thinking', this.#thinkingText);
+        }
+        break;
       case 'usage':
         this.#foldUsage(event.usage);
+        this.#foldTurnTokens(event.usage);
         break;
       case 'background.tasks':
         this.#tasks = event.tasks;
@@ -612,6 +768,7 @@ export class Conversation {
         this.#status = 'idle';
         this.#pending = [];
         this.#queued = [];
+        this.#endTurn();
         /*
          * And nothing else. The run is *not* disposed here, and that omission
          * is load-bearing.
@@ -665,6 +822,10 @@ export class Conversation {
     this.#status = 'running';
     this.#pending = [];
     this.#queued = [];
+    // A provider-started turn is still a turn someone is waiting through, and
+    // its clock starts where we first heard of it — which is the only moment
+    // available, since nothing here asked for it.
+    this.#beginTurn();
     return true;
   }
 
@@ -726,6 +887,96 @@ export class Conversation {
     this.#queued = this.#queued.filter((_, index) => index !== gone);
   }
 
+  /* ---------------------------------------------------------------------- */
+  /* What it is doing, and for how long                                      */
+  /* ---------------------------------------------------------------------- */
+
+  /** A turn is starting: the clock runs and everything the last one said goes. */
+  #beginTurn(): void {
+    this.#endTurn();
+    this.#turnStartedAt = this.#now();
+  }
+
+  /** The turn is over: nothing is happening, so the line must not claim it is. */
+  #endTurn(): void {
+    this.#turnStartedAt = undefined;
+    this.#activity = undefined;
+    this.#turnTokens = undefined;
+    this.#thinkingText = undefined;
+    this.#thinkingBlock = undefined;
+    this.#activeToolCallId = undefined;
+  }
+
+  /**
+   * Put something on the line, and *only* when it is different.
+   *
+   * The reference has to survive an unchanged tick, because a fresh object per
+   * delta would be a fresh state snapshot per delta, which is a re-render per
+   * token of every subscriber of this store. It also keeps `since` honest: the
+   * clock behind "the same thought for 45 seconds" must not be restarted by
+   * the next token of that same thought.
+   */
+  #setActivity(kind: ConversationActivity['kind'], text: string): void {
+    const current = this.#activity;
+    if (current !== undefined && current.kind === kind && current.text === text) return;
+    this.#activity = { kind, text, since: this.#now() };
+  }
+
+  /**
+   * Read a heading out of a thinking block, once, and then stop reading it.
+   *
+   * Only the *first line* is ever wanted, so the block is accumulated only
+   * until that line is known — either a newline arrives, or enough characters
+   * have that the line would be clipped at {@link ACTIVITY_CHARS} anyway and
+   * cannot change what is printed. Either way the answer settles once and the
+   * rest of the block costs nothing. That is also what makes the printed text
+   * stable: a partial first line grown a token at a time would rewrite the
+   * status line on every frame with a word and a half of a header.
+   *
+   * A subagent's reasoning is skipped. `DelegatedStrip` already draws each
+   * delegated agent on its own row, and letting a fan-out of three write to
+   * the main line would make it flicker between three unrelated thoughts while
+   * saying nothing about the agent that is actually being waited on.
+   */
+  #onThinking(event: ThinkingDeltaEvent): void {
+    if (event.agentId !== undefined) return;
+    const key = `${event.messageId}:${String(event.blockIndex)}`;
+    let block = this.#thinkingBlock;
+    if (block === undefined || block.key !== key) {
+      block = { key, text: '', settled: false };
+      this.#thinkingBlock = block;
+    } else if (block.settled) {
+      return;
+    }
+
+    // Leading blank lines are not a heading: a block that opens with one would
+    // otherwise settle on an empty string and never say anything again.
+    block.text = (block.text + event.text).replace(/^\s+/, '');
+    const stop = block.text.indexOf('\n');
+    if (stop === -1 && block.text.length < ACTIVITY_CHARS) return;
+
+    block.settled = true;
+    const text = heading(stop === -1 ? block.text : block.text.slice(0, stop));
+    if (text.length === 0) return;
+    this.#thinkingText = text;
+    this.#setActivity('thinking', text);
+  }
+
+  /**
+   * Output tokens this turn.
+   *
+   * `scope` says how: `delta` events add up, and `cumulative`/`final` are
+   * already the whole of the run — and a run *is* a turn here, which is the
+   * one rule this file is built around, so a cumulative figure needs no
+   * subtraction to become a turn's figure. Ignored when no turn is running,
+   * since a late `usage` belongs to the turn that has already been cleared.
+   */
+  #foldTurnTokens(usage: UsageSnapshot): void {
+    if (this.#turnStartedAt === undefined) return;
+    const output = usage.tokens.outputTokens;
+    this.#turnTokens = usage.scope === 'delta' ? (this.#turnTokens ?? 0) + output : output;
+  }
+
   /** `delta` adds to the running total; `cumulative` and `final` replace it. */
   #foldUsage(usage: UsageSnapshot): void {
     const current = this.#usage;
@@ -767,11 +1018,55 @@ export class Conversation {
       tasks: this.#tasks,
       planUsage: this.#planUsage,
       slashCommands: this.#slashCommands,
+      ...(this.#turnStartedAt === undefined ? {} : { turnStartedAt: this.#turnStartedAt }),
+      ...(this.#activity === undefined ? {} : { activity: this.#activity }),
+      // Zero is not a reading. A provider that has reported usage whose output
+      // count is still nothing has told us nothing worth a column.
+      ...(this.#turnTokens === undefined || this.#turnTokens <= 0
+        ? {}
+        : { turnTokens: this.#turnTokens }),
     };
   }
 
+  /**
+   * Publish, unless nothing observable moved.
+   *
+   * Every event that belongs to this conversation lands here, including each
+   * one of the hundreds of text and thinking deltas in a turn — and before
+   * this comparison each of those replaced the snapshot with an object that
+   * was new but not different, which is a render of the whole app per token.
+   * The transcript never had that problem: its model coalesces into one flush
+   * per frame (`frameScheduler`) and notifies only what changed. This is the
+   * same discipline for the other half of the screen, and it is what lets the
+   * activity line be computed on every delta without costing anything — a
+   * thought whose heading has already settled produces an identical snapshot
+   * and no notification at all, so the status line moves when the transcript
+   * does rather than once per token.
+   *
+   * Field-by-field and by reference, which is sound because every one of these
+   * is replaced wholesale when it changes; `queued` is omitted because it is
+   * derived from `queuedMessages`.
+   */
   #notify(): void {
-    this.#snapshot = this.#buildSnapshot();
+    const next = this.#buildSnapshot();
+    const previous = this.#snapshot;
+    const same =
+      next.settings === previous.settings &&
+      next.status === previous.status &&
+      next.capabilities === previous.capabilities &&
+      next.runId === previous.runId &&
+      next.sessionId === previous.sessionId &&
+      next.usage === previous.usage &&
+      next.pendingPermissions === previous.pendingPermissions &&
+      next.queuedMessages === previous.queuedMessages &&
+      next.tasks === previous.tasks &&
+      next.planUsage === previous.planUsage &&
+      next.slashCommands === previous.slashCommands &&
+      next.turnStartedAt === previous.turnStartedAt &&
+      next.activity === previous.activity &&
+      next.turnTokens === previous.turnTokens;
+    if (same) return;
+    this.#snapshot = next;
     for (const listener of this.#listeners) listener();
   }
 }

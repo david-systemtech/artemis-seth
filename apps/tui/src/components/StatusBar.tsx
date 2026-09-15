@@ -8,6 +8,21 @@
  * desktop's rings show. The second says what is happening now: a spinner
  * while the provider works, what the keys do, tokens and cost so far.
  *
+ *     ⠹ Read apps/tui/src/app.tsx · 1m 04s · 2.3k tok · Enter steers · Esc interrupts
+ *
+ * That second line used to read `working…` from the first token of a turn to
+ * the last, which answers neither question a person has while waiting: what is
+ * it doing, and is it still going. So it now says the thing the agent itself
+ * last said it was doing — its own reasoning header, or the tool and its
+ * target — and how long it has been at it. Only the activity is in the default
+ * foreground; the clock, the tokens and the key hints are furniture and stay
+ * dim, so the eye lands on the words that change meaning.
+ *
+ * None of that is computed here. The activity is folded out of the event
+ * stream by `Conversation` and arrives in its state; the elapsed time is this
+ * bar's own clock ticking against `turnStartedAt`, because an elapsed number
+ * in the store would be a re-render a second to move one digit.
+ *
  * Every value here is read from the conversation's state rather than echoed
  * from the last thing chosen — the mode, in particular, is what the provider
  * *said* it started in, which is why it can differ from the picker until the
@@ -24,6 +39,7 @@ import { isTaskLive, planMeterSlots, type PermissionMode, type PlanMeterSlot } f
 import { contextRatio, formatTokens, formatUsd, totalInputTokens } from '@rx-artemis/transcript';
 
 import type { ConversationState } from '../conversation.js';
+import { useNow } from '../hooks/useNow.js';
 import { useSpinner } from '../hooks/useSpinner.js';
 import { ACCENT } from '../theme.js';
 
@@ -141,19 +157,97 @@ function PlanReading({ slot, cells }: { readonly slot: PlanMeterSlot; readonly c
   );
 }
 
-function describeStatus(state: ConversationState): string {
+/**
+ * How long one unchanging thought may hold the line before the spinner warns.
+ *
+ * Borrowed from Claude Code, which colours its spinner once a turn has been
+ * quiet for a while, and kept honest about what it can actually know: a model
+ * that has thought the same thought for three quarters of a minute without
+ * reaching for a tool is *usually* working on something hard, and
+ * occasionally stuck. The signal is a colour rather than a word for exactly
+ * that reason — it says "worth a glance", which is all it is entitled to say.
+ * A tool call resets it, because tool calls are proof of progress.
+ */
+export const STALLED_MS = 45_000;
+
+/**
+ * Elapsed time for a line that redraws once a second.
+ *
+ * Not `formatDuration`, deliberately. That one is built for a finished
+ * measurement and prints `450ms` and `3.4s` — a precision this line cannot
+ * honour, since it only looks at the clock once a second — and it prints
+ * `1m 4s`, which is a character narrower than `1m 14s`. On a line that
+ * redraws every second, a field that changes width shuffles everything to the
+ * right of it, twice a minute, for the whole turn. Zero-padding costs one
+ * character and buys a column that holds still.
+ */
+export function elapsedClock(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const seconds = total % 60;
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3600);
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  if (total < 60) return `${String(seconds)}s`;
+  if (hours === 0) return `${String(minutes)}m ${pad(seconds)}s`;
+  return `${String(hours)}h ${pad(minutes)}m`;
+}
+
+/**
+ * The left half of the second line, in words.
+ *
+ * Split the way it is drawn: {@link activity} is what the agent is doing and
+ * gets the default foreground, {@link details} is everything that is merely
+ * true and is dim. Keeping the two apart here is what stops the component
+ * having to know which part of a joined string to colour.
+ */
+export interface WorkingLine {
+  /** What is happening, in the agent's own words where it has said any. */
+  readonly activity: string;
+  /** Elapsed, tokens, waiting messages, keys — joined with ` · `, all dim. */
+  readonly details: readonly string[];
+  /** The same thought has held the line for {@link STALLED_MS}. */
+  readonly stalled: boolean;
+}
+
+/**
+ * What the line says, for one state at one moment.
+ *
+ * Pure, and the whole of this bar's logic, so that the component below stays
+ * what it should be: colours and boxes. `now` is an argument rather than a
+ * call to the clock for the same reason `delegatedRows` takes one — it is what
+ * makes the elapsed time and the stall threshold testable at all.
+ */
+export function workingLine(state: ConversationState, now = Date.now()): WorkingLine {
+  const idle = (activity: string): WorkingLine => ({ activity, details: [], stalled: false });
   switch (state.status) {
     case 'idle':
-      return state.sessionId === undefined ? 'ready' : 'idle';
-    case 'starting':
-      return 'starting…';
-    case 'running':
-      return state.queued > 0 ? `working · ${String(state.queued)} queued` : 'working…';
+      return idle(state.sessionId === undefined ? 'ready' : 'idle');
+    // Unchanged, and the one state that overrules the activity: a tool call
+    // parked on a permission prompt is not work in progress, it is a question,
+    // and the card above is asking it.
     case 'awaiting_permission':
-      return 'waiting for you';
+      return idle('waiting for you');
     default:
-      return '';
+      break;
   }
+
+  const { activity } = state;
+  const details: string[] = [];
+  if (state.turnStartedAt !== undefined) details.push(elapsedClock(now - state.turnStartedAt));
+  if (state.turnTokens !== undefined) details.push(`${formatTokens(state.turnTokens)} tok`);
+  // Messages the provider has taken and not yet read. The queued strip names
+  // them; this is the count, for the glance that does not look up.
+  if (state.queued > 0) details.push(`${String(state.queued)} queued`);
+  if (state.capabilities.midRunSteering) details.push('Enter steers');
+  details.push('Esc interrupts');
+
+  return {
+    // `starting…` while the process is still coming up is not a synonym for
+    // `working`: nothing has been asked of the model yet.
+    activity: activity?.text ?? (state.status === 'starting' ? 'starting…' : 'working'),
+    details,
+    stalled: activity?.kind === 'thinking' && now - activity.since >= STALLED_MS,
+  };
 }
 
 export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBarProps): React.JSX.Element {
@@ -166,6 +260,10 @@ export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBar
   const liveTasks = state.tasks.filter(isTaskLive).length;
   const busy = state.status === 'starting' || state.status === 'running';
   const spinner = useSpinner(busy);
+  // The clock runs only while there is a turn to time it against, so an idle
+  // terminal holds no interval at all.
+  const now = useNow(busy && state.turnStartedAt !== undefined);
+  const working = workingLine(state, now);
   const model = settings.modelLabel ?? settings.model ?? 'default model';
   const details = [
     settings.effort,
@@ -207,13 +305,11 @@ export function StatusBar({ state, flash, hint, update, columns = 0 }: StatusBar
             <Text color="yellow">{flash}</Text>
           ) : (
             <>
-              {busy && <Text color={ACCENT}>{spinner} </Text>}
+              {busy && <Text color={working.stalled ? 'yellow' : ACCENT}>{spinner} </Text>}
               <Text dimColor={!busy && state.status !== 'awaiting_permission'} color={state.status === 'awaiting_permission' ? 'yellow' : undefined}>
-                {describeStatus(state)}
+                {working.activity}
               </Text>
-              {busy && (
-                <Text dimColor>{state.capabilities.midRunSteering ? ' · Enter steers · Esc interrupts' : ' · Esc interrupts'}</Text>
-              )}
+              {working.details.length > 0 && <Text dimColor>{` · ${working.details.join(' · ')}`}</Text>}
               {hint !== undefined && <Text dimColor>{` · ${hint}`}</Text>}
             </>
           )}

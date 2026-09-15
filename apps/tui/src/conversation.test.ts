@@ -627,3 +627,270 @@ describe('the messages waiting to be read', () => {
     expect(c.takeBackQueued()).toBeUndefined();
   });
 });
+
+/*
+ * What the agent is doing, and for how long.
+ *
+ * The status line used to say `working…` for every second of every turn. What
+ * it says instead is a fold over the stream that happens here: the turn's
+ * clock, a one-line activity taken from the agent's own words, and the tokens
+ * it has written since the prompt went out. The clock is injected so the
+ * expectations can be exact.
+ */
+describe('Conversation activity', () => {
+  /** A conversation whose idea of "now" a test controls. */
+  function clocked(driver: RunDriver, now: () => number) {
+    return new Conversation({
+      driver,
+      settings,
+      capabilitiesFor: () => CLAUDE,
+      scheduler: syncScheduler,
+      newRunId: ids,
+      now,
+    });
+  }
+
+  /** A live turn, with the clock parked at `start` until a test moves it. */
+  async function turn(start = 1_000) {
+    const driver = fakeDriver();
+    let t = start;
+    const c = clocked(driver, () => t);
+    await c.send('take a look');
+    const runId = c.getState().runId as RunId;
+    driver.emit({ type: 'session.started', runId, sessionId: 's1' as never, providerId: 'claude', cwd: '/repo' });
+    return {
+      driver,
+      c,
+      runId,
+      /** Move the clock. Nothing reads it until the next event. */
+      at: (next: number) => (t = next),
+      /** This turn's events. Routing is by run id, so it is never optional. */
+      emit: (event: Omit<AgentEvent, 'seq' | 'ts' | 'runId'>) => driver.emit({ ...event, runId }),
+      think: (text: string, blockIndex = 0, messageId = 'm1') =>
+        driver.emit({ type: 'thinking.delta', runId, messageId: messageId as never, blockIndex, text }),
+      write: (text: string) =>
+        driver.emit({ type: 'text.delta', runId, messageId: 'm1' as never, blockIndex: 1, text }),
+    };
+  }
+
+  it('starts the turn clock when the turn starts and stops it when it ends', async () => {
+    const { emit, c } = await turn(1_000);
+    expect(c.getState().turnStartedAt).toBe(1_000);
+    emit({ type: 'run.end', reason: 'completed' });
+    // Nothing is running, so nothing may be counting: a clock left ticking
+    // would print a duration for a turn that finished minutes ago.
+    expect(c.getState().turnStartedAt).toBeUndefined();
+  });
+
+  it('times a turn the provider started by itself from when it was heard of', async () => {
+    // An adopted run — the CLI answering about background work of its own —
+    // is a turn someone is waiting through, and the moment it was heard of is
+    // the only start time available.
+    const { driver, emit, c } = await turn(1_000);
+    emit({ type: 'run.end', reason: 'completed' });
+    expect(c.getState().turnStartedAt).toBeUndefined();
+    driver.emit({ type: 'session.started', runId: 'run-adopted' as RunId, sessionId: 's1' as never, providerId: 'claude', cwd: '/repo' });
+    expect(c.getState().status).toBe('running');
+    expect(c.getState().turnStartedAt).toBe(1_000);
+  });
+
+  it('takes the first line of a thinking block and holds it while the block runs on', async () => {
+    const { c, at, think } = await turn(1_000);
+    at(2_000);
+    think('**Investigating ');
+    // Nothing yet: half a header is not a heading, and printing it would
+    // rewrite the status line a word at a time.
+    expect(c.getState().activity).toBeUndefined();
+    think('rendering code**\n');
+    expect(c.getState().activity).toEqual({ kind: 'thinking', text: 'Investigating rendering code', since: 2_000 });
+
+    const settled = c.getState().activity;
+    at(9_000);
+    think('\nThe status bar reads its state from the conversation, so ');
+    think('the fold belongs there rather than in the component.');
+    // Same thought, same object — and the same `since`, which is what the
+    // stall warning is timed against.
+    expect(c.getState().activity).toBe(settled);
+  });
+
+  it('strips the markdown the model wrote its header in', async () => {
+    const { c, think } = await turn();
+    think('## Checking the mapper\nand then the adapter');
+    expect(c.getState().activity?.text).toBe('Checking the mapper');
+  });
+
+  it('settles a header that never ends, rather than saying nothing all turn', async () => {
+    const { c, think } = await turn();
+    // No newline ever arrives, so the line settles at the width the status bar
+    // would clip it to anyway — past which nothing printed can change.
+    think('A'.repeat(200));
+    expect(c.getState().activity?.text).toBe(`${'A'.repeat(59)}…`);
+  });
+
+  it('skips the blank lines a block opens with', async () => {
+    const { c, think } = await turn();
+    think('\n\n');
+    expect(c.getState().activity).toBeUndefined();
+    think('Reading the failing test\n');
+    expect(c.getState().activity?.text).toBe('Reading the failing test');
+  });
+
+  it('reads the next thinking block as a new thought', async () => {
+    const { c, at, think } = await turn();
+    think('First thought\nwith more below');
+    at(30_000);
+    think('Second thought\n', 1);
+    expect(c.getState().activity).toEqual({ kind: 'thinking', text: 'Second thought', since: 30_000 });
+  });
+
+  it('names the tool and its target while one is running', async () => {
+    const { c, at, emit, think } = await turn();
+    think('Looking for the call sites\n');
+    at(5_000);
+    emit({ type: 'tool.start', toolCallId: 't1' as never, name: 'Read', input: { file_path: 'apps/tui/src/app.tsx' } });
+    expect(c.getState().activity).toEqual({ kind: 'tool', text: 'Read apps/tui/src/app.tsx', since: 5_000 });
+    emit({ type: 'tool.start', toolCallId: 't2' as never, name: 'Bash', input: { command: 'pnpm test' } });
+    expect(c.getState().activity?.text).toBe('Bash pnpm test');
+  });
+
+  it('gives the line back to the thought the tool interrupted', async () => {
+    const { c, at, emit, think } = await turn();
+    think('Looking for the call sites\n');
+    emit({ type: 'tool.start', toolCallId: 't1' as never, name: 'Read', input: { file_path: 'a.ts' } });
+    at(20_000);
+    emit({ type: 'tool.end', toolCallId: 't1' as never, status: 'ok' });
+    // The thought returns, but its clock restarts: a tool call is proof of
+    // progress, so the stall warning must not count the time either side of
+    // one as a single unbroken stare.
+    expect(c.getState().activity).toEqual({ kind: 'thinking', text: 'Looking for the call sites', since: 20_000 });
+  });
+
+  it('says nothing in particular when a tool ends with no thought behind it', async () => {
+    const { c, emit } = await turn();
+    emit({ type: 'tool.start', toolCallId: 't1' as never, name: 'Bash', input: { command: 'pnpm test' } });
+    emit({ type: 'tool.end', toolCallId: 't1' as never, status: 'ok' });
+    expect(c.getState().activity).toBeUndefined();
+  });
+
+  it('lets only the call that is on the line take itself off it', async () => {
+    // Tools run in parallel. The first of three to finish must not blank a
+    // line describing one of the other two.
+    const { c, emit } = await turn();
+    emit({ type: 'tool.start', toolCallId: 't1' as never, name: 'Read', input: { file_path: 'a.ts' } });
+    emit({ type: 'tool.start', toolCallId: 't2' as never, name: 'Read', input: { file_path: 'b.ts' } });
+    emit({ type: 'tool.end', toolCallId: 't1' as never, status: 'ok' });
+    expect(c.getState().activity?.text).toBe('Read b.ts');
+  });
+
+  it('says writing once the answer starts, and does not go back to the thought after', async () => {
+    const { c, at, emit, think, write } = await turn();
+    think('Working out the shape\n');
+    at(7_000);
+    write('The status bar ');
+    expect(c.getState().activity).toEqual({ kind: 'writing', text: 'writing', since: 7_000 });
+
+    const first = c.getState().activity;
+    at(8_000);
+    write('reads its state…');
+    // Every token of an answer is the same fact, so it is the same object.
+    expect(c.getState().activity).toBe(first);
+
+    emit({ type: 'tool.start', toolCallId: 't1' as never, name: 'Edit', input: { file_path: 'a.ts' } });
+    emit({ type: 'tool.end', toolCallId: 't1' as never, status: 'ok' });
+    // The thought that led to the answer is spent; restoring it after the
+    // answer has begun would be the line going backwards.
+    expect(c.getState().activity).toBeUndefined();
+  });
+
+  it('ignores a subagent, which has a row of its own', async () => {
+    // `DelegatedStrip` draws every delegated agent. A fan-out of three writing
+    // to the main line would make it flicker between three unrelated thoughts
+    // and say nothing about the agent being waited on.
+    const { c, emit, think } = await turn();
+    think('Reading the mapper\n');
+    emit({ type: 'thinking.delta', messageId: 'm2' as never, blockIndex: 0, text: 'A subagent thinks\n', agentId: 'a1' as never });
+    emit({ type: 'tool.start', toolCallId: 't9' as never, name: 'Grep', input: { pattern: 'x' }, agentId: 'a1' as never });
+    emit({ type: 'text.delta', messageId: 'm2' as never, blockIndex: 0, text: 'hello', agentId: 'a1' as never });
+    expect(c.getState().activity?.text).toBe('Reading the mapper');
+  });
+
+  it("counts the turn's own output tokens from the usage the provider sends mid-turn", async () => {
+    const { c, emit } = await turn();
+    expect(c.getState().turnTokens).toBeUndefined();
+    // Claude and Codex both report `delta` usage during a turn — per assistant
+    // message and per token-count report — so these add up.
+    emit({ type: 'usage', usage: { scope: 'delta', tokens: { inputTokens: 1_200, outputTokens: 800 } } });
+    emit({ type: 'usage', usage: { scope: 'delta', tokens: { inputTokens: 40, outputTokens: 1_540 } } });
+    expect(c.getState().turnTokens).toBe(2_340);
+    // The conversation's own total keeps counting input as well; the two
+    // readings answer different questions and sit at opposite ends of the bar.
+    expect(c.getState().usage?.tokens.outputTokens).toBe(2_340);
+    expect(c.getState().usage?.tokens.inputTokens).toBe(1_240);
+  });
+
+  it('takes a cumulative report as the whole turn, because a run is a turn', async () => {
+    const { c, emit } = await turn();
+    emit({ type: 'usage', usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 500 } } });
+    emit({ type: 'usage', usage: { scope: 'cumulative', tokens: { inputTokens: 20, outputTokens: 900 } } });
+    expect(c.getState().turnTokens).toBe(900);
+  });
+
+  it('starts the next turn from nothing', async () => {
+    const { c, emit, think } = await turn(1_000);
+    think('Reading the mapper\n');
+    emit({ type: 'usage', usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 500 } } });
+    emit({ type: 'run.end', reason: 'completed' });
+
+    const ended = c.getState();
+    expect(ended.activity).toBeUndefined();
+    expect(ended.turnTokens).toBeUndefined();
+    expect(ended.turnStartedAt).toBeUndefined();
+
+    await c.send('now the other one');
+    const next = c.getState();
+    expect(next.turnStartedAt).toBe(1_000);
+    expect(next.activity).toBeUndefined();
+    expect(next.turnTokens).toBeUndefined();
+  });
+
+  it('clears the turn when a start fails, so nothing is left counting', async () => {
+    const driver = fakeDriver();
+    driver.start.mockRejectedValueOnce(new Error('no such profile'));
+    const c = clocked(driver, () => 1_000);
+    expect(await c.send('hello')).toEqual({ ok: false, reason: 'no such profile' });
+    expect(c.getState().turnStartedAt).toBeUndefined();
+  });
+
+  it('forgets the turn when the screen is cleared', async () => {
+    const { c, emit, think } = await turn();
+    think('Reading the mapper\n');
+    emit({ type: 'run.end', reason: 'completed' });
+    expect(c.reset()).toEqual({ ok: true });
+    expect(c.getState().turnStartedAt).toBeUndefined();
+    expect(c.getState().activity).toBeUndefined();
+  });
+
+  it('publishes nothing for a delta that changes nothing', async () => {
+    // The point of settling a heading once. Before this, every token of a turn
+    // replaced the state with an object that was new but not different — a
+    // re-render of the whole app per token, for a line that cannot change.
+    const { c, think, write } = await turn();
+    think('Reading the mapper\n');
+    const settled = c.getState();
+
+    const changed = vi.fn();
+    const stop = c.subscribe(changed);
+    think('There is a lot of it, and ');
+    think('none of it belongs on the status line.');
+    write('So');
+    expect(changed).toHaveBeenCalledTimes(1); // the one that said `writing`
+
+    const writing = c.getState();
+    write(' the fold');
+    write(' lives in the conversation.');
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(c.getState()).toBe(writing);
+    expect(settled).not.toBe(writing);
+    stop();
+  });
+});
