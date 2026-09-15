@@ -17,6 +17,15 @@
  * — and everything the status bar says about "queued" or "wait for this turn"
  * falls out of which path was taken.
  *
+ * The steers that have gone out and not been read yet are kept as a *list*, not
+ * a tally. The provider folds a mid-turn message in at its next tool break, and
+ * that fold is invisible from outside its process: the only thing that can
+ * strike an entry is the `message.delivered` naming the one message that was
+ * read, and a count cannot say *which* one it lost. Keeping the text as well
+ * answers the question a person actually has — what am I waiting on? — and is
+ * what makes {@link Conversation.takeBackQueued} possible at all. The desktop's
+ * `PaneState.queuedSteers` made the same move, for the same reason.
+ *
  * The transcript is `@rx-artemis/transcript`'s model, the same one the desktop
  * renderer draws from, fed the same `AgentEvent`s. The optimistic user row is
  * pushed before the round-trip under the identity the registry will file the
@@ -90,6 +99,36 @@ export interface ConversationSettings {
 
 export type ConversationStatus = 'idle' | 'starting' | 'running' | 'awaiting_permission';
 
+/**
+ * When a waiting message is expected to be read.
+ *
+ * `next-tool-break` is the one that happens: the provider accepted a steer and
+ * will fold it in at its next tool boundary. `after-turn` would be a message
+ * *Artemis* is sitting on until the turn ends, and no path here does that —
+ * `send()` refuses a mid-turn message on a provider without `midRunSteering`
+ * rather than parking the text, so the composer keeps the words and nothing is
+ * queued. The kind is named anyway because the strip has to label whatever it
+ * is handed, and a holding queue is the obvious next thing someone adds; a
+ * label invented at that point would have to be invented in the component.
+ */
+export type QueuedDelivery = 'next-tool-break' | 'after-turn';
+
+/** One message sent but not yet read, as the strip draws it. */
+export interface QueuedMessage {
+  /**
+   * The identity the message was sent under — `${runId}:prompt:${n}`, the same
+   * string the optimistic transcript row claims. It is what a
+   * `message.delivered` names when the provider reads this one, so it is the
+   * only thing that can strike the right entry rather than an arbitrary one.
+   */
+  readonly id: string;
+  /** What was typed, whole. The strip truncates; the state does not. */
+  readonly text: string;
+  readonly delivery: QueuedDelivery;
+  /** When it was sent, for a strip that may one day want to age a row. */
+  readonly ts: number;
+}
+
 export interface ConversationState {
   readonly settings: ConversationSettings;
   readonly status: ConversationStatus;
@@ -99,7 +138,18 @@ export interface ConversationState {
   readonly usage?: UsageSnapshot;
   /** Open permission requests, oldest first. The card draws the first. */
   readonly pendingPermissions: readonly PermissionRequest[];
-  /** Steers accepted by the provider but not yet delivered to the model. */
+  /**
+   * Steers accepted by the provider but not yet delivered to the model, oldest
+   * first — which is also the order they will be read in.
+   */
+  readonly queuedMessages: readonly QueuedMessage[];
+  /**
+   * How many of {@link queuedMessages} there are, for the status line.
+   *
+   * Derived from the list rather than counted alongside it: a tally and a list
+   * that can drift apart is the bug this list was built to end, and two
+   * surfaces reading one array cannot disagree about a message.
+   */
   readonly queued: number;
   /**
    * Background work, as the provider last reported it — a replacement list,
@@ -148,7 +198,7 @@ export class Conversation {
   #sessionId: SessionId | undefined;
   #usage: UsageSnapshot | undefined;
   #pending: PermissionRequest[] = [];
-  #queued = 0;
+  #queued: readonly QueuedMessage[] = [];
   #tasks: readonly BackgroundTask[] = [];
   #planUsage: PlanUsage | null = null;
   #slashCommands: readonly string[] = [];
@@ -235,7 +285,7 @@ export class Conversation {
     this.#usage = undefined;
     this.#runId = undefined;
     this.#pending = [];
-    this.#queued = 0;
+    this.#queued = [];
     this.#status = 'idle';
     this.transcript.reset();
     this.#notify();
@@ -274,6 +324,33 @@ export class Conversation {
   }
 
   /**
+   * Take the newest waiting message off the list and hand its text back.
+   *
+   * What this cannot do, and must not pretend to: un-send it. `driver.send` has
+   * already resolved, which means the provider is holding that message and will
+   * read it at its next tool break whatever happens here — and `RunDriver` has
+   * no retract, because the registry has none to expose and no adapter could
+   * honour one invented at this layer. Nor does the transcript row go: the
+   * message really was sent, and a row that vanished would be the screen lying
+   * about it. Even Esc is not a cancel — the CLI's queue survives an interrupt
+   * by design, so interrupting makes the message be read *sooner*.
+   *
+   * So what it is for is the honest half: Artemis stops counting the message as
+   * outstanding, and the words come back into the composer where they can be
+   * edited and sent again as the next turn's prompt. That is the whole of what
+   * the strip's header offers, and the *newest* is the right one to offer —
+   * it is the one still fresh in the typist's head, and the one the provider is
+   * least likely to have reached already.
+   */
+  takeBackQueued(): string | undefined {
+    const newest = this.#queued.at(-1);
+    if (newest === undefined) return undefined;
+    this.#queued = this.#queued.slice(0, -1);
+    this.#notify();
+    return newest.text;
+  }
+
+  /**
    * Replace the screen with a stored conversation and continue it.
    *
    * The events come from the provider's own store, already flagged `replay`,
@@ -290,7 +367,7 @@ export class Conversation {
     this.#usage = undefined;
     this.#runId = undefined;
     this.#pending = [];
-    this.#queued = 0;
+    this.#queued = [];
     this.#status = 'idle';
     this.#notify();
     return { ok: true };
@@ -396,7 +473,7 @@ export class Conversation {
     this.#runId = runId;
     this.#status = 'starting';
     this.#pending = [];
-    this.#queued = 0;
+    this.#queued = [];
     this.#notify();
 
     const settings = this.#settings;
@@ -442,14 +519,23 @@ export class Conversation {
   async #steer(runId: RunId, prompt: string, attachments: readonly Attachment[] = []): Promise<Outcome> {
     const handle = this.#driver.get(runId);
     const n = (handle?.promptCount ?? 1) + 1;
-    const rowId = this.transcript.pushUserMessage(prompt, attachments.length > 0 ? attachments : undefined, `${runId}:prompt:${n}`);
+    const messageId = `${runId}:prompt:${n}`;
+    const rowId = this.transcript.pushUserMessage(prompt, attachments.length > 0 ? attachments : undefined, messageId);
     try {
       const outcome =
         attachments.length > 0
           ? await this.#driver.send(runId, prompt, attachments)
           : await this.#driver.send(runId, prompt);
       this.transcript.confirmUserMessage(rowId);
-      if (!outcome.deliveredImmediately) this.#queued += 1;
+      // Queued under the id the registry filed it as — the same one the row
+      // above claimed, and the one a `message.delivered` will name. The
+      // provider has taken it; nothing has seen it read it.
+      if (!outcome.deliveredImmediately) {
+        this.#queued = [
+          ...this.#queued,
+          { id: messageId, text: prompt, delivery: 'next-tool-break', ts: Date.now() },
+        ];
+      }
       this.#notify();
       return { ok: true };
     } catch (error) {
@@ -502,7 +588,7 @@ export class Conversation {
         if (this.#status === 'awaiting_permission' && this.#pending.length === 0) this.#status = 'running';
         break;
       case 'message.delivered':
-        this.#queued = Math.max(0, this.#queued - 1);
+        this.#deliver(event.messageId);
         break;
       case 'usage':
         this.#foldUsage(event.usage);
@@ -525,7 +611,7 @@ export class Conversation {
         this.#runId = undefined;
         this.#status = 'idle';
         this.#pending = [];
-        this.#queued = 0;
+        this.#queued = [];
         /*
          * And nothing else. The run is *not* disposed here, and that omission
          * is load-bearing.
@@ -578,7 +664,7 @@ export class Conversation {
     this.#runId = event.runId;
     this.#status = 'running';
     this.#pending = [];
-    this.#queued = 0;
+    this.#queued = [];
     return true;
   }
 
@@ -613,6 +699,31 @@ export class Conversation {
     if (event.type === 'run.end') this.#siblings.delete(event.runId);
     this.#notify();
     for (const listener of this.#eventListeners) listener(event);
+  }
+
+  /**
+   * Strike the waiting message a `message.delivered` names.
+   *
+   * By id where one matches: the event carries the identity the message was sent
+   * under, so this is the one case where the *right* entry can be removed rather
+   * than a plausible one — and a provider that reads a later message first (it
+   * decides the order, not us) is then reported correctly.
+   *
+   * Otherwise the oldest goes, and there is a real case for it: the id is
+   * `promptCount + 1`, and an adopted run — one the provider started, which
+   * {@link #adopt} takes on — reports no `promptCount` at all, so the steer
+   * claims `:prompt:2` while the registry, whose own count is still at zero,
+   * files it as `:prompt:1`. The delivery then names an id this list does not
+   * hold. Dropping it would leave the strip showing a message the agent is
+   * plainly acting on, which is the failure the list was built to end;
+   * deliveries arrive in the order the provider reads them, so oldest-first is
+   * wrong only about *which* row goes, never about how many.
+   */
+  #deliver(messageId: string): void {
+    if (this.#queued.length === 0) return;
+    const named = this.#queued.findIndex((message) => message.id === messageId);
+    const gone = named === -1 ? 0 : named;
+    this.#queued = this.#queued.filter((_, index) => index !== gone);
   }
 
   /** `delta` adds to the running total; `cumulative` and `final` replace it. */
@@ -651,7 +762,8 @@ export class Conversation {
       ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
       ...(this.#usage === undefined ? {} : { usage: this.#usage }),
       pendingPermissions: this.#pending,
-      queued: this.#queued,
+      queuedMessages: this.#queued,
+      queued: this.#queued.length,
       tasks: this.#tasks,
       planUsage: this.#planUsage,
       slashCommands: this.#slashCommands,

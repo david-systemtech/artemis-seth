@@ -504,3 +504,126 @@ describe('a provider turn arriving while a prompt is waiting', () => {
     expect(c.getState().tasks.map((row) => row.status)).toEqual(['running']);
   });
 });
+
+/*
+ * A steer the provider accepted is not a steer it has read.
+ *
+ * It sits with the CLI until the next tool break, and the fold is invisible from
+ * out here: the only thing that says a particular message was read is the
+ * `message.delivered` that names it. So the queue is a list of messages and not
+ * a tally — the tally was the thing nobody could take a message off, and the
+ * thing that could not say *which* two of them the status line meant.
+ *
+ * What these pin: the text survives, in reading order; a delivery strikes the
+ * entry it names; the newest can be handed back to the composer; and the end of
+ * the turn ends the queue with it.
+ */
+describe('the messages waiting to be read', () => {
+  /**
+   * Number the fake's prompts the way the registry numbers its own.
+   *
+   * A steer works out the identity the registry will file it under from
+   * `RunHandle.promptCount`, which the registry advances per prompt accepted.
+   * The fake's handle is static, so without this every steer would claim
+   * `:prompt:2` — two entries under one id, which a real run does not produce
+   * and a test must not lean on.
+   */
+  function numberPrompts(driver: ReturnType<typeof fakeDriver>): void {
+    const handleOf = driver.get;
+    driver.get = (runId) => {
+      const handle = handleOf(runId);
+      return handle === undefined
+        ? undefined
+        : { ...handle, promptCount: 1 + driver.send.mock.calls.length };
+    };
+  }
+
+  /** A live turn with two steers the provider has taken and not read. */
+  async function withTwoQueued() {
+    const driver = fakeDriver();
+    const c = conversation(driver);
+    await c.send('the opening prompt');
+    numberPrompts(driver);
+    await c.send('also check the migration script');
+    await c.send('and rerun the e2e suite');
+    return { driver, c, runId: c.getState().runId as RunId };
+  }
+
+  it('keeps the text of each one, in the order the provider will read them', async () => {
+    const { c, runId } = await withTwoQueued();
+    const state = c.getState();
+    expect(state.queuedMessages.map((message) => message.text)).toEqual([
+      'also check the migration script',
+      'and rerun the e2e suite',
+    ]);
+    // Under the identity the registry filed each one as, which is what a
+    // delivery will name and what the optimistic row already claimed.
+    expect(state.queuedMessages.map((message) => message.id)).toEqual([
+      `${runId}:prompt:2`,
+      `${runId}:prompt:3`,
+    ]);
+    // Both are with the provider already: nothing in the TUI holds a message
+    // back itself, so `after-turn` never occurs on this path.
+    expect(state.queuedMessages.map((message) => message.delivery)).toEqual([
+      'next-tool-break',
+      'next-tool-break',
+    ]);
+    // The number the status line prints is the length of the list, so the two
+    // cannot disagree about a message the way a count and a fold did.
+    expect(state.queued).toBe(2);
+  });
+
+  it('strikes the message a delivery names and leaves the other waiting', async () => {
+    const { driver, c, runId } = await withTwoQueued();
+    driver.emit({ type: 'message.delivered', runId, messageId: `${runId}:prompt:2` as never });
+    expect(c.getState().queuedMessages.map((message) => message.text)).toEqual(['and rerun the e2e suite']);
+    expect(c.getState().queued).toBe(1);
+  });
+
+  it('strikes the oldest when the delivery names an id it does not hold', async () => {
+    // Which happens for real on an adopted run: it reports no `promptCount`, so
+    // a steer claims `:prompt:2` while the registry files it as `:prompt:1`.
+    // A delivery nobody can match is still a delivery, and a strip left
+    // counting a message the agent is acting on is the old bug.
+    const { driver, c, runId } = await withTwoQueued();
+    driver.emit({ type: 'message.delivered', runId, messageId: `${runId}:prompt:1` as never });
+    expect(c.getState().queuedMessages.map((message) => message.text)).toEqual(['and rerun the e2e suite']);
+  });
+
+  it('hands the newest one back and stops counting it', async () => {
+    const { c } = await withTwoQueued();
+    expect(c.takeBackQueued()).toBe('and rerun the e2e suite');
+    expect(c.getState().queuedMessages.map((message) => message.text)).toEqual([
+      'also check the migration script',
+    ]);
+    expect(c.getState().queued).toBe(1);
+    expect(c.takeBackQueued()).toBe('also check the migration script');
+    expect(c.getState().queuedMessages).toEqual([]);
+    // Nothing waiting, nothing to give back — the composer keeps what it has.
+    expect(c.takeBackQueued()).toBeUndefined();
+  });
+
+  it('does not pretend to un-send what it took back', async () => {
+    // The provider has the message and will read it whatever happens here. So
+    // nothing is retracted, nothing is interrupted, and the row the message
+    // already drew stays exactly where it is: it really was sent.
+    const { driver, c } = await withTwoQueued();
+    c.takeBackQueued();
+    expect(driver.interrupt).not.toHaveBeenCalled();
+    expect(
+      rows(c)
+        .filter((row) => row?.kind === 'user')
+        .map((row) => (row as { text: string }).text),
+    ).toEqual(['the opening prompt', 'also check the migration script', 'and rerun the e2e suite']);
+  });
+
+  it('empties the queue when the turn ends', async () => {
+    // Whatever the provider had not read it will never read now, under this run:
+    // the queue died with the turn that was holding it.
+    const { driver, c, runId } = await withTwoQueued();
+    driver.emit({ type: 'run.end', runId, reason: 'completed' });
+    expect(c.getState().queuedMessages).toEqual([]);
+    expect(c.getState().queued).toBe(0);
+    expect(c.takeBackQueued()).toBeUndefined();
+  });
+});
