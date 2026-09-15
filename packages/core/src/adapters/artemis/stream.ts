@@ -33,6 +33,20 @@ export interface ServerExtensionsDelta {
    */
   readonly ignored?: readonly string[];
   /**
+   * The run is on a different account from the route that was sent, because
+   * that account holds the conversation being resumed. On the first chunk,
+   * beside `ignored`, so the transcript can say so before the first token.
+   * Routes and the holding account's own naming, as the server's catalogue
+   * spells them.
+   */
+  readonly redirected?: {
+    readonly from: string;
+    readonly to: string;
+    readonly profileId: string;
+    readonly profileSlug: string;
+    readonly profileLabel: string;
+  };
+  /**
    * The server's own run id, announced once and early on a turn that opted into
    * a remote feature. Distinct from the adapter's local run id — this is the
    * address every native `/api/v0/runs/{id}` route takes, so it is learned off
@@ -160,6 +174,23 @@ function readExtensions(value: unknown): ServerExtensionsDelta | undefined {
   if (Array.isArray(ignored)) {
     const names = ignored.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0);
     if (names.length > 0) out.ignored = names;
+  }
+  const redirected = asRecord(record['redirected']);
+  if (redirected !== undefined) {
+    const from = asString(redirected['from']);
+    const to = asString(redirected['to']);
+    const profileId = asString(redirected['profileId']);
+    const profileSlug = asString(redirected['profileSlug']);
+    const profileLabel = asString(redirected['profileLabel']);
+    if (
+      from !== undefined &&
+      to !== undefined &&
+      profileId !== undefined &&
+      profileSlug !== undefined &&
+      profileLabel !== undefined
+    ) {
+      out.redirected = { from, to, profileId, profileSlug, profileLabel };
+    }
   }
   const runId = asString(record['runId']);
   if (runId !== undefined) out.runId = runId;

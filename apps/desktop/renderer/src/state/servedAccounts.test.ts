@@ -17,6 +17,7 @@ import {
   servedAccountLabel,
   servedAccountSlug,
   servedGaugeFor,
+  servedResumeModel,
   type ServedAccount,
 } from './servedAccounts';
 
@@ -220,5 +221,44 @@ describe('sectionServedAccounts', () => {
 
   it('has no sections at all when the server serves nothing', () => {
     expect(sectionServedAccounts([], providers)).toEqual([]);
+  });
+});
+
+describe('servedResumeModel', () => {
+  const catalogue = [
+    option({ id: 'gmail/opus', accountSlug: 'gmail' }),
+    option({ id: 'gmail/sonnet', accountSlug: 'gmail' }),
+    option({ id: 'andyou/opus', accountSlug: 'andyou' }),
+    option({ id: 'andyou/haiku', accountSlug: 'andyou' }),
+  ];
+
+  it('keeps a choice already on the holding account', () => {
+    expect(servedResumeModel(catalogue, 'andyou', 'andyou/haiku')).toBe('andyou/haiku');
+  });
+
+  it('moves to the same model on the holding account', () => {
+    expect(servedResumeModel(catalogue, 'andyou', 'gmail/opus')).toBe('andyou/opus');
+  });
+
+  it('falls back to the holding account’s first model', () => {
+    expect(servedResumeModel(catalogue, 'andyou', 'gmail/sonnet')).toBe('andyou/opus');
+  });
+
+  it('takes the first model when the column had no preference', () => {
+    expect(servedResumeModel(catalogue, 'andyou', null)).toBe('andyou/opus');
+  });
+
+  it('composes the route when the catalogue has not arrived', () => {
+    expect(servedResumeModel([], 'andyou', 'gmail/opus')).toBe('andyou/opus');
+  });
+
+  it('names nothing when it has nothing to name', () => {
+    expect(servedResumeModel([], 'andyou', null)).toBeNull();
+  });
+
+  it('reads the account off the route prefix for an older catalogue', () => {
+    const old = [option({ id: 'gmail/opus' }), option({ id: 'andyou/opus' })];
+    expect(servedResumeModel(old, 'andyou', 'gmail/opus')).toBe('andyou/opus');
+    expect(servedResumeModel(old, 'andyou', 'andyou/opus')).toBe('andyou/opus');
   });
 });

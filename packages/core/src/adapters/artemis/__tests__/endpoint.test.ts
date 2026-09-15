@@ -1179,3 +1179,56 @@ describe('a stream that dies under the run', () => {
     ]);
   });
 });
+
+/**
+ * A served row carries the account that holds it.
+ *
+ * On this machine the row's `profileId` is the Artemis Server profile — one
+ * profile wearing every account the server offers — so the account whose store
+ * actually has the transcript has to travel separately, or a resume goes out
+ * on whatever route the column was showing and the server's provider cannot
+ * find the conversation.
+ */
+describe('listing served conversations', () => {
+  it('carries the serving account, and tolerates a server that sends none', async () => {
+    const { origin } = await serve((request, response) => {
+      expect(request.url).toBe('/api/v0/sessions');
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(
+        JSON.stringify({
+          object: 'artemis.sessions',
+          sessions: [
+            {
+              id: 'sess-1',
+              title: 'Held by work',
+              updatedAt: 5,
+              profileSlug: 'work-max',
+              profileId: 'p1',
+              providerId: 'claude',
+              cwd: '/srv/repo',
+            },
+            // A 2.4.x server: slug only, no id.
+            { id: 'sess-2', title: 'From an older server', updatedAt: 4, profileSlug: 'work-max', cwd: '/srv/repo' },
+          ],
+        }),
+      );
+    });
+
+    const adapter = createArtemisAdapter();
+    const page = await adapter.listSessions?.({
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok_123' },
+      cwd: process.cwd(),
+      profileId: 'desk-1' as never,
+    });
+
+    expect(page?.sessions[0]).toMatchObject({
+      id: 'sess-1',
+      profileId: 'desk-1',
+      accountSlug: 'work-max',
+      accountId: 'p1',
+      cwd: '/srv/repo',
+    });
+    expect(page?.sessions[1]).toMatchObject({ id: 'sess-2', accountSlug: 'work-max' });
+    expect(page?.sessions[1]).not.toHaveProperty('accountId');
+  });
+});

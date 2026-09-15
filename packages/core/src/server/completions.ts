@@ -88,6 +88,7 @@ import type {
   ServerModel,
   SessionDelegatedWork,
 } from '@rx-artemis/protocol';
+import type { RouteRedirect } from './sessionHome.js';
 
 /* -------------------------------------------------------------------------- */
 /* The seam                                                                   */
@@ -242,6 +243,12 @@ export interface TurnRequest {
   readonly extensions: ArtemisChatExtensions;
   /** Parameters accepted but not applied, echoed back so a caller can see them. */
   readonly ignored: readonly string[];
+  /**
+   * The run is on a different account from the one the route named, because
+   * that account is the one holding the conversation being resumed. Echoed
+   * back beside {@link ignored}, for the same reason. See `sessionHome.ts`.
+   */
+  readonly redirected?: RouteRedirect;
   /** Aborts when the client hangs up. */
   readonly signal?: { readonly aborted: boolean; addEventListener?: unknown };
   /**
@@ -1090,6 +1097,7 @@ export function chatResponse(input: {
   readonly created: number;
   readonly result: TurnResult;
   readonly ignored: readonly string[];
+  readonly redirected?: RouteRedirect;
   readonly resolvedModel?: string;
 }): OpenAiChatResponse {
   const { result } = input;
@@ -1114,6 +1122,7 @@ export function chatResponse(input: {
       ...(result.sessionId === undefined ? {} : { sessionId: result.sessionId }),
       ...(input.resolvedModel === undefined ? {} : { resolvedModel: input.resolvedModel }),
       ...(input.ignored.length === 0 ? {} : { ignored: input.ignored }),
+      ...(input.redirected === undefined ? {} : { redirected: input.redirected }),
       ...(result.activity.length === 0 ? {} : { activity: result.activity }),
       endReason: result.endReason,
       // Only reached when the turn produced text *and* failed — a failure with

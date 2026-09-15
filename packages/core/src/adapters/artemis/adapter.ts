@@ -408,6 +408,8 @@ class ArtemisRun implements Run {
   #notices = 0;
   /** Whether the "instructions set aside" notice has been said. Once per run. */
   #instructionsDropped = false;
+  /** The redirect notice is said once per run, like the instructions one. */
+  #redirectNoted = false;
   /**
    * The ids this run's caller filed its steers under, in send order.
    *
@@ -764,6 +766,20 @@ class ArtemisRun implements Run {
       this.#instructionsDropped = true;
       this.#notice(
         "The serving account's provider cannot take standing instructions, so this run started without your prompt library. Pick an account on a provider that can (Claude, or a local model) to have them apply.",
+      );
+    }
+    /*
+     * The server moved the run to the account that holds this conversation.
+     * The column asked for another one — a route it was left on — and the
+     * transcript lives in exactly one account's store, so the alternative was
+     * a failed turn. Said once, so the status line's account and the account
+     * being billed are never silently different.
+     */
+    if (extensions?.redirected !== undefined && !this.#redirectNoted) {
+      this.#redirectNoted = true;
+      const { redirected } = extensions;
+      this.#notice(
+        `This conversation is held by the account "${redirected.profileLabel}", so it continued there on ${redirected.to} rather than on ${redirected.from}. Pick a model on that account to keep the status line honest.`,
       );
     }
     // Learned like the session id: the server announces it once and early,
@@ -1175,6 +1191,17 @@ async function fetchServerSessions(
       // Carried through so `isArchived` can answer for a served conversation
       // the same way it answers for a local one.
       ...(typeof row.tag === 'string' ? { tag: row.tag } : {}),
+      // The server's own account that holds the transcript — what a resume
+      // has to land on, whatever route the column is showing. The slug is
+      // what routes are spelled in; the id is what a client keys on. Absent
+      // from a server too old to send them, and the resume then goes where
+      // the column points and relies on the server's redirect.
+      ...(typeof row.profileSlug === 'string' && row.profileSlug.length > 0
+        ? { accountSlug: row.profileSlug }
+        : {}),
+      ...(typeof row.profileId === 'string' && row.profileId.length > 0
+        ? { accountId: row.profileId }
+        : {}),
       updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : 0,
     });
   }
