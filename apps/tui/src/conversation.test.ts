@@ -894,3 +894,334 @@ describe('Conversation activity', () => {
     stop();
   });
 });
+
+/*
+ * Going back to an earlier prompt.
+ *
+ * The protocol has carried the intent all along — `rewindToMessageId`, with or
+ * without `forkSession`, gated on `Capabilities.rewind` — and nothing in the
+ * terminal used it. What these pin is the model half: which prompts can be
+ * pointed at, which of the two moves a provider gets, that the next `start()`
+ * carries the truncation exactly once, and that a cut which turns out never to
+ * have happened puts the conversation back.
+ */
+describe('going back to an earlier prompt', () => {
+  const REWINDS: Capabilities = { ...CLAUDE, rewind: true, forkSession: true };
+
+  function rewinding(capabilities: Capabilities = REWINDS) {
+    const driver = fakeDriver(capabilities);
+    const c = new Conversation({
+      driver,
+      settings,
+      capabilitiesFor: () => capabilities,
+      scheduler: syncScheduler,
+      newRunId: ids,
+    });
+    return { driver, c };
+  }
+
+  /**
+   * Two stored turns, as a resume replays them.
+   *
+   * Replayed rows are the ones that carry the provider's own message ids, which
+   * is the whole reason the picker can point at them — see {@link UserTurn}.
+   */
+  function storedTurns(): readonly AgentEvent[] {
+    const old = 'old-run' as RunId;
+    return [
+      { type: 'text.complete', runId: old, seq: 0, ts: 10, messageId: 'u-1', role: 'user', text: 'add a status line', replay: true },
+      { type: 'text.complete', runId: old, seq: 1, ts: 11, messageId: 'm-1', role: 'assistant', text: 'Done.', replay: true },
+      { type: 'text.complete', runId: old, seq: 2, ts: 12, messageId: 'u-2', role: 'user', text: 'now make it blue', replay: true },
+      { type: 'text.complete', runId: old, seq: 3, ts: 13, messageId: 'm-2', role: 'assistant', text: 'Blue it is.', replay: true },
+    ] as AgentEvent[];
+  }
+
+  /** A resumed conversation of two stored turns, idle and ready to wind back. */
+  function resumed(capabilities: Capabilities = REWINDS) {
+    const { driver, c } = rewinding(capabilities);
+    expect(c.loadHistory('s-old' as never, storedTurns())).toEqual({ ok: true });
+    return { driver, c };
+  }
+
+  /** What each row says, or what kind of row it is when it says nothing. */
+  const said = (c: Conversation) =>
+    rows(c).map((row) => {
+      if (row === undefined) return 'nothing';
+      if ('text' in row) return row.text;
+      return 'kind' in row ? row.kind : 'group';
+    });
+
+  it('lists the prompts in order, with the provider id where there is one', async () => {
+    const { driver, c } = resumed();
+    await c.send('and now the other one');
+    const runId = driver.start.mock.calls[0]?.[0]?.runId as RunId;
+
+    expect(c.userTurns()).toEqual([
+      { id: expect.any(String), messageId: 'u-1', text: 'add a status line', ts: 10 },
+      { id: expect.any(String), messageId: 'u-2', text: 'now make it blue', ts: 12 },
+      // Typed in this window, so the only name it has is the registry's own —
+      // a word the provider's stored chain has never heard. Reported as no id
+      // at all, with the run it was sent under, and the list greys it.
+      { id: expect.any(String), messageId: undefined, text: 'and now the other one', ts: expect.any(Number), runId },
+    ]);
+  });
+
+  it('refuses when the provider cannot truncate a resumed session', () => {
+    const { c } = resumed({ ...CLAUDE, rewind: false, forkSession: false });
+    expect(c.canRewind()).toEqual({
+      ok: false,
+      reason: 'Claude cannot go back to an earlier prompt.',
+    });
+  });
+
+  it('refuses a provider that can only branch, rather than cutting the screen and not the context', () => {
+    // `forkSession` alone is not a third way of going back: the truncation is
+    // the part `rewind` gates, so the branch would start from the *end* of the
+    // conversation while the screen showed it cut back to an old prompt, and
+    // the answer would come back confident. Codex and OpenCode are here today.
+    const { c } = resumed({ ...CLAUDE, rewind: false, forkSession: true });
+    expect(c.canRewind()).toEqual({
+      ok: false,
+      reason: 'Claude can branch a conversation but not wind one back to an earlier prompt.',
+    });
+  });
+
+  it('refuses when there is no session to wind back', () => {
+    const { c } = rewinding();
+    expect(c.canRewind()).toEqual({
+      ok: false,
+      reason: 'There is no stored conversation to go back through yet.',
+    });
+  });
+
+  it('refuses while a turn is live', async () => {
+    const { c } = resumed();
+    await c.send('one more thing');
+    expect(c.canRewind()).toEqual({
+      ok: false,
+      reason: 'Wait for this turn to finish, or press Esc to interrupt it.',
+    });
+  });
+
+  it('winds the newest turn back in place and branches for anything older', () => {
+    const { c } = resumed();
+    // The cut a provider is not expected to refuse: one turn, which is the only
+    // range the CLI's drops-a-turn acknowledgement can vouch for.
+    expect(c.canRewind('u-2')).toEqual({ ok: true, fork: false });
+    // Deeper than that, the in-place rewind "takes its chances with the
+    // provider's own guard" — so the branch is taken, and the original session
+    // is left whole rather than argued with.
+    expect(c.canRewind('u-1')).toEqual({ ok: true, fork: true });
+    // No target answers for the newest, which is what a standing hint wants.
+    expect(c.canRewind()).toEqual({ ok: true, fork: false });
+  });
+
+  it('cannot branch on a provider that only rewinds, and says so by not forking', () => {
+    const { c } = resumed({ ...CLAUDE, rewind: true, forkSession: false });
+    expect(c.canRewind('u-1')).toEqual({ ok: true, fork: false });
+  });
+
+  it('cuts the screen back to the prompt and carries the truncation on the next turn, once', async () => {
+    const { driver, c } = resumed();
+    expect(c.armRewind('u-2')).toEqual({ ok: true });
+
+    // The conversation reads as already wound back while the prompt is retyped.
+    expect(said(c)).toEqual(['add a status line', 'Done.']);
+    expect(c.getState().rewindArmed).toEqual({ messageId: 'u-2', fork: false });
+
+    await c.send('now make it green');
+    expect(driver.start.mock.calls[0]?.[0]).toMatchObject({
+      prompt: 'now make it green',
+      resumeSessionId: 's-old',
+      rewindToMessageId: 'u-2',
+    });
+    expect(driver.start.mock.calls[0]?.[0]?.forkSession).toBeUndefined();
+    // Consumed: the arm describes one start, and the turn after it must not ask
+    // for a truncation the provider has already made.
+    expect(c.getState().rewindArmed).toBeUndefined();
+
+    const runId = c.getState().runId as RunId;
+    driver.emit({ type: 'text.complete', runId, role: 'assistant', messageId: 'm-3', blockIndex: 0, text: 'Green it is.' } as never);
+    driver.emit({ type: 'run.end', runId, reason: 'completed' });
+    await c.send('and again');
+    expect(driver.start.mock.calls[1]?.[0]?.rewindToMessageId).toBeUndefined();
+  });
+
+  it('asks for a branch when the target is not the most recent turn', async () => {
+    const { driver, c } = resumed();
+    expect(c.armRewind('u-1')).toEqual({ ok: true });
+    expect(said(c)).toEqual([]);
+    expect(c.getState().rewindArmed).toEqual({ messageId: 'u-1', fork: true });
+
+    await c.send('add a status line, but smaller');
+    expect(driver.start.mock.calls[0]?.[0]).toMatchObject({
+      resumeSessionId: 's-old',
+      rewindToMessageId: 'u-1',
+      forkSession: true,
+    });
+  });
+
+  it('refuses a prompt that is not in the conversation', () => {
+    const { c } = resumed();
+    expect(c.armRewind('u-9')).toEqual({ ok: false, reason: 'That prompt is not in this conversation.' });
+  });
+
+  it('puts the rows back when the arm is dropped', () => {
+    const { c } = resumed();
+    c.armRewind('u-1');
+    expect(said(c)).toEqual([]);
+
+    c.disarmRewind();
+    expect(said(c)).toEqual(['add a status line', 'Done.', 'now make it blue', 'Blue it is.']);
+    expect(c.getState().rewindArmed).toBeUndefined();
+    // And the conversation is whole again, so it can be wound back afresh.
+    expect(c.userTurns().map((turn) => turn.messageId)).toEqual(['u-1', 'u-2']);
+  });
+
+  it('does nothing when the arm is dropped after the turn has gone out', async () => {
+    // The composer empties as the prompt is sent, and that must not redraw the
+    // conversation over a rewind the provider is already making.
+    const { c } = resumed();
+    c.armRewind('u-2');
+    await c.send('now make it green');
+
+    c.disarmRewind();
+    expect(said(c)).toEqual(['add a status line', 'Done.', 'now make it green']);
+  });
+
+  it('puts the rows back when the start fails, with the prompt where the attempt happened', async () => {
+    const { driver, c } = resumed();
+    driver.start.mockRejectedValueOnce(new Error('no such profile'));
+    c.armRewind('u-2');
+
+    expect(await c.send('now make it green')).toEqual({ ok: false, reason: 'no such profile' });
+    // Nothing was truncated anywhere but on this screen, so the conversation is
+    // as it was — with the attempt, and the reason it failed, below it.
+    expect(said(c)).toEqual([
+      'add a status line',
+      'Done.',
+      'now make it blue',
+      'Blue it is.',
+      'now make it green',
+      'no such profile',
+    ]);
+    expect(c.getState().rewindArmed).toBeUndefined();
+
+    // The failure does not re-arm: the next turn is an ordinary one.
+    await c.send('never mind');
+    expect(driver.start.mock.calls[1]?.[0]?.rewindToMessageId).toBeUndefined();
+  });
+
+  it('puts the rows back when the provider refuses the rewind and says nothing', async () => {
+    const { driver, c } = resumed();
+    c.armRewind('u-2');
+    await c.send('now make it green');
+    const runId = c.getState().runId as RunId;
+
+    // An error with nothing said is what a refused truncation looks like from
+    // here: the adapter throws before the model is reached.
+    driver.emit({ type: 'run.end', runId, reason: 'error', error: { code: 'invalid_request', message: 'Could not rewind: that message is not in this session.' } } as never);
+    expect(said(c).slice(0, 4)).toEqual(['add a status line', 'Done.', 'now make it blue', 'Blue it is.']);
+    expect(said(c)).toContain('now make it green');
+  });
+
+  it('keeps the cut when the turn produced something, because the provider really did wind back', async () => {
+    const { driver, c } = resumed();
+    c.armRewind('u-2');
+    await c.send('now make it green');
+    const runId = c.getState().runId as RunId;
+
+    driver.emit({ type: 'text.complete', runId, role: 'assistant', messageId: 'm-3', blockIndex: 0, text: 'Green it is.' } as never);
+    driver.emit({ type: 'run.end', runId, reason: 'error', error: { code: 'unknown', message: 'the process died' } } as never);
+    // The rows are not put back: they would describe a conversation the
+    // provider no longer holds.
+    expect(said(c)).not.toContain('now make it blue');
+  });
+
+  it('brings back what the turns did, not only what they said', async () => {
+    // `TranscriptModel` has no re-insert — `truncateFrom` is the one door out —
+    // so putting rows back means replaying each of them as the event it came
+    // from. What has to survive that is everything a reader looks at.
+    const { driver, c } = resumed();
+    await c.send('run the tests');
+    const runId = c.getState().runId as RunId;
+    driver.emit({ type: 'thinking.delta', runId, messageId: 'm-4', blockIndex: 0, text: 'Working out which suite' } as never);
+    driver.emit({ type: 'tool.start', runId, toolCallId: 'call-1', name: 'Bash', input: { command: 'pnpm test' } } as never);
+    driver.emit({ type: 'tool.end', runId, toolCallId: 'call-1', status: 'ok', resultText: '699 passed' } as never);
+    driver.emit({ type: 'text.complete', runId, role: 'assistant', messageId: 'm-4', blockIndex: 1, text: 'All green.' } as never);
+    driver.emit({ type: 'run.end', runId, reason: 'completed' });
+
+    c.armRewind('u-1');
+    expect(said(c)).toEqual([]);
+    c.disarmRewind();
+
+    // The call keeps its own id, because the provider named it — so a
+    // re-delivery still lands on the row rather than drawing a second one.
+    expect(c.transcript.getItem('t:call-1')).toMatchObject({
+      kind: 'tool',
+      name: 'Bash',
+      input: { command: 'pnpm test' },
+      status: 'ok',
+      resultText: '699 passed',
+    });
+    expect(JSON.stringify(rows(c))).toContain('Working out which suite');
+    expect(said(c)).toContain('All green.');
+    expect(c.userTurns().map((turn) => turn.text)).toEqual([
+      'add a status line',
+      'now make it blue',
+      'run the tests',
+    ]);
+  });
+
+  it('cuts further back when armed twice, and comes back whole', () => {
+    const { c } = resumed();
+    expect(c.armRewind('u-2')).toEqual({ ok: true });
+    expect(c.armRewind('u-1')).toEqual({ ok: true });
+    expect(said(c)).toEqual([]);
+    expect(c.getState().rewindArmed).toEqual({ messageId: 'u-1', fork: true });
+
+    c.disarmRewind();
+    expect(said(c)).toEqual(['add a status line', 'Done.', 'now make it blue', 'Blue it is.']);
+  });
+
+  it('keeps an armed cut when a turn of the provider\'s own speaks and fails', async () => {
+    // The CLI takes turns of its own — a settle turn about background work —
+    // and one of them ending badly says nothing about a rewind it has not been
+    // asked for yet. Nothing has gone out while the arm is still held.
+    const { driver, c } = resumed();
+    c.armRewind('u-2');
+    const settle = 'run-settle' as RunId;
+    driver.emit({ type: 'session.started', runId: settle, sessionId: 's-old' as never, providerId: 'claude', cwd: '/repo' });
+    driver.emit({ type: 'text.complete', runId: settle, role: 'assistant', messageId: 'm-9', blockIndex: 0, text: 'The background work finished.' } as never);
+    driver.emit({ type: 'run.end', runId: settle, reason: 'error' } as never);
+
+    expect(c.getState().rewindArmed).toEqual({ messageId: 'u-2', fork: false });
+    expect(said(c)).not.toContain('now make it blue');
+    await c.send('now make it green');
+    expect(driver.start.mock.calls[0]?.[0]?.rewindToMessageId).toBe('u-2');
+  });
+
+  it('follows the branch when the fork answers with a session of its own', async () => {
+    const { driver, c } = resumed();
+    c.armRewind('u-1');
+    await c.send('add a status line, but smaller');
+    const runId = c.getState().runId as RunId;
+
+    driver.emit({
+      type: 'session.started',
+      runId,
+      sessionId: 's-branch' as never,
+      providerId: 'claude',
+      cwd: '/repo',
+      resumedFrom: 's-old' as never,
+      forked: true,
+    } as never);
+    expect(c.getState().sessionId).toBe('s-branch');
+
+    driver.emit({ type: 'run.end', runId, reason: 'completed' });
+    await c.send('and now the rail says the branch');
+    // The next turn resumes the branch, and the conversation it came off is
+    // left exactly as it was — which is the whole point of having forked.
+    expect(driver.start.mock.calls[1]?.[0]?.resumeSessionId).toBe('s-branch');
+  });
+});
