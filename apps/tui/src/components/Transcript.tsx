@@ -33,6 +33,11 @@
  * gutter from {@link NUMBER_COLUMNS} up, and a renderer that is not told the
  * width cannot know whether it has the room.
  *
+ * `live` and `planDeltaFor` are the other two, and both are about the surface
+ * rather than the fold: whether the conversation is in flight, which is what a
+ * cue on a call that has gone quiet has to be true of, and where a finished
+ * turn's cost against the plan is looked up. Only the viewport sets either.
+ *
  * Collapsed is unchanged but for one thing: a cut result now shows its head
  * *and* its tail. The end of a command's output is where the error is, and
  * three lines from the top of a stack trace is three lines of nothing.
@@ -66,6 +71,8 @@ import {
 } from '@rx-artemis/transcript';
 
 import { ACCENT } from '../theme.js';
+import type { PlanDelta } from '../conversation.js';
+import { useNow } from '../hooks/useNow.js';
 import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import { renderDiff } from '../render/diff.js';
 import { renderMarkdownLines } from '../render/markdown.js';
@@ -144,6 +151,24 @@ export interface RowView {
    * measured", which is the old, gutterless rendering.
    */
   readonly columns?: number;
+  /**
+   * The surface is showing a conversation that is in flight.
+   *
+   * Only the live viewport sets it, and it gates the cue on a call that has
+   * gone quiet (see {@link TOOL_STUCK_MS}). A stored transcript can end with a
+   * call still marked running — an interrupted subagent's does — and "no
+   * output for 47000m · x stops it" under a replay is wrong twice over:
+   * nothing is running, and `x` stops nothing.
+   */
+  readonly live?: boolean;
+  /**
+   * What a finished turn took out of the plan, asked for by the run-end row
+   * that prints it. `Conversation.planDeltaForRow`, passed down because a row
+   * cannot reach the conversation and the transcript model has nowhere to keep
+   * the reading. Absent everywhere it is not wired, and the row simply omits
+   * the figure.
+   */
+  readonly planDeltaFor?: (runEnd: { readonly ts: number }) => readonly PlanDelta[] | undefined;
 }
 
 const COLLAPSED: RowView = {};
@@ -278,6 +303,9 @@ const TOOL_MARK: Record<string, { color?: string; dim?: boolean }> = {
   cancelled: { dim: true },
 };
 
+/** What a call that has gone quiet wears instead. Amber, not red: nothing has failed yet. */
+const STUCK_MARK: { color?: string; dim?: boolean } = { color: 'yellow' };
+
 /**
  * How much of what a call returned is shown, and how it is split.
  *
@@ -303,6 +331,21 @@ const RESULT_TAIL = 1;
 const EDIT_LINES = 20;
 const WRITE_LINES = 6;
 
+/**
+ * How long a running call may say nothing before the row starts to worry.
+ *
+ * A tool call is the one row that can sit there for minutes looking exactly
+ * like a tool call that is working — a `pnpm test` that is running and a
+ * `pnpm test` whose process is wedged are the same line — and the terminal's
+ * only other clue, the spinner, says "waiting" either way. Three minutes is
+ * longer than almost any real call (a full test suite, a big build) and short
+ * enough that nobody sits through ten of them wondering.
+ *
+ * It is a cue, not a verdict: the row goes amber and names the silence, and
+ * the person decides. Exported because it is the number the cue is about.
+ */
+export const TOOL_STUCK_MS = 3 * 60_000;
+
 function ToolRow({
   item,
   view = COLLAPSED,
@@ -310,7 +353,16 @@ function ToolRow({
   readonly item: Extract<TranscriptItem, { kind: 'tool' }>;
   readonly view?: RowView;
 }): React.JSX.Element {
-  const mark = TOOL_MARK[item.status] ?? TOOL_MARK['ok'];
+  /*
+   * The clock runs only while this call does, and only on a live surface: a
+   * settled row wakes nothing up, and a screen of finished calls has no timer
+   * on it at all. See `useNow`.
+   */
+  const running = item.status === 'running';
+  const now = useNow(running && view.live === true);
+  const silentFor = running && view.live === true ? now - item.ts : 0;
+  const stuck = silentFor >= TOOL_STUCK_MS;
+  const mark = stuck ? STUCK_MARK : TOOL_MARK[item.status] ?? TOOL_MARK['ok'];
   const summary = summarizeToolInput(item.input);
   const edit = detectFileEdit(item.name, item.input);
   const resultLines =
@@ -331,7 +383,7 @@ function ToolRow({
   const hidden = cut ? resultLines.length - RESULT_HEAD - RESULT_TAIL : 0;
   return (
     <Block marker={TOOL_MARKER} color={mark?.color} dim={mark?.dim}>
-      <Text>
+      <Text color={stuck ? 'yellow' : undefined}>
         {item.title !== undefined ? (
           <Text bold>{oneLine(item.title, 160)}</Text>
         ) : (
@@ -341,6 +393,13 @@ function ToolRow({
           </>
         )}
         {item.durationMs !== undefined && item.durationMs >= 1_000 && <Text dimColor>{`  ${formatDuration(item.durationMs)}`}</Text>}
+        {/*
+         * Whole minutes. `no output for 3m 6s` is a precision the reading has
+         * not earned — the point is that it has been quiet for a while, not
+         * how long exactly — and a second that moves every tick draws the eye
+         * back to a row nothing is happening on.
+         */}
+        {stuck && <Text>{` · no output for ${String(Math.floor(silentFor / 60_000))}m · x stops it`}</Text>}
       </Text>
       {edit !== null && (
         <Returned>
@@ -514,6 +573,15 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
         tokens !== undefined ? `${formatTokens(tokens)} tok` : undefined,
         item.usage?.costUsd !== undefined ? formatUsd(item.usage.costUsd) : undefined,
       ].filter((part): part is string => part !== undefined);
+      /*
+       * And what it cost the plan. `$0.04` is the wrong unit for someone on a
+       * subscription — they are not billed it, and they cannot spend it — so
+       * the same turn is also priced in the thing that does run out: a share
+       * of the 5-hour window, a share of the week. Dim on both endings,
+       * because it is a footnote to the reading before it rather than part of
+       * the verdict, and absent whenever no window moved far enough to name.
+       */
+      const plan = (view.planDeltaFor?.(item) ?? []).map((window) => `${window.pct.toFixed(1)}% of ${window.label}`);
       if (item.reason === 'completed') {
         /*
          * A turn that produced nothing is named rather than left as a bare
@@ -524,7 +592,7 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
          */
         return (
           <Block marker="" dim spaced={false}>
-            <Text dimColor>{[...(item.silent ? ['no reply'] : []), ...parts].join(' · ')}</Text>
+            <Text dimColor>{[...(item.silent ? ['no reply'] : []), ...parts, ...plan].join(' · ')}</Text>
           </Block>
         );
       }
@@ -533,6 +601,7 @@ function ItemRow({ item, view = COLLAPSED }: { readonly item: TranscriptItem; re
           <Text color={item.reason === 'error' ? 'red' : 'yellow'}>
             {item.reason === 'interrupted' ? 'Interrupted' : item.reason.replace(/_/g, ' ')}
             {parts.length > 0 ? ` · ${parts.join(' · ')}` : ''}
+            {plan.length > 0 && <Text dimColor>{` · ${plan.join(' · ')}`}</Text>}
           </Text>
           {item.error !== undefined && <Text color="red">{oneLine(item.error.message, 300)}</Text>}
         </Block>
@@ -685,6 +754,11 @@ export interface TranscriptViewportProps {
    * between the two views rather than two renderers being kept in step.
    */
   readonly expanded?: boolean;
+  /**
+   * What each finished turn cost the plan, for the run-end rows to print —
+   * `Conversation.planDeltaForRow`. See {@link RowView.planDeltaFor}.
+   */
+  readonly planDeltaFor?: RowView['planDeltaFor'];
 }
 
 /**
@@ -706,12 +780,20 @@ export interface TranscriptViewportProps {
  * far up there is to go. Rows beyond the rendered window are brought in as
  * the offset approaches the top of what is drawn.
  */
-export function TranscriptViewport({ transcript, live, offset, onExtent, columns, expanded }: TranscriptViewportProps): React.JSX.Element {
+export function TranscriptViewport({
+  transcript,
+  live,
+  offset,
+  onExtent,
+  columns,
+  expanded,
+  planDeltaFor,
+}: TranscriptViewportProps): React.JSX.Element {
   const rows = useSyncExternalStore(transcript.subscribeList, transcript.getRowsSnapshot);
   const terminal = useTerminalSize();
   const view = useMemo<RowView>(
-    () => ({ expanded: expanded === true, columns: rowContentColumns(columns ?? terminal.columns) }),
-    [expanded, columns, terminal.columns],
+    () => ({ expanded: expanded === true, live, columns: rowContentColumns(columns ?? terminal.columns), planDeltaFor }),
+    [expanded, live, columns, terminal.columns, planDeltaFor],
   );
   const [windowRows, setWindowRows] = useState(WINDOW_ROWS);
   const viewportRef = useRef<DOMElement>(null);

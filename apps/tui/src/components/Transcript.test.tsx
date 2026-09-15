@@ -6,9 +6,10 @@
 
 import { describe, expect, it } from 'vitest';
 import { render } from 'ink-testing-library';
-import { SUGGESTED_TASK_TOOL, type AgentEvent } from '@rx-artemis/protocol';
+import { SUGGESTED_TASK_TOOL, type AgentEvent, type RunId } from '@rx-artemis/protocol';
+import { TranscriptModel, syncScheduler } from '@rx-artemis/transcript';
 
-import { ReplayRows } from './Transcript.js';
+import { ReplayRows, TOOL_STUCK_MS, TranscriptViewport } from './Transcript.js';
 
 /** Envelope filler; timestamps rise with position, which is what the order rests on. */
 function stream(...drafts: Array<Omit<AgentEvent, 'runId' | 'seq' | 'ts'>>): AgentEvent[] {
@@ -355,5 +356,118 @@ describe('where a command ran', () => {
     expect(markerOf(frame, 'model sonnet')).toBe('/');
     // The output is drawn the same either way.
     expect(frame).toContain('nothing to commit');
+  });
+});
+
+/** The same events, as the live viewport's model rather than a replay's. */
+function model(events: readonly AgentEvent[]): TranscriptModel {
+  const transcript = new TranscriptModel(syncScheduler);
+  for (const event of events) transcript.apply(event);
+  transcript.flush();
+  return transcript;
+}
+
+/**
+ * A turn's cost, in the unit a plan is bought in.
+ *
+ * `1m 6s · 12.3k tok · $0.04` prices a turn in dollars nobody on a
+ * subscription is billed. What runs out is the windows, so the row says how
+ * much of them the turn took — the conversation does the subtraction, the row
+ * only joins it on.
+ */
+describe('what a turn cost the plan', () => {
+  const finished = model([
+    { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'On it.', runId: 'run_1' as RunId, seq: 0, ts: 1000 },
+    { type: 'run.end', reason: 'completed', durationMs: 66_000, runId: 'run_1' as RunId, seq: 1, ts: 1001 },
+  ] as AgentEvent[]);
+
+  it('appends every window the turn moved to the run-end row', async () => {
+    const { lastFrame, unmount } = render(
+      <TranscriptViewport
+        transcript={finished}
+        live={false}
+        offset={0}
+        planDeltaFor={() => [
+          { label: '5hr', pct: 2.1 },
+          { label: 'week', pct: 0.4 },
+        ]}
+      />,
+    );
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    expect(frame).toContain('1m 6s · 2.1% of 5hr · 0.4% of week');
+  });
+
+  it('leaves the row as it was when no window moved far enough to name', async () => {
+    // Which is every turn under Codex, whose limits refresh only when asked.
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={finished} live={false} offset={0} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    expect(frame).toContain('1m 6s');
+    expect(frame).not.toContain('% of');
+  });
+});
+
+/**
+ * A stuck cue on a silent tool.
+ *
+ * A call that is working and a call whose process is wedged are the same row,
+ * and the spinner says "waiting" for both. After three minutes of nothing the
+ * row stops looking like work in progress.
+ */
+describe('a call that has gone quiet', () => {
+  const call = (ago: number): AgentEvent[] =>
+    [
+      {
+        type: 'tool.start',
+        toolCallId: 'c1',
+        name: 'Bash',
+        input: { command: 'pnpm build' },
+        runId: 'run_1' as RunId,
+        seq: 0,
+        ts: Date.now() - ago,
+      },
+    ] as AgentEvent[];
+
+  it('names the silence, and the key that ends it, once the threshold passes', async () => {
+    const { lastFrame, unmount } = render(
+      <TranscriptViewport transcript={model(call(TOOL_STUCK_MS + 60_000))} live offset={0} />,
+    );
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    // Whole minutes: the point is that it has been quiet for a while, not how
+    // long exactly, and a second that moves every tick draws the eye back to a
+    // row where nothing is happening.
+    expect(frame).toContain('Bash(pnpm build)');
+    expect(frame).toContain('no output for 4m · x stops it');
+  });
+
+  it('leaves a call that has only just started alone', async () => {
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={model(call(30_000))} live offset={0} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    expect(frame).toContain('Bash(pnpm build)');
+    expect(frame).not.toContain('no output for');
+  });
+
+  it('says nothing on a replayed transcript, where nothing is running and x stops nothing', async () => {
+    const { lastFrame, unmount } = render(<ReplayRows events={call(TOOL_STUCK_MS + 60_000)} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    // A recording that ended with a call still open — an interrupted subagent's
+    // does — would otherwise report hours of silence about a process that has
+    // not existed since.
+    expect(frame).toContain('Bash(pnpm build)');
+    expect(frame).not.toContain('no output for');
   });
 });

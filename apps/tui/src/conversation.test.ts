@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   Capabilities,
   PermissionRequest,
+  PlanUsage,
   RunHandle,
   RunId,
   RunInput,
@@ -1462,5 +1463,124 @@ describe('Conversation: the change ledger', () => {
     expect(c.getState().filesChanged).toEqual({ files: 1, added: 1, removed: 1 });
     c.refreshChanges();
     expect(c.getState().filesChanged).toBeUndefined();
+  });
+});
+
+/**
+ * What a turn cost the plan.
+ *
+ * `1m 6s · 12.3k tok · $0.04` prices a turn in a unit a subscriber never
+ * spends: they are not billed dollars and cannot spend them. The windows are
+ * what actually run out, so the same turn is priced in those as well — what
+ * the meters read when it began, subtracted from what they read when it
+ * ended. The subtraction is only true at that instant, which is why it is
+ * taken there and kept rather than worked out later.
+ */
+describe('what a turn cost the plan', () => {
+  const seed = (fiveHour: number, week: number): PlanUsage => ({
+    available: true,
+    fetchedAt: 0,
+    windows: [
+      { id: 'five_hour', label: '5 hours', utilization: fiveHour, resetsAt: null },
+      { id: 'seven_day', label: '7 days', utilization: week, resetsAt: null },
+    ],
+  });
+
+  /** What the provider reports mid-run, which is how a meter moves under Claude. */
+  const moved = (runId: RunId, windowId: string, utilization: number): Omit<AgentEvent, 'seq' | 'ts'> =>
+    ({ type: 'plan.limit', runId, limit: { status: 'ok', windowId, utilization } }) as Omit<AgentEvent, 'seq' | 'ts'>;
+
+  const endOf = (c: Conversation) =>
+    c.transcript
+      .getRowsSnapshot()
+      .map((id) => c.transcript.getItem(id))
+      .find((row) => row?.kind === 'run-end');
+
+  it('prices the turn in the windows that moved while it ran', async () => {
+    const driver = fakeDriver();
+    const c = conversation(driver);
+    c.setPlanUsage(seed(12, 40.2));
+
+    await c.send('something long');
+    const runId = c.getState().runId as RunId;
+    driver.emit(moved(runId, 'five_hour', 14.1));
+    driver.emit(moved(runId, 'seven_day', 40.6));
+    driver.emit({ type: 'run.end', runId, reason: 'completed' });
+
+    // One decimal, in the meters' own vocabulary, in the order the meters are
+    // drawn in — so the row and the status bar name the same windows.
+    expect(c.planDeltaFor(runId)).toEqual([
+      { label: '5hr', pct: 2.1 },
+      { label: 'week', pct: 0.4 },
+    ]);
+  });
+
+  it('takes the reading one turn left behind as the next turn\'s baseline', async () => {
+    const driver = fakeDriver();
+    const c = conversation(driver);
+
+    await c.send('first');
+    const first = c.getState().runId as RunId;
+    driver.emit(moved(first, 'five_hour', 30));
+    driver.emit({ type: 'run.end', runId: first, reason: 'completed' });
+    // Nothing to subtract from: the turn began before any reading was held, and
+    // charging the whole 30% to it would be a number invented out of ignorance.
+    expect(c.planDeltaFor(first)).toBeUndefined();
+
+    await c.send('second');
+    const second = c.getState().runId as RunId;
+    driver.emit(moved(second, 'five_hour', 33.5));
+    driver.emit({ type: 'run.end', runId: second, reason: 'completed' });
+
+    expect(c.planDeltaFor(second)).toEqual([{ label: '5hr', pct: 3.5 }]);
+  });
+
+  it('ignores a window that rolled over, and movement too small to print', async () => {
+    const driver = fakeDriver();
+    const c = conversation(driver);
+    c.setPlanUsage(seed(96, 40.2));
+
+    await c.send('a turn that straddles the roll');
+    const runId = c.getState().runId as RunId;
+    // The 5-hour window came back around mid-turn. The meter moved; the turn
+    // did not hand any of the plan back, and `-93.0% of 5hr` would say it had.
+    driver.emit(moved(runId, 'five_hour', 3));
+    // And the week barely felt it: below a tenth, this is a column spent
+    // saying nothing happened.
+    driver.emit(moved(runId, 'seven_day', 40.22));
+    driver.emit({ type: 'run.end', runId, reason: 'completed' });
+
+    expect(c.planDeltaFor(runId)).toBeUndefined();
+  });
+
+  it('says nothing for a provider that refreshes its limits only when asked', async () => {
+    const driver = fakeDriver();
+    const c = conversation(driver, { providerId: 'codex', providerLabel: 'Codex' });
+    c.setPlanUsage(seed(12, 40.2));
+
+    await c.send('hello');
+    const runId = c.getState().runId as RunId;
+    driver.emit({ type: 'run.end', runId, reason: 'completed' });
+
+    // Codex moves no meter on the wire, so there is no second reading to
+    // subtract. Absent, which is what the row draws as nothing at all.
+    expect(c.planDeltaFor(runId)).toBeUndefined();
+  });
+
+  it('finds the reading from the run-end row, which carries no run id', async () => {
+    const driver = fakeDriver();
+    const c = conversation(driver);
+    c.setPlanUsage(seed(12, 40.2));
+
+    await c.send('hello');
+    const runId = c.getState().runId as RunId;
+    driver.emit(moved(runId, 'five_hour', 14.1));
+    driver.emit({ type: 'run.end', runId, reason: 'completed' });
+
+    // The transcript files the card under a counted `e:N` and has nowhere to
+    // keep a run id, so the row is matched on the clock both were stamped with.
+    const row = endOf(c);
+    expect(row).toBeDefined();
+    expect(c.planDeltaForRow({ ts: row?.ts ?? -1 })).toEqual([{ label: '5hr', pct: 2.1 }]);
   });
 });

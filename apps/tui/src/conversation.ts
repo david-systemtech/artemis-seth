@@ -49,6 +49,18 @@
  * the event stream, and the stream only passes through this class: the bar
  * gets a snapshot and a clock of its own. See {@link ConversationActivity}.
  *
+ * What a turn cost *the plan* is folded here for the same reason, and only
+ * here: a person on a subscription thinks in windows, not in dollars, and the
+ * dollar figure under a turn answers a question they are not asking. The
+ * account's meters move while the turn runs — Claude reports each limit on the
+ * wire, so the `plan.limit` events have brought `#planUsage` up to date by the
+ * time `run.end` lands — and the difference between what a meter read when the
+ * turn began and what it reads when it ended is what that turn actually spent.
+ * The subtraction is only true at that instant, so it is taken then and kept;
+ * see {@link Conversation.planDeltaFor}. A provider that refreshes its numbers
+ * only when asked — Codex — moves no meter mid-run, and the reading is then
+ * absent rather than wrong.
+ *
  * Going back to an earlier prompt is the one move here that *takes rows away*.
  * {@link Conversation.armRewind} cuts the transcript at a past prompt and
  * records that the next `start()` must carry `rewindToMessageId` — the
@@ -87,7 +99,7 @@ import type {
   ToolCallId,
   UsageSnapshot,
 } from '@rx-artemis/protocol';
-import { NO_CAPABILITIES, applyPlanLimit } from '@rx-artemis/protocol';
+import { NO_CAPABILITIES, applyPlanLimit, planMeterSlots } from '@rx-artemis/protocol';
 import {
   TranscriptModel,
   frameScheduler,
@@ -188,6 +200,20 @@ export interface ConversationActivity {
   readonly text: string;
   /** Host clock when this text took the line. */
   readonly since: number;
+}
+
+/**
+ * One plan window a turn moved, ready to print: `0.4% of week`.
+ *
+ * The label is the meter's own short name lower-cased, because it is read as
+ * the tail of a dim sentence rather than as a heading — and it is the same
+ * vocabulary the status bar's meters carry ({@link planMeterSlots}), so the
+ * two surfaces cannot disagree about which window a number belongs to.
+ */
+export interface PlanDelta {
+  readonly label: string;
+  /** Points of that window consumed since the turn began, to one decimal. */
+  readonly pct: number;
 }
 
 /** One prompt the person sent, as the go-back list draws it. */
@@ -435,6 +461,48 @@ function heading(line: string): string {
   return oneLine(bare, ACTIVITY_CHARS);
 }
 
+/**
+ * The smallest movement worth a column, in points of a window.
+ *
+ * Below this a turn prints `0.0% of week`, which spends a column saying that
+ * nothing happened — and on a weekly window most turns are below it. Rounding
+ * to a tenth is the same judgement made twice: a plan is a thing you watch
+ * over days, and the second decimal of it is noise.
+ */
+const PLAN_DELTA_FLOOR = 0.05;
+
+/** Each meter's reading, by window, as a turn's before-and-after is taken. */
+function planMeterReadings(usage: PlanUsage | null): ReadonlyMap<string, number> {
+  const readings = new Map<string, number>();
+  for (const slot of planMeterSlots(usage)) {
+    if (slot.window.utilization !== null) readings.set(slot.id, slot.window.utilization);
+  }
+  return readings;
+}
+
+/**
+ * What the meters moved between the reading a turn opened with and the one it
+ * closed with.
+ *
+ * Forwards only. A 5-hour window rolls over on its own schedule, and a turn
+ * that straddles the roll reads as −40%: true about the meter, false about the
+ * turn, which handed none of the plan back. A window absent from `before` is
+ * skipped for the same reason — a meter the account only started reporting
+ * mid-turn cannot have all of its consumption charged to this one.
+ */
+function planDelta(before: ReadonlyMap<string, number>, after: PlanUsage | null): readonly PlanDelta[] {
+  const deltas: PlanDelta[] = [];
+  for (const slot of planMeterSlots(after)) {
+    const ended = slot.window.utilization;
+    const began = before.get(slot.id);
+    if (ended === null || began === undefined) continue;
+    const moved = ended - began;
+    if (moved < PLAN_DELTA_FLOOR) continue;
+    deltas.push({ label: slot.label.toLowerCase(), pct: Math.round(moved * 10) / 10 });
+  }
+  return deltas;
+}
+
 export class Conversation {
   readonly transcript: TranscriptModel;
 
@@ -466,6 +534,22 @@ export class Conversation {
   #queued: readonly QueuedMessage[] = [];
   #tasks: readonly BackgroundTask[] = [];
   #planUsage: PlanUsage | null = null;
+  /**
+   * Each meter's reading when the turn now running began, so the end can be
+   * subtracted from it. Absent between turns, and empty for an account that
+   * had reported no windows by the time one started.
+   */
+  #planAtTurnStart: ReadonlyMap<string, number> | undefined;
+  /**
+   * What each finished turn cost the plan, by the run that spent it.
+   *
+   * One small entry per turn that moved a meter, held for as long as the row
+   * that prints it — which is the transcript's own lifetime, and cleared with
+   * it by {@link reset}.
+   */
+  readonly #planDeltas = new Map<RunId, readonly PlanDelta[]>();
+  /** The run a run-end row belongs to, by the clock it carries. See {@link planDeltaForRow}. */
+  readonly #planDeltaRows = new Map<number, RunId>();
   #slashCommands: readonly string[] = [];
   /** A run has reported its own commands, which outrank every seed. */
   #slashCommandsFromRun = false;
@@ -615,6 +699,9 @@ export class Conversation {
     this.#clearRewind();
     this.#endTurn();
     this.transcript.reset();
+    // The rows that would have asked for these are gone with it.
+    this.#planDeltas.clear();
+    this.#planDeltaRows.clear();
     this.#resetChanges();
     this.#notify();
     return { ok: true };
@@ -874,6 +961,39 @@ export class Conversation {
     this.#planUsage = usage;
     this.#notify();
   }
+
+  /**
+   * What one finished turn took out of the plan, window by window, or
+   * `undefined` where nothing moved far enough to say so.
+   *
+   * Recorded rather than derived, because it cannot be recovered afterwards:
+   * the meters keep moving, the 5-hour window rolls, and the next poll replaces
+   * the snapshot wholesale. Absent for a provider that reports its limits only
+   * when asked, and absent for a turn that began before any reading was held —
+   * in both cases there is no "before" to subtract, which is a different thing
+   * from a turn that cost nothing and is reported the same way, as silence.
+   */
+  planDeltaFor(runId: RunId): readonly PlanDelta[] | undefined {
+    return this.#planDeltas.get(runId);
+  }
+
+  /**
+   * The same reading, found from the run-end row that prints it.
+   *
+   * A `RunEndItem` carries no run id — the transcript files it under a counted
+   * `e:N` and has no field to hang one off — so the row is matched on the one
+   * thing it does carry that the turn's ending also stamped: `ts`, the instant
+   * `run.end` arrived. Two turns of one conversation cannot end in the same
+   * millisecond, and a row put back by a rewind redraw keeps its original
+   * clock, so it keeps its reading with it.
+   *
+   * An arrow, not a method, because it is handed to the transcript's rows as a
+   * prop and a new function per render would redraw every row on the screen.
+   */
+  planDeltaForRow = (row: { readonly ts: number }): readonly PlanDelta[] | undefined => {
+    const runId = this.#planDeltaRows.get(row.ts);
+    return runId === undefined ? undefined : this.#planDeltas.get(runId);
+  };
 
   /** Stop a background task, of this run or the one that just ended. */
   async stopTask(taskId: string): Promise<Outcome> {
@@ -1523,6 +1643,9 @@ export class Conversation {
           else this.#forgetRewindCopy();
         }
         const ended = this.#runId;
+        // Before `#endTurn` lets go of the reading the turn opened with, and
+        // while `#planUsage` still holds what the last `plan.limit` folded in.
+        if (ended !== undefined) this.#recordPlanDelta(ended, event.ts);
         this.#lastRunId = ended;
         this.#runId = undefined;
         this.#status = 'idle';
@@ -1659,16 +1782,28 @@ export class Conversation {
   #beginTurn(): void {
     this.#endTurn();
     this.#turnStartedAt = this.#now();
+    this.#planAtTurnStart = planMeterReadings(this.#planUsage);
   }
 
   /** The turn is over: nothing is happening, so the line must not claim it is. */
   #endTurn(): void {
     this.#turnStartedAt = undefined;
+    this.#planAtTurnStart = undefined;
     this.#activity = undefined;
     this.#turnTokens = undefined;
     this.#thinkingText = undefined;
     this.#thinkingBlock = undefined;
     this.#activeToolCallId = undefined;
+  }
+
+  /** Take the subtraction while it is still true. See {@link planDeltaFor}. */
+  #recordPlanDelta(runId: RunId, at: number): void {
+    const before = this.#planAtTurnStart;
+    if (before === undefined) return;
+    const deltas = planDelta(before, this.#planUsage);
+    if (deltas.length === 0) return;
+    this.#planDeltas.set(runId, deltas);
+    this.#planDeltaRows.set(at, runId);
   }
 
   /**
