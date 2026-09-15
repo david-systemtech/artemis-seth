@@ -36,6 +36,13 @@
  * sent in has no id to file one under, so its draft lives only as long as the
  * process does.
  *
+ * The command a directory runs after the agent has edited something is here
+ * for a different reason again: it is a fact about a project, not about an
+ * account or a conversation. `pnpm test` in one checkout and `cargo clippy` in
+ * another is the ordinary case, so the key is the absolute directory — the one
+ * name a checkout has that Artemis can be sure of — and being asked for it
+ * again at every launch is the reason nobody would use the feature twice.
+ *
  * One JSON file, rewritten whole, atomically, and unreadable-means-empty: a
  * launch is never something a preferences file gets to fail.
  */
@@ -113,6 +120,18 @@ export interface Preferences {
    * Written as a list, the bound is visible in the file.
    */
   readonly drafts?: readonly StoredDraft[];
+  /**
+   * The command each directory runs after a turn that edited files.
+   *
+   * A map, where {@link drafts} is a list, because unlike a draft this is the
+   * one thing in this file somebody might reasonably set by hand:
+   * `"/work/artemis": "pnpm test"` is the whole setting, and a list of objects
+   * would only bury it. The bound still needs an order, and the order JSON
+   * keeps is the one they were inserted in — a directory can never be a key
+   * that looks like an array index, which is the only case where that would
+   * not hold.
+   */
+  readonly afterEdit?: Readonly<Record<string, string>>;
 }
 
 /** One conversation's unsent composer text. */
@@ -134,6 +153,16 @@ const FILE_NAME = 'preferences.json';
  * the rail's recent rows is always there; the oldest fall off the front.
  */
 const MAX_DRAFTS = 20;
+
+/**
+ * How many directories' check commands are kept.
+ *
+ * Bounded for the same reason drafts are — the file is rewritten whole — but
+ * far higher, because a check command is a decision somebody made once about a
+ * project they will come back to, and fifty is more repositories than anyone
+ * works in between one Artemis release and the next.
+ */
+const MAX_AFTER_EDIT = 50;
 
 /** Shared, so that "nothing pinned" is one array and the memo below holds. */
 const NO_PINS: readonly string[] = [];
@@ -272,6 +301,52 @@ export class PreferencesStore {
   #drafts(): readonly StoredDraft[] {
     const stored: unknown = this.#value.drafts;
     return Array.isArray(stored) ? stored.filter(isStoredDraft) : [];
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* The check a directory runs after an edit                                */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * What this directory runs after a turn that edited files, if anything.
+   *
+   * Resolved on the way in and on the way out, so a path typed with a trailing
+   * slash and the directory the app is running in are one directory rather than
+   * two settings that disagree.
+   */
+  afterEditFor(cwd: string): string | undefined {
+    const stored = this.#afterEdits()[resolve(cwd)];
+    return stored === undefined || stored.trim().length === 0 ? undefined : stored;
+  }
+
+  /**
+   * Set this directory's check command, or clear it.
+   *
+   * Nothing and blank both clear it, because `/check off` and a command of
+   * spaces are the same request, and a stored empty string would be a setting
+   * that is switched on and does nothing at all. A directory set again moves to
+   * the back: what somebody is working in today should be the last thing to
+   * fall off the front when the fifty-first arrives.
+   */
+  setAfterEdit(cwd: string, command: string | undefined): void {
+    const directory = resolve(cwd);
+    const text = command?.trim() ?? '';
+    const others: readonly (readonly [string, string])[] = Object.entries(this.#afterEdits()).filter(
+      ([dir]) => dir !== directory,
+    );
+    const next = text.length === 0 ? others : [...others, [directory, text] as const];
+    this.save({ afterEdit: Object.fromEntries(next.slice(-MAX_AFTER_EDIT)) });
+  }
+
+  /** A file edited by hand can hold anything at all under `afterEdit`. */
+  #afterEdits(): Readonly<Record<string, string>> {
+    const stored: unknown = this.#value.afterEdit;
+    if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) return {};
+    const kept: Record<string, string> = {};
+    for (const [dir, command] of Object.entries(stored as Record<string, unknown>)) {
+      if (typeof command === 'string') kept[dir] = command;
+    }
+    return kept;
   }
 
   async #write(snapshot: FileShape): Promise<void> {
