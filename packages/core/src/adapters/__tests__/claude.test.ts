@@ -2245,15 +2245,19 @@ describe('attaching to a live process', () => {
     first.fake.messages.push(INIT_MESSAGE);
     await vi.waitFor(() => expect(run.sessionId).toBe('sess-abc'));
 
-    const second = await adapter.createRun(nextTurn());
-
-    // A fresh spawn, not an attach. `beginTurn` replaces the active state and
-    // queue outright, so attaching here would strand turn one's consumer on a
-    // queue nobody ever closes and map its remaining messages with turn two's
-    // state. Two CLIs on one conversation is the lesser harm: `--resume` is
-    // serialised by the provider's own transcript.
-    expect(harness().fake).not.toBe(first.fake);
-    expect(second.runId).toBe('run-2');
+    /*
+     * Neither an attach nor a fresh spawn. Attaching would strand turn one's
+     * consumer on a queue nobody closes; and the fresh spawn this used to take
+     * instead, on the reading that "two CLIs on one conversation is the lesser
+     * harm" because `--resume` is serialised by the provider's transcript, is
+     * not serialised at all — on 2026-09-16 the two wrote one file for four
+     * minutes. So the turn is refused, naming the run that is busy, and the
+     * message belongs on that run's `send`.
+     */
+    await expect(adapter.createRun(nextTurn())).rejects.toMatchObject({
+      agentError: { code: 'invalid_request', details: { reason: 'session_busy', runId: 'run-1' } },
+    });
+    expect(harness().fake).toBe(first.fake);
 
     // And turn one is untouched by the refusal — its own `result` still ends
     // its stream normally.

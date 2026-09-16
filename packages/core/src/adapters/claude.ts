@@ -1171,7 +1171,10 @@ export function createClaudeAdapter(options?: ClaudeAdapterOptions): ProviderAda
       let rewind: RewindPoint | undefined;
       if (input.rewindToMessageId !== undefined && input.resumeSessionId !== undefined) {
         if (alive !== undefined) {
-          if (alive.busyWithWork) {
+          // `midTurn` as well as work: a release mid-sentence destroys the
+          // words the CLI is producing, which is the one thing the other two
+          // doors below already refuse to do. This one checked only for tasks.
+          if (alive.midTurn || alive.busyWithWork) {
             throw adapterError(
               'invalid_request',
               'This conversation still has work running — stop it before rewinding.',
@@ -1257,6 +1260,46 @@ export function createClaudeAdapter(options?: ClaudeAdapterOptions): ProviderAda
         }
         alive.release();
         alive = undefined;
+      }
+
+      /*
+       * The fourth door, and the one that was standing open.
+       *
+       * The three above each release or refuse, because a fresh spawn against a
+       * file a live CLI is still appending to is the clobber this pool exists
+       * to prevent. This case — a process *mid-turn*, or holding a prompt the
+       * CLI has not opened yet — used to fall through `canServe` to exactly
+       * that spawn, on the belief that the provider serialises two CLIs on one
+       * transcript. It does not. Observed 2026-09-16 on a served conversation:
+       * a turn the provider opened on its own when a subagent finished was
+       * still composing when the client, seeing an idle pane, sent "keep
+       * going"; the second CLI resumed the file mid-write, and for four minutes
+       * both wrote the same plan, opened rival pull requests, and messaged each
+       * other as separate peers. The conversation reconciling its own twin's
+       * commits was the whole of the "confused agent" the user reported.
+       *
+       * Refused, not queued, and the difference is the caller's: a message
+       * meant for a turn already running is a *steer*, which `Run.send` on the
+       * live run already delivers into the open turn or queues behind it. The
+       * refusal names that run so a host can do exactly that — the server's
+       * completions route does — and it names the reason so a renderer can
+       * tell this from a run that merely ended.
+       */
+      if (alive !== undefined) {
+        const busy = alive.busyRunId;
+        if (busy !== undefined) {
+          throw adapterError(
+            'invalid_request',
+            'This conversation is still working on its last message. Send this one into the running turn, or stop it first.',
+            {
+              details: {
+                reason: 'session_busy',
+                runId: String(busy),
+                ...(input.resumeSessionId === undefined ? {} : { sessionId: String(input.resumeSessionId) }),
+              },
+            },
+          );
+        }
       }
 
       if (alive !== undefined && alive.canServe(input, configDir)) {
@@ -3083,6 +3126,22 @@ class ClaudeProcess {
   }
 
   /**
+   * The run this process cannot take another beside: the turn it is serving,
+   * or the prompt it holds for the CLI to open. `undefined` when it could take
+   * one — idle, or on its way out, where the pool's fresh spawn is the answer.
+   *
+   * What the pool refuses a resume on, and what it names when it does, so the
+   * caller can send into that run instead. A process that is closed or
+   * disposing answers nothing: its turn is over whatever its state says, and
+   * refusing a resume against it would refuse for the length of a teardown.
+   */
+  get busyRunId(): RunId | undefined {
+    if (this.#closed || this.#disposing !== undefined) return undefined;
+    if (this.#pendingTurn !== undefined) return this.#pendingTurn.state.runId;
+    return this.#state.ended ? undefined : this.#state.runId;
+  }
+
+  /**
    * Must this turn be served by a fresh spawn, whatever else `canServe` says?
    *
    * True for exactly one turn: one asking for `bypassPermissions` of a process
@@ -3116,13 +3175,17 @@ class ClaudeProcess {
     // state and queue outright — the invariant `#ensureTurn` documents is that
     // a turn only opens after the last one's `run.end` — so attaching here
     // would strand the first turn's consumer on a queue nobody closes and map
-    // its remaining messages with the second turn's state. Refusing sends the
-    // caller down the fresh-spawn path with `--resume`, which is safe: the
-    // provider serialises the two CLIs on its own transcript.
+    // its remaining messages with the second turn's state.
+    //
+    // Nor is it spawnable-around. This used to say the fresh-spawn path was
+    // safe because the provider serialises two CLIs on one transcript; it
+    // does not, and the pool refuses the turn before ever asking here — see
+    // `busyRunId` and the fourth door in `createRun`. Kept as a refusal so a
+    // caller that skipped that door still cannot attach mid-turn.
     if (!this.#state.ended) return false;
     // A prompt is already queued and waiting for the CLI to open its turn. A
-    // second one behind it would be answered in an order nobody can predict;
-    // the fresh-spawn path serialises the two on the provider's transcript.
+    // second one behind it would be answered in an order nobody can predict.
+    // Same door: refused upstream, and refused here for the same reason.
     if (this.#pendingTurn !== undefined) return false;
     if (input.forkSession === true) return false;
     /*

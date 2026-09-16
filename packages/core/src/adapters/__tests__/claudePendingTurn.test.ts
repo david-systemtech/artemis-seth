@@ -327,18 +327,103 @@ describe('a prompt handed to a process running a turn of its own', () => {
     });
   });
 
-  it('refuses to attach a second prompt behind one still waiting', async () => {
+  it('refuses a second prompt behind one still waiting, and names the run to steer', async () => {
     const { adapter, fake, prompts } = await processHoldingWork();
     await adapter.createRun(NEXT);
     await nextPrompt(prompts);
 
-    // A third turn on the same session goes the fresh-spawn way: the pool
-    // will not queue two prompts on a CLI whose order of answering neither
-    // side can predict.
-    const fresh = installQuery();
-    const third = await adapter.createRun({ ...NEXT, runId: 'run-3', prompt: 'and another' });
-    expect(third.runId).toBe('run-3');
-    expect(fresh.fake()).not.toBe(fake);
-    await third.dispose();
+    /*
+     * This used to send the third turn the fresh-spawn way, on the belief that
+     * the provider serialises two CLIs on one transcript. It does not — see the
+     * mid-turn case below for what it did instead — so the pool refuses, and
+     * says which run is holding the conversation so the caller can send into
+     * that one.
+     */
+    sdkMock.onQuery = () => {
+      throw new Error('spawned a second CLI on a conversation already holding a prompt');
+    };
+    await expect(
+      adapter.createRun({ ...NEXT, runId: 'run-3', prompt: 'and another' }),
+    ).rejects.toMatchObject({
+      agentError: {
+        code: 'invalid_request',
+        details: { reason: 'session_busy', runId: 'run-2', sessionId: 'sess-abc' },
+      },
+    });
+    expect(fake.closed).toBe(false);
+  });
+});
+
+/**
+ * The door the others were built to close, found open.
+ *
+ * Reproduced from a served conversation on 2026-09-16: a subagent finished, the
+ * CLI opened a turn of its own and was still composing it, and the client —
+ * whose own last turn had ended, so its pane read idle — sent "keep going" as
+ * a resume. `canServe` refused the mid-turn process, as it should, and the
+ * pool then spawned a second CLI with `--resume` against the file the first
+ * was writing. Both wrote the same plan, opened rival pull requests, and
+ * messaged each other as separate peers for four minutes.
+ */
+describe('a prompt sent to a process mid-turn', () => {
+  it('is refused rather than run beside it, naming the turn already going', async () => {
+    const { adapter, fake, adopted } = await processHoldingWork();
+
+    // The CLI opens its own turn on the settled task and is mid-sentence.
+    fake.messages.push(INIT);
+    fake.messages.push(NOTIFICATION);
+    fake.messages.push(assistantText('The subagent returned early.', 'msg-notif'));
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+
+    sdkMock.onQuery = () => {
+      throw new Error('spawned a second CLI on a conversation mid-turn');
+    };
+    await expect(adapter.createRun(NEXT)).rejects.toMatchObject({
+      agentError: {
+        code: 'invalid_request',
+        details: { reason: 'session_busy', runId: adopted[0]!.runId, sessionId: 'sess-abc' },
+      },
+    });
+
+    // The turn that was refused beside is untouched: it finishes on its own.
+    fake.messages.push(RESULT);
+    const foreign = await drain(adopted[0]!.events);
+    expect(foreign.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+    expect(fake.closed).toBe(false);
+  });
+
+  it('refuses a fork on the same terms — a branch of a sentence still being written', async () => {
+    const { adapter, fake, adopted } = await processHoldingWork();
+    fake.messages.push(INIT);
+    fake.messages.push(NOTIFICATION);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+
+    sdkMock.onQuery = () => {
+      throw new Error('spawned a second CLI to fork a conversation mid-turn');
+    };
+    await expect(adapter.createRun({ ...NEXT, forkSession: true })).rejects.toMatchObject({
+      agentError: { details: { reason: 'session_busy' } },
+    });
+    fake.messages.push(RESULT);
+    await drain(adopted[0]!.events);
+  });
+
+  it('refuses a rewind mid-turn instead of closing the transport under it', async () => {
+    // The rewind door checked for tasks and not for an open turn, so a rewind
+    // that landed mid-sentence released the process and destroyed the words it
+    // was producing. Same refusal as its two neighbours now.
+    const { adapter, fake, adopted } = await processHoldingWork();
+    fake.messages.push(INIT);
+    fake.messages.push(NOTIFICATION);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+
+    await expect(
+      adapter.createRun({ ...NEXT, rewindToMessageId: 'msg-1' }),
+    ).rejects.toMatchObject({
+      agentError: { code: 'invalid_request', message: expect.stringContaining('stop it before rewinding') },
+    });
+    expect(fake.closed).toBe(false);
+    fake.messages.push(RESULT);
+    await drain(adopted[0]!.events);
   });
 });
