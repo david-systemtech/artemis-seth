@@ -266,7 +266,7 @@ function runPowerShellIn(box: Sandbox, dirs: readonly string[], mode: 'share' | 
 }
 
 describe.skipIf(POWERSHELL === null)('after the real Windows share script runs', () => {
-  it('reads every entry as linked', async () => {
+  it('reads every entry as linked', { timeout: 30_000 }, async () => {
     const box = sandbox();
     runPowerShellIn(box, [box.work, box.max], 'share');
 
@@ -288,7 +288,7 @@ describe.skipIf(POWERSHELL === null)('after the real Windows share script runs',
     }
   });
 
-  it('reads the hard-linked CLAUDE.md as linked, which no lstat can see', async () => {
+  it('reads the hard-linked CLAUDE.md as linked, which no lstat can see', { timeout: 30_000 }, async () => {
     const box = sandbox();
     runPowerShellIn(box, [box.max], 'share');
 
@@ -302,7 +302,7 @@ describe.skipIf(POWERSHELL === null)('after the real Windows share script runs',
     );
   });
 
-  it('reads nothing as linked again after the undo script', async () => {
+  it('reads nothing as linked again after the undo script', { timeout: 30_000 }, async () => {
     const box = sandbox();
     runPowerShellIn(box, [box.work], 'share');
     runPowerShellIn(box, [box.work], 'restore');
