@@ -102,6 +102,15 @@ export interface ServerMemoryBanks {
   prepare(run: ServedRunScope): void;
   /** The checkouts this account's banks live in, for a run's extra directories. */
   directoriesFor(profileId: string | undefined): readonly string[];
+  /**
+   * Does any bank reach this account at all?
+   *
+   * Asked before a run is given the memory tools. A tool server built for an
+   * account that carries no bank would answer every call with "no memory bank
+   * reaches this run", which teaches the model that the feature is broken
+   * rather than that it is not configured here.
+   */
+  reaches(profileId: string | undefined): boolean;
   /** Wait for the background pulls, for a test or an orderly shutdown. */
   settle(): Promise<void>;
 }
@@ -306,6 +315,10 @@ export function createServerMemoryBanks(options: ServerMemoryBanksOptions): Serv
 
     directoriesFor(profileId) {
       return inScope(profileId).map((record) => record.path);
+    },
+
+    reaches(profileId) {
+      return inScope(profileId).length > 0;
     },
 
     settle: () => inFlight,

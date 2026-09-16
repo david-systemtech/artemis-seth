@@ -11,11 +11,14 @@
  * the host around that: it owns the locations, composes the environment, and
  * turns each channel into a call on core.
  *
- * The `cerebro` CLI is no longer the contract. It is still resolved and still
- * driven, for the three things core does not do yet: retiring a memory,
- * promoting a legacy bank's queued drafts, and stripping stock Claude Code's
- * own wiring when a bank is forgotten. Each of those is best-effort and named
- * as such; none of them is on the path of a run.
+ * The `cerebro` CLI is no longer the contract, and is now barely a dependency.
+ * Writing goes through core too — `draftMemory`, `promoteBank`, `retireMemory`
+ * and the forge landing behind them — which is the same code the memory tools
+ * run inside an agent's session, so the pane's buttons and the agent's tools
+ * cannot disagree about what promoting or retiring means. What is left of the
+ * CLI here is bootstrap (creating and joining a bank that does not exist yet)
+ * and one best-effort courtesy: stripping stock Claude Code's own wiring when
+ * a bank is forgotten. Neither is on the path of a run.
  *
  * Three decisions carry over unchanged.
  *
@@ -59,18 +62,21 @@ import {
   beginMarker,
   describeBanksForRun,
   detectBankFormat,
+  detectForge,
   embeddedCli,
   isInstalled,
   LEGACY_BANK_SLUG,
   legacyBankRoot,
   profileProjectKeys,
   projectMemoryDir,
+  promoteBank,
   pullBank,
   readBankAt,
   readProfileDirs,
   readRegistryV2,
   reconcileBankInstalls,
   registryPath,
+  retireMemory,
   scopeCoversProfile,
   sharedIndexBudget,
   sourceStamp,
@@ -82,9 +88,13 @@ import {
   type Bank,
   type BankRecord,
   type BankRegistryV2,
+  type Forge,
+  type ForgeCredential,
   type InstallEverywhereReport,
+  type LandingDeps,
   type MemoryBankCredential,
   type MemoryBankSecrets,
+  type MemoryToolServerOptions,
   type ReadRegistryV2Options,
   type ResolvedSecret,
 } from '@rx-artemis/core';
@@ -920,19 +930,27 @@ export function anyBankAvailable(profileId?: string): boolean {
  * right answer for the pane's preview: it is a preview of what any account
  * would be told.
  *
- * `toolsAvailable: false` until the memory tools land — the prompt must not
- * teach a tool nothing serves. The vendored CLI is the fallback for a legacy
- * bank that embeds none; core's reader does the rest, so the desktop and the
- * headless server describe a bank identically.
+ * `toolsAvailable` is the run's, not the machine's: the memory tools are built
+ * per run by `index.ts`'s `agentToolServers` factory, and only a provider that
+ * takes host tool servers ever reaches them — see `bankToolsAvailable` in
+ * `engine.ts`. A run without them is taught the CLI's verbs instead, so
+ * getting this wrong in either direction teaches the agent a way to write that
+ * does not exist. The vendored CLI is the fallback for a legacy bank that
+ * embeds none; core's reader does the rest, so the desktop and the headless
+ * server describe a bank identically.
  */
-export function promptBanks(profileId?: string, cwd?: string): MemoryBankPromptInfo[] {
+export function promptBanks(
+  profileId?: string,
+  cwd?: string,
+  toolsAvailable = false,
+): MemoryBankPromptInfo[] {
   const registry = readBanks();
   return describeBanksForRun({
     registry,
     ...(profileId === undefined ? {} : { profileId }),
     ...(cwd === undefined ? {} : { cwd }),
     budget: sharedIndexBudget(registry.banks.filter((bank) => bank.enabled).length),
-    toolsAvailable: false,
+    toolsAvailable,
     fallbackCli: safeResolveCli(),
   });
 }
@@ -1368,6 +1386,99 @@ async function bankCredentialEnv(slug?: string): Promise<BankEnvironment> {
 interface BankEnvironment {
   readonly env: GitCredentialEnv;
   dispose(): void;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The memory tools, per run                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What Artemis holds for a forge, when it holds anything.
+ *
+ * Core lands a memory through the forge's own API — open the pull request,
+ * merge it, check the file really arrived — and it holds no credential of its
+ * own for that; it asks. This is the desktop's answer: the banks this machine
+ * carries are searched for one whose origin is on the *same host*, and that
+ * bank's credential is resolved through the ordinary path (a stored token, or
+ * a reference cashed in at the key manager). `null` when nothing is held, and
+ * core then falls back to `git credential fill` — which on a machine whose git
+ * already pushes to the forge is the right answer anyway.
+ *
+ * Matched by host rather than by bank, because the caller is a *forge*: core
+ * has already resolved which bank is being landed, and what it needs is a
+ * credential for `forge.example` — which any bank on that host can supply, and
+ * which is how a second bank on the same Forgejo lands without a second token.
+ *
+ * The token is returned and nothing else: never logged, never put in a
+ * receipt, never written to a checkout's config. The resolution is disposed as
+ * soon as the value has been copied out, which ends the scrub registration a
+ * key-manager value carries — see {@link ResolvedCredential}.
+ */
+export async function forgeCredentialFor(forge: Forge): Promise<ForgeCredential | null> {
+  for (const record of readBanks().banks) {
+    const remote = bankRemote(record.path);
+    if (remote === null) continue;
+    const detected = detectForge(remote);
+    if (detected === null || detected.host !== forge.host) continue;
+    const held = await credentialFor(record.slug);
+    if (held === null) continue;
+    try {
+      return {
+        username: held.credential.username ?? DEFAULT_GIT_USERNAME,
+        token: held.credential.token,
+      };
+    } finally {
+      held.dispose();
+    }
+  }
+  return null;
+}
+
+/**
+ * How a write from the memory tools authenticates and says what it did.
+ *
+ * `gitEnv` is deliberately absent: core sends the credential as a per-command
+ * header rather than through a helper — see `writer.ts`'s `gitAuthArgs` — so
+ * there is nothing for the environment to carry, and a spawn that inherits no
+ * token is one that cannot leak one.
+ */
+function landingDeps(): LandingDeps {
+  return {
+    credential: forgeCredentialFor,
+    log: (line) => {
+      log.info(line);
+    },
+  };
+}
+
+/**
+ * The options one run's memory tool server is built with.
+ *
+ * Here rather than in `index.ts` because every field is something this module
+ * already owns — where Artemis's registry is, where the CLI's mirror is, and
+ * how a landing authenticates — and none of it is something the composition
+ * root should have to know a second time. `null` for a process that has not
+ * been told where `userData` is, which is the same complete state every other
+ * read here answers with.
+ *
+ * The run supplies the rest: its account, which decides the banks the tools
+ * will even name, and its directory.
+ */
+export function memoryToolServerOptions(run: {
+  readonly profileId?: string;
+  readonly cwd?: string;
+}): MemoryToolServerOptions | null {
+  if (artemisRoot === null) return null;
+  return {
+    dataDir: artemisRoot,
+    cliRegistryPath: registryPath(),
+    ...(run.profileId === undefined ? {} : { profileId: run.profileId }),
+    ...(run.cwd === undefined ? {} : { cwd: run.cwd }),
+    landing: landingDeps(),
+    log: (line) => {
+      log.info(line);
+    },
+  };
 }
 
 /**
@@ -2096,7 +2207,7 @@ export async function syncMemoryBank(request: MemoryBankSyncRequest): Promise<Me
   for (const record of wanted) {
     const credentials = await bankCredentialEnv(record.slug);
     try {
-      await promoteLegacyDrafts(record);
+      await promoteQueuedDrafts(record);
       const pulled = await pullBank(record.path, credentials.env, 180_000);
       steps.push(`'${record.slug}': ${pulled.detail}.`);
     } finally {
@@ -2108,56 +2219,78 @@ export async function syncMemoryBank(request: MemoryBankSyncRequest): Promise<Me
 }
 
 /**
- * Empty a legacy bank's drafting inbox through its own CLI, if it has both.
+ * Empty a bank's drafting inbox, through core.
  *
- * Best-effort and silent about the ordinary case. An agent on this machine
- * writes a draft by running the bank's CLI — that is still the only way to
- * write until the memory tools exist — and what it produces is a file in
- * `inbox/` that only the CLI knows how to validate and land. Nothing here
- * fails a sync: a bank with no inbox, no CLI, or no Python has nothing to
- * promote, and a promote that is refused is the validator doing its job.
+ * Best-effort and silent about the ordinary case. A draft is a file in
+ * `inbox/` — written by an agent's `memory_draft`, or by a hand-run
+ * `cerebro draft`, which produce the same file — and promoting it means
+ * validating it again, filing it where the bank's format says it goes, and
+ * landing the change the way the bank asks. Core does all three, for every
+ * bank, so this no longer needs the bank to embed a CLI or the machine to have
+ * Python. Nothing here fails a sync: a bank with no inbox has nothing to
+ * promote, and a draft that is refused is the validator doing its job — it is
+ * renamed `.rejected` beside its reasons rather than dropped.
  */
-async function promoteLegacyDrafts(record: BankRecord): Promise<void> {
-  const cli = embeddedCli(record.path);
-  if (cli === null) return;
+async function promoteQueuedDrafts(record: BankRecord): Promise<void> {
+  // A bank this machine only consumes is never written to, whatever ended up
+  // in its inbox — the role is Artemis's own statement about the repository,
+  // and a background pass is the last place to go behind it.
+  if (record.role === 'readonly') return;
   if (!existsSync(join(record.path, 'inbox'))) return;
+  const bank = readBankAt(record.path, { slug: record.slug });
+  if (bank === null) return;
   try {
-    await runCli(cli, ['--bank', record.slug, 'promote', '--quiet'], 120_000);
+    const result = await promoteBank(bank, landingDeps());
+    if (result.landed.length > 0) {
+      log.info(
+        `Promoted ${result.landed.join(', ')} in '${record.slug}': ${result.outcome?.detail ?? 'landed'}`,
+      );
+    }
+    for (const item of result.rejected) {
+      log.warn(`'${record.slug}' rejected the queued draft ${item.name}: ${item.reasons.join('; ')}`);
+    }
   } catch (error) {
     log.warn(`Could not promote queued drafts for '${record.slug}'`, error);
   }
 }
 
 /**
- * Retirement reaches the remote — with a remote configured it opens a pull
- * request — so it carries the bank's credential like any other write.
+ * Retire one memory, through core.
  *
- * The one channel that still *requires* the CLI. Retiring is a write into a
- * repository other people read, through that repository's own review path,
- * and reimplementing the landing half here would mean two implementations of
- * it until the memory tools arrive. A machine that cannot run the CLI is told
- * so rather than shown a button that fails.
+ * Retiring is a write into a repository other people read, so it goes through
+ * that repository's own review path — a pull request where the bank asks for
+ * one, a commit where it does not — and it authenticates the same way every
+ * other landing does: the credential this machine holds for the forge, else
+ * what `git credential fill` answers. See {@link landingDeps}.
+ *
+ * This used to be the one channel that *required* the bank's CLI, and a
+ * machine without Python was told so. It no longer needs one: the same code
+ * the `memory_retire` tool runs is what runs here, so the pane's button and
+ * the agent's tool cannot disagree about what retiring means.
  */
 export async function retireMemoryBankMemory(
   request: MemoryBankRetireRequest,
 ): Promise<MemoryBankActionResponse> {
   const { record } = requireBank(request.slug);
-  const cli = embeddedCli(record.path) ?? safeResolveCli();
-  if (cli === null) {
+  // The same gate the `memory_retire` tool applies — see `pick` in core's
+  // `tools.ts`. A bank this machine only consumes is somebody else's, however
+  // the button got pressed.
+  if (record.role === 'readonly') {
+    throw new WorkspaceError(`'${request.slug}' is read-only on this machine: nothing is written to it.`);
+  }
+  const bank = readBankAt(record.path, { slug: request.slug });
+  if (bank === null) {
     throw new WorkspaceError(
-      "Retiring needs the bank's CLI until the memory tools land, and none is available on this machine. " +
-        'Retire the memory in the bank repository instead, or install Python and a bank that embeds its CLI.',
+      `'${request.slug}' is registered at ${record.path}, but there is no bank there to write to.`,
     );
   }
-  const args = ['--bank', request.slug, 'retire', request.name];
-  if (request.reason !== undefined) args.push('--reason', request.reason);
-  const credentials = await bankCredentialEnv(request.slug);
-  try {
-    const output = (await runCli(cli, args, 120_000, credentials.env)).trim();
-    return { message: output.length > 0 ? output : `Retired ${request.name}.` };
-  } finally {
-    credentials.dispose();
-  }
+  const outcome = await retireMemory(bank, request.name, request.reason, landingDeps());
+  return {
+    message:
+      outcome.kind === 'nothing'
+        ? outcome.detail
+        : `Retired ${request.name}: ${outcome.detail}.`,
+  };
 }
 
 /**

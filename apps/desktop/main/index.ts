@@ -34,7 +34,7 @@ import {
   SUGGESTED_TASK_SERVER,
 } from '@rx-artemis/protocol';
 
-import { profilesRoot } from '@rx-artemis/core';
+import { MEMORY_TOOL_SERVER, memoryToolServer, profilesRoot } from '@rx-artemis/core';
 
 import { APP_NAME, flavouredAppName, previousUserDataDir } from './appNames.js';
 import { configurePrefs, readPrefsSync, writePrefs } from './prefs.js';
@@ -72,6 +72,7 @@ import {
   externalBrowserToolServer,
 } from './browserTools.js';
 import { suggestedTaskToolServer } from './taskTools.js';
+import { banksForRun, isMasterEnabled, memoryToolServerOptions } from './memoryBanks.js';
 import { createServerHost, type ServerHost } from './server.js';
 import { createRoutineHost, type RoutineHost } from './routines.js';
 import { createTerminalHost, type TerminalHost } from './terminal.js';
@@ -440,36 +441,57 @@ async function bootstrap(): Promise<void> {
      * `WebContentsView` is Electron all the way down. So the factory is handed
      * across the wall here, closing over the host that owns the views.
      */
-    agentToolServers: (runId, input) => ({
+    agentToolServers: (runId, input) => {
       /*
-       * Which browser the agent gets is the run input's call — see the
-       * decision table on `agentBrowserServers`. The builders are lazy so a
-       * run that gets the Chrome bridge (or the external opener) never
-       * constructs the embedded server it will not use. It answers `undefined`
-       * for the Chrome case, which spreads to nothing.
-       */
-      ...agentBrowserServers(input, {
-        embedded: () =>
-          browserToolServer(runId, {
-            ensure: (run, url) => browsers.openForAgent(run, url),
-            current: (run) => browsers.agentBrowserFor(run),
-            host: browsers,
-          }),
-        // The same guarded door every other external open goes through: the
-        // tool has already vetted the scheme, and this vets it again on the
-        // way out because model output does not get a second-chance rule.
-        external: () => externalBrowserToolServer((url) => openExternalSafely(url)),
-      }),
-      /*
-       * Suggested tasks, on every run and under no preference.
+       * The memory tools, when there is something for them to reach.
        *
-       * Nothing about it depends on the input: it opens no surface, spends no
-       * quota and cannot act, so there is no arrangement of a run in which
-       * offering it would be wrong. The only thing that turns it off is a
-       * provider that cannot take host tools at all, which never reaches here.
+       * Two gates, and they are the same two the prompt's built-in answers to:
+       * the user has switched the banks on for Artemis, and this run's account
+       * carries at least one. A run that fails either gets no server at all
+       * rather than an empty one — a tool the model can call and be told "no
+       * bank reaches this run" teaches it the feature is broken.
+       *
+       * Everything the server needs beyond the run itself comes from
+       * `memoryBanks.ts`, which owns the locations and the credentials; this
+       * root supplies only what only a run knows.
        */
-      [SUGGESTED_TASK_SERVER]: suggestedTaskToolServer(),
-    }),
+      const memory =
+        isMasterEnabled() && banksForRun(input.profileId).length > 0
+          ? memoryToolServerOptions(input)
+          : null;
+
+      return {
+        /*
+         * Which browser the agent gets is the run input's call — see the
+         * decision table on `agentBrowserServers`. The builders are lazy so a
+         * run that gets the Chrome bridge (or the external opener) never
+         * constructs the embedded server it will not use. It answers
+         * `undefined` for the Chrome case, which spreads to nothing.
+         */
+        ...agentBrowserServers(input, {
+          embedded: () =>
+            browserToolServer(runId, {
+              ensure: (run, url) => browsers.openForAgent(run, url),
+              current: (run) => browsers.agentBrowserFor(run),
+              host: browsers,
+            }),
+          // The same guarded door every other external open goes through: the
+          // tool has already vetted the scheme, and this vets it again on the
+          // way out because model output does not get a second-chance rule.
+          external: () => externalBrowserToolServer((url) => openExternalSafely(url)),
+        }),
+        /*
+         * Suggested tasks, on every run and under no preference.
+         *
+         * Nothing about it depends on the input: it opens no surface, spends no
+         * quota and cannot act, so there is no arrangement of a run in which
+         * offering it would be wrong. The only thing that turns it off is a
+         * provider that cannot take host tools at all, which never reaches here.
+         */
+        [SUGGESTED_TASK_SERVER]: suggestedTaskToolServer(),
+        ...(memory === null ? {} : { [MEMORY_TOOL_SERVER]: memoryToolServer(memory) }),
+      };
+    },
   });
 
   // The updater exists before the IPC layer because the layer's handlers

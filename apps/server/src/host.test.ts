@@ -38,6 +38,24 @@ vi.mock(sdk.path, () => ({
     return sdkMock.onQuery(params);
   },
   listSessions: () => Promise.resolve([]),
+  /*
+   * The memory tools are an in-process MCP server, built at run start through
+   * the same `agentToolServers` seam the desktop hands its browser tools
+   * across — so replacing the SDK means replacing its server builder too. What
+   * the tools *do* is core's own tests' business; what matters here is that
+   * the host built one and gave it to the run.
+   */
+  createSdkMcpServer: (config: { readonly name: string }) => ({
+    type: 'sdk' as const,
+    name: config.name,
+    instance: {},
+  }),
+  tool: (name: string, description: string, inputSchema: unknown, handler: unknown) => ({
+    name,
+    description,
+    inputSchema,
+    handler,
+  }),
 }));
 
 const { createHeadlessHost } = await import('./host.js');
@@ -408,6 +426,46 @@ describe('the memory banks this machine carries', () => {
     const index = await readFile(join(memory, 'MEMORY.md'), 'utf8');
     expect(index).toContain('<!-- cerebro:cortex:begin -->');
     expect(index).toContain('unraid-paths.md');
+  });
+
+  it('gives a run on a provider that takes host tools the memory tools, and tells it so', async () => {
+    await registerBank('cortex', await writeBank('cortex'), { kind: 'all' });
+    const query = installQuery();
+
+    await host.runSource.startRun(started());
+
+    // The server itself, under the name the tools are addressed by:
+    // `mcp__artemisMemory__memory_draft`.
+    const servers = (query.options()['mcpServers'] ?? {}) as Record<string, unknown>;
+    expect(Object.keys(servers)).toContain('artemisMemory');
+    // And the prompt teaches the tools rather than the bank's CLI — a run told
+    // to shell out when it has the tools spends a subprocess on nothing, and
+    // one told the opposite calls a tool that is not there.
+    const append = query.append();
+    expect(append).toContain('memory_draft');
+    expect(append).toContain('memory_promote');
+    expect(append).not.toContain('cerebro draft');
+  });
+
+  it('gives a provider that cannot take host tools neither the server nor the words', async () => {
+    await registerBank('cortex', await writeBank('cortex'), { kind: 'all' });
+    /*
+     * The same adapter under Codex's id, as the inline-index case does it:
+     * what is under test is what the *host* makes of the provider — Codex runs
+     * somebody else's harness and has nowhere to put an in-process MCP server
+     * — not how Codex itself runs.
+     */
+    const claude = host.providers.get('claude');
+    host.providers.register({ ...claude!, id: 'codex' as ProviderId }, { replace: true });
+    const query = installQuery();
+
+    await host.runSource.startRun(started({ providerId: 'codex' }));
+
+    const servers = (query.options()['mcpServers'] ?? {}) as Record<string, unknown>;
+    expect(Object.keys(servers)).not.toContain('artemisMemory');
+    expect(query.append()).not.toContain('memory_draft');
+    // It still hears about the bank; it is only the writing half that differs.
+    expect(query.append()).toContain('`cortex`');
   });
 
   it('starts the run it always started on a machine with no banks', async () => {

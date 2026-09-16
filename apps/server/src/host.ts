@@ -55,6 +55,9 @@ import {
   joinSystemPromptAppends,
   machineBankPrompt,
   managedEnvKeys,
+  memoryToolServer,
+  registryPath,
+  MEMORY_TOOL_SERVER,
   DuplicateProfileLabelError,
   ProfileStore,
   resolveEnv,
@@ -74,6 +77,7 @@ import {
   type SessionSource,
   type UsageSource,
   type WorkspaceResolver,
+  takesHostToolServers,
 } from '@rx-artemis/core';
 
 import {
@@ -89,6 +93,9 @@ import { createFileProfileSecrets } from './secrets.js';
  * rule.
  */
 const MAX_SESSION_TITLE = 200;
+
+/** The providers this host hands its tool servers to — core's list, shared with the desktop. */
+const takesHostTools = takesHostToolServers;
 
 export interface HeadlessHost {
   readonly profiles: ProfileStore;
@@ -143,6 +150,13 @@ export function createHeadlessHost(
   const providers = createDefaultProviderRegistry({
     claude: {
       /*
+       * The memory tools, built per run by this process — the same seam the
+       * desktop hands its browser and task tools across, and the only tools a
+       * headless deployment has to give. `memoryTools` is declared below and
+       * captured, not called, until a run starts.
+       */
+      agentToolServers: (_runId, input) => memoryTools(input),
+      /*
        * The provider started a turn nobody asked for — register it.
        *
        * It does that when background work settles, and a subagent that outlived
@@ -163,6 +177,14 @@ export function createHeadlessHost(
           );
         }
       },
+    },
+    /*
+     * The same factory, for the provider whose loop is Artemis's own. One
+     * call, not a second one built for the occasion — see the desktop's
+     * `engine.ts`, which says the same thing about the same pair.
+     */
+    local: {
+      agentToolServers: (_runId, input) => memoryTools(input),
     },
   });
   const managed = [...new Set(providers.list().flatMap((adapter) => managedEnvKeys(adapter.credentials)))];
@@ -438,6 +460,44 @@ export function createHeadlessHost(
     providers.get(providerId as ProviderId)?.capabilities.systemPromptAppend === true;
 
   /**
+   * The memory tools for one run, or nothing.
+   *
+   * Nothing for a provider that cannot take them, and nothing for an account
+   * that carries no bank — a server whose every call answers "no memory bank
+   * reaches this run" teaches the model the feature is broken rather than that
+   * it is not configured here.
+   *
+   * No credential is supplied. This process has no key manager and no window
+   * to authorise one, so `landing.credential` is left unset and core falls
+   * back to `git credential fill` — the container's ambient helper, or a
+   * deploy key on an ssh remote, which is exactly how `memoryBanks.ts` already
+   * pulls. See its header.
+   */
+  const memoryTools = (
+    input: RunInput,
+  ): Record<string, ReturnType<typeof memoryToolServer>> | undefined => {
+    try {
+      if (!takesHostTools(input.providerId) || !banks.reaches(input.profileId)) return undefined;
+      return {
+        [MEMORY_TOOL_SERVER]: memoryToolServer({
+          dataDir,
+          cliRegistryPath: registryPath(),
+          profileId: input.profileId,
+          cwd: input.cwd,
+          log: (line) => process.stderr.write(`memory banks: ${line}\n`),
+        }),
+      };
+    } catch (error) {
+      // A run starts without the tools rather than not at all: memory is an
+      // augmentation, and an augmentation that can fail a turn is a liability.
+      process.stderr.write(
+        `memory banks: could not build the memory tools: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return undefined;
+    }
+  };
+
+  /**
    * This machine's memory-bank prompt for one run.
    *
    * Here and not on the client, because the prompt is about the machine the
@@ -445,8 +505,10 @@ export function createHeadlessHost(
    * have here. The client's rendering would name its own slugs and a path on a
    * laptop; the desktop keeps that built-in off the wire for exactly this
    * reason. What the run contributes is which of them it may see (its
-   * account's scope), which slice of each it is shown (its project), and
-   * whether the index is carried inline (its provider).
+   * account's scope), which slice of each it is shown (its project), whether
+   * the index is carried inline (its provider), and whether it can write
+   * through the memory tools or has to be taught the bank's CLI (its provider
+   * again — see {@link takesHostTools}, which decides both).
    *
    * Never throws: a bank that cannot be read is a run that starts without it.
    */
@@ -461,6 +523,7 @@ export function createHeadlessHost(
         profileId: run.profileId,
         cwd: run.cwd,
         providerId: run.providerId,
+        toolsAvailable: takesHostTools(run.providerId),
       });
     } catch (error) {
       process.stderr.write(

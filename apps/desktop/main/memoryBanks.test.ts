@@ -18,13 +18,21 @@
  * told apart.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { readBankAt, type BankRecord } from '@rx-artemis/core';
+import {
+  detectForge,
+  EphemeralMemoryBankSecrets,
+  readBankAt,
+  REGISTRY_V2_FILE,
+  type BankRecord,
+  type Forge,
+  type SecretRef,
+} from '@rx-artemis/core';
 
 import {
   acceptsAsPython3,
@@ -32,6 +40,7 @@ import {
   baseCliEnv,
   categorizeLsRemote,
   configureMemoryBanks,
+  forgeCredentialFor,
   hasBankBlock,
   hasSessionStartSyncHook,
   isMasterEnabled,
@@ -40,6 +49,7 @@ import {
   parseRegistry,
   pullDue,
   PYTHON_CANDIDATES,
+  readMemoryBanksStatus,
   selectPython,
   syncDue,
   withoutSecrets,
@@ -534,6 +544,112 @@ describe('parseGitOrigin', () => {
   it('is null for a repository with no origin, and for anything unreadable', () => {
     expect(parseGitOrigin('[core]\n\tbare = false\n')).toBeNull();
     expect(parseGitOrigin('')).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* What a landing authenticates with                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The credential core asks this process for when it lands a memory.
+ *
+ * Core opens the pull request and merges it over the forge's API, and holds no
+ * credential of its own: it names a *forge* and this module answers with what
+ * Artemis holds for that host, or with `null` so core can fall back to
+ * `git credential fill`. Three answers matter and they are the three below —
+ * the bank on that host, a bank somewhere else, and a bank whose token lives
+ * in a key manager that will not give it up.
+ */
+describe('forgeCredentialFor', () => {
+  /** A bank checkout with nothing in it but an origin. */
+  function bankWithOrigin(remote: string): string {
+    const root = mkdtempSync(join(tmpdir(), 'artemis-forge-bank-'));
+    mkdirSync(join(root, 'memories'), { recursive: true });
+    mkdirSync(join(root, '.git'), { recursive: true });
+    writeFileSync(join(root, '.git', 'config'), `[remote "origin"]\n\turl = ${remote}\n`, 'utf8');
+    return root;
+  }
+
+  /**
+   * A data directory whose registry lists one bank — and a scratch
+   * `XDG_CONFIG_HOME`, so the CLI's real registry on the developing machine is
+   * neither read into the answer nor written to.
+   */
+  function machineWith(slug: string, bankPath: string): string {
+    const dataDir = mkdtempSync(join(tmpdir(), 'artemis-forge-data-'));
+    process.env['XDG_CONFIG_HOME'] = join(dataDir, 'xdg');
+    writeFileSync(
+      join(dataDir, REGISTRY_V2_FILE),
+      JSON.stringify({
+        version: 2,
+        banks: [{ slug, path: bankPath, role: 'readwrite', enabled: true, profiles: { kind: 'all' } }],
+        default: slug,
+      }),
+    );
+    return dataDir;
+  }
+
+  const forgeFor = (remote: string): Forge => {
+    const forge = detectForge(remote);
+    if (forge === null) throw new Error(`not a forge: ${remote}`);
+    return forge;
+  };
+
+  const REF: SecretRef = {
+    provider: 'openbao',
+    connectionId: 'conn-1',
+    mount: 'kv',
+    path: 'banks/cortex',
+    key: 'git_token',
+  };
+
+  afterEach(() => {
+    delete process.env['XDG_CONFIG_HOME'];
+  });
+
+  it('answers with the token held for a bank whose origin is on that host', async () => {
+    const bank = bankWithOrigin('https://forge.example/team/cortex.git');
+    const secrets = new EphemeralMemoryBankSecrets();
+    await secrets.write('cortex', { kind: 'token', token: 'forge-token', username: 'david' });
+    configureMemoryBanks(machineWith('cortex', bank), secrets);
+
+    expect(await forgeCredentialFor(forgeFor('https://forge.example/team/cortex.git'))).toEqual({
+      username: 'david',
+      token: 'forge-token',
+    });
+    // The *host* is what is matched, not the repository: a second bank on the
+    // same Forgejo lands with the first one's token rather than needing its own.
+    expect(await forgeCredentialFor(forgeFor('https://forge.example/other/notes.git'))).toEqual({
+      username: 'david',
+      token: 'forge-token',
+    });
+  });
+
+  it('answers null for a forge no bank on this machine is on', async () => {
+    const bank = bankWithOrigin('https://forge.example/team/cortex.git');
+    const secrets = new EphemeralMemoryBankSecrets();
+    await secrets.write('cortex', { kind: 'token', token: 'forge-token', username: 'david' });
+    configureMemoryBanks(machineWith('cortex', bank), secrets);
+
+    // `null` rather than the token: core falls back to `git credential fill`,
+    // and a token for one host must never be presented to another.
+    expect(await forgeCredentialFor(forgeFor('https://github.com/team/cortex.git'))).toBeNull();
+  });
+
+  it('answers null when the bank’s reference cannot be resolved, and records why', async () => {
+    const bank = bankWithOrigin('https://forge.example/team/cortex.git');
+    const secrets = new EphemeralMemoryBankSecrets();
+    await secrets.write('cortex', { kind: 'ref', ref: REF, username: 'david' });
+    const dataDir = machineWith('cortex', bank);
+    configureMemoryBanks(dataDir, secrets, () => Promise.reject(new Error('vault is sealed')));
+
+    expect(await forgeCredentialFor(forgeFor('https://forge.example/team/cortex.git'))).toBeNull();
+
+    // And the sentence survives, for the pane — the three ways a key manager
+    // refuses look identical from the outside otherwise.
+    const status = await readMemoryBanksStatus();
+    expect(status.banks[0]?.credential).toMatchObject({ kind: 'ref', problem: 'vault is sealed' });
   });
 });
 

@@ -37,6 +37,22 @@ import { draftMemory, promoteBank, refreshBank, retireMemory, type LandingDeps }
 /** The server's name: its tools are addressed as `mcp__artemisMemory__<tool>`. */
 export const MEMORY_TOOL_SERVER = 'artemisMemory';
 
+/**
+ * The providers a host hands its tool servers to: the Claude adapter and the
+ * three local adapters, which are the two seams with an `agentToolServers`
+ * option. Codex and OpenCode reach MCP through the runtime Artemis wraps and
+ * take nothing from the host; a served run's tools are the serving machine's.
+ *
+ * One list for both hosts, so the prompt's answer to "are the memory tools
+ * there?" is the same answer as the run's.
+ */
+export const HOST_TOOL_SERVER_PROVIDERS: ReadonlySet<string> = new Set(['claude', 'lmstudio', 'ollama', 'llamacpp']);
+
+/** Does a run on this provider receive the host's tool servers, the memory tools among them? */
+export function takesHostToolServers(providerId: string): boolean {
+  return HOST_TOOL_SERVER_PROVIDERS.has(providerId);
+}
+
 export interface MemoryToolServerOptions {
   /** The host's data directory: where `memory-banks.json` lives. */
   readonly dataDir: string;

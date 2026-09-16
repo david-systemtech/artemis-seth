@@ -9,13 +9,16 @@
  * the same text the desktop would, from the same reader and the same renderer,
  * and the client keeps its own bank prompt at home.
  *
- * Three things the run decides rather than the machine. Its **profile**: a
+ * Four things the run decides rather than the machine. Its **profile**: a
  * bank attached to one account is not described to another, which is the whole
  * point of the scope the v2 registry holds and the CLI's could not. Its
  * **directory**: the index each bank carries is the slice of it that applies
  * to the project about to start. Its **provider**: a harness that loads the
  * project's memory file itself is told where the index is, and one that does
- * not is handed the index inline — see `renderMemoryBanksPrompt`.
+ * not is handed the index inline — see `renderMemoryBanksPrompt`. And its
+ * **tools**: a provider that takes the host's tool servers is taught
+ * `memory_search` and `memory_draft` rather than the CLI's verbs, which is the
+ * host's answer because it is the host that builds that server.
  *
  * Nothing here spawns — see `registryV2.ts` and `formats.ts` — so it is safe
  * on the path of every served turn.
@@ -47,6 +50,16 @@ export interface MachineBankPromptOptions {
   readonly cwd?: string;
   /** The serving provider, for whether the index is carried in the prompt itself. */
   readonly providerId?: string;
+  /**
+   * Whether the memory tools reach this run.
+   *
+   * The host's to answer, because it is the host that builds the tool server:
+   * a provider that takes this process's `agentToolServers` gets
+   * `memory_search` and the rest, and a provider that does not is taught the
+   * CLI instead. Defaults to `false` — a prompt that teaches a tool nothing
+   * serves is worse than one that teaches none.
+   */
+  readonly toolsAvailable?: boolean;
 }
 
 const NOTHING: BankRegistryV2 = { version: REGISTRY_V2_VERSION, banks: [], defaultSlug: null };
@@ -104,9 +117,8 @@ export function machineBankPrompt(options: MachineBankPromptOptions): string | u
     ...(options.profileId === undefined ? {} : { profileId: options.profileId }),
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     budget: sharedIndexBudget(inScope),
-    // The memory tools are the desktop's MCP surface; a host that has them
-    // says so itself. Neither host offers them on this path today.
-    toolsAvailable: false,
+    // Said by the host, per run: see `toolsAvailable` above.
+    toolsAvailable: options.toolsAvailable === true,
   });
   if (banks.length === 0) return undefined;
   return renderMemoryBanksPrompt(banks, {

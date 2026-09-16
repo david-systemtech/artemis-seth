@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 import type { RunInput } from '@rx-artemis/protocol';
 
 import {
+  bankToolsAvailable,
   builtInsFor,
   inlineBankIndex,
   mergeAdditionalDirectories,
@@ -213,5 +214,23 @@ describe('inlineBankIndex', () => {
     expect(inlineBankIndex('llamacpp')).toBe(true);
     expect(inlineBankIndex('codex')).toBe(true);
     expect(inlineBankIndex('artemis')).toBe(true);
+  });
+});
+
+/**
+ * Whether the prompt teaches the memory tools or the bank's CLI.
+ *
+ * Not a preference: a run told about `memory_draft` when it has no such tool
+ * will call it and conclude the bank is broken. The question is whether this
+ * provider takes the host's tool servers at all, which is what
+ * `taskSuggestions` records — the memory server travels through the very same
+ * `agentToolServers` seam the suggested-task server does.
+ */
+describe('bankToolsAvailable', () => {
+  it('follows the providers that receive the host tool servers', () => {
+    expect(bankToolsAvailable('claude')).toBe(true);
+    expect(bankToolsAvailable('llamacpp')).toBe(true);
+    expect(bankToolsAvailable('codex')).toBe(false);
+    expect(bankToolsAvailable('artemis')).toBe(false);
   });
 });

@@ -97,6 +97,25 @@ describe('machineBankPrompt', () => {
     expect(machineBankPrompt(where)).toBe(claude);
   });
 
+  it('teaches the memory tools when the host says they reach the run, and the CLI when it does not', () => {
+    const dataDir = dataDirFor(projectsBank(), 'cortex', { kind: 'all' });
+    const where = { dataDir, cliRegistryPath: NOWHERE, legacyRoot: NOWHERE };
+
+    const tools = machineBankPrompt({ ...where, toolsAvailable: true });
+    expect(tools).toContain('memory_search');
+    expect(tools).toContain('memory_draft');
+    expect(tools).toContain('memory_promote');
+    expect(tools).toContain('memory_retire');
+    // The two ways to write are alternatives, never both: an agent told about
+    // a tool and a command will use whichever it read last.
+    expect(tools).not.toContain('cerebro draft');
+
+    // The default is the CLI, for a provider that cannot take host tools.
+    const cli = machineBankPrompt(where);
+    expect(cli).toContain('cerebro');
+    expect(cli).not.toContain('memory_draft');
+  });
+
   it('keeps a machine with only the legacy clone working, under the legacy slug', () => {
     const legacyRoot = projectsBank();
     const dataDir = scratch();

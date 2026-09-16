@@ -45,6 +45,7 @@
 import type {
   AgentEvent,
   Attachment,
+  Capabilities,
   PermissionDecision,
   PermissionRequestId,
   Profile,
@@ -123,6 +124,7 @@ import {
   buildContentBridge,
   discoverMarketplacePlugins,
   linkSkillsIntoCodexHome,
+  takesHostToolServers,
 } from '@rx-artemis/core';
 import {
   applyPlanLimit,
@@ -219,6 +221,19 @@ export function builtInsFor(
  */
 export function inlineBankIndex(providerId: string): boolean {
   return providerId !== 'claude';
+}
+
+/**
+ * Does this run receive the memory tools?
+ *
+ * The same question as "does this provider get the host's tool servers",
+ * answered from core's one list so the prompt and the run agree: a Claude or
+ * local-model run gets `artemisMemory` through `agentToolServers` and is
+ * taught `memory_draft`; a Codex or OpenCode run gets neither and is taught
+ * the CLI for a bank that embeds one.
+ */
+export function bankToolsAvailable(providerId: string): boolean {
+  return takesHostToolServers(providerId);
 }
 
 export function withSystemPromptAppended(input: RunInput, text: string | undefined): RunInput {
@@ -945,11 +960,16 @@ function createEngine(options: EngineOptions): ArtemisEngine {
         profileId: input.profileId,
         availableBuiltIns: available,
         // The banks this profile carries, described against the project the run
-        // starts in: their own names, how they are filed, and the index of the
-        // entries that apply here.
+        // starts in: their own names, how they are filed, the index of the
+        // entries that apply here, and whether this run can write through the
+        // memory tools or has to be taught the CLI — see `bankToolsAvailable`.
         ...(available.has('builtin:cerebro')
           ? {
-              memoryBanks: promptBanks(input.profileId, input.cwd),
+              memoryBanks: promptBanks(
+                input.profileId,
+                input.cwd,
+                bankToolsAvailable(input.providerId),
+              ),
               memoryBanksOptions: { inlineIndex: inlineBankIndex(input.providerId) },
             }
           : {}),
