@@ -11,6 +11,9 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+
 import { REGISTRY_V2_FILE } from '../registryV2.js';
 import { loadRunBanks, memoryTools, MEMORY_TOOL_SERVER, memoryToolServer } from '../tools.js';
 
@@ -76,6 +79,31 @@ describe('the memory tools', () => {
     expect(Object.keys(handlers({ dataDir: scratch(), cliRegistryPath: NOWHERE })).sort()).toEqual([
       'memory_draft', 'memory_promote', 'memory_read', 'memory_retire', 'memory_search',
     ]);
+  });
+
+  it('lists its tools over a real MCP transport, the way a local model reaches them', { timeout: 30_000 }, async () => {
+    // The SDK server converts each tool's zod schema when a client asks for
+    // the list. That conversion is where a zod the SDK was not built against
+    // fails — the served container met exactly that with zod 4.6.5 — and the
+    // handler-level cases below never exercise it.
+    const server = memoryToolServer({ dataDir: scratch(), cliRegistryPath: NOWHERE });
+    if (server.type !== 'sdk') throw new Error('expected an sdk server');
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.instance.connect(serverSide);
+    const client = new Client({ name: 'test', version: '1' });
+    await client.connect(clientSide);
+    try {
+      const listed = await client.listTools();
+      expect(listed.tools.map((tool) => tool.name).sort()).toEqual([
+        'memory_draft', 'memory_promote', 'memory_read', 'memory_retire', 'memory_search',
+      ]);
+      const draft = listed.tools.find((tool) => tool.name === 'memory_draft');
+      expect(draft?.inputSchema).toMatchObject({ type: 'object' });
+      const properties = (draft?.inputSchema as { properties?: Record<string, unknown> } | undefined)?.properties ?? {};
+      expect(Object.keys(properties)).toEqual(expect.arrayContaining(['name', 'description', 'body', 'scope', 'applies_to']));
+    } finally {
+      await client.close();
+    }
   });
 
   it('offers only the banks the run\'s profile carries', () => {
