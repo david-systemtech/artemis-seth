@@ -30,6 +30,7 @@ import { promisify } from 'node:util';
 import { defaultBranch, detectForge, fileOnBranch, gitCredentialFill, mergePullRequest, openPullRequest, type Forge, type ForgeCredential } from './forge.js';
 import { readBank, readBankAt } from './formats.js';
 import { parseFrontmatter, serializeFrontmatter } from './frontmatter.js';
+import { renderBankIndexFile } from './indexFile.js';
 import type { Bank, BankEntry } from './model.js';
 import { CEREBRO_SCHEMA, checkEntry, SLUG_PATTERN } from './schema.js';
 import { hasRemote } from './sync.js';
@@ -274,6 +275,26 @@ export async function landChanges(
     }
   };
 
+  /**
+   * The bank's own index, rewritten from the tree as it now stands, so a
+   * landing can never leave it a line out of date. Read from the tree being
+   * committed — a worktree or the checkout — not from `bank`, which describes
+   * the checkout before the change. Returns the file's path when it was
+   * written, for the commit's path list.
+   */
+  const regenerateIndex = (tree: string): string | null => {
+    if (!bank.indexGenerated || bank.indexFile === null) return null;
+    const now = readBankAt(tree, { slug: bank.name });
+    if (now === null) return null;
+    const rendered = renderBankIndexFile(now, (deps.now?.() ?? new Date()).toISOString().slice(0, 10));
+    if (rendered === null) return null;
+    const target = resolve(tree, bank.indexFile);
+    if (!target.startsWith(resolve(tree) + sep)) return null;
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, rendered, 'utf8');
+    return bank.indexFile;
+  };
+
   const remote = hasRemote(bank.root);
   const remoteUrl = remote ? await originUrl(bank.root) : null;
   const forge = remoteUrl === null ? null : detectForge(remoteUrl);
@@ -282,7 +303,8 @@ export async function landChanges(
   const env = deps.gitEnv ?? {};
   if (!wantsPullRequest) {
     apply(bank.root);
-    const paths = input.changes.map((change) => change.path);
+    const index = regenerateIndex(bank.root);
+    const paths = [...input.changes.map((change) => change.path), ...(index === null ? [] : [index])];
     const identity = await gitIdentityArgs(bank.root, env);
     await git(bank.root, ['add', '-A', '--', ...paths], env);
     await git(bank.root, [...identity, 'commit', '-q', '-m', input.message, '--', ...paths], env);
@@ -316,7 +338,8 @@ export async function landChanges(
   try {
     await git(bank.root, ['worktree', 'add', '-q', '--detach', worktree, `origin/${base}`], env);
     apply(worktree);
-    const paths = input.changes.map((change) => change.path);
+    const index = regenerateIndex(worktree);
+    const paths = [...input.changes.map((change) => change.path), ...(index === null ? [] : [index])];
     const identity = await gitIdentityArgs(worktree, env);
     await git(worktree, ['add', '-A', '--', ...paths], env);
     await git(worktree, [...identity, 'commit', '-q', '-m', input.message, '--', ...paths], env);

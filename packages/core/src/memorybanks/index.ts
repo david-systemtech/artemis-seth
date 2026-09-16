@@ -21,6 +21,7 @@ export * from './forge.js';
 export * from './formats.js';
 export * from './frontmatter.js';
 export * from './glob.js';
+export * from './indexFile.js';
 export * from './install.js';
 export * from './manifest.js';
 export * from './model.js';

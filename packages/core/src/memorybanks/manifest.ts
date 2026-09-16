@@ -39,6 +39,8 @@ export interface BankManifest {
   readonly schema: BankSchemaSpec;
   readonly docGlobs: readonly string[];
   readonly indexFile: string | null;
+  /** `index: { file, generate: true }` — the host writes the index on every landing. */
+  readonly indexGenerated: boolean;
   /** A file to read instructions from instead of the body. */
   readonly instructionsFile: string | null;
   readonly place: string | null;
@@ -163,6 +165,13 @@ export function parseBankManifest(text: string): ParsedManifest {
     bytes: positiveInt(budget['bytes'], DEFAULT_INDEX_BUDGET.bytes),
   };
 
+  // `index: INDEX.md` names a file the bank keeps itself; `index: { file,
+  // generate: true }` asks the host to write it from the docs and entries on
+  // every landing.
+  const rawIndex = data['index'];
+  const indexFile = isRecord(rawIndex) ? optionalText(rawIndex['file']) : optionalText(rawIndex);
+  const indexGenerated = isRecord(rawIndex) && rawIndex['generate'] === true && indexFile !== null;
+
   return {
     manifest: {
       name: name ?? '',
@@ -171,7 +180,8 @@ export function parseBankManifest(text: string): ParsedManifest {
       scopeTemplate,
       schema,
       docGlobs,
-      indexFile: optionalText(data['index']),
+      indexFile,
+      indexGenerated,
       instructionsFile: optionalText(data['instructions']),
       place,
       landing,
@@ -186,6 +196,14 @@ export function parseBankManifest(text: string): ParsedManifest {
 export interface CompiledScope {
   readonly levels: readonly string[];
   readonly scopeOf: (relativePath: string) => Readonly<Record<string, string>>;
+  /**
+   * The labels a *directory* carries: the template matched only as far as
+   * the directory goes, so `projects/personal/agents` under
+   * `projects/{org}/{project}/memories/` is `{ org, project }` and
+   * `projects/personal` is `{ org }`. For docs and entry points, which sit
+   * above the memories folder.
+   */
+  readonly scopeOfDirectory: (relativeDir: string) => Readonly<Record<string, string>>;
 }
 
 /**
@@ -197,13 +215,24 @@ export interface CompiledScope {
  * template only says what its folders are called.
  */
 export function compileScope(template: string | null): CompiledScope {
-  if (template === null) return { levels: [], scopeOf: () => ({}) };
+  if (template === null) return { levels: [], scopeOf: () => ({}), scopeOfDirectory: () => ({}) };
   const segments = template.split('/').filter((segment) => segment.length > 0);
   const levels = segments
     .filter((segment) => segment.startsWith('{'))
     .map((segment) => segment.slice(1, -1));
   return {
     levels,
+    scopeOfDirectory: (relativeDir) => {
+      const parts = relativeDir.replace(/\\/g, '/').split('/').filter((part) => part.length > 0);
+      const scope: Record<string, string> = {};
+      for (let i = 0; i < segments.length && i < parts.length; i += 1) {
+        const segment = segments[i] ?? '';
+        const part = parts[i] ?? '';
+        if (segment.startsWith('{')) scope[segment.slice(1, -1)] = part;
+        else if (segment !== part) return {};
+      }
+      return scope;
+    },
     scopeOf: (relativePath) => {
       const parts = relativePath.replace(/\\/g, '/').split('/');
       const scope: Record<string, string> = {};
