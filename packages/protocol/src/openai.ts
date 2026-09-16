@@ -257,10 +257,53 @@ export function reviewParameters(
  */
 export type OpenAiFinishReason = 'stop' | 'length' | 'tool_calls' | 'content_filter';
 
+/**
+ * What a turn cost, in OpenAI's vocabulary.
+ *
+ * ## `prompt_tokens` is the whole prompt, cached parts included
+ *
+ * Which is OpenAI's own definition and worth stating, because the provider
+ * Artemis relays from counts differently and the translation is where this went
+ * wrong. Anthropic reports a *disjoint* triple — `input_tokens` for what was
+ * billed at the full rate, `cache_read_input_tokens` for what came back from
+ * the prompt cache, `cache_creation_input_tokens` for what was written into it
+ * — and the prompt is the sum of all three. Passing the first one through alone
+ * reported a twenty-thousand-token prompt as ten tokens: not a rounding error
+ * but a different measurement, and one that reads as a suspiciously cheap turn
+ * rather than as a missing field.
+ *
+ * So the sum is what goes here, and the parts that OpenAI has a place for go in
+ * the details below.
+ */
 export interface OpenAiUsage {
+  /** The whole prompt, cached and uncached alike. */
   readonly prompt_tokens: number;
   readonly completion_tokens: number;
   readonly total_tokens: number;
+  /**
+   * How much of {@link prompt_tokens} came back from the prompt cache.
+   *
+   * OpenAI's own field, and the one a cost calculation needs: cached input is
+   * billed at a fraction of the full rate everywhere it exists, so a client
+   * that cannot separate it prices every cached turn as though nothing were
+   * cached. Omitted rather than zeroed when the serving provider has no prompt
+   * cache, since `0` is a claim that nothing was cached and absence is not.
+   */
+  readonly prompt_tokens_details?: { readonly cached_tokens: number };
+  /**
+   * How much of {@link prompt_tokens} was *written* into the cache this turn.
+   *
+   * OpenAI has no field for this — its caching is implicit and costs nothing to
+   * populate — so this carries Anthropic's own name, which is what the
+   * OpenAI-shaped relays in the wild (LiteLLM and the proxies built on it)
+   * already emit and read. Same reasoning as `reasoning_content`: where a
+   * de-facto field exists, using it reaches more clients than a private one in
+   * the `artemis` namespace would.
+   *
+   * Worth its own field rather than being folded into the uncached remainder,
+   * because a cache write is billed *above* the full input rate, not below it.
+   */
+  readonly cache_creation_input_tokens?: number;
 }
 
 /**

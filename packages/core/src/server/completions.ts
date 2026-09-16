@@ -88,6 +88,7 @@ import type {
   RunInput,
   ServerModel,
   SessionDelegatedWork,
+  TokenUsage,
 } from '@rx-artemis/protocol';
 import type { RouteRedirect } from './sessionHome.js';
 
@@ -1203,15 +1204,32 @@ export function finishReasonFor(reason: RunEndReason): OpenAiFinishReason {
   return reason === 'max_turns' || reason === 'budget_exceeded' ? 'length' : 'stop';
 }
 
-/** Artemis counts more kinds of token than OpenAI reports; these are the three it has. */
-function toOpenAiUsage(tokens: {
-  readonly inputTokens: number;
-  readonly outputTokens: number;
-}): OpenAiUsage {
+/**
+ * Artemis's token counts in OpenAI's vocabulary.
+ *
+ * The two vocabularies do not line up field for field, and taking the two that
+ * share a *name* is what made this wrong: Artemis's `inputTokens` is the
+ * uncached remainder of the prompt, where OpenAI's `prompt_tokens` is the whole
+ * of it. Every cached turn therefore reported a prompt one or two orders of
+ * magnitude smaller than the one it had actually sent — confirmed live against
+ * a served account, which answered `prompt_tokens: 10` for a turn whose prompt
+ * ran to about twenty thousand. Nothing looked broken; it looked cheap.
+ *
+ * So the prompt is summed and the parts are named. See {@link OpenAiUsage} for
+ * which field each part goes to and why one of them is not OpenAI's.
+ */
+function toOpenAiUsage(tokens: TokenUsage): OpenAiUsage {
+  const cacheRead = tokens.cacheReadInputTokens;
+  const cacheCreation = tokens.cacheCreationInputTokens;
+  const prompt = tokens.inputTokens + (cacheRead ?? 0) + (cacheCreation ?? 0);
   return {
-    prompt_tokens: tokens.inputTokens,
+    prompt_tokens: prompt,
     completion_tokens: tokens.outputTokens,
-    total_tokens: tokens.inputTokens + tokens.outputTokens,
+    total_tokens: prompt + tokens.outputTokens,
+    // Omitted, not zeroed, on a provider with no prompt cache: `0` claims
+    // nothing was cached, and absence claims nothing at all.
+    ...(cacheRead === undefined ? {} : { prompt_tokens_details: { cached_tokens: cacheRead } }),
+    ...(cacheCreation === undefined ? {} : { cache_creation_input_tokens: cacheCreation }),
   };
 }
 

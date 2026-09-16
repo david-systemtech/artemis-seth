@@ -212,3 +212,76 @@ describe('a served run', () => {
     expect(end.usage?.contextWindow).toBeUndefined();
   });
 });
+
+/**
+ * The bill, which is a different measurement from the reading above.
+ *
+ * The same function that discarded the context also flattened the prompt: it
+ * reported Artemis's *uncached* input as OpenAI's `prompt_tokens`, which is the
+ * whole prompt by definition. A served turn with a warm cache therefore came
+ * back claiming a prompt of a few tokens. These pin the client's half of the
+ * round trip — splitting the whole back into the disjoint triple every other
+ * adapter reports, without which the same error happens again in reverse.
+ */
+describe('the token counts a served run reports', () => {
+  it('splits the prompt back into uncached, cached and written', async () => {
+    const events = await collect([
+      {
+        choices: [{ delta: {}, finish_reason: 'stop' }],
+        usage: {
+          prompt_tokens: 20_810,
+          completion_tokens: 173,
+          total_tokens: 20_983,
+          prompt_tokens_details: { cached_tokens: 19_000 },
+          cache_creation_input_tokens: 1_800,
+        },
+        artemis: { endReason: 'completed' },
+      },
+    ]);
+
+    const end = events.find((event) => event.type === 'run.end') as { usage?: UsageSnapshot };
+    expect(end.usage?.tokens).toEqual({
+      inputTokens: 10,
+      outputTokens: 173,
+      cacheReadInputTokens: 19_000,
+      cacheCreationInputTokens: 1_800,
+    });
+  });
+
+  it('leaves the prompt whole when the server named no cached part', async () => {
+    // A provider with no prompt cache, or a server too old to say. The whole
+    // prompt is uncached as far as anyone here knows, which is the truth.
+    const events = await collect([
+      {
+        choices: [{ delta: {}, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 100, completion_tokens: 40, total_tokens: 140 },
+        artemis: { endReason: 'completed' },
+      },
+    ]);
+
+    const end = events.find((event) => event.type === 'run.end') as { usage?: UsageSnapshot };
+    expect(end.usage?.tokens).toEqual({ inputTokens: 100, outputTokens: 40 });
+  });
+
+  it('never lets the parts make the remainder negative', async () => {
+    // A token count below zero on a diagnostic panel, arrived at by arithmetic
+    // rather than by anything that happened. The parser clamps; this is the
+    // guard that says so.
+    const events = await collect([
+      {
+        choices: [{ delta: {}, finish_reason: 'stop' }],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 40,
+          total_tokens: 140,
+          prompt_tokens_details: { cached_tokens: 900 },
+        },
+        artemis: { endReason: 'completed' },
+      },
+    ]);
+
+    const end = events.find((event) => event.type === 'run.end') as { usage?: UsageSnapshot };
+    expect(end.usage?.tokens.inputTokens).toBe(0);
+    expect(end.usage?.tokens.cacheReadInputTokens).toBe(100);
+  });
+});
