@@ -264,6 +264,35 @@ export interface OpenAiUsage {
 }
 
 /**
+ * How full the conversation's context is — which `usage` cannot say.
+ *
+ * Two different questions, and OpenAI's shape only has a field for one of them.
+ * `usage` is a *bill*: what this turn cost, counted once and never again. This
+ * is an *occupancy*: what is sitting in the window right now, which does not
+ * accumulate across turns and which shrinks when the conversation is compacted.
+ * Summing prompt tokens to get it produces a number that only ever rises, on a
+ * gauge whose whole job is to fall when room is made.
+ *
+ * And the denominator is not derivable at all. `window` is a property of the
+ * process serving the model, not of the weights — `llama-server -c 32768`
+ * serves 32k out of a checkpoint trained at 262144 — so a client that guessed
+ * it from the model name would draw a confident scale that is wrong in the
+ * direction that matters least kindly: 12% full on a conversation about to be
+ * truncated. It is stated here or it is not known.
+ *
+ * Both halves are optional and they arrive at different times. The serving
+ * providers report occupancy per assistant message and the window size once, on
+ * the result — so a chunk carrying only `tokens` is the ordinary case, and a
+ * reading is built up rather than received whole.
+ */
+export interface ArtemisContextReading {
+  /** Tokens occupying the window right now. */
+  readonly tokens?: number;
+  /** The window they sit in, when the serving provider has stated one. */
+  readonly window?: number;
+}
+
+/**
  * What the agent did, reported rather than requested.
  *
  * This is where a turn's real work goes: the files it read, the commands it
@@ -348,6 +377,16 @@ export interface ArtemisResponseExtensions {
    * for another twenty minutes. See `BackgroundTasksEvent` for the shape.
    */
   readonly tasks?: readonly BackgroundTask[];
+  /**
+   * How full the served conversation's context is. See
+   * {@link ArtemisContextReading} for why this cannot ride on `usage`.
+   *
+   * Rides an empty-delta chunk as the run reports it, the same way `tasks`
+   * does, and is repeated on the final chunk so a client that joined late — or
+   * that reads only the last thing — still ends holding a reading. An OpenAI
+   * client appends nothing either way.
+   */
+  readonly context?: ArtemisContextReading;
   /**
    * The serving run has read a message that was sent into it mid-turn.
    *

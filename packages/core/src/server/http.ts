@@ -3200,6 +3200,14 @@ function chunkFor(
     case 'tasks':
       return chatChunk({ ...frame, delta: {}, ...stamped({ tasks: event.tasks }) });
 
+    // How full the conversation is, on the same empty delta. `usage` could not
+    // carry it — see `ArtemisContextReading` — and waiting for the final chunk
+    // would mean the reading only ever arrives once there is nothing left to
+    // decide with it. An OpenAI client appends nothing; an Artemis client moves
+    // its context gauge while the turn is still running.
+    case 'context':
+      return chatChunk({ ...frame, delta: {}, ...stamped({ context: event.reading }) });
+
     // A steered message was read. Same empty delta; the client clears its
     // "queued" marker.
     case 'delivered':
@@ -3224,6 +3232,11 @@ function chunkFor(
         artemis: {
           ...(result.sessionId === undefined ? {} : { sessionId: result.sessionId }),
           ...(result.activity.length === 0 ? {} : { activity: result.activity }),
+          // Repeated here even though the reading already crossed on its own
+          // chunk: a client that reconnected mid-turn, or one that renders only
+          // the terminal chunk, must not finish the turn holding no reading at
+          // all when the server has one.
+          ...(result.context === undefined ? {} : { context: result.context }),
           endReason: result.endReason,
           /*
            * The reason, on the only chunk that can carry it.

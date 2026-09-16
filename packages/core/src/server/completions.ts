@@ -71,6 +71,7 @@ import type {
   AgentEvent,
   ArtemisActivity,
   ArtemisChatExtensions,
+  ArtemisContextReading,
   ArtemisPermissionNotice,
   Attachment,
   OpenAiChatChunk,
@@ -376,6 +377,15 @@ export interface TurnResult {
   readonly endReason: RunEndReason;
   readonly sessionId?: string;
   readonly usage?: OpenAiUsage;
+  /**
+   * How full the conversation is, as of the last thing the run said about it.
+   *
+   * Separate from {@link usage} because it is a different measurement — see
+   * {@link ArtemisContextReading} — and repeated here rather than left to the
+   * chunks alone because the whole-response path has no chunks, and because a
+   * client that reconnects mid-turn needs the last chunk to be self-sufficient.
+   */
+  readonly context?: ArtemisContextReading;
   readonly activity: readonly ArtemisActivity[];
   /** Set when the run failed; the caller turns this into a 502. */
   readonly error?: string;
@@ -470,6 +480,26 @@ type TurnEventBody =
        */
       readonly kind: 'tasks';
       readonly tasks: readonly BackgroundTask[];
+    }
+  | {
+      /**
+       * How full the conversation is, whenever the run restates it.
+       *
+       * Its own kind rather than a field on the terminal result, because the
+       * moment a person wants this number is while the turn is running and the
+       * window is filling — a reading that only arrives once the turn is over
+       * is a fuel gauge that reports at the end of the journey. It rides an
+       * empty-delta chunk for the same reason `tasks` does: an OpenAI client
+       * appends nothing and is unharmed, and there is no field in OpenAI's
+       * shape that could carry it honestly (`usage` is a bill, not an
+       * occupancy).
+       *
+       * Emitted only when the reading actually moved, so a provider that
+       * restates the same numbers on every assistant message does not put a
+       * chunk on the wire for each one.
+       */
+      readonly kind: 'context';
+      readonly reading: ArtemisContextReading;
     }
   | {
       /**
@@ -573,11 +603,46 @@ class TurnTranslator {
    */
   #announced: string | undefined;
   usage: OpenAiUsage | undefined;
+  /**
+   * The context reading, accumulated rather than replaced.
+   *
+   * Its two halves arrive on different events and neither restates the other.
+   * Claude reports occupancy on every assistant message (`delta` scope, no
+   * window) and the window size once, on the result (`final` scope, no
+   * occupancy); Codex repeats the window on each update and the local adapter
+   * probes it once over HTTP. Taking the latest snapshot wholesale would
+   * therefore leave the reading with only ever one of the two numbers — which
+   * is exactly a gauge with a needle and no dial, or a dial and no needle.
+   */
+  context: { tokens?: number; window?: number } = {};
   deniedPermission = false;
   readonly activity: ArtemisActivity[] = [];
   /** Set by the `run.end` this saw. The turn is over from then on. */
   result: TurnResult | undefined;
   readonly #remotePermissions: boolean;
+
+  /**
+   * Fold one usage snapshot's context half into {@link context}.
+   *
+   * Returns the merged reading when it moved, and `undefined` when it did not,
+   * so the caller can decide whether the wire needs a chunk. A snapshot with
+   * neither half — every provider that reports a bill and no occupancy — moves
+   * nothing and produces nothing, which is how a route that cannot answer this
+   * question stays silent rather than sending empty readings.
+   */
+  #readContext(usage: {
+    readonly contextTokens?: number;
+    readonly contextWindow?: number;
+  }): ArtemisContextReading | undefined {
+    const tokens = usage.contextTokens ?? this.context.tokens;
+    const window = usage.contextWindow ?? this.context.window;
+    if (tokens === this.context.tokens && window === this.context.window) return undefined;
+    this.context = {
+      ...(tokens === undefined ? {} : { tokens }),
+      ...(window === undefined ? {} : { window }),
+    };
+    return { ...this.context };
+  }
 
   constructor(options: { readonly remotePermissions: boolean; readonly sessionId?: string }) {
     this.#remotePermissions = options.remotePermissions;
@@ -753,9 +818,12 @@ class TurnTranslator {
         }
         break;
 
-      case 'usage':
+      case 'usage': {
         this.usage = toOpenAiUsage(event.usage.tokens);
+        const reading = this.#readContext(event.usage);
+        if (reading !== undefined) out.push({ kind: 'context', reading, seq });
         break;
+      }
 
       case 'background.tasks':
         out.push({ kind: 'tasks', tasks: event.tasks, seq });
@@ -767,7 +835,13 @@ class TurnTranslator {
 
       case 'run.end': {
         if (event.sessionId !== undefined) this.sessionId = String(event.sessionId);
-        if (event.usage !== undefined) this.usage = toOpenAiUsage(event.usage.tokens);
+        if (event.usage !== undefined) {
+          this.usage = toOpenAiUsage(event.usage.tokens);
+          // Folded in, not emitted: the `done` chunk below carries the whole
+          // reading, so a separate `context` event before it would be the same
+          // numbers twice.
+          this.#readContext(event.usage);
+        }
         // The provider's own summary, when it wrote one and nothing streamed.
         if (this.text.length === 0 && event.result !== undefined) this.text = event.result;
 
@@ -778,6 +852,9 @@ class TurnTranslator {
           endReason: event.reason,
           ...(this.sessionId === undefined ? {} : { sessionId: this.sessionId }),
           ...(this.usage === undefined ? {} : { usage: this.usage }),
+          ...(this.context.tokens === undefined && this.context.window === undefined
+            ? {}
+            : { context: { ...this.context } }),
           activity: this.activity,
           ...(event.reason === 'error' ? { error: event.error?.message ?? 'The run failed.' } : {}),
           ...(this.deniedPermission && event.reason === 'permission_denied'
@@ -1191,6 +1268,7 @@ export function chatResponse(input: {
       ...(input.ignored.length === 0 ? {} : { ignored: input.ignored }),
       ...(input.redirected === undefined ? {} : { redirected: input.redirected }),
       ...(result.activity.length === 0 ? {} : { activity: result.activity }),
+      ...(result.context === undefined ? {} : { context: result.context }),
       endReason: result.endReason,
       // Only reached when the turn produced text *and* failed — a failure with
       // nothing to show for it never gets here, because the handler turns that

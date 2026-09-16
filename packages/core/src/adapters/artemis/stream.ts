@@ -15,6 +15,7 @@
 
 import type {
   ArtemisActivity,
+  ArtemisContextReading,
   ArtemisPermissionNotice,
   BackgroundTask,
   PermissionRequest,
@@ -78,6 +79,15 @@ export interface ServerExtensionsDelta {
    * `background.tasks` event the renderer draws from.
    */
   readonly tasks?: readonly BackgroundTask[];
+  /**
+   * How full the served conversation's context is, when a chunk stated it.
+   *
+   * Either half may be absent and the two arrive at different times, so this is
+   * a partial reading rather than a complete one — the adapter accumulates it.
+   * A server older than this field sends none, and the reading stays unknown,
+   * which is the state the gauge already draws for a route that will not say.
+   */
+  readonly context?: ArtemisContextReading;
   /** The server read a message steered into the run, by the server's id. */
   readonly delivered?: string;
   /**
@@ -219,6 +229,31 @@ function readExtensions(value: unknown): ServerExtensionsDelta | undefined {
   }
   const delivered = asString(record['delivered']);
   if (delivered !== undefined) out.delivered = delivered;
+
+  /*
+   * The context reading, validated to the one thing that makes a gauge wrong
+   * rather than merely blank: a non-positive window.
+   *
+   * A zero or negative denominator is not a smaller scale, it is a division by
+   * zero rendered as "100% full" or as nothing at all, and either reads as a
+   * conversation in trouble. Dropped, so the reading degrades to occupancy with
+   * no scale — which is the honest state and one the UI already draws. Token
+   * counts are only floored at zero, since an occupancy of nought is a real
+   * answer for a turn that has not started.
+   */
+  const context = asRecord(record['context']);
+  if (context !== undefined) {
+    const tokens = context['tokens'];
+    const window = context['window'];
+    const reading: { tokens?: number; window?: number } = {};
+    if (typeof tokens === 'number' && Number.isFinite(tokens) && tokens >= 0) {
+      reading.tokens = tokens;
+    }
+    if (typeof window === 'number' && Number.isFinite(window) && window > 0) {
+      reading.window = window;
+    }
+    if (Object.keys(reading).length > 0) out.context = reading;
+  }
 
   const activity = record['activity'];
   if (Array.isArray(activity)) {
