@@ -1,6 +1,24 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.16.0
+
+Memory banks become Artemis's own: a bank describes itself, attaches to the profiles you choose, and is read, kept and written by Artemis — the cerebro CLI is no longer needed by anything Artemis does.
+
+**A bank describes itself in `BANK.md`.** One file at the bank's root says where its memories are (a glob), what its folder names mean (a scope template such as `brands/{brand}/{system}/`), what an entry must contain (the cerebro schema by default, or one of the bank's own), where a new entry is filed and how it lands — pull request, commit, or read-only — and, in its body, how the bank wants to be used. A bank with no manifest still works: the two cerebro layouts are read as they are, with no change to the repository, so a team on the old shape notices nothing. Artemis reads a bank in any of those shapes, validates every entry with the same rules the bank's own gate applies, installs it into each profile's project memory in the same layout and with the same markers the CLI used, and writes the bank's `INDEX.md` on every landing so it can never go stale.
+
+**Banks attach to profiles.** Each bank reaches every profile or a chosen set, from a new **Memory banks** section in Settings that also shows a bank's format, its description, what is wrong with any of its entries, and its memories grouped the way the bank files them. The one built-in prompt, now "Use the team memory banks", is rendered per run from the banks the run's profile carries and no longer has a scope of its own. A provider whose harness does not load the project's memory file — a local model — gets the index in the prompt itself, so the banks reach it too. A project's memory file shares one allowance between the banks it carries, so two banks no longer push each other past what the harness reads.
+
+**Agents write through memory tools.** Every run on a provider that takes host tools carries `artemisMemory`: search, read, draft, promote and retire. A draft is validated and refused with reasons when the bank's gates would refuse it; a promote files the drafts and lands them the way the bank asked — a pull request opened through the forge's own API, on GitHub or on Forgejo, merged and checked on the base branch when the bank auto-merges, or a plain commit — using the bank's stored token or key-manager reference, or what git already holds. No Python, no PATH, no `gh`.
+
+**A bank with no manifest gets a guided session.** "Describe this bank…" on a bank's card opens a conversation in the bank's checkout that reads the tree, proposes the manifest, asks you only what it cannot infer, and lands `BANK.md` through the bank's review path. "Revise BANK.md…" does the same for a bank that has one.
+
+**The headless server does all of this too.** A served run is told about the banks its account carries on every path — the ordinary run, the remote bridge, and a routine's firing, which had none — installs them before the run starts, keeps them fresh in the background, and carries the memory tools. The host cron that used to run the CLI is no longer needed.
+
+**A message to a conversation still working steers it, and never forks it.** A served session that "randomly stopped" had in fact forked: a subagent's notification opened a turn of its own, the desktop saw an idle pane, the user typed "keep going", and a second run started writing the same transcript beside the first — the agent then spent minutes reconciling its twin's commits. A message sent to a session with a live turn now goes into that turn; the adapter refuses to start a second run on a busy session, and the server answers a fork or a rewind of a working conversation with `session_busy` rather than obliging.
+
+**What is gone.** The cerebro CLI Artemis shipped for bootstrap. Joining, creating and adopting a bank are native git now; wiring a bank into stock Claude Code on the same machine — the one thing that still wants the CLI — is a per-bank action that uses the bank's own embedded copy, when it has one.
+
 ## What's new in 2.15.0
 
 The terminal catches up with the other agent terminals, and goes past them.

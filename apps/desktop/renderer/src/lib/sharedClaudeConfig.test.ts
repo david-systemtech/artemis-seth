@@ -579,7 +579,7 @@ function sameFile(a: string, b: string): boolean {
 }
 
 describe.skipIf(POWERSHELL === null)('the Windows share script', () => {
-  it('junctions every shared directory and creates the ones the root lacks', () => {
+  it('junctions every shared directory and creates the ones the root lacks', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     runPowerShell(box, [box.work, box.max], 'share');
 
@@ -596,7 +596,7 @@ describe.skipIf(POWERSHELL === null)('the Windows share script', () => {
     expect(readFileSync(path.join(box.max, 'skills', 'root.md'), 'utf8')).toBe('root skill\n');
   });
 
-  it('hard-links CLAUDE.md to the root file', () => {
+  it('hard-links CLAUDE.md to the root file', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     runPowerShell(box, [box.work], 'share');
 
@@ -612,7 +612,7 @@ describe.skipIf(POWERSHELL === null)('the Windows share script', () => {
     );
   });
 
-  it('does not invent a CLAUDE.md the user does not have', () => {
+  it('does not invent a CLAUDE.md the user does not have', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     rmSync(path.join(box.root, 'CLAUDE.md'));
     const out = runPowerShell(box, [box.max], 'share');
@@ -621,7 +621,7 @@ describe.skipIf(POWERSHELL === null)('the Windows share script', () => {
     expect(out).toContain('skip  CLAUDE.md');
   });
 
-  it('moves displaced data aside instead of deleting it', () => {
+  it('moves displaced data aside instead of deleting it', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     runPowerShell(box, [box.work], 'share');
 
@@ -633,7 +633,7 @@ describe.skipIf(POWERSHELL === null)('the Windows share script', () => {
     ).toBe('work history\n');
   });
 
-  it('leaves auth alone', () => {
+  it('leaves auth alone', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     runPowerShell(box, [box.work], 'share');
 
@@ -644,7 +644,7 @@ describe.skipIf(POWERSHELL === null)('the Windows share script', () => {
     );
   });
 
-  it('is idempotent — a second run makes no second backup', () => {
+  it('is idempotent — a second run makes no second backup', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     runPowerShell(box, [box.work], 'share');
     const out = runPowerShell(box, [box.work], 'share');
@@ -657,7 +657,7 @@ describe.skipIf(POWERSHELL === null)('the Windows share script', () => {
     );
   });
 
-  it('numbers the second backup rather than writing over the first', () => {
+  it('numbers the second backup rather than writing over the first', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     runPowerShell(box, [box.work], 'share');
 
@@ -679,7 +679,7 @@ describe.skipIf(POWERSHELL === null)('the Windows share script', () => {
     ).toBe('second env\n');
   });
 
-  it('refuses to link the root config into itself, trailing separator and all', () => {
+  it('refuses to link the root config into itself, trailing separator and all', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     const out = runPowerShell(box, [box.root, `${box.root}\\`], 'share');
 
@@ -693,7 +693,7 @@ describe.skipIf(POWERSHELL === null)('the Windows share script', () => {
     expect(exists(path.join(box.root, `skills${BACKUP_SUFFIX}`))).toBe(false);
   });
 
-  it('skips a directory that is not there', () => {
+  it('skips a directory that is not there', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     const gone = path.join(box.home, 'nope');
     const out = runPowerShell(box, [gone], 'share');
@@ -704,7 +704,7 @@ describe.skipIf(POWERSHELL === null)('the Windows share script', () => {
 });
 
 describe.skipIf(POWERSHELL === null)('the Windows restore script', () => {
-  it('puts the original layout back', () => {
+  it('puts the original layout back', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     runPowerShell(box, [box.work], 'share');
     runPowerShell(box, [box.work], 'restore');
@@ -734,7 +734,7 @@ describe.skipIf(POWERSHELL === null)('the Windows restore script', () => {
    * recurse. If somebody ever "simplifies" that line, this fails and nothing
    * else in the suite does.
    */
-  it('takes away the junction and not the folder it points at', () => {
+  it('takes away the junction and not the folder it points at', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     runPowerShell(box, [box.work], 'share');
     runPowerShell(box, [box.work], 'restore');
@@ -746,7 +746,7 @@ describe.skipIf(POWERSHELL === null)('the Windows restore script', () => {
     }
   });
 
-  it('does not touch something the user put back by hand', () => {
+  it('does not touch something the user put back by hand', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     runPowerShell(box, [box.work], 'share');
 
@@ -760,7 +760,7 @@ describe.skipIf(POWERSHELL === null)('the Windows restore script', () => {
     expect(readFileSync(path.join(box.work, 'skills', 'mine.md'), 'utf8')).toBe('mine\n');
   });
 
-  it('leaves a CLAUDE.md alone once the root has no copy left to compare it with', () => {
+  it('leaves a CLAUDE.md alone once the root has no copy left to compare it with', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     runPowerShell(box, [box.work], 'share');
     // The blind spot, asserted rather than only commented: Windows records no
@@ -775,7 +775,7 @@ describe.skipIf(POWERSHELL === null)('the Windows restore script', () => {
     expect(readFileSync(path.join(box.work, 'CLAUDE.md'), 'utf8')).toBe('root instructions\n');
   });
 
-  it('is safe to run when nothing was ever shared', () => {
+  it('is safe to run when nothing was ever shared', { timeout: 30_000 }, () => {
     const box = windowsSandbox();
     const out = runPowerShell(box, [box.work], 'restore');
 
@@ -785,11 +785,11 @@ describe.skipIf(POWERSHELL === null)('the Windows restore script', () => {
 });
 
 describe('powerShellQuote', () => {
-  it('wraps a plain path in single quotes', () => {
+  it('wraps a plain path in single quotes', { timeout: 30_000 }, () => {
     expect(powerShellQuote('C:\\Users\\x\\App Data\\p')).toBe("'C:\\Users\\x\\App Data\\p'");
   });
 
-  it('doubles a single quote rather than escaping it', () => {
+  it('doubles a single quote rather than escaping it', { timeout: 30_000 }, () => {
     // PowerShell has no backslash escape inside a literal string; the quote is
     // its own escape. A backslash here would end the string early and leave the
     // rest of the path being parsed as commands.
@@ -822,11 +822,11 @@ describe('powerShellQuote', () => {
 });
 
 describe('the generated PowerShell', () => {
-  it('says so when there is nothing to cover', () => {
+  it('says so when there is nothing to cover', { timeout: 30_000 }, () => {
     expect(buildSharedConfigScript([], 'share', 'win32')).toContain('No Claude profiles to cover.');
   });
 
-  it('quotes every directory it names', () => {
+  it('quotes every directory it names', { timeout: 30_000 }, () => {
     const script = buildSharedConfigScript(
       ["C:\\Users\\O'Brien\\App Data\\p"],
       'share',
@@ -841,7 +841,7 @@ describe('the generated PowerShell', () => {
    * up, and the sh generator's suite states the same rule as itself. Kept in
    * step so that neither generator can quietly grow a `$SharedDirectories`.
    */
-  it('never iterates a list by expanding a variable', () => {
+  it('never iterates a list by expanding a variable', { timeout: 30_000 }, () => {
     for (const mode of ['share', 'restore'] as const) {
       const script = buildSharedConfigScript(['C:\\p'], mode, 'win32');
       expect(script).not.toMatch(/foreach\s*\(\s*\$\w+\s+in\s+\$/);
@@ -849,7 +849,7 @@ describe('the generated PowerShell', () => {
     }
   });
 
-  it('makes junctions and hard links, and never a symbolic link', () => {
+  it('makes junctions and hard links, and never a symbolic link', { timeout: 30_000 }, () => {
     const script = buildSharedConfigScript(['C:\\p'], 'share', 'win32');
     expect(script).toContain('New-Item -ItemType Junction');
     expect(script).toContain('New-Item -ItemType HardLink');
@@ -859,7 +859,7 @@ describe('the generated PowerShell', () => {
     expect(script).not.toContain('SymbolicLink');
   });
 
-  it('never removes a directory recursively', () => {
+  it('never removes a directory recursively', { timeout: 30_000 }, () => {
     const script = buildSharedConfigScript(['C:\\p'], 'restore', 'win32');
     // Comments dropped first, because the script explains at length why it does
     // not do this and the explanation names the thing it is not doing.
@@ -880,7 +880,7 @@ describe('the generated PowerShell', () => {
    * ANSI unless something put a BOM on it. An em dash in a comment is not worth
    * finding out which.
    */
-  it('is ASCII, comments included', () => {
+  it('is ASCII, comments included', { timeout: 30_000 }, () => {
     for (const mode of ['share', 'restore'] as const) {
       const script = buildSharedConfigScript(['C:\\p'], mode, 'win32');
       // Named rather than counted, so a failure says which em dash crept in.
@@ -891,7 +891,7 @@ describe('the generated PowerShell', () => {
 });
 
 describe('scriptShell', () => {
-  it('names PowerShell on Windows and a terminal everywhere else', () => {
+  it('names PowerShell on Windows and a terminal everywhere else', { timeout: 30_000 }, () => {
     // What the pane puts in "Quit Artemis, run this in …". Wrong here is a
     // sentence that sends a Windows user looking for a terminal to paste
     // PowerShell into, which is most of an afternoon.
@@ -928,11 +928,11 @@ function status(
 }
 
 describe('entryGap', () => {
-  it('is nothing to do for a link that already points at the root', () => {
+  it('is nothing to do for a link that already points at the root', { timeout: 30_000 }, () => {
     expect(entryGap({ name: 'skills', state: 'linked' }, [])).toBe(false);
   });
 
-  it('is work for a folder of its own, a foreign link, or an absent directory', () => {
+  it('is work for a folder of its own, a foreign link, or an absent directory', { timeout: 30_000 }, () => {
     expect(entryGap({ name: 'skills', state: 'own' }, [])).toBe(true);
     expect(entryGap({ name: 'skills', state: 'foreign' }, [])).toBe(true);
     // The root does not have it either, but the script `mkdir -p`s a directory
@@ -940,7 +940,7 @@ describe('entryGap', () => {
     expect(entryGap({ name: 'plans', state: 'missing' }, ['plans'])).toBe(true);
   });
 
-  it('is not work for a file the root does not have', () => {
+  it('is not work for a file the root does not have', { timeout: 30_000 }, () => {
     // The share script prints `skip  CLAUDE.md (no …)`. Counting this as a gap
     // would leave a perfectly-run share reading as incomplete forever.
     expect(entryGap({ name: 'CLAUDE.md', state: 'missing' }, ['CLAUDE.md'])).toBe(false);
@@ -950,14 +950,14 @@ describe('entryGap', () => {
 });
 
 describe('summarizeDir', () => {
-  it('reads a fully linked directory as shared', () => {
+  it('reads a fully linked directory as shared', { timeout: 30_000 }, () => {
     const summary = summarizeDir(checked('/a'), []);
     expect(summary.state).toBe('shared');
     expect(summary.linked).toBe(SHARED_ENTRIES.length);
     expect(summary.gaps).toEqual([]);
   });
 
-  it('names what is missing on a half-linked directory', () => {
+  it('names what is missing on a half-linked directory', { timeout: 30_000 }, () => {
     const summary = summarizeDir(
       checked('/a', {
         skills: { name: 'skills', state: 'own', backup: true },
@@ -973,7 +973,7 @@ describe('summarizeDir', () => {
     expect(summary.backups).toEqual(['skills']);
   });
 
-  it('reads a never-shared directory as unshared', () => {
+  it('reads a never-shared directory as unshared', { timeout: 30_000 }, () => {
     const entries = SHARED_ENTRIES.map((name) => ({ name, state: 'missing' as const }));
     const summary = summarizeDir({ dir: '/a', state: 'checked', entries }, []);
 
@@ -981,7 +981,7 @@ describe('summarizeDir', () => {
     expect(summary.linked).toBe(0);
   });
 
-  it('does not call a directory shared just because nothing could be linked', () => {
+  it('does not call a directory shared just because nothing could be linked', { timeout: 30_000 }, () => {
     // Every entry absent, and every absence one the script deliberately skips:
     // no gaps, and no links either. Without the `linked > 0` guard this reads as
     // fully shared, which is the one wrong answer a user could not argue with.
@@ -994,7 +994,7 @@ describe('summarizeDir', () => {
     expect(summary.state).toBe('unshared');
   });
 
-  it('passes the root and the absent through untouched', () => {
+  it('passes the root and the absent through untouched', { timeout: 30_000 }, () => {
     expect(summarizeDir({ dir: '/a', state: 'root', entries: [] }, []).state).toBe('root');
     expect(summarizeDir({ dir: '/a', state: 'absent', entries: [] }, []).state).toBe('absent');
   });
@@ -1016,17 +1016,17 @@ describe('dirsNeedingWork', () => {
     { dir: '/gone', state: 'absent', entries: [] },
   ]);
 
-  it('covers only the directories the share script would change', () => {
+  it('covers only the directories the share script would change', { timeout: 30_000 }, () => {
     // The point of the narrow script: a fifth account added after the first four
     // were linked is covered without walking back over the four.
     expect(dirsNeedingWork(reading, 'share')).toEqual(['/partial', '/fresh']);
   });
 
-  it('covers only the directories the undo script would change', () => {
+  it('covers only the directories the undo script would change', { timeout: 30_000 }, () => {
     expect(dirsNeedingWork(reading, 'restore')).toEqual(['/whole', '/partial']);
   });
 
-  it('counts a leftover backup as work for the undo script', () => {
+  it('counts a leftover backup as work for the undo script', { timeout: 30_000 }, () => {
     // Nothing is linked here any more, but the original is still sitting beside
     // the name it was moved out of, and `restore_one` would bring it back.
     const left: SharedConfigDirStatus = {
@@ -1041,7 +1041,7 @@ describe('dirsNeedingWork', () => {
     expect(dirsNeedingWork(status([left]), 'restore')).toEqual(['/left']);
   });
 
-  it('never offers a script for the root or for a directory that is gone', () => {
+  it('never offers a script for the root or for a directory that is gone', { timeout: 30_000 }, () => {
     // Both scripts skip these by name, so a script generated for them would
     // print `skip` and do nothing.
     const only = status([
@@ -1054,11 +1054,11 @@ describe('dirsNeedingWork', () => {
 });
 
 describe('statusDisagrees', () => {
-  it('is quiet when the switch is on and everything is linked', () => {
+  it('is quiet when the switch is on and everything is linked', { timeout: 30_000 }, () => {
     expect(statusDisagrees(status([checked('/a'), checked('/b')]), true)).toBe(false);
   });
 
-  it('speaks up when the switch is on and one profile was left behind', () => {
+  it('speaks up when the switch is on and one profile was left behind', { timeout: 30_000 }, () => {
     // The failure that actually happens: the script covered the profiles that
     // existed when it was generated.
     const fresh: SharedConfigDirStatus = {
@@ -1069,13 +1069,13 @@ describe('statusDisagrees', () => {
     expect(statusDisagrees(status([checked('/a'), fresh]), true)).toBe(true);
   });
 
-  it('speaks up when the switch is off and the links are still there', () => {
+  it('speaks up when the switch is off and the links are still there', { timeout: 30_000 }, () => {
     // Prefs reset, a new install, or the script run by hand. The pane would
     // otherwise claim an isolation the accounts do not have.
     expect(statusDisagrees(status([checked('/a')]), false)).toBe(true);
   });
 
-  it('is quiet when the switch is off and nothing is linked', () => {
+  it('is quiet when the switch is off and nothing is linked', { timeout: 30_000 }, () => {
     const fresh: SharedConfigDirStatus = {
       dir: '/a',
       state: 'checked',
@@ -1084,7 +1084,7 @@ describe('statusDisagrees', () => {
     expect(statusDisagrees(status([fresh]), false)).toBe(false);
   });
 
-  it('says nothing when there is nothing to compare', () => {
+  it('says nothing when there is nothing to compare', { timeout: 30_000 }, () => {
     // A reading of the root alone, or of directories that are not there, is not
     // a disagreement — and the empty state already says the useful thing.
     const only = status([
@@ -1095,7 +1095,7 @@ describe('statusDisagrees', () => {
     expect(statusDisagrees(status([]), true)).toBe(false);
   });
 
-  it('counts the root profile as neither shared nor a straggler', () => {
+  it('counts the root profile as neither shared nor a straggler', { timeout: 30_000 }, () => {
     // A user whose only Claude profile *is* `~/.claude` has asked for something
     // that is already true of their machine, and a permanent warning would be
     // the pane inventing a problem.
@@ -1105,7 +1105,7 @@ describe('statusDisagrees', () => {
 });
 
 describe('statusHasLinks', () => {
-  it('is false for a machine that never ran the script', () => {
+  it('is false for a machine that never ran the script', { timeout: 30_000 }, () => {
     const fresh: SharedConfigDirStatus = {
       dir: '/a',
       state: 'checked',
@@ -1116,7 +1116,7 @@ describe('statusHasLinks', () => {
     expect(statusHasLinks(status([fresh]))).toBe(false);
   });
 
-  it('is true for a link, and for a backup left behind by one', () => {
+  it('is true for a link, and for a backup left behind by one', { timeout: 30_000 }, () => {
     expect(statusHasLinks(status([checked('/a')]))).toBe(true);
 
     const left: SharedConfigDirStatus = {

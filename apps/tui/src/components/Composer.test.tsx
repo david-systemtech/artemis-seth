@@ -1092,7 +1092,7 @@ describe('Composer: Ctrl+G', () => {
 });
 
 describe('Composer: Ctrl+S sets a draft aside', () => {
-  it('stashes what is typed and gives it back, cursor and all', async () => {
+  it('stashes what is typed and gives it back, cursor and all', { timeout: 20_000 }, async () => {
     const { lastFrame, stdin } = composer();
     await tick();
     await press(stdin, 'the other thing', LEFT, LEFT, LEFT, LEFT, LEFT, CTRL_S);

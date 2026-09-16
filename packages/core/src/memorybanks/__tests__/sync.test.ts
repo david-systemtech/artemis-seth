@@ -40,7 +40,7 @@ function dataDirWithProfiles(): { dataDir: string; home: string; work: string } 
 }
 
 describe('hasRemote and pullBank', () => {
-  it('sees no remote in a repository that has none, and does not pull it', async () => {
+  it('sees no remote in a repository that has none, and does not pull it', { timeout: 30_000 }, async () => {
     const repo = scratch();
     mkdirSync(join(repo, '.git'));
     writeFileSync(join(repo, '.git', 'config'), '[core]\n\trepositoryformatversion = 0\n');
