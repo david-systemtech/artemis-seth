@@ -1,6 +1,14 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.16.2
+
+Artemis installs on Arch again, and updates itself there.
+
+**The Arch package asks for the libraries it actually links.** `pacman -U` refused the 2.16.1 package on a current Arch machine, and an unresolvable dependency is not a warning — the whole transaction aborts. The list it refused was electron-builder's default for the pacman target, which describes Arch's *own* `electron` package, the one compiled against system libraries; this build ships prebuilt Electron with all of them inside it, so eight of the fourteen names were never real, and one of the eight — `http-parser` — has since been dropped from the Arch repositories altogether. The package now declares the twenty-two packages its binaries name and nothing else, each one checked to exist.
+
+**Which also unblocks the in-app updater on Arch.** The updater hands the downloaded package to `pacman -U --noconfirm`, and `--noconfirm` answers no to pacman's offer to skip an unsatisfiable package — so every Arch update since the feature arrived in 2.10.0 failed at the last step, after a correct download and a passing checksum. An installation stuck anywhere in that range, including one still on the version it was first installed at, takes this update from the app.
+
 ## What's new in 2.16.1
 
 The memory tools reach a served run.
