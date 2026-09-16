@@ -1,6 +1,14 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.16.1
+
+The memory tools reach a served run.
+
+**The `artemisMemory` tool server lists on the headless server.** The first served turn after 2.16.0 answered that the tool server was not available. The container's production deploy had resolved a newer zod than every other host runs, and the SDK's in-process tool server fails to convert its schemas under it when a client asks for the list — so a local model on the server could see the banks in its prompt and reach none of the tools. One zod is now pinned for every host, and a test lists the tools over a real MCP transport, the path a local model takes.
+
+**Tests that spawn git or PowerShell say how long they need.** Three different five-second timeouts held up the 2.16.0 cut on a loaded Windows runner; the tests that spawn processes now carry explicit timeouts.
+
 ## What's new in 2.16.0
 
 Memory banks become Artemis's own: a bank describes itself, attaches to the profiles you choose, and is read, kept and written by Artemis — the cerebro CLI is no longer needed by anything Artemis does.
