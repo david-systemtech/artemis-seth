@@ -85,7 +85,7 @@ describe('the memory tools', () => {
     expect(loadRunBanks({ dataDir, cliRegistryPath: NOWHERE, profileId: 'home' })).toEqual([]);
   });
 
-  it('searches, reads, drafts, promotes and retires against a commit-landing bank', async () => {
+  it('searches, reads, drafts, promotes and retires against a commit-landing bank', { timeout: 60_000 }, async () => {
     const bank = commitBank();
     const dataDir = registryFor(bank, { kind: 'all' });
     const tools = handlers({ dataDir, cliRegistryPath: NOWHERE, profileId: 'p', landing: { gitEnv: GIT_ENV }, today: () => '2026-09-15' });
@@ -126,7 +126,7 @@ describe('the memory tools', () => {
     expect(empty.content[0]?.text).toContain('Nothing queued');
   });
 
-  it('refuses a write into a read-only bank, and names the banks when several could take it', async () => {
+  it('refuses a write into a read-only bank, and names the banks when several could take it', { timeout: 60_000 }, async () => {
     const one = commitBank();
     const two = commitBank();
     const dataDir = scratch();

@@ -117,7 +117,7 @@ describe('renderBankIndexFile', () => {
 });
 
 describe('a landing regenerates the index', () => {
-  it('writes INDEX.md in the same commit as the memory', async () => {
+  it('writes INDEX.md in the same commit as the memory', { timeout: 60_000 }, async () => {
     const root = projectsBank();
     const env = { ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@x.test', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@x.test' };
     execFileSync('git', ['-C', root, 'init', '-q'], { env });

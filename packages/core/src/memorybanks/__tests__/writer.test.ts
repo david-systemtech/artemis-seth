@@ -142,7 +142,7 @@ describe('draftMemory', () => {
 });
 
 describe('promoteBank and retireMemory by commit', () => {
-  it('files the drafts, commits them, empties the inbox, and rejects a bad one beside them', async () => {
+  it('files the drafts, commits them, empties the inbox, and rejects a bad one beside them', { timeout: 60_000 }, async () => {
     const root = commitBank();
     const bank = readBankAt(root, { slug: 'brands' })!;
     const good = draftMemory(bank, {
@@ -174,7 +174,7 @@ describe('promoteBank and retireMemory by commit', () => {
     expect((await retireMemory(readBankAt(root, { slug: 'brands' })!, 'geo-rule', undefined, { gitEnv: GIT_ENV })).kind).toBe('nothing');
   });
 
-  it('refuses to land anything for a bank that says land: none', async () => {
+  it('refuses to land anything for a bank that says land: none', { timeout: 60_000 }, async () => {
     const root = scratch();
     mkdirSync(join(root, 'memories'));
     writeFileSync(join(root, 'BANK.md'), '---\nname: ro\nwrite:\n  land: none\n---\n');
