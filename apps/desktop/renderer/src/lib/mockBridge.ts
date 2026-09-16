@@ -443,6 +443,10 @@ let mockBanks: MemoryBankInfo[] = [
     mirrored: 0,
     validationErrors: 1,
     projects: 27,
+    // Carries its own `bin/cerebro`, so the "Wire for stock Claude Code" offer
+    // is live on this card and refused-with-a-reason on the other one — both
+    // states reachable in dev without arranging anything.
+    embedsCli: true,
     // Held as a reference rather than as a token, so the pane's "from a key
     // manager" rendering is what dev meets by default — including the degraded
     // sentence, which is the state a real machine reaches only when its vault
@@ -469,9 +473,20 @@ let mockBanks: MemoryBankInfo[] = [
     mirrored: 0,
     validationErrors: 0,
     projects: 4,
+    embedsCli: false,
     credential: { kind: 'none' },
   },
 ];
+
+/**
+ * Which banks are wired into "stock Claude Code" on this fake machine.
+ *
+ * Its own list rather than a derivation of `enabled`, because that is exactly
+ * the distinction the row exists to draw: a bank can be on for Artemis and
+ * unwired for the other harness, and a mock that conflated them would render a
+ * state the real pane never shows.
+ */
+let mockWiredBanks: string[] = ['team-memory'];
 
 /* -------------------------------------------------------------------------- */
 /* Key managers                                                               */
@@ -1803,14 +1818,18 @@ export function createMockBridge(): ArtemisBridge {
             {
               name: 'demo-personal',
               label: 'Demo — personal',
-              hook: true,
-              banks: Object.fromEntries(mockBanks.map((bank) => [bank.slug, bank.enabled])),
+              hook: mockWiredBanks.length > 0,
+              banks: Object.fromEntries(
+                mockBanks.map((bank) => [bank.slug, mockWiredBanks.includes(bank.slug)]),
+              ),
             },
             {
+              // Wired on one profile and not the other, which is the partial
+              // state the row has a sentence for.
               name: 'demo-work',
               label: 'Demo — work',
               hook: false,
-              banks: Object.fromEntries(mockBanks.map((bank) => [bank.slug, bank.enabled])),
+              banks: Object.fromEntries(mockBanks.map((bank) => [bank.slug, false])),
             },
           ],
         }),
@@ -1895,6 +1914,9 @@ export function createMockBridge(): ArtemisBridge {
             mirrored: 0,
             validationErrors: 0,
             projects: 0,
+            // A bank Artemis just made carries no CLI: Artemis writes a
+            // BANK.md and a memories/ folder, and nothing else.
+            embedsCli: false,
           },
         ];
         mockMasterEnabled = true;
@@ -1928,8 +1950,35 @@ export function createMockBridge(): ArtemisBridge {
               : `'${request.slug}' is attached to ${request.profiles.profileIds.length} profile(s). Installed into their projects; removed from the rest.`,
         });
       },
+      /*
+       * The other harness's wiring, which the real channel does by spawning
+       * the bank's own CLI. Refused here the way main refuses it, so the
+       * card's disabled state and its receipt are both reachable in dev.
+       */
+      wireClaudeCode: async (request) => {
+        const bank = mockBanks.find((entry) => entry.slug === request.slug);
+        if (bank?.embedsCli !== true) {
+          return {
+            ok: false,
+            error: {
+              code: 'invalid_request',
+              message: `'${request.slug}' embeds no cerebro CLI, so it cannot be wired into stock Claude Code; Artemis’s own runs are unaffected.`,
+              retryable: false,
+            },
+          };
+        }
+        mockWiredBanks = request.enabled
+          ? [...new Set([...mockWiredBanks, request.slug])]
+          : mockWiredBanks.filter((slug) => slug !== request.slug);
+        return ok({
+          message: request.enabled
+            ? `Wired '${request.slug}' into stock Claude Code: a managed block in each profile's CLAUDE.md, the /cerebro command, and a session-start sync hook.`
+            : `Unwired '${request.slug}' from stock Claude Code (managed block, /cerebro command, session-start hook).`,
+        });
+      },
       forget: async (request) => {
         mockBanks = mockBanks.filter((bank) => bank.slug !== request.slug);
+        mockWiredBanks = mockWiredBanks.filter((slug) => slug !== request.slug);
         return ok({ message: `Unwired '${request.slug}' from every profile. Forgot '${request.slug}'.` });
       },
       setMasterEnabled: async (request) => {

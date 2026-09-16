@@ -38,6 +38,7 @@ import type {
   MemoryBankSetProfilesRequest,
   MemoryBankVerifyRemoteRequest,
   MemoryBankVerifyRemoteResponse,
+  MemoryBankWireClaudeCodeRequest,
   MemoryBanksStatus,
   SecretConnectionState,
   SecretProviderDescriptor,
@@ -117,6 +118,7 @@ const bank = (over: Partial<MemoryBankInfo> = {}): MemoryBankInfo => ({
   mirrored: 0,
   validationErrors: 0,
   projects: 2,
+  embedsCli: true,
   ...over,
 });
 
@@ -160,6 +162,7 @@ let verifyAnswer: MemoryBankVerifyRemoteResponse = {
 const verifyCalls: MemoryBankVerifyRemoteRequest[] = [];
 const addCalls: unknown[] = [];
 const profileCalls: MemoryBankSetProfilesRequest[] = [];
+const wireCalls: MemoryBankWireClaudeCodeRequest[] = [];
 /** Entries the next `memories` read answers with, per slug. */
 let bankMemories: readonly MemoryBankMemory[] = [];
 
@@ -257,6 +260,10 @@ const testRefCalls: SecretsRefTestRequest[] = [];
       profileCalls.push(request);
       return ok({ message: 'Attached.' });
     },
+    wireClaudeCode: async (request: MemoryBankWireClaudeCodeRequest) => {
+      wireCalls.push(request);
+      return ok({ message: 'Wired.' });
+    },
     forget: async () => ok({ message: '' }),
     setMasterEnabled: async () => ok({ message: '' }),
   },
@@ -305,6 +312,7 @@ afterEach(() => {
   addCalls.length = 0;
   testRefCalls.length = 0;
   profileCalls.length = 0;
+  wireCalls.length = 0;
   describeMemoryBank.mockClear();
 });
 
@@ -687,6 +695,100 @@ describe('a bank card', () => {
     withBanks(bank());
     await renderPane();
     expect(screen.queryByText(/entries have problems/)).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The other harness                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Wiring a bank into stock Claude Code — the one thing on this pane that is
+ * not about Artemis.
+ *
+ * Three properties, and they are the whole of the row. It reports what the
+ * *files* say rather than what the pane remembers; it asks for the state it
+ * wants rather than toggling; and a bank with no embedded CLI cannot do it at
+ * all, which is a dimmed button with a sentence rather than a hidden one or a
+ * click that fails.
+ */
+describe('wiring a bank into stock Claude Code', () => {
+  const PROFILE_STATES = [
+    { name: 'work', label: 'Work', hook: true, banks: { team: true } },
+    { name: 'side', label: 'Side', hook: false, banks: { team: false } },
+  ];
+
+  const withBanks = (
+    banks: readonly MemoryBankInfo[],
+    profiles: MemoryBanksStatus['profiles'] = PROFILE_STATES,
+  ): void => {
+    status = { ...NO_BANKS, masterEnabled: true, banks, profiles };
+  };
+
+  const wireButton = (): HTMLElement =>
+    screen.getByRole('button', { name: 'Wire for stock Claude Code' });
+
+  it('says what the profiles carry, block count and hook', async () => {
+    withBanks([bank()]);
+    await renderPane();
+    expect(screen.getByText(/Managed block in 1 of 2 profiles/)).toBeTruthy();
+    expect(screen.getByText(/session-start sync hook installed/)).toBeTruthy();
+  });
+
+  it('says when no profile carries it, and offers to wire', async () => {
+    withBanks([bank()], [{ name: 'work', label: 'Work', hook: false, banks: { team: false } }]);
+    await renderPane();
+    expect(screen.getByText(/Managed block in 0 of 1 profile /)).toBeTruthy();
+    expect(screen.getByText(/session-start sync hook not installed/)).toBeTruthy();
+    expect(wireButton()).toBeTruthy();
+  });
+
+  it('offers to unwire a bank some profile already carries', async () => {
+    withBanks([bank()]);
+    await renderPane();
+    expect(screen.getByRole('button', { name: 'Unwire' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Wire for stock Claude Code' })).toBeNull();
+  });
+
+  it('asks for the state it wants, both ways', async () => {
+    withBanks([bank()], [{ name: 'work', label: 'Work', hook: false, banks: { team: false } }]);
+    await renderPane();
+    await act(async () => {
+      wireButton().click();
+    });
+    expect(wireCalls).toEqual([{ slug: 'team', enabled: true }]);
+
+    wireCalls.length = 0;
+    cleanup();
+    withBanks([bank()]);
+    await renderPane();
+    await act(async () => {
+      screen.getByRole('button', { name: 'Unwire' }).click();
+    });
+    expect(wireCalls).toEqual([{ slug: 'team', enabled: false }]);
+  });
+
+  it('refuses, with a reason, on a bank that embeds no CLI', async () => {
+    // Not hidden: a bank with no `bin/cerebro` is perfectly healthy, and the
+    // sentence is what keeps the dimmed button from reading as a fault.
+    withBanks(
+      [bank({ embedsCli: false })],
+      [{ name: 'work', label: 'Work', hook: false, banks: { team: false } }],
+    );
+    await renderPane();
+
+    const button = wireButton();
+    expect(button.getAttribute('aria-disabled')).toBe('true');
+    await act(async () => {
+      button.click();
+    });
+    expect(wireCalls).toEqual([]);
+  });
+
+  it('says whose path this is, so nobody reads it as an Artemis setting', async () => {
+    withBanks([bank()]);
+    await renderPane();
+    expect(screen.getByText(/Artemis's own runs need none of this/)).toBeTruthy();
   });
 });
 

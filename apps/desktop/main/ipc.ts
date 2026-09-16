@@ -73,6 +73,7 @@ import {
   setMemoryBankProfiles,
   syncMemoryBank,
   verifyMemoryBankRemote,
+  wireMemoryBankClaudeCode,
   promptBanks,
 } from './memoryBanks.js';
 import type { EngineHost } from './engine.js';
@@ -190,6 +191,7 @@ import {
   validateMemoryBankSetEnabled,
   validateMemoryBankSetProfiles,
   validateMemoryBankSync,
+  validateMemoryBankWireClaudeCode,
   validateMemoryBanksPreflight,
   validateMemoryBanksSetMasterEnabled,
   validateSecretsConnectionDelete,
@@ -672,6 +674,17 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
     [IPC.memoryBankSetProfiles]: {
       validate: validateMemoryBankSetProfiles,
       handle: async (request) => setMemoryBankProfiles(request),
+    },
+
+    /*
+     * The one bank channel whose whole effect is outside Artemis: it runs the
+     * bank's own CLI to write (or strip) stock Claude Code's managed block,
+     * slash command and session-start hook. Nothing an Artemis run reads, and
+     * refused by name on a bank that embeds no CLI.
+     */
+    [IPC.memoryBankWireClaudeCode]: {
+      validate: validateMemoryBankWireClaudeCode,
+      handle: async (request) => wireMemoryBankClaudeCode(request),
     },
 
     [IPC.memoryBankForget]: {

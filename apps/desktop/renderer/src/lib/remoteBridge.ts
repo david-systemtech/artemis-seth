@@ -813,6 +813,10 @@ export function createRemoteBridge(
       retire: async () => absent(LOCAL_SETTINGS_REASON),
       setEnabled: async () => absent(LOCAL_SETTINGS_REASON),
       setProfiles: async () => absent(LOCAL_SETTINGS_REASON),
+      // Stock Claude Code's wiring is files in the serving machine's profile
+      // directories, written by a CLI that lives in a bank on that machine.
+      // Nothing about it is reachable from here.
+      wireClaudeCode: async () => absent(LOCAL_SETTINGS_REASON),
       forget: async () => absent(LOCAL_SETTINGS_REASON),
       setMasterEnabled: async () => absent(LOCAL_SETTINGS_REASON),
     },

@@ -33,6 +33,7 @@ import {
   type Forge,
   type SecretRef,
 } from '@rx-artemis/core';
+import type { MemoryBankCheck } from '@rx-artemis/protocol';
 
 import {
   acceptsAsPython3,
@@ -49,9 +50,11 @@ import {
   parseRegistry,
   pullDue,
   PYTHON_CANDIDATES,
+  readMemoryBanksPreflight,
   readMemoryBanksStatus,
   selectPython,
   syncDue,
+  wireMemoryBankClaudeCode,
   withoutSecrets,
   type LsRemoteResult,
   type PythonProbe,
@@ -99,7 +102,13 @@ function writeLegacyFlatBank(): string {
 }
 
 describe('bankInfoFrom', () => {
-  const facts = { isDefault: true, remote: null, source: 'artemis@1a2b3c4', projects: 2 };
+  const facts = {
+    isDefault: true,
+    remote: null,
+    source: 'artemis@1a2b3c4',
+    projects: 2,
+    embedsCli: false,
+  };
 
   it('describes a legacy bank read off disk, problems and all', () => {
     const path = writeLegacyFlatBank();
@@ -294,18 +303,200 @@ describe('the master switch', () => {
  * itself Python actually one.
  */
 describe('needsPythonInterpreter', () => {
-  it('is true for the shipped CLI on Windows and false everywhere else', () => {
-    expect(needsPythonInterpreter('C:/App/resources/cerebro', 'win32')).toBe(true);
-    expect(needsPythonInterpreter('/Applications/Artemis.app/resources/cerebro', 'darwin')).toBe(false);
-    expect(needsPythonInterpreter('/usr/share/artemis/cerebro', 'linux')).toBe(false);
+  it('is true for a bank`s embedded script on Windows and false everywhere else', () => {
+    expect(needsPythonInterpreter('C:/banks/team/bin/cerebro', 'win32')).toBe(true);
+    expect(needsPythonInterpreter('/Users/me/Documents/cortex/bin/cerebro', 'darwin')).toBe(false);
+    expect(needsPythonInterpreter('/home/me/cortex/bin/cerebro', 'linux')).toBe(false);
   });
 
   it('leaves a real executable alone, so a bank may embed one', () => {
-    // Resolution also finds a bank's *own* copy of the CLI, and a bank is free
-    // to ship something Windows can start by itself.
+    // The only CLI that is ever resolved is a bank's *own* copy, and a bank is
+    // free to ship something Windows can start by itself.
     expect(needsPythonInterpreter('C:/banks/team/bin/cerebro.exe', 'win32')).toBe(false);
     expect(needsPythonInterpreter('C:/banks/team/bin/cerebro.cmd', 'win32')).toBe(false);
     expect(needsPythonInterpreter('C:/banks/team/bin/cerebro.BAT', 'win32')).toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Which CLI, if any — and what depends on the answer                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A bank on disk, optionally carrying its own `bin/cerebro`.
+ *
+ * The CLI is written as a plain file rather than a runnable one: nothing here
+ * spawns it. What is under test is *resolution* — which is a question about
+ * whether the file is there, and about the fallbacks that no longer exist.
+ */
+function writeBank(embedsCli: boolean): string {
+  const root = mkdtempSync(join(tmpdir(), 'artemis-cli-bank-'));
+  mkdirSync(join(root, 'memories'), { recursive: true });
+  if (embedsCli) {
+    mkdirSync(join(root, 'bin'), { recursive: true });
+    writeFileSync(join(root, 'bin', 'cerebro'), '#!/usr/bin/env python3\n', 'utf8');
+  }
+  return root;
+}
+
+/**
+ * A data directory whose registry lists these banks — and a scratch
+ * `XDG_CONFIG_HOME`, so the CLI's real registry on the developing machine is
+ * neither read into the answer nor written to.
+ */
+function machineWithBanks(banks: readonly { slug: string; path: string }[]): string {
+  const dataDir = mkdtempSync(join(tmpdir(), 'artemis-cli-data-'));
+  process.env['XDG_CONFIG_HOME'] = join(dataDir, 'xdg');
+  writeFileSync(
+    join(dataDir, REGISTRY_V2_FILE),
+    JSON.stringify({
+      version: 2,
+      banks: banks.map((bank) => ({
+        ...bank,
+        role: 'readwrite',
+        enabled: true,
+        profiles: { kind: 'all' },
+      })),
+      default: banks[0]?.slug ?? null,
+    }),
+  );
+  return dataDir;
+}
+
+/**
+ * Resolution, after the vendored copy left the build.
+ *
+ * The rule is now one sentence — a bank is driven by its own `bin/cerebro` or
+ * by nothing — and the tests that matter are the ones about what was *removed*:
+ * there is no copy shipped beside the app, no borrowing the default bank's,
+ * and no legacy root to fall back through. A machine whose banks carry none has
+ * no CLI at all, and that is an ordinary state rather than a fault.
+ */
+describe('the CLI a bank is driven with', () => {
+  afterEach(() => {
+    delete process.env['XDG_CONFIG_HOME'];
+    delete process.env['ARTEMIS_VENDORED_CEREBRO'];
+  });
+
+  it('reports the bank that embeds one, per bank', async () => {
+    const withCli = writeBank(true);
+    const without = writeBank(false);
+    configureMemoryBanks(
+      machineWithBanks([
+        { slug: 'cortex', path: withCli },
+        { slug: 'notes', path: without },
+      ]),
+    );
+
+    const status = await readMemoryBanksStatus();
+    expect(status.banks.map((bank) => [bank.slug, bank.embedsCli])).toEqual([
+      ['cortex', true],
+      ['notes', false],
+    ]);
+    // The machine-wide answer is "any of them", and it is about one thing only:
+    // whether stock Claude Code can be wired to anything here.
+    expect(status.cliAvailable).toBe(true);
+  });
+
+  it('does not borrow another bank`s copy for a bank that has none', async () => {
+    // The removed fallback. `cortex` is the default bank and carries a CLI;
+    // `notes` still answers `false`, because its block is namespaced by its own
+    // slug and another repository's script is not a substitute.
+    configureMemoryBanks(
+      machineWithBanks([
+        { slug: 'cortex', path: writeBank(true) },
+        { slug: 'notes', path: writeBank(false) },
+      ]),
+    );
+    const status = await readMemoryBanksStatus();
+    expect(status.banks.find((bank) => bank.slug === 'notes')?.embedsCli).toBe(false);
+  });
+
+  it('has no vendored copy to fall back to, however it is pointed at one', async () => {
+    // Artemis used to ship a CLI and let `ARTEMIS_VENDORED_CEREBRO` move it.
+    // Neither exists: a machine whose banks embed none has no CLI, full stop.
+    process.env['ARTEMIS_VENDORED_CEREBRO'] = join(tmpdir(), 'anything');
+    configureMemoryBanks(machineWithBanks([{ slug: 'notes', path: writeBank(false) }]));
+
+    const status = await readMemoryBanksStatus();
+    expect(status.cliAvailable).toBe(false);
+    expect(status.banks[0]?.embedsCli).toBe(false);
+  });
+});
+
+/**
+ * The preflight's `cli` row, which stopped being about Artemis.
+ *
+ * It used to mean "can this machine drive a bank at all", and a `warn` there
+ * read as a degraded install. Everything Artemis does with a bank is core's
+ * now, so the row answers a narrower question — can anything here be wired
+ * into stock Claude Code — and says so in the words a person needs to not go
+ * looking for a fault.
+ */
+describe('readMemoryBanksPreflight: the cli check', () => {
+  afterEach(() => {
+    delete process.env['XDG_CONFIG_HOME'];
+  });
+
+  const cliCheck = async (): Promise<MemoryBankCheck> => {
+    const check = (await readMemoryBanksPreflight()).checks.find((entry) => entry.id === 'cli');
+    if (check === undefined) throw new Error('the preflight no longer reports a cli check');
+    return check;
+  };
+
+  it('is ok when a registered bank embeds one', async () => {
+    configureMemoryBanks(machineWithBanks([{ slug: 'cortex', path: writeBank(true) }]));
+    expect((await cliCheck()).state).toBe('ok');
+  });
+
+  it('warns — and says everything else works — when none does', async () => {
+    configureMemoryBanks(machineWithBanks([{ slug: 'notes', path: writeBank(false) }]));
+    const check = await cliCheck();
+    expect(check.state).toBe('warn');
+    expect(check.detail).toBe(
+      'no bank embeds the cerebro CLI; stock Claude Code wiring is unavailable, everything else works',
+    );
+  });
+
+  it('never fails on it, so a machine with no CLI is still ready', async () => {
+    // The whole point of the demotion: the row is about the other harness, and
+    // `ready` is about whether this one can carry a bank.
+    configureMemoryBanks(machineWithBanks([{ slug: 'notes', path: writeBank(false) }]));
+    const preflight = await readMemoryBanksPreflight();
+    expect(preflight.checks.find((check) => check.id === 'cli')?.state).not.toBe('fail');
+  });
+});
+
+/**
+ * Wiring, refused.
+ *
+ * The success path spawns a Python script inside a git checkout and is not
+ * something a unit test should arrange. What is worth pinning is the refusal,
+ * because it is the one the removal of the vendored copy created: a bank with
+ * no `bin/cerebro` cannot be wired by anything, and the sentence has to name
+ * the bank and say that Artemis is unaffected — otherwise it reads as Artemis
+ * being broken.
+ */
+describe('wireMemoryBankClaudeCode', () => {
+  afterEach(() => {
+    delete process.env['XDG_CONFIG_HOME'];
+  });
+
+  it('refuses a bank that embeds no CLI, by name', async () => {
+    configureMemoryBanks(machineWithBanks([{ slug: 'notes', path: writeBank(false) }]));
+    await expect(wireMemoryBankClaudeCode({ slug: 'notes', enabled: true })).rejects.toThrow(
+      /'notes' embeds no cerebro CLI/,
+    );
+    await expect(wireMemoryBankClaudeCode({ slug: 'notes', enabled: false })).rejects.toThrow(
+      /Artemis’s own runs are unaffected/,
+    );
+  });
+
+  it('refuses a slug this machine does not have', async () => {
+    configureMemoryBanks(machineWithBanks([{ slug: 'notes', path: writeBank(false) }]));
+    await expect(wireMemoryBankClaudeCode({ slug: 'gone', enabled: true })).rejects.toThrow(
+      /No memory bank called 'gone'/,
+    );
   });
 });
 

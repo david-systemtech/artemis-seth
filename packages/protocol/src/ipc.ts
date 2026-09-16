@@ -508,6 +508,24 @@ export const IPC = {
    */
   memoryBankSetProfiles: 'artemis:memory-banks:set-profiles',
   /**
+   * Wire one bank into *stock Claude Code* on this machine, or unwire it.
+   *
+   * A courtesy, and explicitly not Artemis's own path. Artemis reads, installs
+   * and describes a bank itself and runs with `settingSources: []`, so none of
+   * what this writes has any effect on an Artemis run. What it writes is the
+   * other harness's setup: a managed block in each profile's `CLAUDE.md`, a
+   * `/cerebro` slash command, and a `SessionStart` hook that syncs — the three
+   * things a person who also opens that profile in `claude` needs, and which
+   * only the bank's own embedded CLI knows how to write.
+   *
+   * An action rather than a side effect of enabling a bank, because it changes
+   * files Artemis does not own for the benefit of a program the user may not
+   * run. A bank that embeds no CLI cannot do it at all — see
+   * {@link MemoryBankInfo.embedsCli}, which is what lets the pane say so
+   * instead of failing on click.
+   */
+  memoryBankWireClaudeCode: 'artemis:memory-banks:wire-claude-code',
+  /**
    * Drop a bank from this machine: unwire it, remove its installed copies,
    * forget it in the registry. The repository itself stays on disk — the
    * renderer cannot delete a git repo through this channel, deliberately.
@@ -2450,6 +2468,17 @@ export interface MemoryBankInfo {
   /** Projects whose Artemis memory currently carries this bank's install. */
   readonly projects: number;
   /**
+   * The bank carries a `bin/cerebro` of its own.
+   *
+   * Nothing Artemis does needs it — reading, installing and describing a bank
+   * are core's, and a run never spawns it. It is here for exactly one offer:
+   * wiring the bank into stock Claude Code, which is that CLI's own `enable`
+   * and cannot be done by anything else. False means the pane disables the
+   * offer with a reason rather than failing on click. See
+   * `IPC.memoryBankWireClaudeCode`.
+   */
+  readonly embedsCli: boolean;
+  /**
    * Where this bank's git credential comes from, and what came of the last
    * attempt to use it.
    *
@@ -2498,7 +2527,13 @@ export interface MemoryBankProfileState {
  * is the state the settings pane exists to fix, not an error to fail on.
  */
 export interface MemoryBanksStatus {
-  /** A CLI exists to drive (bank-embedded or the copy Artemis ships). */
+  /**
+   * At least one registered bank embeds a `bin/cerebro`.
+   *
+   * Artemis ships no copy of its own any more, so this is the machine's answer
+   * to one question only: can anything here be wired into stock Claude Code.
+   * `false` is an ordinary state — every Artemis path works without it.
+   */
   readonly cliAvailable: boolean;
   /**
    * Artemis's master gate: inject the prompt, sync at run start. Off by
@@ -2720,6 +2755,22 @@ export interface MemoryBankSetProfilesRequest {
 }
 
 export type MemoryBankSetProfilesResponse = MemoryBankActionResponse;
+
+/**
+ * Wire this bank into stock Claude Code on this machine, or unwire it. See
+ * `IPC.memoryBankWireClaudeCode`.
+ *
+ * The desired state rather than a toggle, for {@link
+ * MemoryBankSetEnabledRequest}'s reason — and because the files being written
+ * are shared with another program, so two windows disagreeing about which way
+ * the toggle went would leave a managed block nobody meant to write.
+ */
+export interface MemoryBankWireClaudeCodeRequest {
+  readonly slug: string;
+  readonly enabled: boolean;
+}
+
+export type MemoryBankWireClaudeCodeResponse = MemoryBankActionResponse;
 
 /** Unwire, uninstall, and forget one bank. The repository stays on disk. */
 export interface MemoryBankForgetRequest {
@@ -3192,6 +3243,7 @@ export type IpcRequestMap = {
   [IPC.memoryBankRetire]: MemoryBankRetireRequest;
   [IPC.memoryBankSetEnabled]: MemoryBankSetEnabledRequest;
   [IPC.memoryBankSetProfiles]: MemoryBankSetProfilesRequest;
+  [IPC.memoryBankWireClaudeCode]: MemoryBankWireClaudeCodeRequest;
   [IPC.memoryBankForget]: MemoryBankForgetRequest;
   [IPC.memoryBanksSetMasterEnabled]: MemoryBanksSetMasterEnabledRequest;
   [IPC.secretsConnectionsList]: SecretsConnectionsListRequest;
@@ -3302,6 +3354,7 @@ export type IpcResponseMap = {
   [IPC.memoryBankRetire]: MemoryBankRetireResponse;
   [IPC.memoryBankSetEnabled]: MemoryBankSetEnabledResponse;
   [IPC.memoryBankSetProfiles]: MemoryBankSetProfilesResponse;
+  [IPC.memoryBankWireClaudeCode]: MemoryBankWireClaudeCodeResponse;
   [IPC.memoryBankForget]: MemoryBankForgetResponse;
   [IPC.memoryBanksSetMasterEnabled]: MemoryBanksSetMasterEnabledResponse;
   [IPC.secretsConnectionsList]: SecretsConnectionsListResponse;
@@ -3622,6 +3675,14 @@ export interface ArtemisBridge {
     setEnabled(request: MemoryBankSetEnabledRequest): Promise<IpcResult<MemoryBankSetEnabledResponse>>;
     /** Attach one bank to every profile, or to a chosen set. Installs follow. */
     setProfiles(request: MemoryBankSetProfilesRequest): Promise<IpcResult<MemoryBankSetProfilesResponse>>;
+    /**
+     * Wire this bank into stock Claude Code on this machine, or unwire it —
+     * the other harness's managed block, slash command and session-start
+     * hook. Nothing an Artemis run reads.
+     */
+    wireClaudeCode(
+      request: MemoryBankWireClaudeCodeRequest,
+    ): Promise<IpcResult<MemoryBankWireClaudeCodeResponse>>;
     /** Unwire, uninstall, and forget one bank. The repo stays on disk. */
     forget(request: MemoryBankForgetRequest): Promise<IpcResult<MemoryBankForgetResponse>>;
     /** Artemis's master gate: prompt injection + run-start syncs. */
