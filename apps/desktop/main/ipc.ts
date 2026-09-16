@@ -70,6 +70,7 @@ import {
   retireMemoryBankMemory,
   setMasterEnabled,
   setMemoryBankEnabled,
+  setMemoryBankProfiles,
   syncMemoryBank,
   verifyMemoryBankRemote,
   promptBanks,
@@ -187,6 +188,7 @@ import {
   validateMemoryBankMemories,
   validateMemoryBankRetire,
   validateMemoryBankSetEnabled,
+  validateMemoryBankSetProfiles,
   validateMemoryBankSync,
   validateMemoryBanksPreflight,
   validateMemoryBanksSetMasterEnabled,
@@ -662,6 +664,16 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       handle: async (request) => setMemoryBankEnabled(request),
     },
 
+    /*
+     * Artemis's own record, in Artemis's own registry: the CLI's config has no
+     * room for a profile scope. The installs follow the write, which is why
+     * this answers with a message like the other write channels.
+     */
+    [IPC.memoryBankSetProfiles]: {
+      validate: validateMemoryBankSetProfiles,
+      handle: async (request) => setMemoryBankProfiles(request),
+    },
+
     [IPC.memoryBankForget]: {
       validate: validateMemoryBankForget,
       handle: async (request) => forgetMemoryBank(request),
@@ -733,9 +745,15 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       validate: validateAgentPromptsList,
       // The banks ride along because only main can see them, and the pane's
       // preview of a built-in is wrong without them — see the response type.
+      //
+      // `toolsAvailable: true` so the preview shows the memory tools, which is
+      // what a Claude run on this machine is actually told. A preview is not a
+      // run and has no provider to ask; showing the CLI's verbs instead would
+      // make the pane disagree with every run the user then starts, and this
+      // is also the text an override is seeded from.
       handle: async () => ({
         document: await engine.require().readAgentPrompts(),
-        memoryBanks: promptBanks(),
+        memoryBanks: promptBanks(undefined, undefined, true),
       }),
     },
 

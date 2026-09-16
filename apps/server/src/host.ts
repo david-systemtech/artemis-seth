@@ -15,7 +15,9 @@
  *  - **No prompt library of its own.** A served run's standing instructions
  *    are the client's, carried on the wire; what this process adds is the
  *    memory-bank prompt for the banks *this* machine carries, composed from
- *    the CLI's registry under this process's home — see `runSource.startRun`.
+ *    this machine's own registry — see `withMemoryBanks` below, which every
+ *    path that starts a run goes through, and `memoryBanks.ts`, which keeps
+ *    those banks installed and fresh without anybody's cron.
  *  - **No plan-usage polling, no update checks, no notifications.** All
  *    window furniture.
  *  - **Permission prompts on the completions surface are auto-denied**, exactly
@@ -36,6 +38,7 @@ import type {
   ProfileId,
   ProviderId,
   RunId,
+  RunInput,
   ServerConnection,
   SessionDelegatedWork,
 } from '@rx-artemis/protocol';
@@ -52,6 +55,9 @@ import {
   joinSystemPromptAppends,
   machineBankPrompt,
   managedEnvKeys,
+  memoryToolServer,
+  registryPath,
+  MEMORY_TOOL_SERVER,
   DuplicateProfileLabelError,
   ProfileStore,
   resolveEnv,
@@ -71,8 +77,14 @@ import {
   type SessionSource,
   type UsageSource,
   type WorkspaceResolver,
+  takesHostToolServers,
 } from '@rx-artemis/core';
 
+import {
+  createServerMemoryBanks,
+  mergeBankDirectories,
+  withSystemPromptAppended,
+} from './memoryBanks.js';
 import { createFileProfileSecrets } from './secrets.js';
 
 /**
@@ -81,6 +93,9 @@ import { createFileProfileSecrets } from './secrets.js';
  * rule.
  */
 const MAX_SESSION_TITLE = 200;
+
+/** The providers this host hands its tool servers to — core's list, shared with the desktop. */
+const takesHostTools = takesHostToolServers;
 
 export interface HeadlessHost {
   readonly profiles: ProfileStore;
@@ -135,6 +150,13 @@ export function createHeadlessHost(
   const providers = createDefaultProviderRegistry({
     claude: {
       /*
+       * The memory tools, built per run by this process — the same seam the
+       * desktop hands its browser and task tools across, and the only tools a
+       * headless deployment has to give. `memoryTools` is declared below and
+       * captured, not called, until a run starts.
+       */
+      agentToolServers: (_runId, input) => memoryTools(input),
+      /*
        * The provider started a turn nobody asked for — register it.
        *
        * It does that when background work settles, and a subagent that outlived
@@ -155,6 +177,14 @@ export function createHeadlessHost(
           );
         }
       },
+    },
+    /*
+     * The same factory, for the provider whose loop is Artemis's own. One
+     * call, not a second one built for the occasion — see the desktop's
+     * `engine.ts`, which says the same thing about the same pair.
+     */
+    local: {
+      agentToolServers: (_runId, input) => memoryTools(input),
     },
   });
   const managed = [...new Set(providers.list().flatMap((adapter) => managedEnvKeys(adapter.credentials)))];
@@ -419,30 +449,149 @@ export function createHeadlessHost(
     },
   };
 
+  /**
+   * The banks this machine carries, kept installed and fresh by this process.
+   * See `memoryBanks.ts` for what is synchronous and what is not.
+   */
+  const banks = createServerMemoryBanks({ dataDir });
+
+  /** Can this provider take an append on top of its own preset? */
+  const canAppend = (providerId: string): boolean =>
+    providers.get(providerId as ProviderId)?.capabilities.systemPromptAppend === true;
+
+  /**
+   * The memory tools for one run, or nothing.
+   *
+   * Nothing for a provider that cannot take them, and nothing for an account
+   * that carries no bank — a server whose every call answers "no memory bank
+   * reaches this run" teaches the model the feature is broken rather than that
+   * it is not configured here.
+   *
+   * No credential is supplied. This process has no key manager and no window
+   * to authorise one, so `landing.credential` is left unset and core falls
+   * back to `git credential fill` — the container's ambient helper, or a
+   * deploy key on an ssh remote, which is exactly how `memoryBanks.ts` already
+   * pulls. See its header.
+   */
+  const memoryTools = (
+    input: RunInput,
+  ): Record<string, ReturnType<typeof memoryToolServer>> | undefined => {
+    try {
+      if (!takesHostTools(input.providerId) || !banks.reaches(input.profileId)) return undefined;
+      return {
+        [MEMORY_TOOL_SERVER]: memoryToolServer({
+          dataDir,
+          cliRegistryPath: registryPath(),
+          profileId: input.profileId,
+          cwd: input.cwd,
+          log: (line) => process.stderr.write(`memory banks: ${line}\n`),
+        }),
+      };
+    } catch (error) {
+      // A run starts without the tools rather than not at all: memory is an
+      // augmentation, and an augmentation that can fail a turn is a liability.
+      process.stderr.write(
+        `memory banks: could not build the memory tools: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return undefined;
+    }
+  };
+
+  /**
+   * This machine's memory-bank prompt for one run.
+   *
+   * Here and not on the client, because the prompt is about the machine the
+   * run executes on — the banks *this* container carries, at the paths they
+   * have here. The client's rendering would name its own slugs and a path on a
+   * laptop; the desktop keeps that built-in off the wire for exactly this
+   * reason. What the run contributes is which of them it may see (its
+   * account's scope), which slice of each it is shown (its project), whether
+   * the index is carried inline (its provider), and whether it can write
+   * through the memory tools or has to be taught the bank's CLI (its provider
+   * again — see {@link takesHostTools}, which decides both).
+   *
+   * Never throws: a bank that cannot be read is a run that starts without it.
+   */
+  const bankPrompt = (run: {
+    readonly providerId: string;
+    readonly profileId: string;
+    readonly cwd: string;
+  }): string | undefined => {
+    try {
+      return machineBankPrompt({
+        dataDir,
+        profileId: run.profileId,
+        cwd: run.cwd,
+        providerId: run.providerId,
+        toolsAvailable: takesHostTools(run.providerId),
+      });
+    } catch (error) {
+      process.stderr.write(
+        `memory banks: could not compose the prompt: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return undefined;
+    }
+  };
+
+  /**
+   * A run about to start, with this machine's banks folded into it.
+   *
+   * The whole-`RunInput` paths — the remote bridge and this server's own
+   * routines — go through here, which is the half that used to be missing:
+   * both started runs on a machine whose banks were installed for them and
+   * described to nobody. Three things happen, in this order, because the
+   * install has to be on disk before the provider reads the project's memory
+   * file at the start of the first turn:
+   *
+   *  1. the banks in scope are installed for this project, synchronously, and
+   *     a pull is scheduled in the background;
+   *  2. their prompt is appended, for a provider that can take an append —
+   *     after the caller's own standing instructions, never replacing them;
+   *  3. their checkouts are attached as readable directories, so a run whose
+   *     tool sandbox is rooted at `cwd` can still open the files the index
+   *     points at.
+   *
+   * A no-op returns the input by reference, so a server with no banks starts
+   * exactly the run it would have started before any of this existed.
+   */
+  const withMemoryBanks = (input: RunInput): RunInput => {
+    banks.prepare({ profileId: input.profileId, cwd: input.cwd });
+    const withPrompt = canAppend(input.providerId)
+      ? withSystemPromptAppended(input, bankPrompt(input))
+      : input;
+    const directories = mergeBankDirectories(
+      input.additionalDirectories,
+      banks.directoriesFor(input.profileId),
+    );
+    return directories === input.additionalDirectories
+      ? withPrompt
+      : { ...withPrompt, additionalDirectories: directories };
+  };
+
   const runSource: RunSource = {
     startRun: (input) => {
       const permissionMode = clampMode(input.providerId as ProviderId, input.permissionMode);
       /*
+       * The banks this account carries, installed for this project before the
+       * run starts — see `withMemoryBanks`, which does the same for the two
+       * paths that carry a whole `RunInput`. This one cannot: a completions
+       * caller may not choose a tool set or a directory, so the bank
+       * checkouts are not attached here and the prompt is the only thing the
+       * run gets. A Claude harness loads the installed index itself.
+       */
+      banks.prepare({ profileId: input.profileId, cwd: input.cwd });
+
+      /*
        * What the run is told, on top of the serving provider's preset: the
        * client's own standing instructions (the route has already set the
        * field aside for a provider that cannot append), then this machine's
-       * memory-bank prompt, composed here from this machine's own registry.
-       *
-       * Here and not on the client, because the prompt is about the machine
-       * the run executes on — the banks *this* container carries, at the paths
-       * they have here, driven by the CLI on this PATH. The client's rendering
-       * would name its own slugs and a path on a laptop; the desktop keeps
-       * that built-in off the wire for exactly this reason. Consent is the
-       * CLI's own: a bank is described only if `cerebro enable` left it
-       * enabled in the registry and it is present on disk.
+       * memory-bank prompt, scoped to the account the turn bills.
        *
        * The wire and the adapter both refuse a replacement, so an append is
        * the only shape that reaches here.
        */
-      const canAppend =
-        providers.get(input.providerId as ProviderId)?.capabilities.systemPromptAppend === true;
-      const instructions = canAppend
-        ? joinSystemPromptAppends(input.systemPrompt, machineBankPrompt())
+      const instructions = canAppend(input.providerId)
+        ? joinSystemPromptAppends(input.systemPrompt, bankPrompt(input))
         : undefined;
       return runs.start({
         providerId: input.providerId as ProviderId,
@@ -532,8 +681,10 @@ export function createHeadlessHost(
 
     // The control surface. `startUserRun` takes the whole RunInput — the
     // routes have already enforced the token's scope, and the registry
-    // enforces capabilities exactly as it does for a window.
-    startUserRun: (input) => runs.start(input),
+    // enforces capabilities exactly as it does for a window. The banks go in
+    // here rather than in the routes, so every bridge-started run gets them
+    // whatever route started it.
+    startUserRun: (input) => runs.start(withMemoryBanks(input)),
     send: async (runId, text, attachments) => {
       const outcome = await runs.send(runId as RunId, text, attachments);
       return { deliveredImmediately: outcome.deliveredImmediately };
@@ -550,11 +701,15 @@ export function createHeadlessHost(
    * bridge uses — and pinned to the connection's directory, resolved afresh on
    * every firing exactly as a completion's is. Its scheduler is begun by the
    * `serve` command after the port is bound and stopped by {@link dispose}.
+   *
+   * Through `withMemoryBanks` for the same reason the bridge is: a firing is
+   * the most unattended run this process starts, and the one most in need of
+   * the standing knowledge the banks hold.
    */
   const routines = createServerRoutineStore({
     dataDir,
     runs: {
-      start: (input) => runs.start(input),
+      start: (input) => runs.start(withMemoryBanks(input)),
       subscribe: (listener) => runs.subscribe(listener),
     },
     workspaces,
