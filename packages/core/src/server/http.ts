@@ -65,6 +65,7 @@ import type {
   OpenAiChatRequest,
   OpenAiModelList,
   ProviderId,
+  RunHandle,
   RunId,
   RunsInterruptResponse,
   RunsRespondPermissionResponse,
@@ -109,10 +110,13 @@ import type { Catalogue } from './catalogue.js';
 import {
   chatChunk,
   chatResponse,
+  promptFromMessages,
   resumeTurn,
   runTurn,
+  steerTurn,
   type ResumeRequest,
   type RunSource,
+  type SteerRequest,
   type TurnEvent,
   type TurnResult,
 } from './completions.js';
@@ -2846,6 +2850,40 @@ async function handleChatCompletions(
   const { model, redirected } = resumed;
 
   /*
+   * A message to a conversation the server is still working on is a steer,
+   * not a second run.
+   *
+   * The server can be working on a conversation with no client attached:
+   * the provider opens a turn of its own when a subagent finishes, and the
+   * registry adopts it, while the client that started the conversation saw
+   * its last turn end and shows an idle pane. What that client sends next —
+   * "did the session stop? keep going", on 2026-09-16 — arrives here as an
+   * ordinary resume. Starting a run on it put a second CLI on a transcript
+   * the first was still writing; the adapters now refuse that, and a refusal
+   * alone would lose the message. So it goes into the live run as the steer
+   * it was, and the caller follows that run from the start — everything it
+   * missed, then the live tail — which is the answer to what it was asking.
+   */
+  if (extensions.sessionId !== undefined) {
+    const live = await liveRunOn(context.runs, extensions.sessionId);
+    if (live !== undefined) {
+      return attribute(
+        await steerLiveRun({
+          context,
+          connection,
+          request,
+          chat,
+          extensions,
+          model,
+          live,
+          ignored: review.ignored,
+          ...(redirected === undefined ? {} : { redirected }),
+        }),
+      );
+    }
+  }
+
+  /*
    * Standing instructions reach the run only where the serving account's
    * provider can append to its preset. Codex and OpenCode have no append —
    * `systemPromptAppend: false` on their descriptors, and the catalogue
@@ -3349,6 +3387,217 @@ async function* streamTurn(input: {
     yield sseEvent(failureChunk(frame, error));
   }
 
+  yield sseEvent(SSE_DONE);
+}
+
+/**
+ * The run still going on a conversation, if the engine has one.
+ *
+ * `listRuns` answers only live runs, and a handle carries its session id from
+ * the moment the run knows it, so this is one scan. A build without the
+ * observation surface answers nothing — and its adapters refuse the second
+ * run on their own, so the outcome there is a refusal rather than a fork.
+ */
+async function liveRunOn(
+  runs: RunSource | undefined,
+  sessionId: string,
+): Promise<RunHandle | undefined> {
+  if (runs?.listRuns === undefined) return undefined;
+  const handles = await runs.listRuns({});
+  return handles.find(
+    (handle) => handle.status !== 'ended' && String(handle.sessionId) === sessionId,
+  );
+}
+
+/**
+ * The `artemis.*` fields a steer cannot carry, named so the caller knows.
+ *
+ * A turn already running has its mode, its effort and its instructions; what
+ * goes in is the message. Reported under `ignored` on the same terms as a
+ * field the serving provider cannot honour — accepted, set aside, and said.
+ */
+const STEER_IGNORED: readonly (readonly [keyof ArtemisChatExtensions, string])[] = [
+  ['systemPrompt', 'artemis.systemPrompt'],
+  ['permissionMode', 'artemis.permissionMode'],
+  ['thinking', 'artemis.thinking'],
+  ['fastMode', 'artemis.fastMode'],
+  ['ultracode', 'artemis.ultracode'],
+];
+
+/**
+ * Send a completions caller's message into the run already serving its
+ * conversation, and answer with that run's stream.
+ *
+ * Ownership first, on the one rule the run surface has: a run belongs to the
+ * connection that started it. A run the provider started on its own has no
+ * such connection, and the resume gate has already proven this caller owns
+ * the conversation it is in — so the claim is made here, idempotently, and a
+ * run another connection already holds is refused rather than shared. The
+ * caller is then attached exactly as a client picking a lost stream back up
+ * is, deadlines and all, and its request's `artemis` fields ride the reply as
+ * the run's do.
+ *
+ * `409` throughout, and never a fork: a fork or a rewind reshapes a
+ * conversation that is mid-sentence, and a build with no directory cannot say
+ * whose the run is. Both are told to wait or stop the turn, which is the
+ * truth, and neither is quietly turned into a second run — which is the whole
+ * failure this exists to end.
+ */
+async function steerLiveRun(input: {
+  readonly context: ServerContext;
+  readonly connection: ServerConnection;
+  readonly request: ServerRequestInfo;
+  readonly chat: OpenAiChatRequest;
+  readonly extensions: ArtemisChatExtensions;
+  readonly model: ServerModel;
+  readonly live: RunHandle;
+  readonly ignored: readonly string[];
+  readonly redirected?: RouteRedirect;
+}): Promise<ServerReply | ServerStreamReply> {
+  const { context, connection, extensions, model, live } = input;
+  const runs = context.runs;
+  const directory = context.runDirectory;
+  const busy = (detail: string): ServerReply =>
+    fail(409, 'invalid_request_error', 'session_busy', detail);
+
+  if (extensions.forkSession === true || extensions.rewindToMessageId !== undefined) {
+    return busy(
+      'This conversation is still working on its last message. Stop it before forking or rewinding it.',
+    );
+  }
+  if (runs === undefined || runs.send === undefined || directory === undefined) {
+    return busy(
+      'This conversation is still working on its last message. Wait for it to finish, or stop it, before sending another.',
+    );
+  }
+
+  directory.claim({
+    runId: live.runId,
+    connectionId: connection.id,
+    permissions: extensions.remote?.permissions === true,
+    route: model.route,
+  });
+  if (!directory.owns(connection.id, live.runId)) {
+    return busy(
+      'This conversation is being driven from another connection. Wait for that turn to finish before sending another.',
+    );
+  }
+  directory.noteSeen(live.runId);
+  directory.noteAttached(live.runId);
+
+  const ignored = [
+    ...input.ignored,
+    ...STEER_IGNORED.filter(([field]) => extensions[field] !== undefined).map(([, name]) => name),
+  ];
+  const steer: SteerRequest = {
+    runId: live.runId,
+    prompt: promptFromMessages(input.chat.messages, { resuming: true }),
+    ...(extensions.sessionId === undefined ? {} : { sessionId: extensions.sessionId }),
+    ...(input.request.signal === undefined ? {} : { signal: input.request.signal }),
+    onDetach: (id: RunId) => directory.noteDetached(id),
+  };
+  const id = `chatcmpl-${Math.random().toString(36).slice(2, 12)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  if (input.chat.stream === true) {
+    return {
+      status: 200,
+      headers: {
+        ...CORS_HEADERS,
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+      },
+      connectionId: connection.id,
+      stream: streamSteer({
+        id,
+        created,
+        model,
+        runs,
+        request: steer,
+        ignored,
+        ...(input.redirected === undefined ? {} : { redirected: input.redirected }),
+        heartbeatMs: context.remoteStream?.heartbeatMs ?? DEFAULT_COMPLETIONS_HEARTBEAT_MS,
+      }),
+    };
+  }
+
+  let result: TurnResult | undefined;
+  try {
+    for await (const event of steerTurn(runs, steer)) {
+      if (event.kind === 'done') result = event.result;
+    }
+  } catch (error) {
+    return fail(
+      502,
+      'server_error',
+      'run_failed',
+      error instanceof Error ? error.message : 'The message could not be sent into the running turn.',
+    );
+  }
+  if (result === undefined) {
+    return fail(502, 'server_error', 'no_result', 'The run ended without producing a reply.');
+  }
+  if (result.error !== undefined && result.text.length === 0) {
+    return fail(502, 'server_error', 'run_failed', result.error);
+  }
+  return {
+    status: 200,
+    headers: { ...JSON_HEADERS, ...CORS_HEADERS },
+    body: chatResponse({
+      id,
+      model: model.route,
+      created,
+      result,
+      ignored,
+      ...(input.redirected === undefined ? {} : { redirected: input.redirected }),
+      ...(model.resolvedModel === undefined ? {} : { resolvedModel: model.resolvedModel }),
+    }),
+  };
+}
+
+/**
+ * A steered run's stream: the role chunk a fresh turn opens with — this
+ * caller has no message open yet — then the run picked up from the start.
+ */
+async function* streamSteer(input: {
+  readonly id: string;
+  readonly created: number;
+  readonly model: ServerModel;
+  readonly runs: RunSource;
+  readonly request: SteerRequest;
+  readonly ignored: readonly string[];
+  readonly redirected?: RouteRedirect;
+  readonly heartbeatMs: number;
+}): AsyncIterable<string> {
+  const frame: ChunkFrame = { id: input.id, model: input.model.route, created: input.created };
+  const { ignored, redirected } = input;
+  yield sseEvent(
+    chatChunk({
+      ...frame,
+      delta: { role: 'assistant' },
+      ...(ignored.length === 0 && redirected === undefined
+        ? {}
+        : {
+            artemis: {
+              ...(ignored.length === 0 ? {} : { ignored }),
+              ...(redirected === undefined ? {} : { redirected }),
+            },
+          }),
+    }),
+  );
+  try {
+    for await (const item of paced(steerTurn(input.runs, input.request), input.heartbeatMs)) {
+      if (item === HEARTBEAT) {
+        yield SSE_HEARTBEAT;
+        continue;
+      }
+      const chunk = chunkFor(item, frame, {});
+      if (chunk !== undefined) yield sseEvent(chunk);
+    }
+  } catch (error) {
+    yield sseEvent(failureChunk(frame, error));
+  }
   yield sseEvent(SSE_DONE);
 }
 
