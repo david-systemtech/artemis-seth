@@ -71,7 +71,8 @@ import { secretRefProblem } from '@rx-artemis/protocol';
 
 import { useMemoryBanks, type MemoryBanksPane } from '../../hooks/useMemoryBanks';
 import { useSecretManagers } from '../../hooks/useSecretManagers';
-import { useApp } from '../../state/store';
+import { describeMemoryBank, useApp } from '../../state/store';
+import { ReasonButton } from '../disabled-reason';
 import { CodeBlock, Fold, Row, StatusDot, ToneBadge } from '../primitives';
 import { SettingsGroup, SettingsPane } from './pane';
 import {
@@ -283,6 +284,7 @@ function BankCard({
           </ToneBadge>
         ) : null}
         <span className="ml-auto flex items-center gap-1">
+          <DescribeButton bank={bank} />
           {bank.enabled ? (
             <Button
               size="sm"
@@ -306,6 +308,19 @@ function BankCard({
           <ForgetButton bank={bank} pane={pane} />
         </span>
       </div>
+      {/*
+        What the button above starts, in one line, and only on a bank that has
+        no manifest yet — which is the bank the offer is really for, and the
+        only card where a person is being asked to do something they did not
+        come here to do. A bank that already describes itself keeps the button
+        (its manifest can always be better) and drops the pitch.
+      */}
+      {bank.format !== 'manifest' ? (
+        <p className="text-2xs leading-relaxed text-ink-faint">
+          Starts a conversation in the bank&apos;s checkout that reads the tree, proposes a BANK.md,
+          asks you what it cannot infer, and lands it through the bank&apos;s review path.
+        </p>
+      ) : null}
       {/* The bank's own line about itself, from its manifest. It is the
           routing signal the prompt carries, so a person deciding which
           profiles to attach it to should be reading the same sentence the
@@ -365,6 +380,49 @@ function BankCard({
         <BankMemories bank={bank} pane={pane} />
       </Fold>
     </div>
+  );
+}
+
+/**
+ * How a bank gets a manifest, or a better one.
+ *
+ * A `BANK.md` is not a form. Nearly all of it is already in the tree — where
+ * the memories are, what the folder levels mean, how changes reach the remote
+ * — and the two or three things that are not are questions for the person. So
+ * this is a button that starts a conversation rather than a dialog that asks
+ * for a name, a glob and a scope template: the store action opens a column in
+ * the bank's checkout, sends the first message and closes this dialog behind
+ * it. See `describeMemoryBank`, and `renderDescribeBankPrompt` for the words.
+ *
+ * Two labels for one action. A bank with a manifest is being *revised*, and a
+ * button offering to describe a bank that already describes itself would be
+ * proposing work the user can see on the card is done.
+ *
+ * Not dimmed by `pane.busy`, unlike everything else on this card: it spawns no
+ * CLI, writes nothing, and produces no receipt to race the pane's one receipt
+ * line for. Missing on disk is the one refusal — there is no tree to read and
+ * no directory to run in — and it is a reason rather than a silent grey, the
+ * house rule `disabled-reason.tsx` states.
+ */
+function DescribeButton({ bank }: { readonly bank: MemoryBankInfo }): ReactElement {
+  return (
+    <ReasonButton
+      size="sm"
+      variant="ghost"
+      className="text-2xs"
+      disabled={!bank.exists}
+      disabledReason={`${bank.path} is not on disk, so there is no tree to read and nowhere to run.`}
+      onClick={() =>
+        void describeMemoryBank({
+          slug: bank.slug,
+          path: bank.path,
+          format: bank.format,
+          name: bank.name,
+        })
+      }
+    >
+      {bank.format === 'manifest' ? 'Revise BANK.md…' : 'Describe this bank…'}
+    </ReasonButton>
   );
 }
 

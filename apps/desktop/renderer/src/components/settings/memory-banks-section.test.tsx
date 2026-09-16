@@ -59,6 +59,20 @@ vi.stubGlobal('ResizeObserver', NoopObserver);
 vi.stubGlobal('DOMRectReadOnly', class {});
 Element.prototype.scrollIntoView ??= function scrollIntoView(): void {};
 
+/**
+ * The one store action this pane calls.
+ *
+ * Mocked rather than exercised: what it does — split a column, move its
+ * directory, close this dialog, send — is pinned in `state/describeBank.test.ts`
+ * against the real store, and what the card owes is only that it calls it, with
+ * the four facts the prompt is composed from.
+ */
+const describeMemoryBank = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+vi.mock('@/state/store', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/state/store')>()),
+  describeMemoryBank,
+}));
+
 const ok = <T,>(value: T) => ({ ok: true as const, value });
 
 /** A machine with nothing set up yet — the state onboarding actually happens in. */
@@ -291,6 +305,7 @@ afterEach(() => {
   addCalls.length = 0;
   testRefCalls.length = 0;
   profileCalls.length = 0;
+  describeMemoryBank.mockClear();
 });
 
 describe('joining a private bank', () => {
@@ -672,6 +687,107 @@ describe('a bank card', () => {
     withBanks(bank());
     await renderPane();
     expect(screen.queryByText(/entries have problems/)).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Giving a bank a BANK.md                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The card's one route to a manifest.
+ *
+ * A `BANK.md` is not a form — nearly all of it is in the tree and the rest is a
+ * conversation — so the card's whole obligation is to start that conversation
+ * in the right checkout, and to say which of the two jobs it is starting.
+ */
+describe('describing a bank', () => {
+  const withBanks = (...banks: readonly MemoryBankInfo[]): void => {
+    status = { ...NO_BANKS, masterEnabled: true, banks };
+  };
+
+  const describeButton = (): HTMLElement =>
+    screen.getByRole('button', { name: 'Describe this bank…' });
+
+  it('offers to write a manifest for a bank that has none, whatever it is kept as', async () => {
+    withBanks(
+      bank({ slug: 'flat-bank', format: 'legacy-flat' }),
+      bank({ slug: 'projects-bank', format: 'legacy-projects', isDefault: false }),
+      // Not a format at all — a registered directory Artemis does not read as a
+      // bank, which is the card most in need of this.
+      bank({ slug: 'empty-dir', format: null, isDefault: false }),
+    );
+    await renderPane();
+
+    expect(screen.getAllByRole('button', { name: 'Describe this bank…' })).toHaveLength(3);
+    expect(screen.queryByRole('button', { name: 'Revise BANK.md…' })).toBeNull();
+  });
+
+  it('offers to revise the manifest a bank already has', async () => {
+    // Describing a bank that already describes itself would be proposing work
+    // the user can see on the card is done.
+    withBanks(bank({ format: 'manifest' }));
+    await renderPane();
+
+    expect(screen.getByRole('button', { name: 'Revise BANK.md…' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Describe this bank…' })).toBeNull();
+  });
+
+  it('says what pressing it starts, on the card that needs telling', async () => {
+    withBanks(bank({ format: null }));
+    await renderPane();
+    expect(
+      screen.getByText(
+        "Starts a conversation in the bank's checkout that reads the tree, proposes a BANK.md, asks you what it cannot infer, and lands it through the bank's review path.",
+      ),
+    ).toBeTruthy();
+
+    cleanup();
+    // A bank with a manifest keeps the button and drops the pitch.
+    withBanks(bank({ format: 'manifest' }));
+    await renderPane();
+    expect(screen.queryByText(/Starts a conversation in the bank/)).toBeNull();
+  });
+
+  it('hands the store the four facts the prompt is composed from', async () => {
+    withBanks(
+      bank({
+        slug: 'cortex',
+        name: 'Cortex',
+        path: '/Users/demo/Documents/cortex',
+        format: 'legacy-projects',
+      }),
+    );
+    await renderPane();
+
+    await act(async () => {
+      describeButton().click();
+    });
+
+    expect(describeMemoryBank).toHaveBeenCalledWith({
+      slug: 'cortex',
+      name: 'Cortex',
+      path: '/Users/demo/Documents/cortex',
+      format: 'legacy-projects',
+    });
+  });
+
+  it('refuses on a bank that is not on disk, and names the path', async () => {
+    // There is no tree to read and no directory to run in. Disabled with the
+    // reason rather than hidden — `disabled-reason.tsx` has the house rule, and
+    // the reason is why the button stays focusable instead of natively
+    // `disabled`.
+    withBanks(bank({ format: null, exists: false, path: '/Users/demo/gone' }));
+    await renderPane();
+
+    const button = describeButton();
+    expect(button.getAttribute('aria-disabled')).toBe('true');
+    expect(button.hasAttribute('disabled')).toBe(false);
+
+    await act(async () => {
+      button.click();
+    });
+    expect(describeMemoryBank).not.toHaveBeenCalled();
   });
 });
 
