@@ -180,6 +180,7 @@ let saved: { prompts: unknown[]; dismissedBuiltIns?: unknown }[] = [];
             mirrored: 0,
             validationErrors: 0,
             projects: 0,
+            embedsCli: false,
           },
         ],
         profiles: [],

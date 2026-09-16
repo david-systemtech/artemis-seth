@@ -40,11 +40,14 @@
  * TWO KINDS OF SWITCH, AND WHY BOTH ARE BUTTONS
  * ---------------------------------------------------------------------------
  *
- * Each bank has a wiring switch (the CLI's, honoured by stock Claude Code's
- * hook too) and Artemis has one master gate (prompt + run-start syncs). Both
- * render as buttons, not `Switch`es: the per-bank one spawns `enable`/
- * `disable` and a sync, takes seconds and can fail, and a toggle that
- * animates to a position it then has to animate back from is lying twice.
+ * Each bank has an on/off switch (the registry flag, and the installs that
+ * follow it) and Artemis has one master gate (prompt + run-start syncs). Both
+ * render as buttons, not `Switch`es: the per-bank one rewrites every project's
+ * memory, takes seconds and can fail, and a toggle that animates to a position
+ * it then has to animate back from is lying twice. The same argument makes
+ * "Wire for stock Claude Code" a button — a third control, on its own row,
+ * because what it writes is *another program's* setup and folding it into the
+ * bank's switch would edit files the user never asked Artemis to touch.
  *
  * The profile checkboxes are the exception that proves the rule: they are
  * checkboxes because ticking three of five profiles is a *list* being built,
@@ -334,6 +337,7 @@ function BankCard({
         {`${bank.memories} memories${bank.mirrored > 0 ? ` (${bank.mirrored} mirrored, read-only)` : ''} · ${bank.validationErrors} validation errors · installed in ${bank.projects} projects`}
       </Row>
       <BankProfiles bank={bank} pane={pane} />
+      <BankClaudeCode bank={bank} pane={pane} />
       {/*
         What the bank's reader would not accept, folded rather than listed: on
         a healthy bank it is nothing, on a broken one it is a file-by-file
@@ -515,6 +519,77 @@ function BankProfiles({
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * What *stock Claude Code* on this machine carries of this bank, and the one
+ * button that changes it.
+ *
+ * The distinction this row exists to draw: none of it is Artemis's path.
+ * Artemis reads the bank through its own code, installs its memories itself and
+ * runs with `settingSources: []`, so the managed block and the session-start
+ * hook are inert under Artemis and always were. They matter to the person who
+ * *also* opens these profiles in `claude` — and for them, wiring is a real
+ * setup step that nothing else performs.
+ *
+ * So it is an action rather than a consequence of switching the bank on, and
+ * its state is read back out of the files rather than remembered: how many
+ * profiles carry the block, and whether the hook is there. A pane that said
+ * "wired" from its own memory would keep saying it after someone edited a
+ * `CLAUDE.md` by hand.
+ *
+ * The refusal is the interesting case. `enable` and `disable` are the *bank's*
+ * CLI — its block is namespaced by its slug and its hook is its own dialect —
+ * and Artemis ships no copy to stand in for a bank that carries none. That is
+ * a reason on a dimmed button, not a hidden one: a bank with no `bin/cerebro`
+ * is perfectly healthy, and the sentence has to say so.
+ */
+function BankClaudeCode({
+  bank,
+  pane,
+}: {
+  readonly bank: MemoryBankInfo;
+  readonly pane: MemoryBanksPane;
+}): ReactElement {
+  const profiles = pane.status?.profiles ?? [];
+  const carrying = profiles.filter((profile) => profile.banks[bank.slug] === true).length;
+  const hooked = profiles.some((profile) => profile.hook);
+  const wired = carrying > 0;
+  const working = pane.busy === 'wire';
+
+  return (
+    <div className="flex flex-col gap-1.5 border-t border-hairline pt-2">
+      <span className="chrome-label text-ink-faint">Stock Claude Code</span>
+      <div className="flex items-start gap-3">
+        <p className="min-w-0 flex-1 text-2xs leading-relaxed text-ink-muted">
+          {profiles.length === 0
+            ? 'No Claude Code profile directories on this machine, so there is nothing to wire.'
+            : `Managed block in ${carrying} of ${profiles.length} ${
+                profiles.length === 1 ? 'profile' : 'profiles'
+              } · session-start sync hook ${hooked ? 'installed' : 'not installed'}.`}
+        </p>
+        <ReasonButton
+          size="sm"
+          variant={wired ? 'ghost' : 'outline'}
+          className="text-2xs"
+          disabled={!bank.embedsCli || pane.busy !== null}
+          disabledReason={
+            bank.embedsCli
+              ? undefined
+              : `${bank.slug} embeds no cerebro CLI, so nothing here can write stock Claude Code’s block, command and hook. Artemis’s own runs are unaffected.`
+          }
+          onClick={() => pane.wireClaudeCode(bank.slug, !wired)}
+        >
+          {working ? '…' : wired ? 'Unwire' : 'Wire for stock Claude Code'}
+        </ReasonButton>
+      </div>
+      <p className="text-2xs leading-relaxed text-ink-faint">
+        Stock Claude Code sessions on this machine read a managed block in each profile&apos;s
+        CLAUDE.md and sync at session start through the bank&apos;s own cerebro CLI. Artemis&apos;s
+        own runs need none of this.
+      </p>
     </div>
   );
 }

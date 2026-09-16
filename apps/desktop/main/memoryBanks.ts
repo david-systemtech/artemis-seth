@@ -11,14 +11,19 @@
  * the host around that: it owns the locations, composes the environment, and
  * turns each channel into a call on core.
  *
- * The `cerebro` CLI is no longer the contract, and is now barely a dependency.
- * Writing goes through core too — `draftMemory`, `promoteBank`, `retireMemory`
- * and the forge landing behind them — which is the same code the memory tools
- * run inside an agent's session, so the pane's buttons and the agent's tools
- * cannot disagree about what promoting or retiring means. What is left of the
- * CLI here is bootstrap (creating and joining a bank that does not exist yet)
- * and one best-effort courtesy: stripping stock Claude Code's own wiring when
- * a bank is forgotten. Neither is on the path of a run.
+ * The `cerebro` CLI is no longer the contract, and Artemis no longer ships
+ * one. Writing goes through core too — `draftMemory`, `promoteBank`,
+ * `retireMemory` and the forge landing behind them — which is the same code
+ * the memory tools run inside an agent's session, so the pane's buttons and
+ * the agent's tools cannot disagree about what promoting or retiring means.
+ * Creating and joining a bank is git and file writes, here. What is left for a
+ * CLI is **one courtesy, for the other harness**: wiring a bank into stock
+ * Claude Code on this machine — the managed block in each profile's
+ * `CLAUDE.md`, the `/cerebro` command, the session-start hook — which only a
+ * bank's own embedded copy can write, and which no Artemis run reads. It is an
+ * explicit action (`wireMemoryBankClaudeCode`) plus its best-effort mirror
+ * when a bank is forgotten. Neither is on the path of a run, and a machine
+ * whose banks embed no CLI simply cannot make the offer.
  *
  * Three decisions carry over unchanged.
  *
@@ -26,10 +31,10 @@
  * arbitrary path. Banks come from Artemis's own registry —
  * `<userData>/memory-banks.json`, through core's `registryV2`, which keeps the
  * CLI's `~/.config/cerebro/config.json` mirrored in both directions so a
- * machine that also runs stock Claude Code keeps working — and nothing runs
- * that is not a `cerebro` CLI this module resolved itself. That is the rule the
- * terminal keeps ("main chooses the shell"), applied to a subprocess that can
- * write.
+ * machine that also runs stock Claude Code keeps working — and the only thing
+ * that ever runs is a `bin/cerebro` inside a bank this module resolved itself.
+ * That is the rule the terminal keeps ("main chooses the shell"), applied to a
+ * subprocess that can write.
  *
  * **The pure half is split from the spawning half**, `shellPath.ts`-style: the
  * decisions here (what a bank's condition is, whether a profile carries a
@@ -53,7 +58,6 @@ import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import {
@@ -117,6 +121,7 @@ import type {
   MemoryBankVerifyOutcome,
   MemoryBankVerifyRemoteRequest,
   MemoryBankVerifyRemoteResponse,
+  MemoryBankWireClaudeCodeRequest,
   MemoryBanksSetMasterEnabledRequest,
   MemoryBanksStatus,
   SecretRef,
@@ -169,60 +174,23 @@ export type { BankRecord, RegistryBank } from '@rx-artemis/core';
 /* -------------------------------------------------------------------------- */
 
 /**
- * The copy of the CLI Artemis ships, for machines with no bank-embedded one.
+ * The CLI that drives one bank, or `null`.
  *
- * Bootstrap only: it creates and joins banks that do not exist yet, and
- * drives content-only banks (a bank someone published without embedding the
- * CLI). The moment a bank carries its own copy, that copy wins for the bank's
- * operations — see {@link resolveCli}.
- */
-export function vendoredCliPath(): string | null {
-  const override = process.env['ARTEMIS_VENDORED_CEREBRO'];
-  const candidates = [
-    ...(override !== undefined && override.length > 0 ? [override] : []),
-    ...(typeof process.resourcesPath === 'string'
-      ? [join(process.resourcesPath, 'cerebro')]
-      : []),
-    // Development: apps/desktop/resources/cerebro relative to the built main.
-    join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'resources', 'cerebro'),
-    join(dirname(fileURLToPath(import.meta.url)), '..', 'resources', 'cerebro'),
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate;
-  }
-  return null;
-}
-
-/**
- * The CLI to drive a bank (or the machine) with.
+ * **The bank's own `bin/cerebro` and nothing else.** Artemis used to ship a
+ * copy and fall back to the default bank's, which made sense while the CLI was
+ * the contract; it no longer is. Reading, installing, describing, drafting,
+ * promoting and retiring are all core's, and the single thing left that a CLI
+ * can do and core cannot is write *stock Claude Code's* wiring into a
+ * profile — which is that bank's own `enable`, in that bank's own dialect.
+ * Borrowing another bank's copy to wire this one would be asking one
+ * repository's script to write a managed block for another repository's slug.
  *
- * Preference order is about staying current: a bank's embedded CLI updates
- * with the bank, so it speaks that bank's dialect; the default bank's CLI is
- * the machine's own convention (it owns the PATH shim and the hook); the
- * vendored copy is the bootstrap floor. Throws only when there is nothing at
- * all — which is now an ordinary state rather than a broken install: every
- * path that reads, installs or describes a bank goes through core, and the
- * three callers that still need the CLI ask through {@link safeResolveCli} and
- * degrade when it answers `null`.
+ * So `null` is an ordinary answer rather than a broken install, and every
+ * caller degrades: the preflight warns, the prompt passes no fallback, forget
+ * skips the courtesy, and {@link wireMemoryBankClaudeCode} refuses by name.
  */
-function resolveCli(bankPath?: string): string {
-  if (bankPath !== undefined) {
-    const own = embeddedCli(bankPath);
-    if (own !== null) return own;
-  }
-  const { banks, defaultSlug } = readBanks();
-  const chosen = banks.find((bank) => bank.slug === defaultSlug) ?? banks[0];
-  if (chosen !== undefined) {
-    const own = embeddedCli(chosen.path);
-    if (own !== null) return own;
-  }
-  const legacy = embeddedCli(legacyRoot());
-  if (legacy !== null) return legacy;
-  const vendored = vendoredCliPath();
-  if (vendored !== null) return vendored;
-  throw new WorkspaceError(
-    'No memory-bank CLI is available on this machine — reinstall Artemis, or clone a bank that embeds one.',
-  );
+function resolveCli(bankPath: string): string | null {
+  return embeddedCli(bankPath);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -365,9 +333,10 @@ async function resolvePython(): Promise<PythonCandidate | null> {
 /** The error a machine with no interpreter gets, worded so it can be acted on. */
 function noPythonError(): WorkspaceError {
   return new WorkspaceError(
-    'Python 3 is required for the team memory bank CLI, and this machine has none that answers ' +
+    'Running a bank’s own cerebro CLI needs Python 3, and this machine has none that answers ' +
       '`--version` (the Microsoft Store stub does not count). Install it from python.org/downloads ' +
-      'or with `winget install Python.Python.3.13`, then re-check.',
+      'or with `winget install Python.Python.3.13`, then try again. Nothing else about the bank ' +
+      'depends on it.',
   );
 }
 
@@ -553,6 +522,8 @@ export function bankInfoFrom(
     readonly remote: string | null;
     readonly source: string | null;
     readonly projects: number;
+    /** The bank carries a `bin/cerebro`. A parameter, for this function's reason. */
+    readonly embedsCli: boolean;
   },
 ): MemoryBankInfo {
   const entries = bank?.entries ?? [];
@@ -578,6 +549,7 @@ export function bankInfoFrom(
     mirrored: 0,
     validationErrors: entries.filter((entry) => entry.problems.length > 0).length,
     projects: facts.projects,
+    embedsCli: facts.embedsCli,
   };
 }
 
@@ -935,9 +907,14 @@ export function anyBankAvailable(profileId?: string): boolean {
  * takes host tool servers ever reaches them — see `bankToolsAvailable` in
  * `engine.ts`. A run without them is taught the CLI's verbs instead, so
  * getting this wrong in either direction teaches the agent a way to write that
- * does not exist. The vendored CLI is the fallback for a legacy bank that
- * embeds none; core's reader does the rest, so the desktop and the headless
- * server describe a bank identically.
+ * does not exist.
+ *
+ * `fallbackCli` is `null` and stays `null`. There is no machine-wide copy to
+ * fall back to any more: a bank that embeds a CLI is described with its own
+ * path, and one that does not is described with core's own default spelling
+ * (`bin/cerebro`) rather than with a binary from somewhere else on the disk.
+ * Core's reader does the rest, so the desktop and the headless server describe
+ * a bank identically.
  */
 export function promptBanks(
   profileId?: string,
@@ -951,16 +928,19 @@ export function promptBanks(
     ...(cwd === undefined ? {} : { cwd }),
     budget: sharedIndexBudget(registry.banks.filter((bank) => bank.enabled).length),
     toolsAvailable,
-    fallbackCli: safeResolveCli(),
+    fallbackCli: null,
   });
 }
 
-function safeResolveCli(): string | null {
-  try {
-    return resolveCli();
-  } catch {
-    return null;
-  }
+/**
+ * Does any registered bank embed a CLI?
+ *
+ * The machine-wide question, and the only one left that a CLI answers: it is
+ * what decides whether stock Claude Code can be wired to anything on this
+ * machine. Not "can Artemis work" — Artemis works either way.
+ */
+function anyBankEmbedsCli(): boolean {
+  return readBanks().banks.some((bank) => resolveCli(bank.path) !== null);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -985,10 +965,11 @@ export async function readMemoryBanksStatus(): Promise<MemoryBanksStatus> {
       remote: bankRemote(record.path),
       source: bank === null ? null : sourceStamp(record.path),
       projects: installedProjects(record.slug, profiles),
+      embedsCli: resolveCli(record.path) !== null,
     });
   });
   return withCredentialState({
-    cliAvailable: safeResolveCli() !== null,
+    cliAvailable: banks.some((bank) => bank.embedsCli),
     masterEnabled: isMasterEnabled(),
     banks,
     profiles: profiles.map((profile) => profileState(profile, registry)),
@@ -1127,9 +1108,10 @@ export async function readMemoryBankMemories(slug: string): Promise<MemoryBankMe
  *
  *  - `git` and `git-identity` **fail**. A bank is a git repository; joining one
  *    needs git, and creating one needs an identity to commit under.
- *  - `python` and `cli` **warn**. Reading, installing and describing a bank is
- *    core's work now. Python is needed only by the legacy CLI, and the CLI
- *    itself only for retiring a memory and for a legacy bank's drafts.
+ *  - `python` and `cli` **warn**, and both are now about the *other* harness.
+ *    Everything Artemis does with a bank is core's; a CLI — a bank's own, since
+ *    Artemis ships none — is needed only to wire a bank into stock Claude
+ *    Code, and Python only to run that CLI on Windows.
  */
 export async function readMemoryBanksPreflight(): Promise<MemoryBankPreflight> {
   const checks: MemoryBankCheck[] = [];
@@ -1165,24 +1147,25 @@ export async function readMemoryBanksPreflight(): Promise<MemoryBankPreflight> {
     state: python === null ? 'warn' : 'ok',
     detail:
       python === null
-        ? 'no Python 3 on this machine — needed only for the legacy cerebro CLI, not to read, install or describe a bank'
-        : `driving the legacy CLI with ${[python.command, ...python.args].join(' ')}`,
+        ? 'no Python 3 on this machine — needed only to run a bank’s own cerebro CLI, not to read, install or describe a bank'
+        : `driving a bank’s cerebro CLI with ${[python.command, ...python.args].join(' ')}`,
     remedy:
       python === null
-        ? 'Only if you need the legacy CLI: install it from python.org/downloads, or with `winget install Python.Python.3.13`.'
+        ? 'Only if you wire a bank into stock Claude Code: install it from python.org/downloads, or with `winget install Python.Python.3.13`.'
         : null,
   });
 
-  const cli = safeResolveCli();
+  const embedded = anyBankEmbedsCli();
   checks.push({
     id: 'cli',
     label: 'Bank CLI',
-    state: cli === null ? 'warn' : 'ok',
-    detail:
-      cli === null
-        ? 'no cerebro CLI resolves on this machine — legacy banks can still be read; drafting through the CLI is unavailable'
-        : cli,
-    remedy: cli === null ? 'Join a bank that embeds its own copy, or reinstall Artemis, if you need it.' : null,
+    state: embedded ? 'ok' : 'warn',
+    detail: embedded
+      ? 'a registered bank embeds the cerebro CLI, so it can be wired into stock Claude Code'
+      : 'no bank embeds the cerebro CLI; stock Claude Code wiring is unavailable, everything else works',
+    remedy: embedded
+      ? null
+      : 'Only if you also drive these profiles with stock Claude Code: join a bank that carries its own bin/cerebro.',
   });
 
   return { ready: checks.every((check) => check.state !== 'fail'), checks };
@@ -2167,6 +2150,44 @@ export async function setMemoryBankProfiles(
   };
 }
 
+/** How long the wiring pass is worth waiting for: it edits a few profile files. */
+const WIRE_TIMEOUT_MS = 60_000;
+
+/**
+ * Wire one bank into **stock Claude Code** on this machine, or unwire it.
+ *
+ * The one thing left that only a CLI can do, and the reason a bank still
+ * carries one. `enable` writes a managed block into each profile's
+ * `CLAUDE.md`, a `/cerebro` slash command, and a `SessionStart` hook that
+ * syncs; `disable` removes all three. None of it is Artemis's path — every run
+ * here uses `settingSources: []`, reads the banks through core and injects the
+ * prompt itself — so this changes nothing about Artemis and is offered as an
+ * explicit action rather than folded into enabling a bank.
+ *
+ * **The bank's own copy, or nothing.** The block is namespaced by slug and the
+ * hook is the bank's own dialect, so another bank's script is not a substitute
+ * for a missing one; a bank that embeds none is refused by name, with the
+ * sentence that keeps a person from reading it as Artemis being broken.
+ */
+export async function wireMemoryBankClaudeCode(
+  request: MemoryBankWireClaudeCodeRequest,
+): Promise<MemoryBankActionResponse> {
+  const { record } = requireBank(request.slug);
+  const cli = resolveCli(record.path);
+  if (cli === null) {
+    throw new WorkspaceError(
+      `'${request.slug}' embeds no cerebro CLI, so it cannot be wired into stock Claude Code; ` +
+        'Artemis’s own runs are unaffected.',
+    );
+  }
+  await runCli(cli, ['--bank', request.slug, request.enabled ? 'enable' : 'disable'], WIRE_TIMEOUT_MS);
+  return {
+    message: request.enabled
+      ? `Wired '${request.slug}' into stock Claude Code: a managed block in each profile's CLAUDE.md, the /cerebro command, and a session-start sync hook. Artemis's own runs read none of it.`
+      : `Unwired '${request.slug}' from stock Claude Code (managed block, /cerebro command, session-start hook). Artemis still reads the bank exactly as before.`,
+  };
+}
+
 /** Artemis's gate alone: no CLI call, no machine rewiring. */
 export function setMasterEnabled(
   request: MemoryBanksSetMasterEnabledRequest,
@@ -2300,10 +2321,11 @@ export async function retireMemoryBankMemory(
  * The repository stays on disk: deleting a git repo is not something this
  * channel can be aimed at.
  *
- * The CLI's `disable` is the one call that still matters here and it is
+ * The bank's own `disable` is the one call that still matters here and it is
  * best-effort: it strips the managed block, the `/cerebro` command and the
  * session-start hook from every profile — wiring Artemis never uses but a
- * user's own `claude` does. A machine without the CLI keeps those files as
+ * user's own `claude` does, and which {@link wireMemoryBankClaudeCode} is the
+ * deliberate way to put there. A bank that embeds no CLI leaves those files as
  * they are, which is inert rather than wrong, and the reason is logged rather
  * than reported: the bank *is* forgotten by then, and failing the action would
  * say the opposite.
@@ -2319,10 +2341,11 @@ export async function forgetMemoryBank(request: MemoryBankForgetRequest): Promis
   saveBanks(withoutBank(registry, request.slug));
   steps.push('Forgot it; the repository is untouched on disk.');
 
-  // After the registry write, and with the CLI resolved from the bank's own
-  // copy: `disable` only edits profile files, so its failure cannot leave the
-  // registry half-written.
-  const cli = embeddedCli(record.path) ?? safeResolveCli();
+  // After the registry write, and with the bank's own CLI or none at all:
+  // `disable` only edits profile files, so its failure cannot leave the
+  // registry half-written, and borrowing another bank's copy to unwire this
+  // one is not a thing this module does — see {@link resolveCli}.
+  const cli = resolveCli(record.path);
   if (cli !== null) {
     try {
       await runCli(cli, ['--bank', request.slug, 'disable'], 60_000);

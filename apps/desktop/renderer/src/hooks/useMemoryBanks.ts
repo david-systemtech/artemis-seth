@@ -48,6 +48,7 @@ export type MemoryBankAction =
   | 'switch'
   | 'profiles'
   | 'master'
+  | 'wire'
   | 'forget';
 
 /** What the last click came to — the CLI's own words, kept until the next click. */
@@ -118,6 +119,15 @@ export interface MemoryBanksPane {
    * write, not the checkbox's before it.
    */
   readonly setProfiles: (slug: string, profiles: MemoryBankProfileScope) => void;
+  /**
+   * Wire this bank into stock Claude Code on this machine, or unwire it.
+   *
+   * The other harness's setup — a managed block per profile, a `/cerebro`
+   * command, a session-start hook — written by the bank's own embedded CLI.
+   * Nothing an Artemis run reads, which is why it is its own action rather
+   * than part of the bank's on/off switch.
+   */
+  readonly wireClaudeCode: (slug: string, enabled: boolean) => void;
   /** Artemis's master gate: prompt injection + run-start syncs. */
   readonly setMasterEnabled: (enabled: boolean) => void;
   /** Unwire, uninstall, and forget one bank. The repo stays on disk. */
@@ -253,6 +263,10 @@ export function useMemoryBanks(): MemoryBanksPane {
       void act('profiles', (c) => c.setProfiles({ slug, profiles })),
     [act],
   );
+  const wireClaudeCode = useCallback(
+    (slug: string, enabled: boolean) => void act('wire', (c) => c.wireClaudeCode({ slug, enabled })),
+    [act],
+  );
   const setMasterEnabled = useCallback(
     (enabled: boolean) => void act('master', (c) => c.setMasterEnabled({ enabled })),
     [act],
@@ -279,6 +293,7 @@ export function useMemoryBanks(): MemoryBanksPane {
     retire,
     setEnabled,
     setProfiles,
+    wireClaudeCode,
     setMasterEnabled,
     forget,
   };

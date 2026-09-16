@@ -85,6 +85,7 @@ import {
   type MemoryBankSetProfilesRequest,
   type MemoryBankSyncRequest,
   type MemoryBankVerifyRemoteRequest,
+  type MemoryBankWireClaudeCodeRequest,
   type MemoryBanksPreflightRequest,
   type MemoryBanksSetMasterEnabledRequest,
   type MemoryBanksStatusRequest,
@@ -2401,6 +2402,25 @@ export function validateMemoryBankSetProfiles(raw: unknown): MemoryBankSetProfil
       MEMORY_BANK_PROFILE_ID_MAX,
     ) ?? [];
   return { slug, profiles: { kind: 'profiles', profileIds: [...new Set(profileIds)] } };
+}
+
+/**
+ * Wiring a bank into stock Claude Code, or out of it.
+ *
+ * The same two fields and the same strictness as
+ * {@link validateMemoryBankSetEnabled}, and for a sharper version of its
+ * reason: what this writes is not Artemis's own state but *another program's*
+ * configuration — a managed block in each profile's `CLAUDE.md`, a slash
+ * command, a session-start hook. A default in either direction would edit
+ * files the user did not ask to have edited, or leave behind wiring they asked
+ * to have removed.
+ */
+export function validateMemoryBankWireClaudeCode(raw: unknown): MemoryBankWireClaudeCodeRequest {
+  const request = requireRequest(raw);
+  const slug = requireBankSlug(request['slug'], 'slug');
+  const enabled = optionalBoolean(request['enabled'], 'enabled');
+  if (enabled === undefined) throw new ValidationError('enabled', 'is required');
+  return { slug, enabled };
 }
 
 /** Forgetting names a bank; everything else is main's. */

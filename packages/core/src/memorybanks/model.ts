@@ -40,6 +40,8 @@ export interface MemoriesSource {
   readonly globs: readonly string[];
   readonly levels: readonly string[];
   readonly scopeOf: (relativePath: string) => Readonly<Record<string, string>>;
+  /** The labels a directory above the memories carries; see `CompiledScope.scopeOfDirectory`. */
+  readonly scopeOfDirectory: (relativeDir: string) => Readonly<Record<string, string>>;
   readonly schema: BankSchemaSpec;
   /** Where a new entry is written, as a template: `brands/{brand}/{system}/memories/{name}.md`. */
   readonly place: string | null;
@@ -57,8 +59,14 @@ export interface ResolvedBank {
   readonly memories: MemoriesSource;
   /** Documents worth surfacing (entry points, handoffs), as patterns. */
   readonly docGlobs: readonly string[];
-  /** A bank-provided index, relative to the root, when it keeps one. */
+  /** The bank's index file, relative to the root, when it keeps one. */
   readonly indexFile: string | null;
+  /**
+   * The host regenerates the index file on every landing, from the bank's
+   * docs and entries, so it can never be stale. Off for an index the bank
+   * maintains by other means.
+   */
+  readonly indexGenerated: boolean;
   readonly landing: BankLanding;
   readonly merge: BankMerge;
   readonly indexBudget: IndexBudget;
