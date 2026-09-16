@@ -1107,6 +1107,54 @@ export interface ResumeRequest {
    * that has already outlived one socket is nobody's to end on the next.
    */
   readonly onDetach?: (runId: RunId) => void;
+  /**
+   * The conversation the run is known to be in, when the caller already holds
+   * it. Echoed on the final chunk the way a resumed turn echoes the id it was
+   * handed: this turn did run in that session, and a client that joined a run
+   * it never started has no other way to learn it if the replay has dropped
+   * the announcement.
+   */
+  readonly sessionId?: string;
+}
+
+/** What a caller that wants to speak into a run already going asks for. */
+export interface SteerRequest extends ResumeRequest {
+  /** The message, already flattened the way {@link promptFromMessages} does. */
+  readonly prompt: string;
+}
+
+/**
+ * Speak into a run that is already going, then follow it.
+ *
+ * The turn a completions caller means when it sends a message to a
+ * conversation the server is still working on. Starting a second run there
+ * is not an option — the provider adapters refuse it, and before they did it
+ * put two CLIs on one transcript — and refusing the caller outright would
+ * lose the one thing they had to say. So the message goes in as a steer, the
+ * way a window's composer steers a live run, and the caller is attached to
+ * the run's stream exactly as a client that lost its socket is: every event
+ * the server still holds, then the live tail, until the run ends.
+ *
+ * The send comes first and the subscription second, and that order is safe:
+ * {@link resumeTurn} replays the retained buffer after subscribing and
+ * deduplicates by `seq`, so an event the steer provoked before the
+ * subscription landed is still delivered, once, from the buffer.
+ *
+ * Replayed from the start unless the caller says otherwise. A caller steering
+ * a run it never saw has missed everything that run has done — that is why
+ * it thought the conversation was idle — and the catch-up is the answer to
+ * the question it was really asking.
+ */
+export async function* steerTurn(
+  source: RunSource,
+  request: SteerRequest,
+): AsyncGenerator<TurnEvent> {
+  if (source.send === undefined) {
+    throw new Error('This Artemis build cannot send into a running turn.');
+  }
+  await source.send(request.runId, request.prompt);
+  const { prompt: _prompt, ...resume } = request;
+  yield* resumeTurn(source, resume);
 }
 
 /**
@@ -1146,7 +1194,10 @@ export async function* resumeTurn(
   const after = request.afterSeq ?? -1;
   const queue = subscribeQueue(source, (event) => event.runId === runId);
   // Nobody is denied on a resumed stream; see the function comment.
-  const translator = new TurnTranslator({ remotePermissions: true });
+  const translator = new TurnTranslator({
+    remotePermissions: true,
+    ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
+  });
   let ended = false;
   let lastSeq = -1;
 
