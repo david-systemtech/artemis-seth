@@ -109,8 +109,21 @@ export interface ServerStreamDelta {
   readonly thinking?: string;
   /** Why generation stopped, on the final chunk that carries one. */
   readonly finishReason?: string;
-  /** Token counts, which arrive only on the final chunk. */
-  readonly usage?: { readonly promptTokens: number; readonly completionTokens: number };
+  /**
+   * Token counts, which arrive only on the final chunk.
+   *
+   * `promptTokens` is the *whole* prompt, on OpenAI's own definition — the two
+   * cache figures are parts of it, not additions to it, so summing all three
+   * counts the cached input twice.
+   */
+  readonly usage?: {
+    readonly promptTokens: number;
+    readonly completionTokens: number;
+    /** The part of the prompt served from the cache, when the server said. */
+    readonly cacheReadTokens?: number;
+    /** The part written into the cache this turn, when the server said. */
+    readonly cacheCreationTokens?: number;
+  };
   /** The server reporting a failed generation. */
   readonly error?: string;
   /** The Artemis namespace, when the chunk carried one. */
@@ -299,9 +312,32 @@ export function readServerChunk(chunk: unknown): ServerStreamDelta | undefined {
     const prompt = usage['prompt_tokens'];
     const completion = usage['completion_tokens'];
     if (typeof prompt === 'number' || typeof completion === 'number') {
+      /*
+       * The cached halves of the prompt, read back so the seam can put them on
+       * the fields they came from.
+       *
+       * Clamped to the prompt rather than trusted: these are *parts* of
+       * `prompt_tokens`, and a server that reported parts larger than the whole
+       * would make the uncached remainder negative — a token count below zero
+       * on a diagnostic panel, from arithmetic rather than from anything that
+       * happened. Absent stays absent: `0` would claim a provider has a prompt
+       * cache and used none of it.
+       */
+      const promptTokens = typeof prompt === 'number' ? prompt : 0;
+      const details = asRecord(usage['prompt_tokens_details']);
+      const cached = details?.['cached_tokens'];
+      const created = usage['cache_creation_input_tokens'];
+      const cacheRead =
+        typeof cached === 'number' && cached >= 0 ? Math.min(cached, promptTokens) : undefined;
+      const cacheCreation =
+        typeof created === 'number' && created >= 0
+          ? Math.min(created, promptTokens - (cacheRead ?? 0))
+          : undefined;
       delta.usage = {
-        promptTokens: typeof prompt === 'number' ? prompt : 0,
+        promptTokens,
         completionTokens: typeof completion === 'number' ? completion : 0,
+        ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
+        ...(cacheCreation === undefined ? {} : { cacheCreationTokens: cacheCreation }),
       };
     }
   }

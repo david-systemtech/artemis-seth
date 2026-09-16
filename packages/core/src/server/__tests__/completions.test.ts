@@ -442,6 +442,61 @@ describe('a turn', () => {
     expect(readings).toHaveLength(1);
   });
 
+  it('counts the whole prompt, not the uncached remainder of it', async () => {
+    /*
+     * The bug this replaced reported a twenty-thousand-token prompt as ten
+     * tokens. Artemis's triple is disjoint — uncached, cache reads, cache
+     * writes — and OpenAI's `prompt_tokens` is all three together, so passing
+     * `inputTokens` through alone was a different measurement wearing the same
+     * name. Nothing looked broken; it looked cheap.
+     */
+    const source = fakeRuns([
+      {
+        type: 'run.end',
+        reason: 'completed',
+        usage: {
+          scope: 'final',
+          tokens: {
+            inputTokens: 10,
+            outputTokens: 173,
+            cacheReadInputTokens: 19_000,
+            cacheCreationInputTokens: 1_800,
+          },
+        },
+      },
+    ] as Partial<AgentEvent>[]);
+
+    const done = (await drain(source)).at(-1) as { result: { usage?: Record<string, unknown> } };
+    expect(done.result.usage).toEqual({
+      prompt_tokens: 20_810,
+      completion_tokens: 173,
+      total_tokens: 20_983,
+      // The parts a cost calculation needs: cached input is billed at a
+      // fraction of the full rate, and a cache write above it.
+      prompt_tokens_details: { cached_tokens: 19_000 },
+      cache_creation_input_tokens: 1_800,
+    });
+  });
+
+  it('omits the cache figures rather than zeroing them', async () => {
+    // `0` claims the provider has a prompt cache and used none of it. A
+    // provider with no cache at all has made no such claim.
+    const source = fakeRuns([
+      {
+        type: 'run.end',
+        reason: 'completed',
+        usage: { scope: 'final', tokens: { inputTokens: 100, outputTokens: 40 } },
+      },
+    ] as Partial<AgentEvent>[]);
+
+    const done = (await drain(source)).at(-1) as { result: { usage?: Record<string, unknown> } };
+    expect(done.result.usage).toEqual({
+      prompt_tokens: 100,
+      completion_tokens: 40,
+      total_tokens: 140,
+    });
+  });
+
   it('always disposes the run, so a reply never leaks a process', async () => {
     const source = fakeRuns([{ type: 'run.end', reason: 'completed' }]);
     await drain(source);

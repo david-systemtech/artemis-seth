@@ -286,14 +286,35 @@ function authHeaders(env: Readonly<Record<string, string | undefined>>): Record<
  */
 export { baseUrl as artemisEndpoint, authHeaders as artemisAuthHeaders };
 
-/** Token counts in the shape the seam expects. */
+/**
+ * Token counts in the shape the seam expects.
+ *
+ * The prompt is split back into the disjoint triple every other adapter reports,
+ * because that is what {@link TokenUsage} means by `inputTokens`: the *uncached*
+ * remainder, billed at the full rate. OpenAI's `prompt_tokens` is the whole
+ * prompt with the cached parts inside it, so handing it over unsplit would count
+ * cached input as though it had been paid for in full — the mirror image of the
+ * server-side bug that made this worth fixing, and just as invisible.
+ */
 function toUsage(
-  usage: { promptTokens: number; completionTokens: number },
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
+  },
   context: ArtemisContextReading,
 ): UsageSnapshot {
+  const cacheRead = usage.cacheReadTokens;
+  const cacheCreation = usage.cacheCreationTokens;
   return {
     scope: 'final',
-    tokens: { inputTokens: usage.promptTokens, outputTokens: usage.completionTokens },
+    tokens: {
+      inputTokens: Math.max(0, usage.promptTokens - (cacheRead ?? 0) - (cacheCreation ?? 0)),
+      outputTokens: usage.completionTokens,
+      ...(cacheRead === undefined ? {} : { cacheReadInputTokens: cacheRead }),
+      ...(cacheCreation === undefined ? {} : { cacheCreationInputTokens: cacheCreation }),
+    },
     // Carried on the final snapshot as well as on its own events, because the
     // renderer *replaces* a run's usage with what `run.end` hands it. Omitting
     // it here would blank the gauge at exactly the moment the turn finished —
