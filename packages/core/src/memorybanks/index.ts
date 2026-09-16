@@ -17,6 +17,7 @@
 
 export * from './bankIndex.js';
 export * from './describe.js';
+export * from './forge.js';
 export * from './formats.js';
 export * from './frontmatter.js';
 export * from './glob.js';
@@ -27,5 +28,8 @@ export * from './prompt.js';
 export * from './registry.js';
 export * from './registryV2.js';
 export * from './schema.js';
+export * from './search.js';
 export * from './secrets.js';
 export * from './sync.js';
+export * from './tools.js';
+export * from './writer.js';
