@@ -195,6 +195,14 @@ export interface CommandItem extends ItemBase {
   readonly args?: string;
   readonly output?: string;
   readonly failed?: boolean;
+  /**
+   * Whose command it was: the app's, or the shell's.
+   *
+   * Carried so the row can mark a `!git status` as a shell line rather than a
+   * slash command; absent means slash, as every provider-emitted one is. See
+   * `CommandRunEvent.source`.
+   */
+  readonly source?: 'slash' | 'shell';
 }
 
 /** The terminal card for a run. */
@@ -1158,6 +1166,7 @@ export class TranscriptModel {
           ...(event.command.args === undefined ? {} : { args: event.command.args }),
           ...(event.command.output === undefined ? {} : { output: event.command.output }),
           ...(event.command.failed === undefined ? {} : { failed: event.command.failed }),
+          ...(event.source === undefined ? {} : { source: event.source }),
         });
         break;
       }

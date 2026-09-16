@@ -787,13 +787,24 @@ function toolDescriptor(type: string, item: Record<string, unknown>): ToolDescri
     }
 
     case 'fileChange': {
-      const changes = Array.isArray(item['changes']) ? (item['changes'] as unknown[]) : [];
+      // Every file of the patch, with the patch text for each. Codex reports a
+      // file change as a list of entries carrying a path, a kind and that
+      // file's own diff, and reducing that to a list of names threw away the
+      // only thing a reviewer wants: a call that rewrote four files rendered as
+      // four file names and no changes.
+      //
+      // A bare `paths` array is deliberately *not* sent alongside. The reader
+      // takes the first file list it recognises and prefers `paths` to
+      // `changes`, so sending both would hide the diffs behind the summary that
+      // exists because they used to be missing. Every path is still here, one
+      // per entry, and the title still names them.
+      const changes = readFileChanges(item['changes']);
       const paths = changes
-        .map((change) => readString(asRecord(change), 'path'))
-        .filter((path): path is string => path !== undefined);
+        .map((change) => change['path'])
+        .filter((path): path is string => typeof path === 'string');
       return {
         name: 'ApplyPatch',
-        input: { paths: paths as unknown as JsonValue } as JsonObject,
+        input: { changes },
         title:
           paths.length === 0
             ? 'Edit files'
@@ -828,6 +839,35 @@ function toolDescriptor(type: string, item: Record<string, unknown>): ToolDescri
     default:
       return undefined;
   }
+}
+
+/**
+ * The `changes` of a `fileChange` item, as JSON a transcript can read.
+ *
+ * Rebuilt field by field rather than handed over as it arrived: the item comes
+ * off the wire as `unknown` and ends up inside an event that crosses an IPC
+ * boundary, where a value that does not survive a structured clone is not an
+ * error anyone sees but an event that silently never arrives. These three
+ * fields are the whole of what a file edit is made of — which file, what became
+ * of it, and the patch itself — so an entry carrying none of them describes no
+ * change and is left out.
+ */
+function readFileChanges(value: unknown): readonly JsonObject[] {
+  const entries = Array.isArray(value) ? (value as unknown[]) : [];
+  const changes: JsonObject[] = [];
+  for (const entry of entries) {
+    const record = asRecord(entry);
+    const path = readString(record, 'path');
+    const kind = readString(record, 'kind');
+    const diff = readString(record, 'diff');
+    if (path === undefined && kind === undefined && diff === undefined) continue;
+    changes.push({
+      ...(path === undefined ? {} : { path }),
+      ...(kind === undefined ? {} : { kind }),
+      ...(diff === undefined ? {} : { diff }),
+    });
+  }
+  return changes;
 }
 
 /** How a finished item's outcome reads as a `tool.end`. */

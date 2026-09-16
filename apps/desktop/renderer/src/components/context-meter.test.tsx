@@ -232,9 +232,9 @@ describe('the context-only meter', () => {
     expect(await glyphExplanation()).toContain('does not report plan usage or context');
   });
 
-  it('leaves a plan provider on its rings', async () => {
-    // The regression guard. A Claude or Artemis Server profile keeps the three
-    // plan gauges; nothing about this feature reaches that path.
+  it('leaves a plan provider on its own trigger', async () => {
+    // The regression guard. A Claude or Artemis Server profile keeps the plan
+    // trigger and its rings; the context-only shape is not what it gets.
     seed({
       capabilities: { ...ALL_CAPABILITIES, planUsageReporting: true, contextReporting: true },
       usage: { scope: 'cumulative', tokens: {}, contextTokens: 12_300, contextWindow: 32_768 },
@@ -243,5 +243,78 @@ describe('the context-only meter', () => {
 
     expect(screen.getByRole('button', { name: /Plan usage/ })).toBeTruthy();
     expect(screen.queryByRole('button', { name: /Context window/ })).toBeNull();
+  });
+});
+
+/**
+ * The context ring on a provider that *does* have a plan.
+ *
+ * It used to be popover-only here, on the reasoning that the rings were about
+ * the plan. That put the one number which ends a conversation without warning
+ * behind a click, while three that end it with hours of notice sat in the open.
+ */
+describe('the context ring beside the plan rings', () => {
+  const PLAN_CAPS = { ...ALL_CAPABILITIES, planUsageReporting: true, contextReporting: true };
+
+  /** The plan trigger, which is the one slot both readings now live on. */
+  function planMeter(): HTMLElement {
+    return screen.getByRole('button', { name: /Plan usage/ });
+  }
+
+  it('joins the row once a reading exists', async () => {
+    seed({
+      capabilities: PLAN_CAPS,
+      usage: { scope: 'cumulative', tokens: {}, contextTokens: 12_300, contextWindow: 32_768 },
+    });
+    mount();
+
+    expect(planMeter().textContent ?? '').toContain('Ctx');
+    // 38% of 33k, drawn as a ring like every other slot. The figures are the
+    // popover's job — 22px on a status bar is room for a proportion.
+    expect(planMeter().textContent ?? '').toContain('38');
+  });
+
+  it('spells it out for a screen reader, beside the plan windows', async () => {
+    seed({
+      capabilities: PLAN_CAPS,
+      usage: { scope: 'cumulative', tokens: {}, contextTokens: 12_300, contextWindow: 32_768 },
+    });
+    mount();
+
+    expect(planMeter().getAttribute('aria-label') ?? '').toContain('context 12k of 33k');
+  });
+
+  it('says the size is unknown rather than inventing one', async () => {
+    seed({
+      capabilities: PLAN_CAPS,
+      usage: { scope: 'cumulative', tokens: {}, contextTokens: 12_300 },
+    });
+    mount();
+
+    expect(planMeter().textContent ?? '').toContain('Ctx');
+    expect(planMeter().getAttribute('aria-label') ?? '').toContain('window size unknown');
+  });
+
+  it('occupies no width before anything has run', async () => {
+    /*
+      Absent, not an empty ring. An unfilled ring is indistinguishable from a
+      ring at 0% — the same trap the glyph fallback exists to avoid — and here
+      there is no need for a placeholder at all, because the plan rings already
+      hold the slot.
+    */
+    seed({ capabilities: PLAN_CAPS, live: false });
+    mount();
+
+    expect(planMeter().textContent ?? '').not.toContain('Ctx');
+  });
+
+  it('stays away from a plan provider that cannot report context', async () => {
+    seed({
+      capabilities: { ...PLAN_CAPS, contextReporting: false },
+      usage: { scope: 'cumulative', tokens: {}, contextTokens: 12_300, contextWindow: 32_768 },
+    });
+    mount();
+
+    expect(planMeter().textContent ?? '').not.toContain('Ctx');
   });
 });

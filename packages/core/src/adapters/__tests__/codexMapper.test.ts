@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { AgentEvent, JsonValue, RunId } from '@rx-artemis/protocol';
+import type { AgentEvent, JsonObject, JsonValue, RunId } from '@rx-artemis/protocol';
 
 import {
   createCodexMapperState,
@@ -44,6 +44,11 @@ function feed(
   params: unknown,
 ): readonly AgentEvent[] {
   return mapCodexNotification(method, params as JsonValue, state);
+}
+
+/** The arguments of a `tool.start`, for the assertions that are about them. */
+function inputOf(event: AgentEvent | undefined): JsonObject | undefined {
+  return event?.type === 'tool.start' ? event.input : undefined;
 }
 
 /**
@@ -375,6 +380,76 @@ describe('tool calls', () => {
     });
 
     expect(start).toMatchObject({ name: 'ApplyPatch', title: 'Edit 2 files' });
+  });
+
+  it('carries every change of a patch through, kind and diff and all', () => {
+    // The per-file diff is the whole value of the event: without it a call that
+    // rewrote two files is two file names. `@rx-artemis/transcript` reads
+    // exactly this shape (`detectFileEdits`) and renders a diff from it, but
+    // core does not depend on that package, so the claim here is the shape.
+    const state = startedState();
+    const [start] = feed(state, 'item/started', {
+      item: {
+        type: 'fileChange',
+        id: 'fc-1',
+        changes: [
+          { path: 'src/a.ts', kind: 'update', diff: '@@ -1,1 +1,1 @@\n-a\n+b\n' },
+          { path: 'src/new.md', kind: 'add', diff: '@@ -0,0 +1,1 @@\n+hello\n' },
+        ],
+      },
+    });
+
+    expect(start).toMatchObject({
+      type: 'tool.start',
+      name: 'ApplyPatch',
+      title: 'Edit 2 files',
+      input: {
+        changes: [
+          { path: 'src/a.ts', kind: 'update', diff: '@@ -1,1 +1,1 @@\n-a\n+b\n' },
+          { path: 'src/new.md', kind: 'add', diff: '@@ -0,0 +1,1 @@\n+hello\n' },
+        ],
+      },
+    });
+  });
+
+  it('sends no bare path list that would hide the diffs', () => {
+    // The reader picks the first file list it recognises and prefers `paths`,
+    // so a `paths` key beside `changes` would cost every diff in the call.
+    const state = startedState();
+    const [start] = feed(state, 'item/started', {
+      item: {
+        type: 'fileChange',
+        id: 'fc-1',
+        changes: [{ path: 'src/a.ts', kind: 'update', diff: '@@ -1,1 +1,1 @@\n-a\n+b\n' }],
+      },
+    });
+
+    expect(start).toMatchObject({ title: 'Edit src/a.ts' });
+    expect(inputOf(start)).not.toHaveProperty('paths');
+  });
+
+  it('drops an entry that describes no change, and keeps one that only names a file', () => {
+    const state = startedState();
+    const [start] = feed(state, 'item/started', {
+      item: {
+        type: 'fileChange',
+        id: 'fc-1',
+        changes: [{ path: 'src/a.ts' }, { unrelated: 7 }, 'not an entry', null],
+      },
+    });
+
+    // A path with nothing else is still worth sending: the transcript names the
+    // file and says no more, which beats saying nothing at all.
+    expect(inputOf(start)).toEqual({ changes: [{ path: 'src/a.ts' }] });
+    expect(start).toMatchObject({ title: 'Edit src/a.ts' });
+  });
+
+  it('reports a file change that touched nothing as an edit of no files', () => {
+    const state = startedState();
+    const [start] = feed(state, 'item/started', { item: { type: 'fileChange', id: 'fc-1' } });
+
+    expect(start).toMatchObject({ name: 'ApplyPatch', title: 'Edit files' });
+    expect(inputOf(start)).toEqual({ changes: [] });
   });
 
   it('names an MCP call server.tool', () => {

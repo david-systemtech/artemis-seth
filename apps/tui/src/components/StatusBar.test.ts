@@ -6,9 +6,14 @@
  * look untouched, and a window that is not yet full must not look full.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { meterBar, meterCells, meterTone } from './StatusBar.js';
+import type { Capabilities } from '@rx-artemis/protocol';
+import { NO_CAPABILITIES, PERMISSION_MODES } from '@rx-artemis/protocol';
+
+import type { ConversationState } from '../conversation.js';
+import { ACCENT } from '../theme.js';
+import { changedSummary, elapsedClock, leftHalf, meterBar, meterCells, meterTone, modeBadge, needYouLabel, workingLine } from './StatusBar.js';
 
 describe('meterBar', () => {
   it('fills in proportion', () => {
@@ -69,5 +74,297 @@ describe('meterTone', () => {
 
   it('has no tone for a window with no reading', () => {
     expect(meterTone(null)).toBeUndefined();
+  });
+});
+
+/*
+ * The working line.
+ *
+ * `workingLine` is where the second line's meaning lives, so it is where the
+ * second line is tested: the component around it is colours and boxes. Every
+ * case here is a shape a real turn passes through — nothing said yet, a
+ * thought, a tool, a thought that has gone quiet, a question to answer.
+ */
+describe('elapsedClock', () => {
+  it('pads the seconds so the column does not shuffle as it ticks', () => {
+    // `1m 4s` is a character narrower than `1m 14s`, and everything to the
+    // right of a field that changes width moves with it — twice a minute,
+    // for the whole turn, on a line that redraws every second.
+    expect(elapsedClock(64_000)).toBe('1m 04s');
+    expect(elapsedClock(74_000)).toBe('1m 14s');
+    expect(elapsedClock(3_722_000)).toBe('1h 02m');
+  });
+
+  it('keeps to whole seconds, which is all a once-a-second clock knows', () => {
+    expect(elapsedClock(0)).toBe('0s');
+    expect(elapsedClock(450)).toBe('0s');
+    expect(elapsedClock(4_900)).toBe('4s');
+    expect(elapsedClock(59_999)).toBe('59s');
+    expect(elapsedClock(60_000)).toBe('1m 00s');
+  });
+
+  it('does not go backwards when the clock does', () => {
+    // A tick read before the turn's own timestamp — a clock adjustment, or a
+    // turn adopted a moment after it started — must not print `-1s`.
+    expect(elapsedClock(-5_000)).toBe('0s');
+  });
+});
+
+const CAPABLE: Capabilities = { ...NO_CAPABILITIES, midRunSteering: true };
+
+const running = (patch: Partial<ConversationState> = {}): ConversationState => ({
+  settings: {
+    profileId: 'p1' as never,
+    providerId: 'claude',
+    profileLabel: 'work',
+    providerLabel: 'Claude',
+    cwd: '/repo',
+    permissionMode: 'default',
+  },
+  status: 'running',
+  capabilities: CAPABLE,
+  pendingPermissions: [],
+  queuedMessages: [],
+  queued: 0,
+  tasks: [],
+  planUsage: null,
+  slashCommands: [],
+  turnStartedAt: 1_000,
+  ...patch,
+});
+
+describe('workingLine', () => {
+  it('says what the agent is doing, for how long, and what it has written', () => {
+    const line = workingLine(
+      running({
+        activity: { kind: 'tool', text: 'Read apps/tui/src/app.tsx', since: 60_000 },
+        turnTokens: 2_340,
+      }),
+      65_000,
+    );
+    // The agent's own words lead; everything else is furniture behind them.
+    expect(line.activity).toBe('Read apps/tui/src/app.tsx');
+    expect(line.details).toEqual(['1m 04s', '2.3k tok', 'Enter steers', 'Esc interrupts']);
+    expect(line.stalled).toBe(false);
+  });
+
+  it('says `working` until the agent has said anything, and still times it', () => {
+    const line = workingLine(running(), 13_000);
+    expect(line.activity).toBe('working');
+    // No token count at all rather than a `0` — the provider has reported
+    // nothing, and a zero would read as a model that has written nothing.
+    expect(line.details).toEqual(['12s', 'Enter steers', 'Esc interrupts']);
+  });
+
+  it('keeps `starting…` distinct from `working`', () => {
+    // Nothing has been asked of the model yet; the process is coming up.
+    expect(workingLine(running({ status: 'starting' }), 1_000).activity).toBe('starting…');
+  });
+
+  it('offers only the keys the provider actually has', () => {
+    const line = workingLine(running({ capabilities: NO_CAPABILITIES }), 1_000);
+    expect(line.details).toEqual(['0s', 'Esc interrupts']);
+  });
+
+  it('counts the messages the provider has taken and not yet read', () => {
+    const line = workingLine(
+      running({ queuedMessages: [{ id: 'm', text: 'and rerun the suite', delivery: 'next-tool-break', ts: 0 }], queued: 1 }),
+      1_000,
+    );
+    expect(line.details).toContain('1 queued');
+  });
+
+  it('omits the clock when there is no turn to time', () => {
+    // An adopted turn is timed from when we first heard of it; a turn with no
+    // start at all prints no duration rather than one counted from the epoch.
+    const line = workingLine(running({ turnStartedAt: undefined }), 5_000);
+    expect(line.details).toEqual(['Enter steers', 'Esc interrupts']);
+  });
+
+  it('warns once a thought has held the line for 45 seconds', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000);
+      const state = running({ activity: { kind: 'thinking', text: 'Weighing two designs', since: 1_000 } });
+      expect(workingLine(state).stalled).toBe(false);
+      vi.advanceTimersByTime(44_999);
+      expect(workingLine(state).stalled).toBe(false);
+      // A model that has thought the same thought this long is usually working
+      // on something hard and occasionally stuck. A colour is the most the bar
+      // can honestly say about which.
+      vi.advanceTimersByTime(1);
+      expect(workingLine(state).stalled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not warn about a tool that is taking its time', () => {
+    // Tool calls are proof of progress, and a long one — a test suite, a
+    // build — is the ordinary case, not a symptom.
+    const state = running({ activity: { kind: 'tool', text: 'Bash pnpm test', since: 1_000 } });
+    expect(workingLine(state, 600_000).stalled).toBe(false);
+    expect(workingLine(running({ activity: { kind: 'writing', text: 'writing', since: 1_000 } }), 600_000).stalled).toBe(false);
+  });
+
+  it('leaves a pending permission saying exactly what it said before', () => {
+    const line = workingLine(
+      running({
+        status: 'awaiting_permission',
+        activity: { kind: 'tool', text: 'Bash rm -rf build', since: 1_000 },
+        turnTokens: 900,
+      }),
+      99_000,
+    );
+    // The card above is asking a question. A clock and a token count beside it
+    // would be measuring the wrong thing — the wait is the user's, not the
+    // model's — and the tool's name is already on the card.
+    expect(line).toEqual({ activity: 'waiting for you', details: [], stalled: false });
+  });
+
+  it('says nothing is happening when nothing is', () => {
+    expect(workingLine(running({ status: 'idle' }), 1_000)).toEqual({ activity: 'ready', details: [], stalled: false });
+    expect(workingLine(running({ status: 'idle', sessionId: 's1' as never }), 1_000).activity).toBe('idle');
+  });
+});
+
+/*
+ * The mode, as a badge.
+ *
+ * The word on its own left the one reading on this line that is a *warning*
+ * looking like the ones that are merely settings, and made "will this ask me
+ * first" a thing to read rather than a thing to see. The glyph answers that
+ * before the word is read: `⏵⏵` goes through, `⏸` stops. So what is tested is
+ * the pairing and the paint, which is the whole of what the component does
+ * with this.
+ */
+describe('modeBadge', () => {
+  it('says whether anything stops before it says which mode it is', () => {
+    expect(modeBadge('default').text).toBe('⏸ ask');
+    expect(modeBadge('plan').text).toBe('⏸ plan');
+    // The provider decides, and asks when it judges the risk real — which is a
+    // mode that stops, whatever it usually does.
+    expect(modeBadge('auto').text).toBe('⏸ auto');
+    expect(modeBadge('acceptEdits').text).toBe('⏵⏵ accept edits');
+    expect(modeBadge('dontAsk').text).toBe("⏵⏵ don't ask");
+    // Its shout, not its tail: six characters survive a narrow terminal.
+    expect(modeBadge('bypassPermissions').text).toBe('⏵⏵ BYPASS');
+  });
+
+  it('leaves ask plain, paints plan in the accent and the two that do not ask green', () => {
+    expect(modeBadge('default').color).toBeUndefined();
+    expect(modeBadge('plan').color).toBe(ACCENT);
+    expect(modeBadge('acceptEdits').color).toBe('green');
+    expect(modeBadge('dontAsk').color).toBe('green');
+  });
+
+  it('keeps bypass red and bold, and nothing else bold', () => {
+    // The one mode where this line is a warning, and it must never be able to
+    // be mistaken for the others.
+    expect(modeBadge('bypassPermissions').color).toBe('red');
+    expect(modeBadge('bypassPermissions').bold).toBe(true);
+    for (const mode of PERMISSION_MODES) {
+      if (mode !== 'bypassPermissions') expect(modeBadge(mode).bold).not.toBe(true);
+    }
+  });
+
+  it('has a badge for every mode the protocol knows', () => {
+    // A mode added to the protocol and not to this record would draw nothing
+    // at all where the line says what the next turn goes out as.
+    for (const mode of PERMISSION_MODES) expect(modeBadge(mode).text.trim()).not.toBe('');
+  });
+});
+
+/*
+ * What the conversation has done to the files.
+ *
+ * The one reading on this line that is not about the turn: tokens and cost say
+ * what was spent, this says what came of it. The rule that matters is when it
+ * says nothing at all — a bar reading `0 files` spends columns reporting that
+ * nothing happened.
+ */
+describe('changedSummary', () => {
+  it('splits the count from the churn, so each can be painted', () => {
+    expect(changedSummary({ files: 3, added: 42, removed: 7 })).toEqual({
+      files: '3 files',
+      added: '+42',
+      // The true minus sign, as the desktop's churn counts use: a hyphen
+      // beside a `+` reads as punctuation rather than as its opposite.
+      removed: '−7',
+    });
+  });
+
+  it('says "1 file" for one', () => {
+    expect(changedSummary({ files: 1, added: 2, removed: 0 })?.files).toBe('1 file');
+  });
+
+  it('is nothing at all until something has been edited', () => {
+    expect(changedSummary(undefined)).toBeUndefined();
+    // A ledger folded to zero files — every change undone — is the same
+    // nothing, and must not leave `0 files +0 −0` on the bar.
+    expect(changedSummary({ files: 0, added: 0, removed: 0 })).toBeUndefined();
+  });
+
+  it('keeps a file that was only added to, or only cut from', () => {
+    // `+0` is worth drawing: it is what a pure deletion looks like, and
+    // leaving it out would make the pair read as a single number.
+    expect(changedSummary({ files: 1, added: 0, removed: 12 })).toEqual({ files: '1 file', added: '+0', removed: '−12' });
+    expect(changedSummary({ files: 2, added: 9, removed: 0 })).toEqual({ files: '2 files', added: '+9', removed: '−0' });
+  });
+});
+
+/*
+ * The one reading on this line that is about the other conversations.
+ *
+ * The rail has a glyph per row and the window title has the same sentence for
+ * a taskbar nobody can see from inside the app; this is the count at eye
+ * level, and what is worth pinning is the silence at zero.
+ */
+describe('needYouLabel', () => {
+  it('says how many are waiting, in the words the window title uses', () => {
+    expect(needYouLabel(2)).toBe('2 need you');
+    // Ungrammatical for one, and deliberately the same as `titleFor`'s: two
+    // surfaces reporting one number in two different sentences reads worse
+    // than one wrong verb in both.
+    expect(needYouLabel(1)).toBe('1 need you');
+  });
+
+  it('says nothing when nothing is waiting', () => {
+    // `0 need you` is columns spent saying that nothing is wrong.
+    expect(needYouLabel(0)).toBeUndefined();
+    expect(needYouLabel(-1)).toBeUndefined();
+  });
+});
+
+/*
+ * What owns the second line's left half.
+ *
+ * Three things can want it and only one can have it, so the ranking is by how
+ * long each is true for — shortest on top, because that is the only order in
+ * which nothing is lost: the two-second flash clears and the offer under it is
+ * still there. The offer covering the working line is the one case worth a
+ * test of its own, since the sentence it hides reads `idle`, which is both
+ * true and the least useful thing the bar could be saying at the moment an
+ * account has run out of plan.
+ */
+describe('leftHalf', () => {
+  it('leaves the line to the turn when nothing else claims it', () => {
+    expect(leftHalf(undefined, undefined)).toEqual({ kind: 'working' });
+  });
+
+  it('gives the hand-off offer the line over an idle conversation', () => {
+    expect(leftHalf(undefined, { text: '5hr window out · resets 14:30 · hand off to work (12%) · Ctrl+H' })).toEqual({
+      kind: 'failover',
+      text: '5hr window out · resets 14:30 · hand off to work (12%) · Ctrl+H',
+    });
+  });
+
+  it('lets a flash sit on top of the offer, and the offer come back', () => {
+    // The flash is about the key just pressed and lasts two seconds; the offer
+    // lasts until the window rolls. Ranking them the other way round would
+    // mean "pinned" never appeared on an account that was out of plan.
+    const offer = { text: '5hr window out · no other account can take this · Ctrl+H' };
+    expect(leftHalf('pinned', offer)).toEqual({ kind: 'flash', text: 'pinned' });
+    expect(leftHalf(undefined, offer)).toEqual({ kind: 'failover', text: offer.text });
   });
 });

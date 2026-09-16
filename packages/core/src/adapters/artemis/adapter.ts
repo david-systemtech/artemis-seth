@@ -62,6 +62,7 @@ import type {
   AgentError,
   AgentEvent,
   ArtemisActivity,
+  ArtemisContextReading,
   ArtemisPermissionNotice,
   Attachment,
   BackgroundTask,
@@ -139,6 +140,15 @@ export const ARTEMIS_CAPABILITIES: Capabilities = {
   partialMessages: true,
   // Final chunks carry token counts when the remote provider reported them.
   usageReporting: true,
+  // And `artemis.context` carries how full the conversation is, restated
+  // whenever the serving run moves it. Every adapter a server can route to
+  // reports this — claude off its result message, codex off `tokenUsage`,
+  // opencode off `usage_update`, a local server by asking it — so the claim
+  // holds for every route rather than for a lucky subset. A server older than
+  // the field sends none, and the reading degrades to the same unknown-window
+  // state a router that will not state a size already produces: occupancy with
+  // no scale, drawn as such rather than guessed at.
+  contextReporting: true,
   // The server stores real sessions; `artemis.sessionId` continues one. The
   // raw local endpoints cannot say this — their server remembers nothing.
   resumeSession: true,
@@ -276,11 +286,42 @@ function authHeaders(env: Readonly<Record<string, string | undefined>>): Record<
  */
 export { baseUrl as artemisEndpoint, authHeaders as artemisAuthHeaders };
 
-/** Token counts in the shape the seam expects. */
-function toUsage(usage: { promptTokens: number; completionTokens: number }): UsageSnapshot {
+/**
+ * Token counts in the shape the seam expects.
+ *
+ * The prompt is split back into the disjoint triple every other adapter reports,
+ * because that is what {@link TokenUsage} means by `inputTokens`: the *uncached*
+ * remainder, billed at the full rate. OpenAI's `prompt_tokens` is the whole
+ * prompt with the cached parts inside it, so handing it over unsplit would count
+ * cached input as though it had been paid for in full — the mirror image of the
+ * server-side bug that made this worth fixing, and just as invisible.
+ */
+function toUsage(
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
+  },
+  context: ArtemisContextReading,
+): UsageSnapshot {
+  const cacheRead = usage.cacheReadTokens;
+  const cacheCreation = usage.cacheCreationTokens;
   return {
     scope: 'final',
-    tokens: { inputTokens: usage.promptTokens, outputTokens: usage.completionTokens },
+    tokens: {
+      inputTokens: Math.max(0, usage.promptTokens - (cacheRead ?? 0) - (cacheCreation ?? 0)),
+      outputTokens: usage.completionTokens,
+      ...(cacheRead === undefined ? {} : { cacheReadInputTokens: cacheRead }),
+      ...(cacheCreation === undefined ? {} : { cacheCreationInputTokens: cacheCreation }),
+    },
+    // Carried on the final snapshot as well as on its own events, because the
+    // renderer *replaces* a run's usage with what `run.end` hands it. Omitting
+    // it here would blank the gauge at exactly the moment the turn finished —
+    // the reading would climb all through the turn and vanish on the last
+    // chunk, which looks far more like a bug than never having worked.
+    ...(context.tokens === undefined ? {} : { contextTokens: context.tokens }),
+    ...(context.window === undefined ? {} : { contextWindow: context.window }),
   };
 }
 
@@ -390,6 +431,15 @@ class ArtemisRun implements Run {
   #sessionId: SessionId | undefined;
   #sessionAnnounced = false;
   #usage: UsageSnapshot | undefined;
+  /**
+   * The context reading so far, accumulated across chunks.
+   *
+   * Kept here rather than read off each chunk in isolation for the reason the
+   * server accumulates it too: the occupancy and the window arrive on different
+   * chunks, and a reading rebuilt from the latest one alone would hold only
+   * ever one of the pair.
+   */
+  #context: ArtemisContextReading = {};
   /**
    * The server's run id, learned off the stream the way the session id is and
    * kept for the native `/api/v0/runs/{id}` routes. Distinct from {@link runId},
@@ -882,7 +932,35 @@ class ArtemisRun implements Run {
         'Some of what the run did while this pane was disconnected is no longer on the server and could not be replayed.',
       );
     }
-    if (delta.usage !== undefined) this.#usage = toUsage(delta.usage);
+    /*
+     * The context reading, folded in and passed on as its own usage event.
+     *
+     * `delta` scope with zero token counts, which is the identity element: the
+     * renderer accumulates deltas, so this moves the context readout and leaves
+     * the token bill exactly as it was. `cumulative` — what the OpenCode mapper
+     * uses for the same job — would *replace* the counts, zeroing a bill the
+     * final chunk has not restated yet.
+     */
+    if (extensions?.context !== undefined) {
+      const merged: ArtemisContextReading = {
+        ...this.#context,
+        ...(extensions.context.tokens === undefined ? {} : { tokens: extensions.context.tokens }),
+        ...(extensions.context.window === undefined ? {} : { window: extensions.context.window }),
+      };
+      if (merged.tokens !== this.#context.tokens || merged.window !== this.#context.window) {
+        this.#context = merged;
+        this.#emit({
+          type: 'usage',
+          usage: {
+            scope: 'delta',
+            tokens: { inputTokens: 0, outputTokens: 0 },
+            ...(merged.tokens === undefined ? {} : { contextTokens: merged.tokens }),
+            ...(merged.window === undefined ? {} : { contextWindow: merged.window }),
+          } satisfies UsageSnapshot,
+        } as never);
+      }
+    }
+    if (delta.usage !== undefined) this.#usage = toUsage(delta.usage, this.#context);
     if (delta.thinking !== undefined) stream.thinking(delta.thinking);
     if (delta.text !== undefined) stream.text(delta.text);
     // Last, so a chunk that failed to apply is not remembered as rendered.

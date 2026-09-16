@@ -81,12 +81,12 @@ try {
 }
 
 /*
- * The notes have to be about this release. `release.yml` publishes
- * `.github/RELEASE_NOTES.md` verbatim as the release body, and nothing in that
- * pipeline reads the file's contents — so notes left over from the previous
- * version would go out under the new one's heading-less name, telling every
- * updater's "what's new" card a story about the release before it. The file's
- * convention is a `## What's new in X` heading per version; the one for the
+ * The notes have to be about this release. `release.yml` publishes the
+ * `## What's new in X` section for the version being cut as the release body
+ * (the whole file only when no section matches — and the whole file outgrew
+ * GitHub's limit on a body at 2.15.0), so notes left over from the previous
+ * version would go out under the new one's name, telling every updater's
+ * "what's new" card a story about the release before it. The section for the
  * version being cut has to exist before the tag does.
  */
 const notes = readFileSync('.github/RELEASE_NOTES.md', 'utf8');

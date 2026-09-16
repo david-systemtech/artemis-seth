@@ -6,9 +6,10 @@
 
 import { describe, expect, it } from 'vitest';
 import { render } from 'ink-testing-library';
-import type { AgentEvent } from '@rx-artemis/protocol';
+import { SUGGESTED_TASK_TOOL, type AgentEvent, type Attachment, type RunId } from '@rx-artemis/protocol';
+import { TranscriptModel, syncScheduler } from '@rx-artemis/transcript';
 
-import { ReplayRows } from './Transcript.js';
+import { ReplayRows, TOOL_STUCK_MS, TranscriptViewport, inOrderOfStart, offsetShowing } from './Transcript.js';
 
 /** Envelope filler; timestamps rise with position, which is what the order rests on. */
 function stream(...drafts: Array<Omit<AgentEvent, 'runId' | 'seq' | 'ts'>>): AgentEvent[] {
@@ -158,5 +159,671 @@ describe('a silent run', () => {
     await tick();
 
     expect(lastFrame() ?? '').not.toMatch(/no reply/i);
+  });
+});
+
+/**
+ * The fold has an unfold.
+ *
+ * Collapsed is a preview and stays one; what changed is *which* lines a
+ * preview keeps, and that there is now a view with nothing held back for the
+ * pager to draw. The rows are the same components either way, which is the
+ * point: two renderers for one conversation would disagree within a week.
+ */
+describe('a cut result', () => {
+  /*
+   * A finished call is normally a number in "Ran 3 commands" and has no
+   * preview to cut — an `ok` call stands as its own row only when it is an
+   * offer of follow-up work or an artifact. A suggested task is the one of
+   * those a bare model recognises, so it is what these are written against.
+   */
+  const offer = (result: string): AgentEvent[] =>
+    stream(
+      { type: 'tool.start', toolCallId: 's1', name: SUGGESTED_TASK_TOOL, input: { title: 'Follow up' } },
+      { type: 'tool.end', toolCallId: 's1', status: 'ok', resultText: result },
+    );
+
+  const SIX = 'one\ntwo\nthree\nfour\nfive\nsix';
+
+  it('keeps the head and the tail, and says how much is between them', async () => {
+    // The end of a command's output is where the error is; three lines from
+    // the top of a stack trace is three lines of nothing.
+    const { lastFrame } = render(<ReplayRows events={offer(SIX)} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(frame).toContain('one');
+    expect(frame).toContain('two');
+    expect(frame).toContain('… +3 lines · Ctrl+O');
+    expect(frame).toContain('six');
+    expect(frame).not.toContain('three');
+    expect(frame).not.toContain('four');
+    expect(frame).not.toContain('five');
+
+    // And the count sits between the two halves, not after both.
+    const at = (text: string): number => frame.indexOf(text);
+    expect(at('two')).toBeLessThan(at('… +3 lines'));
+    expect(at('… +3 lines')).toBeLessThan(at('six'));
+  });
+
+  it('shows every line of it once nothing is folded', async () => {
+    const { lastFrame } = render(<ReplayRows events={offer(SIX)} expanded />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    for (const line of ['one', 'two', 'three', 'four', 'five', 'six']) expect(frame).toContain(line);
+    expect(frame).not.toContain('… +');
+  });
+
+  it('leaves a result that fits alone', async () => {
+    const { lastFrame } = render(<ReplayRows events={offer('one\ntwo\nthree')} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(frame).toContain('three');
+    expect(frame).not.toContain('… +');
+  });
+});
+
+describe('an unfolded run', () => {
+  const run = stream(
+    { type: 'tool.start', toolCallId: 'c1', name: 'Bash', input: { command: 'ls' } },
+    { type: 'tool.end', toolCallId: 'c1', status: 'ok', resultText: 'README.md' },
+    { type: 'tool.start', toolCallId: 'c2', name: 'Read', input: { file_path: 'README.md' } },
+    { type: 'tool.end', toolCallId: 'c2', status: 'ok', resultText: '# Artemis' },
+  );
+
+  it('draws every call as its own row, under the summary it folded into', async () => {
+    const { lastFrame } = render(<ReplayRows events={run} expanded />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(frame).toContain('Ran a command, read a file');
+    expect(frame).toContain('Bash(ls)');
+    expect(frame).toContain('README.md');
+    expect(frame).toContain('# Artemis');
+
+    // The summary is still the heading: forty rows with nothing over them is a
+    // list nobody can hold in their head.
+    const at = (text: string): number => frame.indexOf(text);
+    expect(at('Ran a command')).toBeLessThan(at('Bash(ls)'));
+    expect(at('Bash(ls)')).toBeLessThan(at('Read(README.md)'));
+  });
+
+  it('still folds them when it is not asked not to', async () => {
+    const { lastFrame } = render(<ReplayRows events={run} />);
+    await tick();
+
+    expect(lastFrame() ?? '').not.toContain('Bash(ls)');
+  });
+});
+
+/**
+ * When it was said.
+ *
+ * Only on the two rows that are a *turn*, and only unfolded: a column of times
+ * down the side of a burst of tool calls is noise around the two questions a
+ * time answers, and a live viewport has no room to spend on either.
+ */
+describe('the clock', () => {
+  const said = stream(
+    { type: 'text.complete', messageId: 'u1', role: 'user', text: 'Count to three.' },
+    { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'One, two, three.' },
+  );
+
+  const lineWith = (frame: string, text: string): string =>
+    frame.split('\n').find((candidate) => candidate.includes(text)) ?? '';
+
+  it('is at the right of what was said, unfolded', async () => {
+    const { lastFrame } = render(<ReplayRows events={said} expanded />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    // The events are stamped at epoch + 1s; the row shows that in local time.
+    const shown = new Date(1000);
+    const hhmm = `${String(shown.getHours()).padStart(2, '0')}:${String(shown.getMinutes()).padStart(2, '0')}`;
+    expect(lineWith(frame, 'Count to three.').trimEnd().endsWith(hhmm)).toBe(true);
+    expect(lineWith(frame, 'One, two, three.').trimEnd().endsWith(hhmm)).toBe(true);
+  });
+
+  it('is nowhere on a folded row', async () => {
+    const { lastFrame } = render(<ReplayRows events={said} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(lineWith(frame, 'Count to three.')).not.toMatch(/\d\d:\d\d/);
+    expect(lineWith(frame, 'One, two, three.')).not.toMatch(/\d\d:\d\d/);
+  });
+});
+
+/**
+ * A diff knows how wide the pane is.
+ *
+ * `renderDiff` will only put line numbers in the gutter when it is told there
+ * is room for them — a call that does not say how wide the terminal is gets
+ * the old, gutterless shape — and a row that never measured could never say.
+ * Now the viewport passes the width it has, less its padding and the two
+ * gutters the content already hangs off.
+ */
+describe('the width a row is drawn in', () => {
+  const write = stream({
+    type: 'tool.start',
+    toolCallId: 'w1',
+    name: 'Write',
+    input: { file_path: 'notes.ts', content: 'const a = 1;\nconst b = 2;\n' },
+  });
+
+  it('earns the diff a line-number gutter on a wide pane', async () => {
+    const { lastFrame } = render(<ReplayRows events={write} columns={140} />);
+    await tick();
+
+    expect(lastFrame() ?? '').toContain('1 +const a = 1;');
+  });
+
+  it('and leaves it plain on a narrow one, where the code wants the columns', async () => {
+    const { lastFrame } = render(<ReplayRows events={write} columns={60} />);
+    await tick();
+
+    expect(lastFrame() ?? '').toContain('+ const a = 1;');
+  });
+});
+
+/**
+ * A `!` line ran in the shell, and the row says which.
+ *
+ * Every command row was drawn with a slash, so `!git status` came back as
+ * `/ git status` — a slash command the app has never had, sitting in the
+ * transcript next to the ones it does.
+ */
+describe('where a command ran', () => {
+  const markerOf = (frame: string, text: string): string | undefined =>
+    frame
+      .split('\n')
+      .find((line) => line.includes(text))
+      ?.trimStart()
+      .slice(0, 1);
+
+  it('gives the shell the prompt character and leaves the slash to slash commands', async () => {
+    const events = stream(
+      { type: 'command.run', command: { name: 'model', args: 'sonnet' } },
+      { type: 'command.run', source: 'shell', command: { name: 'git', args: 'status', output: 'nothing to commit' } },
+    );
+    const { lastFrame } = render(<ReplayRows events={events} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(markerOf(frame, 'git status')).toBe('$');
+    expect(markerOf(frame, 'model sonnet')).toBe('/');
+    // The output is drawn the same either way.
+    expect(frame).toContain('nothing to commit');
+  });
+});
+
+/** The same events, as the live viewport's model rather than a replay's. */
+function model(events: readonly AgentEvent[]): TranscriptModel {
+  const transcript = new TranscriptModel(syncScheduler);
+  for (const event of events) transcript.apply(event);
+  transcript.flush();
+  return transcript;
+}
+
+/**
+ * A turn's cost, in the unit a plan is bought in.
+ *
+ * `1m 6s · 12.3k tok · $0.04` prices a turn in dollars nobody on a
+ * subscription is billed. What runs out is the windows, so the row says how
+ * much of them the turn took — the conversation does the subtraction, the row
+ * only joins it on.
+ */
+describe('what a turn cost the plan', () => {
+  const finished = model([
+    { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'On it.', runId: 'run_1' as RunId, seq: 0, ts: 1000 },
+    { type: 'run.end', reason: 'completed', durationMs: 66_000, runId: 'run_1' as RunId, seq: 1, ts: 1001 },
+  ] as AgentEvent[]);
+
+  it('appends every window the turn moved to the run-end row', async () => {
+    const { lastFrame, unmount } = render(
+      <TranscriptViewport
+        transcript={finished}
+        live={false}
+        offset={0}
+        planDeltaFor={() => [
+          { label: '5hr', pct: 2.1 },
+          { label: 'week', pct: 0.4 },
+        ]}
+      />,
+    );
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    expect(frame).toContain('1m 6s · 2.1% of 5hr · 0.4% of week');
+  });
+
+  it('leaves the row as it was when no window moved far enough to name', async () => {
+    // Which is every turn under Codex, whose limits refresh only when asked.
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={finished} live={false} offset={0} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    expect(frame).toContain('1m 6s');
+    expect(frame).not.toContain('% of');
+  });
+});
+
+/**
+ * A stuck cue on a silent tool.
+ *
+ * A call that is working and a call whose process is wedged are the same row,
+ * and the spinner says "waiting" for both. After three minutes of nothing the
+ * row stops looking like work in progress.
+ */
+describe('a call that has gone quiet', () => {
+  const call = (ago: number): AgentEvent[] =>
+    [
+      {
+        type: 'tool.start',
+        toolCallId: 'c1',
+        name: 'Bash',
+        input: { command: 'pnpm build' },
+        runId: 'run_1' as RunId,
+        seq: 0,
+        ts: Date.now() - ago,
+      },
+    ] as AgentEvent[];
+
+  it('names the silence, and the key that ends it, once the threshold passes', async () => {
+    const { lastFrame, unmount } = render(
+      <TranscriptViewport transcript={model(call(TOOL_STUCK_MS + 60_000))} live offset={0} />,
+    );
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    // Whole minutes: the point is that it has been quiet for a while, not how
+    // long exactly, and a second that moves every tick draws the eye back to a
+    // row where nothing is happening.
+    expect(frame).toContain('Bash(pnpm build)');
+    expect(frame).toContain('no output for 4m · x stops it');
+  });
+
+  it('leaves a call that has only just started alone', async () => {
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={model(call(30_000))} live offset={0} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    expect(frame).toContain('Bash(pnpm build)');
+    expect(frame).not.toContain('no output for');
+  });
+
+  it('says nothing on a replayed transcript, where nothing is running and x stops nothing', async () => {
+    const { lastFrame, unmount } = render(<ReplayRows events={call(TOOL_STUCK_MS + 60_000)} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    // A recording that ended with a call still open — an interrupted subagent's
+    // does — would otherwise report hours of silence about a process that has
+    // not existed since.
+    expect(frame).toContain('Bash(pnpm build)');
+    expect(frame).not.toContain('no output for');
+  });
+});
+
+/**
+ * A cursor over the rows.
+ *
+ * The transcript was the one surface in the terminal a person could read and
+ * not touch. The cursor is what gives a row an identity the keys can act on,
+ * and these are the three things it has to get right: it marks one row, it
+ * tells the app which rows it drew and in what order, and a row it has been
+ * asked to unfold unfolds without taking the conversation with it.
+ */
+describe('a cursor over the rows', () => {
+  const lineWith = (frame: string, text: string): string =>
+    frame.split('\n').find((candidate) => candidate.includes(text)) ?? '';
+
+  it('marks the row it is on, and leaves every other row where it was', async () => {
+    const transcript = model(
+      stream(
+        { type: 'text.complete', messageId: 'u1', role: 'user', text: 'Count to three.' },
+        { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'One, two, three.' },
+      ),
+    );
+    const ids = inOrderOfStart(transcript.getRowsSnapshot(), transcript);
+    const { lastFrame, unmount } = render(
+      <TranscriptViewport transcript={transcript} live={false} offset={0} cursor={ids[1] ?? null} />,
+    );
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    const marked = lineWith(frame, 'One, two, three.');
+    const rest = lineWith(frame, 'Count to three.');
+    expect(marked.trimStart().startsWith('❯')).toBe(true);
+    expect(rest).not.toContain('❯');
+
+    // The column is held open on every row, so arriving on one does not shove
+    // its text sideways: both markers sit at the same column either way.
+    expect(rest.indexOf('▌')).toBe(marked.indexOf('●'));
+  });
+
+  it('reserves nothing at all when it has not been given a cursor', async () => {
+    const transcript = model(stream({ type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'On it.' }));
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={transcript} live={false} offset={0} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    expect(lineWith(frame, 'On it.').trimStart().startsWith('●')).toBe(true);
+  });
+
+  it('reports the rows it drew, in the order they are on the screen', async () => {
+    const transcript = model(
+      stream(
+        { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'Looking around.' },
+        { type: 'tool.start', toolCallId: 'c1', name: 'Bash', input: { command: 'ls' } },
+        { type: 'tool.end', toolCallId: 'c1', status: 'ok', resultText: 'README.md' },
+        { type: 'text.delta', messageId: 'm2', blockIndex: 0, text: 'Still going.' },
+      ),
+    );
+    const seen: string[][] = [];
+    const { unmount } = render(
+      <TranscriptViewport
+        transcript={transcript}
+        live={false}
+        offset={0}
+        cursor={null}
+        onCursorRows={(ids) => seen.push([...ids])}
+      />,
+    );
+    await tick();
+    unmount();
+
+    // Once for the list, not once per render: `shown` is a fresh array on every
+    // token that arrives, and an app told a hundred times a second that nothing
+    // has changed would step its cursor over nothing else.
+    expect(seen).toHaveLength(1);
+
+    // Screen order, which is not the model's: the model parks a run's calls at
+    // the foot of the run and the screen puts the count where the first call
+    // was made.
+    const rows = transcript.getRowsSnapshot();
+    expect(seen[0]).toEqual(inOrderOfStart(rows, transcript));
+    expect(seen[0]).not.toEqual([...rows]);
+  });
+
+  it('unfolds the row it is asked to and leaves the others cut', async () => {
+    const offer = (id: string, title: string, lines: readonly string[]): Array<Omit<AgentEvent, 'runId' | 'seq' | 'ts'>> => [
+      { type: 'tool.start', toolCallId: id, name: SUGGESTED_TASK_TOOL, input: { title } },
+      { type: 'tool.end', toolCallId: id, status: 'ok', resultText: lines.join('\n') },
+    ];
+    const alpha = ['alpha1', 'alpha2', 'alpha3', 'alpha4', 'alpha5', 'alpha6'];
+    const beta = ['beta1', 'beta2', 'beta3', 'beta4', 'beta5', 'beta6'];
+    const transcript = model(stream(...offer('s1', 'First', alpha), ...offer('s2', 'Second', beta)));
+    const ids = inOrderOfStart(transcript.getRowsSnapshot(), transcript);
+    const { lastFrame, unmount } = render(
+      <TranscriptViewport
+        transcript={transcript}
+        live={false}
+        offset={0}
+        cursor={ids[0] ?? null}
+        expandedRows={new Set(ids.slice(0, 1))}
+      />,
+    );
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    // The row asked about is whole.
+    for (const line of alpha) expect(frame).toContain(line);
+    // Its neighbour is still a preview: head, count, tail.
+    expect(frame).toContain('beta1');
+    expect(frame).toContain('beta6');
+    expect(frame).not.toContain('beta3');
+    expect(frame.split('… +3 lines').length - 1).toBe(1);
+  });
+});
+
+/**
+ * The arithmetic that keeps the cursor row on the screen.
+ *
+ * Scrolling is by line and the cursor is by row, so moving onto a row the clip
+ * has cut off means working out which offset would show it. Tested directly:
+ * the numbers are the whole of it, and a mounted terminal in a test has no
+ * fixed height and therefore never clips anything.
+ */
+describe('the offset that shows a row', () => {
+  // A hundred lines of content in a twenty-line pane: at offset 0 the visible
+  // band is the last twenty lines, 80 to 100.
+  const measured = { content: 100, viewport: 20 };
+
+  it('is nothing at all when the row is already on the screen', () => {
+    expect(offsetShowing({ id: 'r', top: 90, height: 3 }, measured, 0)).toBeNull();
+  });
+
+  it('brings a row above the band down by its head', () => {
+    // 100 − 20 − 50: the row's first line becomes the first line shown.
+    expect(offsetShowing({ id: 'r', top: 50, height: 3 }, measured, 0)).toBe(30);
+  });
+
+  it('brings a row below the band up by its foot', () => {
+    // Scrolled back to the band 40–60, with the row at 70–73 below it.
+    expect(offsetShowing({ id: 'r', top: 70, height: 3 }, measured, 40)).toBe(27);
+  });
+
+  it('shows the head of a row that is taller than the screen, and settles there', () => {
+    const tall = { id: 'r', top: 50, height: 40 };
+    const head = offsetShowing(tall, measured, 0);
+    expect(head).toBe(30);
+
+    // And asks for the same offset again once it is there, rather than
+    // chasing the foot it can never show — which is what stops the two
+    // corrections taking turns to undo one another.
+    expect(offsetShowing(tall, measured, 30)).toBe(30);
+  });
+});
+
+/**
+ * A turn that came with a picture.
+ *
+ * Images live on the user item and nowhere else — `attachments`, the same
+ * base64 that went to the model — so this is the one row kind with anything to
+ * draw. What reaches the terminal is `ImageRow`'s business and is tested
+ * there; what is tested here is that the row finds the images, that a file
+ * riding along with them is not mistaken for one, and that the protocol the
+ * app was given is the protocol the row uses.
+ */
+describe('a turn with an image in it', () => {
+  const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+  /** How an image write starts: save the cursor, then move it. Nothing else here does. */
+  const IMAGE_PREFIX = '\u001b7\u001b[';
+
+  /** A file that begins with a readable PNG header and is `bytes` long. */
+  function png(width: number, height: number, bytes: number): Buffer {
+    const file = Buffer.alloc(Math.max(33, bytes));
+    file.set(PNG_SIGNATURE, 0);
+    file.writeUInt32BE(13, 8);
+    file.write('IHDR', 12, 'ascii');
+    file.writeUInt32BE(width, 16);
+    file.writeUInt32BE(height, 20);
+    return file;
+  }
+
+  const shot: Attachment = {
+    kind: 'image',
+    id: 'a1',
+    mediaType: 'image/png',
+    name: 'shot.png',
+    data: png(640, 400, 8 * 1024).toString('base64'),
+  };
+
+  const notes: Attachment = { kind: 'file', id: 'a2', name: 'notes.pdf', mediaType: 'application/pdf', data: 'JVBER' };
+
+  /** The model as the app builds it: the prompt is pushed before it is answered. */
+  function asked(...attachments: readonly Attachment[]): TranscriptModel {
+    const transcript = new TranscriptModel(syncScheduler);
+    transcript.pushUserMessage('what is this?', attachments);
+    transcript.flush();
+    return transcript;
+  }
+
+  /** The last frame Ink drew, ignoring any image sequence written over the top of it. */
+  const lastDrawn = (frames: readonly string[]): string => frames.filter((frame) => frame.includes('▌')).at(-1) ?? '';
+
+  it('says what it is carrying when the terminal cannot draw it', async () => {
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={asked(shot)} live={false} offset={0} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    // Which is most terminals, and the default for every surface that has not
+    // been told otherwise. The size is there so a reader can decide whether it
+    // is worth opening in something that draws pictures.
+    expect(frame).toContain('what is this?');
+    expect(frame).toContain('[image shot.png 640×400 · 8 KB]');
+  });
+
+  it('reserves the lines and captions them when the terminal speaks a protocol', async () => {
+    const { frames, unmount } = render(
+      <TranscriptViewport transcript={asked(shot)} live={false} offset={0} imageProtocol="kitty" />,
+    );
+    await tick();
+    const frame = lastDrawn(frames);
+    unmount();
+
+    // The picture itself cannot be asserted from here — see `ImageRow.test.tsx`
+    // — but the caption under it can, and the caption is what is left on a
+    // terminal that claims the protocol and does not implement it.
+    expect(frame).toContain('shot.png · 640×400');
+    expect(frame).not.toContain('[image shot.png');
+
+    // And the sequence did leave. The viewport is an `overflow: hidden` box
+    // with the conversation scrolled inside it, and a row the clip has cut off
+    // writes nothing at all — so a wiring that quietly vetoed every row would
+    // look exactly like this test passing on the caption alone.
+    expect(frames.some((written) => written.startsWith(`${IMAGE_PREFIX}`))).toBe(true);
+  });
+
+  it('draws one row per image and leaves the other attachments alone', async () => {
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={asked(notes, shot)} live={false} offset={0} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    // A PDF is something the agent will read, not something to draw: an image
+    // row for it would be a chip reporting a size nothing could ever show.
+    expect(frame.split('[image').length - 1).toBe(1);
+    expect(frame).not.toContain('notes.pdf');
+  });
+
+  it('leaves a turn with no attachments exactly as it was', async () => {
+    const { lastFrame, unmount } = render(<TranscriptViewport transcript={asked()} live={false} offset={0} imageProtocol="kitty" />);
+    await tick();
+    const frame = lastFrame() ?? '';
+    unmount();
+
+    expect(frame).toContain('what is this?');
+    expect(frame).not.toContain('[image');
+  });
+});
+
+/**
+ * An offer of follow-up work.
+ *
+ * The agent's last act in a turn is often a call to one tool — ADR 0005 — whose
+ * only effect is to say "here is something I noticed and did not do". Drawn as a
+ * tool row that read as `mcp__artemisTasks__suggest_task(…)`: a machine name for
+ * a question, with the sentence the handler echoes back hanging under it on a
+ * connector. So it is drawn as chips instead, and the numbers on them are the
+ * keys that take one — which is why they are absent on every surface that has no
+ * keys to offer. `suggestions.test.ts` pins which offers those are.
+ */
+describe('an offer of follow-up work', () => {
+  const offer = (
+    id: string,
+    task: { readonly title: string; readonly prompt?: string; readonly tldr?: string },
+  ): Array<Omit<AgentEvent, 'runId' | 'seq' | 'ts'>> => [
+    { type: 'tool.start', toolCallId: id, name: SUGGESTED_TASK_TOOL, input: { ...task } },
+    { type: 'tool.end', toolCallId: id, status: 'ok', resultText: 'Suggested.' },
+  ];
+
+  const both = stream(
+    { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'Done. Two things I noticed:' },
+    ...offer('s1', { title: 'Add tests for the parser', tldr: 'Nothing covers it.', prompt: 'Write the tests.' }),
+    ...offer('s2', { title: 'Update the README', tldr: 'The flags changed.', prompt: 'Document the flags.' }),
+  );
+
+  const lineWith = (frame: string, text: string): string => frame.split('\n').find((line) => line.includes(text)) ?? '';
+
+  it('draws the titles as chips on one row rather than as tool cards', async () => {
+    const { lastFrame } = render(<ReplayRows events={both} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    // Two calls, one row: three rows each carrying one chip would read as three
+    // things the agent did rather than one question with two answers.
+    expect(lineWith(frame, 'Add tests for the parser')).toContain('Update the README');
+    // Neither the machine name of the tool nor the sentence its handler returns.
+    expect(frame).not.toContain('suggest_task');
+    expect(frame).not.toContain('Suggested.');
+    // `◇`: the tool marker's shape, because this is a tool call, and hollow,
+    // because nothing was done — the filled diamonds are the work.
+    expect(lineWith(frame, 'Add tests for the parser').trimStart().startsWith('◇')).toBe(true);
+    // Followed, the row is titles only. The sentences are what unfolding adds.
+    expect(frame).not.toContain('Nothing covers it.');
+  });
+
+  it('puts the sentence behind each title on its own line once nothing is folded', async () => {
+    const { lastFrame } = render(<ReplayRows events={both} expanded />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    expect(frame).toContain('Add tests for the parser');
+    expect(frame).toContain('Nothing covers it.');
+    expect(frame).toContain('The flags changed.');
+    // A chip a line, so that each title has its sentence under it rather than
+    // under the pair of them.
+    expect(lineWith(frame, 'Add tests for the parser')).not.toContain('Update the README');
+  });
+
+  it('numbers the chips only while the digits are bound to them', async () => {
+    const bound = render(<TranscriptViewport transcript={model(both)} live={false} offset={0} suggestionDigits />);
+    await tick();
+    const live = bound.lastFrame() ?? '';
+    bound.unmount();
+
+    // What is printed is the key to press, which is the whole reason it is `1.`
+    // and not `①`: the pretty glyph is two cells wide in half the terminal fonts
+    // that have it and a replacement box in the ones that do not.
+    expect(live).toContain('1. Add tests for the parser');
+    expect(live).toContain('2. Update the README');
+
+    const idle = render(<TranscriptViewport transcript={model(both)} live={false} offset={0} />);
+    await tick();
+    const frame = idle.lastFrame() ?? '';
+    idle.unmount();
+
+    // The offer is still the record of what was offered; what it has stopped
+    // doing is promising a keystroke the app is not listening for.
+    expect(frame).toContain('Add tests for the parser');
+    expect(frame).toContain('Update the README');
+    expect(frame).not.toMatch(/\d\.\s*Add tests/);
+  });
+
+  it('keeps the ordinary tool row for a call the agent got wrong', async () => {
+    const { lastFrame } = render(<ReplayRows events={stream(...offer('s1', { title: 'Follow up' }))} />);
+    await tick();
+    const frame = lastFrame() ?? '';
+
+    // No prompt, so there is nothing a chip could do — and a chip that starts
+    // nothing is worse than the mistake shown where it can be read. The
+    // desktop's rule, in `SuggestedTask.tsx`, and the terminal keeps it.
+    expect(frame).toContain(SUGGESTED_TASK_TOOL);
+    expect(frame).toContain('Suggested.');
+    expect(frame).not.toContain('◇');
   });
 });

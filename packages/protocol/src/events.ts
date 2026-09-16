@@ -450,10 +450,26 @@ export interface LocalCommand {
  * One event per command: an invocation and the output it produced are two
  * messages on the wire and one thing that happened, so the adapter pairs them
  * before emitting. A command that prints nothing still gets an event.
+ *
+ * A host that runs a shell line for the user records it here too, and says so
+ * on {@link CommandRunEvent.source}.
  */
 export interface CommandRunEvent extends AgentEventBase {
   readonly type: 'command.run';
   readonly command: LocalCommand;
+  /**
+   * Which table the name came from: the app's commands, or the user's `PATH`.
+   *
+   * A `!git status` typed at the composer is run by the host and recorded
+   * through this event, but it is not a slash command — nothing looked it up
+   * in the command list, and there is no `/git`. Surfaces mark the two rows
+   * differently for that reason; a shell line drawn with a slash reads as a
+   * command the app does not have.
+   *
+   * Absent means `slash`, which is every event an adapter emits: providers
+   * only ever announce their own commands.
+   */
+  readonly source?: 'slash' | 'shell';
 }
 
 /* -------------------------------------------------------------------------- */

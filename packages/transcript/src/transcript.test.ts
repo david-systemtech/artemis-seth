@@ -8,6 +8,7 @@ import {
   frameScheduler,
   syncScheduler,
   type AssistantItem,
+  type CommandItem,
   type ToolItem,
 } from './transcript.js';
 
@@ -1562,5 +1563,45 @@ describe('TranscriptModel suggested tasks', () => {
     // and the prefix is the whole of the identity.
     expect(isSuggestedTaskCall(model.getItem('t:c1'))).toBe(false);
     expect(model.getRowsSnapshot()).toEqual(['g:t:c1']);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Where a command ran.
+ *
+ * `!git status` is executed by the terminal, not looked up in the command
+ * table, and the row that draws it has to be able to say so — otherwise it is
+ * marked as a slash command the app does not have. The event says which; the
+ * item carries it through.
+ */
+describe('a command\'s source', () => {
+  it('reaches the item when the host ran a shell line', () => {
+    const model = build();
+    for (const event of stream({
+      type: 'command.run',
+      source: 'shell',
+      command: { name: 'git', args: 'status', output: 'nothing to commit' },
+    })) {
+      model.apply(event);
+    }
+
+    const item = model.getItem('c:1') as CommandItem;
+    expect(item.kind).toBe('command');
+    expect(item.name).toBe('git');
+    expect(item.args).toBe('status');
+    expect(item.source).toBe('shell');
+    // Not folded into the machinery marker: it is something the user did.
+    expect(model.getRowsSnapshot()).toEqual(['c:1']);
+  });
+
+  it('is left off entirely by a slash command, which is what absent means', () => {
+    const model = build();
+    for (const event of stream({ type: 'command.run', command: { name: 'model', args: 'sonnet' } })) {
+      model.apply(event);
+    }
+
+    expect((model.getItem('c:1') as CommandItem).source).toBeUndefined();
   });
 });

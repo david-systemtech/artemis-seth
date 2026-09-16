@@ -130,6 +130,23 @@ export interface TuiHost {
     cwd: string,
     archived: boolean,
   ): Promise<boolean>;
+  /**
+   * Give a stored conversation a name of its own.
+   *
+   * The adapter's `setSessionTitle` — the same door the automatic namer writes
+   * through, and the same one the desktop's rename handler and the server's
+   * `/rename` route take. Deliberately not a second path: a typed title and a
+   * generated one are the same fact about a session, and two writes into one
+   * store would eventually disagree about which of them `titleIsCustom`
+   * describes.
+   *
+   * `false` for a provider whose store has no such field — Codex has
+   * `thread/name/set` and Claude the SDK's own, but an adapter is entitled to
+   * have neither — so the caller can say so rather than appearing to succeed.
+   * The title is trimmed and capped here, because whoever stores it is who has
+   * to say what was stored.
+   */
+  renameSession(profileId: ProfileId, providerId: ProviderId, sessionId: SessionId, cwd: string, title: string): Promise<boolean>;
   /** Destroy a stored conversation. The transcript file goes; nothing here can undo it. */
   deleteSession(profileId: ProfileId, providerId: ProviderId, sessionId: SessionId, cwd: string): Promise<boolean>;
   /**
@@ -151,6 +168,12 @@ export interface ModelListing {
   readonly models: readonly ProviderModelOption[];
   readonly live: boolean;
 }
+
+/**
+ * Longest title stored for a conversation. The desktop's engine and the
+ * server's host cap at the same number, and they all write to the same stores.
+ */
+const MAX_SESSION_TITLE = 200;
 
 export interface TuiHostOptions {
   /** Working directory the model listing is asked in. Defaults to `dataDir`. */
@@ -402,6 +425,16 @@ export function createTuiHost(dataDir: string, options: TuiHostOptions = {}): Tu
         env: await historyEnvFor(profileId, providerId),
         tag: archived ? ARCHIVED_TAG : null,
       });
+    },
+    renameSession: async (profileId, providerId, sessionId, cwd, title) => {
+      const adapter = providers.get(providerId);
+      if (adapter?.setSessionTitle === undefined) return false;
+      const named = title.trim().slice(0, MAX_SESSION_TITLE);
+      // A name that trims to nothing is not a rename; storing it would blank
+      // the one label the rail has for this conversation.
+      if (named.length === 0) return false;
+      await adapter.setSessionTitle({ sessionId, title: named, cwd, env: await historyEnvFor(profileId, providerId) });
+      return true;
     },
     deleteSession: async (profileId, providerId, sessionId, cwd) => {
       const adapter = providers.get(providerId);
