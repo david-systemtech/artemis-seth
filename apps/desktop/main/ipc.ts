@@ -70,8 +70,10 @@ import {
   retireMemoryBankMemory,
   setMasterEnabled,
   setMemoryBankEnabled,
+  setMemoryBankProfiles,
   syncMemoryBank,
   verifyMemoryBankRemote,
+  wireMemoryBankClaudeCode,
   promptBanks,
 } from './memoryBanks.js';
 import type { EngineHost } from './engine.js';
@@ -187,7 +189,9 @@ import {
   validateMemoryBankMemories,
   validateMemoryBankRetire,
   validateMemoryBankSetEnabled,
+  validateMemoryBankSetProfiles,
   validateMemoryBankSync,
+  validateMemoryBankWireClaudeCode,
   validateMemoryBanksPreflight,
   validateMemoryBanksSetMasterEnabled,
   validateSecretsConnectionDelete,
@@ -662,6 +666,27 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       handle: async (request) => setMemoryBankEnabled(request),
     },
 
+    /*
+     * Artemis's own record, in Artemis's own registry: the CLI's config has no
+     * room for a profile scope. The installs follow the write, which is why
+     * this answers with a message like the other write channels.
+     */
+    [IPC.memoryBankSetProfiles]: {
+      validate: validateMemoryBankSetProfiles,
+      handle: async (request) => setMemoryBankProfiles(request),
+    },
+
+    /*
+     * The one bank channel whose whole effect is outside Artemis: it runs the
+     * bank's own CLI to write (or strip) stock Claude Code's managed block,
+     * slash command and session-start hook. Nothing an Artemis run reads, and
+     * refused by name on a bank that embeds no CLI.
+     */
+    [IPC.memoryBankWireClaudeCode]: {
+      validate: validateMemoryBankWireClaudeCode,
+      handle: async (request) => wireMemoryBankClaudeCode(request),
+    },
+
     [IPC.memoryBankForget]: {
       validate: validateMemoryBankForget,
       handle: async (request) => forgetMemoryBank(request),
@@ -733,9 +758,15 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       validate: validateAgentPromptsList,
       // The banks ride along because only main can see them, and the pane's
       // preview of a built-in is wrong without them — see the response type.
+      //
+      // `toolsAvailable: true` so the preview shows the memory tools, which is
+      // what a Claude run on this machine is actually told. A preview is not a
+      // run and has no provider to ask; showing the CLI's verbs instead would
+      // make the pane disagree with every run the user then starts, and this
+      // is also the text an override is seeded from.
       handle: async () => ({
         document: await engine.require().readAgentPrompts(),
-        memoryBanks: promptBanks(),
+        memoryBanks: promptBanks(undefined, undefined, true),
       }),
     },
 

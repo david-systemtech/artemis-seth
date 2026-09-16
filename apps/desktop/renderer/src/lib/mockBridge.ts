@@ -414,12 +414,24 @@ function advanceMockSignIn(current: ServerSignInStatus | null): ServerSignInStat
 /**
  * The banks "on this machine": agents write to the real ones; here, retire
  * deletes. Two banks so the multi-bank rendering — read-only badge, default
- * marker, per-bank switches — is the state dev meets by default.
+ * marker, per-bank switches — is the state dev meets by default, and one of
+ * each format, attached two different ways, so the format badge and the
+ * profile picker both have something to draw without anyone arranging it.
  */
 let mockMasterEnabled = true;
 let mockBanks: MemoryBankInfo[] = [
   {
     slug: 'team-memory',
+    name: 'Team memory',
+    description:
+      'What the team has learned about its own systems. Use for anything about the harness, its deployments or its conventions.',
+    format: 'manifest',
+    profiles: { kind: 'all' },
+    // One refused entry, so the problems disclosure and the memory card's
+    // "not installed" rendering are both reachable in dev.
+    problems: [
+      'memories/demo-org/harness/half-written.md: metadata.type must be one of decision, feedback, reference, workflow',
+    ],
     path: '/Users/demo/Documents/team-memory',
     remote: 'https://github.com/demo-team/team-memory.git',
     role: 'readwrite',
@@ -427,10 +439,14 @@ let mockBanks: MemoryBankInfo[] = [
     isDefault: true,
     exists: true,
     source: 'cerebro@52a0a32',
-    memories: 3,
+    memories: 4,
     mirrored: 0,
-    validationErrors: 0,
+    validationErrors: 1,
     projects: 27,
+    // Carries its own `bin/cerebro`, so the "Wire for stock Claude Code" offer
+    // is live on this card and refused-with-a-reason on the other one — both
+    // states reachable in dev without arranging anything.
+    embedsCli: true,
     // Held as a reference rather than as a token, so the pane's "from a key
     // manager" rendering is what dev meets by default — including the degraded
     // sentence, which is the state a real machine reaches only when its vault
@@ -438,7 +454,14 @@ let mockBanks: MemoryBankInfo[] = [
     credential: { kind: 'ref' },
   },
   {
+    // No manifest and no name of its own, so the card prints the slug once —
+    // the case a legacy cerebro bank is in until someone describes it.
     slug: 'client-docs',
+    name: 'client-docs',
+    description: null,
+    format: 'legacy-projects',
+    profiles: { kind: 'profiles', profileIds: ['demo-personal'] },
+    problems: [],
     path: '/Users/demo/Documents/client-docs',
     remote: null,
     role: 'readonly',
@@ -450,9 +473,20 @@ let mockBanks: MemoryBankInfo[] = [
     mirrored: 0,
     validationErrors: 0,
     projects: 4,
+    embedsCli: false,
     credential: { kind: 'none' },
   },
 ];
+
+/**
+ * Which banks are wired into "stock Claude Code" on this fake machine.
+ *
+ * Its own list rather than a derivation of `enabled`, because that is exactly
+ * the distinction the row exists to draw: a bank can be on for Artemis and
+ * unwired for the other harness, and a mock that conflated them would render a
+ * state the real pane never shows.
+ */
+let mockWiredBanks: string[] = ['team-memory'];
 
 /* -------------------------------------------------------------------------- */
 /* Key managers                                                               */
@@ -637,6 +671,7 @@ function rememberMockVerify(id: string, result: SecretVerifyResult): void {
 let mockBankMemories: MemoryBankMemory[] = [
   {
     name: 'team-memory-bank',
+    title: 'Team memory bank',
     type: 'reference',
     description: "What the team memory bank is, and how agents keep it current",
     body: "The team memory bank is shared by every developer on the Artemis harness — and agents, not developers, maintain it.",
@@ -644,11 +679,14 @@ let mockBankMemories: MemoryBankMemory[] = [
     author: 'demo@example.com',
     org: null,
     project: null,
+    scope: {},
+    problems: [],
     readonly: false,
     file: 'memories/team-memory-bank.md',
   },
   {
     name: 'writing-team-memories',
+    title: 'Writing team memories',
     type: 'feedback',
     description: 'House style for team memories: atomic, durable, absolute dates, team-relevant, no secrets',
     body: 'A team memory is one fact per file, written so a teammate (or their agent) who lacks your context can act on it.',
@@ -656,13 +694,34 @@ let mockBankMemories: MemoryBankMemory[] = [
     author: 'demo@example.com',
     org: 'demo-org',
     project: 'harness',
+    scope: { org: 'demo-org', project: 'harness' },
+    problems: [],
     readonly: false,
     file: 'memories/demo-org/harness/writing-team-memories.md',
+  },
+  // The refused entry the bank's `problems` line counts. Browsable, so the
+  // person who can fix it can see what is wrong — which is the whole reason
+  // an entry with problems is listed at all.
+  {
+    name: 'half-written',
+    title: 'Half written',
+    type: 'note',
+    description: 'Something an agent started and did not finish',
+    body: 'No metadata.type, so the reader will not install it.',
+    added: null,
+    author: null,
+    org: 'demo-org',
+    project: 'harness',
+    scope: { org: 'demo-org', project: 'harness' },
+    problems: ['metadata.type must be one of decision, feedback, reference, workflow'],
+    readonly: false,
+    file: 'memories/demo-org/harness/half-written.md',
   },
   // A mirror-tree memory, so dev meets the grouped, read-only rendering —
   // badge on, retire hidden — without arranging a real mirror.
   {
     name: 'artemis-agent-harness',
+    title: 'Artemis agent harness',
     type: 'reference',
     description: 'Artemis is our in-house Claude agent harness; where its profiles, projects, and memory live on disk',
     body: 'Artemis is the team’s in-house agent harness, an Electron app wrapping the Claude Agent SDK.',
@@ -670,6 +729,8 @@ let mockBankMemories: MemoryBankMemory[] = [
     author: 'demo@example.com',
     org: 'demo-org',
     project: 'sessions',
+    scope: { org: 'demo-org', project: 'sessions' },
+    problems: [],
     readonly: true,
     file: 'memory/sessions/artemis-agent-harness.md',
   },
@@ -1757,14 +1818,18 @@ export function createMockBridge(): ArtemisBridge {
             {
               name: 'demo-personal',
               label: 'Demo — personal',
-              hook: true,
-              banks: Object.fromEntries(mockBanks.map((bank) => [bank.slug, bank.enabled])),
+              hook: mockWiredBanks.length > 0,
+              banks: Object.fromEntries(
+                mockBanks.map((bank) => [bank.slug, mockWiredBanks.includes(bank.slug)]),
+              ),
             },
             {
+              // Wired on one profile and not the other, which is the partial
+              // state the row has a sentence for.
               name: 'demo-work',
               label: 'Demo — work',
               hook: false,
-              banks: Object.fromEntries(mockBanks.map((bank) => [bank.slug, bank.enabled])),
+              banks: Object.fromEntries(mockBanks.map((bank) => [bank.slug, false])),
             },
           ],
         }),
@@ -1830,6 +1895,14 @@ export function createMockBridge(): ArtemisBridge {
           ...mockBanks,
           {
             slug: request.slug,
+            name: request.slug,
+            description: null,
+            // A created bank starts from the BANK.md Artemis writes it; a
+            // joined or adopted one is whatever was already there, and the
+            // mock has no directory to look in, so it guesses the same.
+            format: 'manifest',
+            profiles: { kind: 'all' },
+            problems: [],
             path: request.path ?? `/Users/demo/Documents/${request.slug}`,
             remote: request.remote ?? null,
             role: request.role,
@@ -1841,6 +1914,9 @@ export function createMockBridge(): ArtemisBridge {
             mirrored: 0,
             validationErrors: 0,
             projects: 0,
+            // A bank Artemis just made carries no CLI: Artemis writes a
+            // BANK.md and a memories/ folder, and nothing else.
+            embedsCli: false,
           },
         ];
         mockMasterEnabled = true;
@@ -1863,8 +1939,46 @@ export function createMockBridge(): ArtemisBridge {
             : `'${request.slug}' is off — its profile block is out, and syncs skip it.`,
         });
       },
+      setProfiles: async (request) => {
+        mockBanks = mockBanks.map((bank) =>
+          bank.slug === request.slug ? { ...bank, profiles: request.profiles } : bank,
+        );
+        return ok({
+          message:
+            request.profiles.kind === 'all'
+              ? `'${request.slug}' is attached to every profile, including accounts added later.`
+              : `'${request.slug}' is attached to ${request.profiles.profileIds.length} profile(s). Installed into their projects; removed from the rest.`,
+        });
+      },
+      /*
+       * The other harness's wiring, which the real channel does by spawning
+       * the bank's own CLI. Refused here the way main refuses it, so the
+       * card's disabled state and its receipt are both reachable in dev.
+       */
+      wireClaudeCode: async (request) => {
+        const bank = mockBanks.find((entry) => entry.slug === request.slug);
+        if (bank?.embedsCli !== true) {
+          return {
+            ok: false,
+            error: {
+              code: 'invalid_request',
+              message: `'${request.slug}' embeds no cerebro CLI, so it cannot be wired into stock Claude Code; Artemis’s own runs are unaffected.`,
+              retryable: false,
+            },
+          };
+        }
+        mockWiredBanks = request.enabled
+          ? [...new Set([...mockWiredBanks, request.slug])]
+          : mockWiredBanks.filter((slug) => slug !== request.slug);
+        return ok({
+          message: request.enabled
+            ? `Wired '${request.slug}' into stock Claude Code: a managed block in each profile's CLAUDE.md, the /cerebro command, and a session-start sync hook.`
+            : `Unwired '${request.slug}' from stock Claude Code (managed block, /cerebro command, session-start hook).`,
+        });
+      },
       forget: async (request) => {
         mockBanks = mockBanks.filter((bank) => bank.slug !== request.slug);
+        mockWiredBanks = mockWiredBanks.filter((slug) => slug !== request.slug);
         return ok({ message: `Unwired '${request.slug}' from every profile. Forgot '${request.slug}'.` });
       },
       setMasterEnabled: async (request) => {

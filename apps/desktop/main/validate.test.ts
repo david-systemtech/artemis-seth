@@ -15,6 +15,8 @@ import {
   validateSessionsListAll,
   validateMemoryBankAdd,
   validateMemoryBankSetEnabled,
+  validateMemoryBankSetProfiles,
+  validateMemoryBankWireClaudeCode,
   validateMemoryBanksSetMasterEnabled,
   validateMemoryBanksVerifyRemote,
   validateSecretsConnectionDelete,
@@ -1062,6 +1064,121 @@ describe('validateMemoryBankSetEnabled', () => {
       slug: 'cerebro',
       enabled: true,
     });
+  });
+});
+
+/**
+ * The profile scope: which accounts a bank reaches.
+ *
+ * The consequences run in three directions — which runs are briefed about the
+ * bank, whose projects it is installed into, and which runs may read its
+ * directory — so the shape is checked rather than trusted, and a list that
+ * repeats an id is understood rather than refused.
+ */
+describe('validateMemoryBankSetProfiles', () => {
+  it('takes the two scopes the protocol names', () => {
+    expect(validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'all' } })).toEqual({
+      slug: 'cortex',
+      profiles: { kind: 'all' },
+    });
+    expect(
+      validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: ['work'] } }),
+    ).toEqual({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: ['work'] } });
+  });
+
+  it('reads an empty list as a bank that reaches nobody, not as `all`', () => {
+    // The dangerous default. A scope that fell back to `all` would put a bank
+    // the user has just detached from every profile in front of every run.
+    expect(
+      validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: [] } }),
+    ).toEqual({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: [] } });
+    expect(
+      validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'profiles' } }),
+    ).toEqual({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: [] } });
+  });
+
+  it('deduplicates rather than refusing a list that names a profile twice', () => {
+    expect(
+      validateMemoryBankSetProfiles({
+        slug: 'cortex',
+        profiles: { kind: 'profiles', profileIds: ['work', 'work', 'home'] },
+      }),
+    ).toEqual({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: ['work', 'home'] } });
+  });
+
+  it('refuses a scope that is not one of the two, and a slug outside the grammar', () => {
+    expect(() => validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'some' } })).toThrow(
+      ValidationError,
+    );
+    expect(() => validateMemoryBankSetProfiles({ slug: 'cortex' })).toThrow(ValidationError);
+    expect(() => validateMemoryBankSetProfiles({ slug: '../etc', profiles: { kind: 'all' } })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('caps the list, and refuses an id that is not a string or is too long', () => {
+    const many = Array.from({ length: 51 }, (_unused, index) => `p${String(index)}`);
+    expect(() =>
+      validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: many } }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: [42] } }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateMemoryBankSetProfiles({
+        slug: 'cortex',
+        profiles: { kind: 'profiles', profileIds: ['x'.repeat(65)] },
+      }),
+    ).toThrow(ValidationError);
+  });
+});
+
+/**
+ * Wiring a bank into stock Claude Code.
+ *
+ * The same shape as the on/off switch and a sharper version of its reason:
+ * what this writes is another program's configuration — a managed block in
+ * every profile's `CLAUDE.md`, a slash command, a session-start hook — so a
+ * guessed direction either edits files nobody asked to have edited or leaves
+ * behind wiring somebody asked to have removed.
+ */
+describe('validateMemoryBankWireClaudeCode', () => {
+  it('takes the state it is given, both ways', () => {
+    expect(validateMemoryBankWireClaudeCode({ slug: 'cortex', enabled: true })).toEqual({
+      slug: 'cortex',
+      enabled: true,
+    });
+    expect(validateMemoryBankWireClaudeCode({ slug: 'cortex', enabled: false })).toEqual({
+      slug: 'cortex',
+      enabled: false,
+    });
+  });
+
+  it('refuses silence and truthy stand-ins', () => {
+    expect(() => validateMemoryBankWireClaudeCode({ slug: 'cortex' })).toThrow(ValidationError);
+    expect(() => validateMemoryBankWireClaudeCode({ slug: 'cortex', enabled: 'true' })).toThrow(
+      ValidationError,
+    );
+    expect(() => validateMemoryBankWireClaudeCode({ slug: 'cortex', enabled: 1 })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('refuses a slug outside the banks` own grammar', () => {
+    // The slug reaches a spawn's argument list and namespaces a managed block
+    // in a file Artemis does not own, so the grammar is the whole gate.
+    expect(() => validateMemoryBankWireClaudeCode({ slug: '../etc', enabled: true })).toThrow(
+      ValidationError,
+    );
+    expect(() => validateMemoryBankWireClaudeCode({ slug: 'No Caps', enabled: true })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('rebuilds the request, so nothing extra reaches main', () => {
+    expect(
+      validateMemoryBankWireClaudeCode({ slug: 'cortex', enabled: true, cli: '/bin/sh' }),
+    ).toEqual({ slug: 'cortex', enabled: true });
   });
 });
 

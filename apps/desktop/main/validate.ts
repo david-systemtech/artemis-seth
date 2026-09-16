@@ -82,8 +82,10 @@ import {
   type MemoryBankMemoriesRequest,
   type MemoryBankRetireRequest,
   type MemoryBankSetEnabledRequest,
+  type MemoryBankSetProfilesRequest,
   type MemoryBankSyncRequest,
   type MemoryBankVerifyRemoteRequest,
+  type MemoryBankWireClaudeCodeRequest,
   type MemoryBanksPreflightRequest,
   type MemoryBanksSetMasterEnabledRequest,
   type MemoryBanksStatusRequest,
@@ -2351,6 +2353,69 @@ export function validateMemoryBankRetire(raw: unknown): MemoryBankRetireRequest 
  * decision this layer gets to make on the user's behalf.
  */
 export function validateMemoryBankSetEnabled(raw: unknown): MemoryBankSetEnabledRequest {
+  const request = requireRequest(raw);
+  const slug = requireBankSlug(request['slug'], 'slug');
+  const enabled = optionalBoolean(request['enabled'], 'enabled');
+  if (enabled === undefined) throw new ValidationError('enabled', 'is required');
+  return { slug, enabled };
+}
+
+/**
+ * How many profiles one bank may be pinned to, and how long an id may be.
+ *
+ * The profile list is the machine's own and is never long; the cap is here for
+ * the reason every cap on this boundary is — a payload nobody typed should not
+ * be able to make main iterate an arbitrary list.
+ */
+const MEMORY_BANK_SCOPE_PROFILES = 50;
+const MEMORY_BANK_PROFILE_ID_MAX = 64;
+
+/**
+ * Which profiles a bank reaches — the one bank setting the CLI has no room
+ * for, and the one with consequences in three directions: which runs are
+ * briefed about the bank, whose projects it is installed into, and which runs
+ * may read its directory.
+ *
+ * The ids are deduplicated rather than refused. A list that names a profile
+ * twice means the same thing as one that names it once, and rejecting it would
+ * be the boundary failing a request it understands perfectly.
+ *
+ * Whether an id names a profile that exists is deliberately not checked here:
+ * the profile list is main's, the scope is stored as written, and a bank
+ * scoped to a profile that is later deleted is a bank that reaches nobody —
+ * which is what it already meant.
+ */
+export function validateMemoryBankSetProfiles(raw: unknown): MemoryBankSetProfilesRequest {
+  const request = requireRequest(raw);
+  const slug = requireBankSlug(request['slug'], 'slug');
+  const scope = requireObject(request['profiles'], 'profiles');
+  const kind = requireString(scope['kind'], 'profiles.kind', 20);
+  if (kind === 'all') return { slug, profiles: { kind: 'all' } };
+  if (kind !== 'profiles') {
+    throw new ValidationError('profiles.kind', 'must be "all" or "profiles"');
+  }
+  const profileIds =
+    optionalStringArray(
+      scope['profileIds'],
+      'profiles.profileIds',
+      MEMORY_BANK_SCOPE_PROFILES,
+      MEMORY_BANK_PROFILE_ID_MAX,
+    ) ?? [];
+  return { slug, profiles: { kind: 'profiles', profileIds: [...new Set(profileIds)] } };
+}
+
+/**
+ * Wiring a bank into stock Claude Code, or out of it.
+ *
+ * The same two fields and the same strictness as
+ * {@link validateMemoryBankSetEnabled}, and for a sharper version of its
+ * reason: what this writes is not Artemis's own state but *another program's*
+ * configuration — a managed block in each profile's `CLAUDE.md`, a slash
+ * command, a session-start hook. A default in either direction would edit
+ * files the user did not ask to have edited, or leave behind wiring they asked
+ * to have removed.
+ */
+export function validateMemoryBankWireClaudeCode(raw: unknown): MemoryBankWireClaudeCodeRequest {
   const request = requireRequest(raw);
   const slug = requireBankSlug(request['slug'], 'slug');
   const enabled = optionalBoolean(request['enabled'], 'enabled');

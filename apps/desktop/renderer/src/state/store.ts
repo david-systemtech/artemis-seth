@@ -45,6 +45,7 @@ import {
   NO_CAPABILITIES,
   recommendProfile,
   isSuggestedTaskTarget,
+  renderDescribeBankPrompt,
   resolvePlanWeight,
   suggestedTaskBranch,
 } from '@rx-artemis/protocol';
@@ -57,6 +58,7 @@ import type {
   Attachment,
   Capabilities,
   IpcError,
+  MemoryBankInfo,
   PermissionDecision,
   PermissionMode,
   PermissionRequest,
@@ -207,9 +209,9 @@ export type Screen = 'chat' | 'profiles';
  *
  * An id is an address, not a label, so ids outlive the panes they named.
  * `browser` and `cerebro` no longer have panes of their own — the browser
- * switches live under Permissions & access, the banks under Instructions — but
- * every deep link and every preferences file that says `cerebro` is still a
- * correct request, so the ids stay in the union and
+ * switches live under Permissions & access, the banks under their own
+ * `memory-banks` pane — but every deep link and every preferences file that
+ * says `cerebro` is still a correct request, so the ids stay in the union and
  * {@link resolveSettingsSection} says where each one lands today. Renaming a
  * *pane* is cheap; renaming an *address* breaks callers that were never wrong.
  */
@@ -222,6 +224,7 @@ export type SettingsSection =
   | 'permissions'
   | 'agents'
   | 'cerebro'
+  | 'memory-banks'
   | 'secrets'
   | 'server'
   | 'remote'
@@ -238,8 +241,11 @@ export type SettingsSection =
  *
  *  - `browser` — its two switches were always permission questions, and they
  *    moved in with the pane that answers the rest of them.
- *  - `cerebro` — memory banks are one instance of "what the agent is told
- *    before the conversation starts", and they live with the rule now.
+ *  - `cerebro` — the banks were folded into Instructions for a while and have
+ *    their own pane again, now that a bank carries a name, a format and a set
+ *    of profiles rather than being one paragraph under the prompt library.
+ *    The CLI's name is still what people type and deep-link, so it keeps
+ *    resolving — to `memory-banks` now, which is where the room moved.
  *
  * Everything else is its own home, including `agents` (the Instructions pane
  * kept the id it was born with) and `advanced` (the This-machine pane, same).
@@ -252,7 +258,8 @@ const SETTINGS_SECTION_HOMES: Readonly<Record<SettingsSection, SettingsSection>>
   browser: 'permissions',
   permissions: 'permissions',
   agents: 'agents',
-  cerebro: 'agents',
+  cerebro: 'memory-banks',
+  'memory-banks': 'memory-banks',
   secrets: 'secrets',
   server: 'server',
   remote: 'remote',
@@ -6252,6 +6259,84 @@ async function createTaskWorktree(task: SuggestedTask, pane: Pane): Promise<stri
     return null;
   }
   return result.value.path;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Describing a memory bank                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Start the conversation that writes a bank's `BANK.md`.
+ *
+ * A bank with no manifest still works — the legacy layouts are read as they
+ * are — but it cannot say what it holds or how a new entry is filed, and
+ * Artemis cannot say it on the bank's behalf. No form in the settings pane
+ * could: nearly every answer is already in the tree, and the two or three that
+ * are not are questions for the person. So the pane does not ask them, and
+ * hands the job to an agent standing in the bank's own checkout instead. The
+ * words it sends are `renderDescribeBankPrompt`'s, kept in the protocol so a
+ * server-side starter would compose the same ones.
+ *
+ * Modelled on {@link startSuggestedTask}'s `session` target, down to sharing
+ * its column: beside the focused pane where the grid has room, falling back to
+ * a new conversation in place where it does not. The settings dialog closes on
+ * the way out, because what it was asked for is now happening in a column
+ * behind it, and a dialog left open over the answer is a dialog the user has
+ * to dismiss before they can read it.
+ *
+ * ## It sends, unless the column could not have sent
+ *
+ * The checkout is local and the prompt is complete, so in the ordinary case
+ * there is nothing left for the user to decide and sending is the whole of
+ * what a one-click action is for. Two columns cannot be sent into, and both
+ * fall back the way the `server` target does — the prompt into the composer,
+ * the caret in it — rather than posting a run that will fail:
+ *
+ *  - **A served column.** Which account runs the work, on which model, at what
+ *    thinking level is exactly the choice a person moves work to a server in
+ *    order to make, and a freshly split column has answered none of them.
+ *    {@link startSuggestedTask} has the long version, including the
+ *    `model_not_found` a send into that gap actually produces.
+ *  - **A column with no model, or no profile to get one from.** `refreshModels`
+ *    has not landed, or the account has no catalogue at all; either way the run
+ *    would go out with no model behind it.
+ *
+ * The prompt is on screen and editable in both cases, so the fallback costs one
+ * keypress and never costs the words.
+ */
+export async function describeMemoryBank(
+  bank: Pick<MemoryBankInfo, 'slug' | 'path' | 'format' | 'name'>,
+  pane: Pane = focusedPane(),
+): Promise<void> {
+  const column = openTaskColumn(pane);
+  // On the column that will do the sending, for the reason the worktree target
+  // does the same: every instruction in the prompt is about reading the tree
+  // around the run and landing a file in it, so the run has to be *in* the bank.
+  setCwd(bank.path, column);
+  closeSettings();
+
+  const prompt = renderDescribeBankPrompt({
+    slug: bank.slug,
+    path: bank.path,
+    format: bank.format,
+    name: bank.name,
+  });
+
+  const state = paneState(column);
+  const canSend =
+    state.activeProviderId !== 'artemis' &&
+    state.activeProfileId !== null &&
+    activeModel(state) !== undefined;
+  if (!canSend) {
+    // The same field a restored or parked draft lands in — see `swapDraft` — so
+    // the prompt is editable, recallable and survives the column being looked
+    // away from, exactly as anything else typed here would be.
+    setPaneState(column, { draft: prompt });
+    focusComposer(column.id);
+    return;
+  }
+
+  await submitPrompt(prompt, undefined, column);
 }
 
 /**

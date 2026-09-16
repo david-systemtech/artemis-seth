@@ -32,9 +32,13 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import type {
   IpcResult,
   MemoryBankCheck,
+  MemoryBankInfo,
+  MemoryBankMemory,
   MemoryBankPreflight,
+  MemoryBankSetProfilesRequest,
   MemoryBankVerifyRemoteRequest,
   MemoryBankVerifyRemoteResponse,
+  MemoryBankWireClaudeCodeRequest,
   MemoryBanksStatus,
   SecretConnectionState,
   SecretProviderDescriptor,
@@ -44,6 +48,7 @@ import type {
 
 import { MemoryBankGroups, slugFromRemote } from '@/components/settings/MemoryBanksSection';
 import { useMemoryBanks } from '@/hooks/useMemoryBanks';
+import { seedApp } from '@/state/testkit';
 import { TooltipProvider } from '@/components/ui/tooltip';
 
 class NoopObserver {
@@ -54,6 +59,20 @@ class NoopObserver {
 vi.stubGlobal('ResizeObserver', NoopObserver);
 vi.stubGlobal('DOMRectReadOnly', class {});
 Element.prototype.scrollIntoView ??= function scrollIntoView(): void {};
+
+/**
+ * The one store action this pane calls.
+ *
+ * Mocked rather than exercised: what it does — split a column, move its
+ * directory, close this dialog, send — is pinned in `state/describeBank.test.ts`
+ * against the real store, and what the card owes is only that it calls it, with
+ * the four facts the prompt is composed from.
+ */
+const describeMemoryBank = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+vi.mock('@/state/store', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/state/store')>()),
+  describeMemoryBank,
+}));
 
 const ok = <T,>(value: T) => ({ ok: true as const, value });
 
@@ -73,6 +92,60 @@ const check = (id: string, state: MemoryBankCheck['state']): MemoryBankCheck => 
   remedy: null,
 });
 
+/**
+ * One configured bank, healthy, with everything the card draws.
+ *
+ * A builder rather than literals per test because the record grew a name, a
+ * description, a format, a profile scope and a problems list, and a test that
+ * spelled all of them out to assert on one of them would be five lines of
+ * noise around the line that matters.
+ */
+const bank = (over: Partial<MemoryBankInfo> = {}): MemoryBankInfo => ({
+  slug: 'team',
+  name: 'team',
+  description: null,
+  format: 'manifest',
+  profiles: { kind: 'all' },
+  problems: [],
+  path: '/Users/demo/Documents/team',
+  remote: 'https://git.example.com/team/bank.git',
+  role: 'readwrite',
+  enabled: true,
+  isDefault: true,
+  exists: true,
+  source: 'cerebro@52a0a32',
+  memories: 3,
+  mirrored: 0,
+  validationErrors: 0,
+  projects: 2,
+  embedsCli: true,
+  ...over,
+});
+
+/** One entry in a bank, as the browser reads it. */
+const memory = (over: Partial<MemoryBankMemory> = {}): MemoryBankMemory => ({
+  name: 'a-fact',
+  title: 'A fact',
+  type: 'reference',
+  description: 'Something durable',
+  body: 'The body of the memory.',
+  added: '2026-09-15',
+  author: 'demo@example.com',
+  org: null,
+  project: null,
+  scope: {},
+  problems: [],
+  readonly: false,
+  file: 'memories/a-fact.md',
+  ...over,
+});
+
+/** The two accounts the profile picker draws its rows from. */
+const PROFILES = [
+  { id: 'work', label: 'Work', providerId: 'claude', configDir: '/home/u/.work' },
+  { id: 'side', label: 'Side', providerId: 'codex', configDir: '/home/u/.side' },
+];
+
 /** Every check green — the baseline the gating tests vary one row from. */
 const HEALTHY: MemoryBankPreflight = {
   ready: true,
@@ -88,6 +161,10 @@ let verifyAnswer: MemoryBankVerifyRemoteResponse = {
 };
 const verifyCalls: MemoryBankVerifyRemoteRequest[] = [];
 const addCalls: unknown[] = [];
+const profileCalls: MemoryBankSetProfilesRequest[] = [];
+const wireCalls: MemoryBankWireClaudeCodeRequest[] = [];
+/** Entries the next `memories` read answers with, per slug. */
+let bankMemories: readonly MemoryBankMemory[] = [];
 
 /* -------------------------------------------------------------------------- */
 /* The key managers this machine has                                          */
@@ -167,7 +244,7 @@ const testRefCalls: SecretsRefTestRequest[] = [];
   memoryBanks: {
     status: async () => ok(status),
     preflight: async () => preflight,
-    memories: async () => ok({ memories: [] }),
+    memories: async () => ok({ memories: bankMemories }),
     verifyRemote: async (request: MemoryBankVerifyRemoteRequest) => {
       verifyCalls.push(request);
       return ok(verifyAnswer);
@@ -179,6 +256,14 @@ const testRefCalls: SecretsRefTestRequest[] = [];
     sync: async () => ok({ message: '' }),
     retire: async () => ok({ message: '' }),
     setEnabled: async () => ok({ message: '' }),
+    setProfiles: async (request: MemoryBankSetProfilesRequest) => {
+      profileCalls.push(request);
+      return ok({ message: 'Attached.' });
+    },
+    wireClaudeCode: async (request: MemoryBankWireClaudeCodeRequest) => {
+      wireCalls.push(request);
+      return ok({ message: 'Wired.' });
+    },
     forget: async () => ok({ message: '' }),
     setMasterEnabled: async () => ok({ message: '' }),
   },
@@ -217,6 +302,8 @@ beforeEach(() => {
   verifyAnswer = { outcome: 'ok', headPresent: true, detail: 'HEAD is 52a0a327' };
   connections = CONNECTIONS;
   refTestAnswer = { found: true, keysAtPath: ['git_token', 'username'] };
+  bankMemories = [];
+  seedApp({ profiles: PROFILES as never });
 });
 
 afterEach(() => {
@@ -224,6 +311,9 @@ afterEach(() => {
   verifyCalls.length = 0;
   addCalls.length = 0;
   testRefCalls.length = 0;
+  profileCalls.length = 0;
+  wireCalls.length = 0;
+  describeMemoryBank.mockClear();
 });
 
 describe('joining a private bank', () => {
@@ -382,12 +472,12 @@ describe('verifying a remote', () => {
 
 describe('what actually blocks the button', () => {
   it('joins with a failing check that has nothing to do with joining', async () => {
-    // `remote` is the doctor's probe of the CLI's *default* upstream, which an
-    // outside user can only ever fail; `repo` is about a destination directory
-    // a join does not use. Neither is a reason to refuse the button.
+    // `repo` is about a destination directory a join does not use, and
+    // `python` is about a CLI nothing on this path runs any more — Artemis
+    // reads the banks itself. Neither is a reason to refuse the button.
     preflight = ok({
       ready: false,
-      checks: [check('git', 'ok'), check('python', 'ok'), check('remote', 'fail'), check('repo', 'fail')],
+      checks: [check('git', 'ok'), check('python', 'fail'), check('repo', 'fail')],
     });
     await renderPane();
     fillJoin();
@@ -413,7 +503,8 @@ describe('what actually blocks the button', () => {
 
   it('still refuses to create a bank with no git identity, because creating commits', async () => {
     // The same failed check gates the two modes differently, which is the
-    // whole point of a per-mode list: joining is a clone, creating is a commit.
+    // whole point of a per-mode list: joining is a clone, creating is a commit
+    // — of the BANK.md the bank starts from.
     preflight = ok({ ready: false, checks: [check('git', 'ok'), check('git-identity', 'fail')] });
     await renderPane();
     fillJoin();
@@ -423,6 +514,426 @@ describe('what actually blocks the button', () => {
       screen.getByRole('button', { name: 'Create local' }).click();
     });
     expect(screen.getByRole('button', { name: 'Create bank' }).hasAttribute('disabled')).toBe(true);
+  });
+
+  it('adopts a folder on a machine that can do nothing else', async () => {
+    // Adopting writes nothing and clones nothing: it registers a directory
+    // that already is a bank. No git, no identity, and it is still a legal
+    // thing to ask for — which is why its blocking list is empty.
+    preflight = ok({
+      ready: false,
+      checks: [check('git', 'fail'), check('git-identity', 'fail'), check('python', 'fail')],
+    });
+    await renderPane();
+    await act(async () => {
+      screen.getByRole('button', { name: 'Adopt a folder' }).click();
+    });
+    fireEvent.change(screen.getByLabelText('Bank slug'), { target: { value: 'team' } });
+    fireEvent.change(screen.getByLabelText('Bank path'), { target: { value: '/Users/demo/team' } });
+
+    expect(screen.getByRole('button', { name: 'Adopt bank' }).hasAttribute('disabled')).toBe(false);
+  });
+
+  it('blocks all three modes in a window driving another machine', async () => {
+    // `remote` is the synthetic row `remoteBridge` answers the preflight with.
+    // The banks are on the serving machine and managed there, so every button
+    // has to be off — the version that left Join enabled produced a click
+    // whose only result was `add` refusing.
+    preflight = ok({
+      ready: false,
+      checks: [
+        {
+          id: 'remote',
+          label: 'Remote connection',
+          state: 'fail',
+          detail: 'Memory banks live on the serving machine and are managed there.',
+          remedy: null,
+        },
+      ],
+    });
+    await renderPane();
+    fillJoin();
+    expect(joinButton().hasAttribute('disabled')).toBe(true);
+
+    await act(async () => {
+      screen.getByRole('button', { name: 'Create local' }).click();
+    });
+    expect(screen.getByRole('button', { name: 'Create bank' }).hasAttribute('disabled')).toBe(true);
+
+    await act(async () => {
+      screen.getByRole('button', { name: 'Adopt a folder' }).click();
+    });
+    expect(screen.getByRole('button', { name: 'Adopt bank' }).hasAttribute('disabled')).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The bank card                                                              */
+/* -------------------------------------------------------------------------- */
+
+describe('a bank card', () => {
+  const withBanks = (...banks: readonly MemoryBankInfo[]): void => {
+    status = { ...NO_BANKS, masterEnabled: true, banks };
+  };
+
+  it('says how the bank is kept, in the words of the thing on disk', async () => {
+    // The format decides what everything else on the card means, so it is a
+    // badge rather than a fact row: a manifest bank describes its own layout,
+    // the two legacy ones are read with the shapes the CLI baked in.
+    withBanks(
+      bank({ slug: 'manifest-bank', format: 'manifest' }),
+      bank({ slug: 'projects-bank', format: 'legacy-projects', isDefault: false }),
+      bank({ slug: 'flat-bank', format: 'legacy-flat', isDefault: false }),
+      bank({ slug: 'empty-dir', format: null, isDefault: false }),
+    );
+    await renderPane();
+
+    expect(screen.getByText('BANK.md')).toBeTruthy();
+    expect(screen.getByText('cerebro · by project')).toBeTruthy();
+    expect(screen.getByText('cerebro · flat')).toBeTruthy();
+    // Not a format at all — a registered directory that holds no bank, which
+    // is a condition and is drawn as one.
+    expect(screen.getByText('not a bank')).toBeTruthy();
+  });
+
+  it('shows the bank’s own name and description, and prints the name once', async () => {
+    withBanks(
+      bank({ slug: 'cortex', name: 'Cortex', description: 'Everything the homelab has learned.' }),
+    );
+    await renderPane();
+
+    expect(screen.getByText('Cortex')).toBeTruthy();
+    expect(screen.getByText('Everything the homelab has learned.')).toBeTruthy();
+
+    cleanup();
+    // A bank that calls itself after its slug says it once, not twice.
+    withBanks(bank({ slug: 'cortex', name: 'cortex' }));
+    await renderPane();
+    expect(screen.getAllByText('cortex')).toHaveLength(1);
+  });
+
+  it('no longer offers to wire profiles, because there are no blocks to repair', async () => {
+    // The drift-repair button existed for the CLI's managed CLAUDE.md blocks,
+    // which are stock Claude Code's path and not Artemis's any more. What
+    // "which profiles" means now is the picker below it.
+    withBanks(bank());
+    await renderPane();
+    expect(screen.queryByRole('button', { name: 'Wire profiles' })).toBeNull();
+  });
+
+  it('attaches the bank to every profile, or to the ones ticked', async () => {
+    withBanks(bank({ profiles: { kind: 'all' } }));
+    await renderPane();
+
+    // Narrowing hands back every profile ticked, so the act of narrowing does
+    // not itself detach the bank from everything.
+    await act(async () => {
+      screen.getByLabelText('Attach “team” to every profile').click();
+    });
+    expect(profileCalls).toEqual([
+      { slug: 'team', profiles: { kind: 'profiles', profileIds: ['work', 'side'] } },
+    ]);
+  });
+
+  it('ticks and unticks one profile at a time', async () => {
+    withBanks(bank({ profiles: { kind: 'profiles', profileIds: ['work'] } }));
+    await renderPane();
+
+    // The per-profile rows are only there once "every profile" is off, which
+    // is the state this bank is already in.
+    expect(screen.getByLabelText('Attach “team” to Work').getAttribute('data-state')).toBe('checked');
+    expect(screen.getByLabelText('Attach “team” to Side').getAttribute('data-state')).toBe('unchecked');
+
+    await act(async () => {
+      screen.getByLabelText('Attach “team” to Side').click();
+    });
+    expect(profileCalls).toEqual([
+      { slug: 'team', profiles: { kind: 'profiles', profileIds: ['work', 'side'] } },
+    ]);
+
+    profileCalls.length = 0;
+    await act(async () => {
+      screen.getByLabelText('Attach “team” to Work').click();
+    });
+    expect(profileCalls).toEqual([
+      { slug: 'team', profiles: { kind: 'profiles', profileIds: [] } },
+    ]);
+  });
+
+  it('hides the per-profile list behind "every profile"', async () => {
+    withBanks(bank({ profiles: { kind: 'all' } }));
+    await renderPane();
+    expect(screen.queryByLabelText('Attach “team” to Work')).toBeNull();
+  });
+
+  it('folds what the reader refused, with the count on the summary', async () => {
+    withBanks(
+      bank({
+        validationErrors: 2,
+        problems: [
+          'memories/a/b/one.md: metadata.type is missing',
+          'memories/a/b/two.md: body exceeds 6000 characters',
+        ],
+      }),
+    );
+    await renderPane();
+
+    // Folded: on a healthy bank it is nothing, and on a broken one it would
+    // bury every other fact on the card. The count is on the summary so a
+    // person can see there is something to open without opening it.
+    expect(screen.getByText('2 entries have problems')).toBeTruthy();
+    expect(screen.queryByText(/metadata.type is missing/)).toBeNull();
+
+    await act(async () => {
+      screen.getByText('2 entries have problems').click();
+    });
+    expect(screen.getByText(/metadata.type is missing/)).toBeTruthy();
+    expect(screen.getByText(/body exceeds 6000 characters/)).toBeTruthy();
+  });
+
+  it('says nothing about problems when there are none', async () => {
+    withBanks(bank());
+    await renderPane();
+    expect(screen.queryByText(/entries have problems/)).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The other harness                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Wiring a bank into stock Claude Code — the one thing on this pane that is
+ * not about Artemis.
+ *
+ * Three properties, and they are the whole of the row. It reports what the
+ * *files* say rather than what the pane remembers; it asks for the state it
+ * wants rather than toggling; and a bank with no embedded CLI cannot do it at
+ * all, which is a dimmed button with a sentence rather than a hidden one or a
+ * click that fails.
+ */
+describe('wiring a bank into stock Claude Code', () => {
+  const PROFILE_STATES = [
+    { name: 'work', label: 'Work', hook: true, banks: { team: true } },
+    { name: 'side', label: 'Side', hook: false, banks: { team: false } },
+  ];
+
+  const withBanks = (
+    banks: readonly MemoryBankInfo[],
+    profiles: MemoryBanksStatus['profiles'] = PROFILE_STATES,
+  ): void => {
+    status = { ...NO_BANKS, masterEnabled: true, banks, profiles };
+  };
+
+  const wireButton = (): HTMLElement =>
+    screen.getByRole('button', { name: 'Wire for stock Claude Code' });
+
+  it('says what the profiles carry, block count and hook', async () => {
+    withBanks([bank()]);
+    await renderPane();
+    expect(screen.getByText(/Managed block in 1 of 2 profiles/)).toBeTruthy();
+    expect(screen.getByText(/session-start sync hook installed/)).toBeTruthy();
+  });
+
+  it('says when no profile carries it, and offers to wire', async () => {
+    withBanks([bank()], [{ name: 'work', label: 'Work', hook: false, banks: { team: false } }]);
+    await renderPane();
+    expect(screen.getByText(/Managed block in 0 of 1 profile /)).toBeTruthy();
+    expect(screen.getByText(/session-start sync hook not installed/)).toBeTruthy();
+    expect(wireButton()).toBeTruthy();
+  });
+
+  it('offers to unwire a bank some profile already carries', async () => {
+    withBanks([bank()]);
+    await renderPane();
+    expect(screen.getByRole('button', { name: 'Unwire' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Wire for stock Claude Code' })).toBeNull();
+  });
+
+  it('asks for the state it wants, both ways', async () => {
+    withBanks([bank()], [{ name: 'work', label: 'Work', hook: false, banks: { team: false } }]);
+    await renderPane();
+    await act(async () => {
+      wireButton().click();
+    });
+    expect(wireCalls).toEqual([{ slug: 'team', enabled: true }]);
+
+    wireCalls.length = 0;
+    cleanup();
+    withBanks([bank()]);
+    await renderPane();
+    await act(async () => {
+      screen.getByRole('button', { name: 'Unwire' }).click();
+    });
+    expect(wireCalls).toEqual([{ slug: 'team', enabled: false }]);
+  });
+
+  it('refuses, with a reason, on a bank that embeds no CLI', async () => {
+    // Not hidden: a bank with no `bin/cerebro` is perfectly healthy, and the
+    // sentence is what keeps the dimmed button from reading as a fault.
+    withBanks(
+      [bank({ embedsCli: false })],
+      [{ name: 'work', label: 'Work', hook: false, banks: { team: false } }],
+    );
+    await renderPane();
+
+    const button = wireButton();
+    expect(button.getAttribute('aria-disabled')).toBe('true');
+    await act(async () => {
+      button.click();
+    });
+    expect(wireCalls).toEqual([]);
+  });
+
+  it('says whose path this is, so nobody reads it as an Artemis setting', async () => {
+    withBanks([bank()]);
+    await renderPane();
+    expect(screen.getByText(/Artemis's own runs need none of this/)).toBeTruthy();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Giving a bank a BANK.md                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The card's one route to a manifest.
+ *
+ * A `BANK.md` is not a form — nearly all of it is in the tree and the rest is a
+ * conversation — so the card's whole obligation is to start that conversation
+ * in the right checkout, and to say which of the two jobs it is starting.
+ */
+describe('describing a bank', () => {
+  const withBanks = (...banks: readonly MemoryBankInfo[]): void => {
+    status = { ...NO_BANKS, masterEnabled: true, banks };
+  };
+
+  const describeButton = (): HTMLElement =>
+    screen.getByRole('button', { name: 'Describe this bank…' });
+
+  it('offers to write a manifest for a bank that has none, whatever it is kept as', async () => {
+    withBanks(
+      bank({ slug: 'flat-bank', format: 'legacy-flat' }),
+      bank({ slug: 'projects-bank', format: 'legacy-projects', isDefault: false }),
+      // Not a format at all — a registered directory Artemis does not read as a
+      // bank, which is the card most in need of this.
+      bank({ slug: 'empty-dir', format: null, isDefault: false }),
+    );
+    await renderPane();
+
+    expect(screen.getAllByRole('button', { name: 'Describe this bank…' })).toHaveLength(3);
+    expect(screen.queryByRole('button', { name: 'Revise BANK.md…' })).toBeNull();
+  });
+
+  it('offers to revise the manifest a bank already has', async () => {
+    // Describing a bank that already describes itself would be proposing work
+    // the user can see on the card is done.
+    withBanks(bank({ format: 'manifest' }));
+    await renderPane();
+
+    expect(screen.getByRole('button', { name: 'Revise BANK.md…' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Describe this bank…' })).toBeNull();
+  });
+
+  it('says what pressing it starts, on the card that needs telling', async () => {
+    withBanks(bank({ format: null }));
+    await renderPane();
+    expect(
+      screen.getByText(
+        "Starts a conversation in the bank's checkout that reads the tree, proposes a BANK.md, asks you what it cannot infer, and lands it through the bank's review path.",
+      ),
+    ).toBeTruthy();
+
+    cleanup();
+    // A bank with a manifest keeps the button and drops the pitch.
+    withBanks(bank({ format: 'manifest' }));
+    await renderPane();
+    expect(screen.queryByText(/Starts a conversation in the bank/)).toBeNull();
+  });
+
+  it('hands the store the four facts the prompt is composed from', async () => {
+    withBanks(
+      bank({
+        slug: 'cortex',
+        name: 'Cortex',
+        path: '/Users/demo/Documents/cortex',
+        format: 'legacy-projects',
+      }),
+    );
+    await renderPane();
+
+    await act(async () => {
+      describeButton().click();
+    });
+
+    expect(describeMemoryBank).toHaveBeenCalledWith({
+      slug: 'cortex',
+      name: 'Cortex',
+      path: '/Users/demo/Documents/cortex',
+      format: 'legacy-projects',
+    });
+  });
+
+  it('refuses on a bank that is not on disk, and names the path', async () => {
+    // There is no tree to read and no directory to run in. Disabled with the
+    // reason rather than hidden — `disabled-reason.tsx` has the house rule, and
+    // the reason is why the button stays focusable instead of natively
+    // `disabled`.
+    withBanks(bank({ format: null, exists: false, path: '/Users/demo/gone' }));
+    await renderPane();
+
+    const button = describeButton();
+    expect(button.getAttribute('aria-disabled')).toBe('true');
+    expect(button.hasAttribute('disabled')).toBe(false);
+
+    await act(async () => {
+      button.click();
+    });
+    expect(describeMemoryBank).not.toHaveBeenCalled();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The memory browser                                                         */
+/* -------------------------------------------------------------------------- */
+
+describe('browsing a bank', () => {
+  const open = async (): Promise<void> => {
+    await act(async () => {
+      screen.getByText('memories').click();
+    });
+  };
+
+  it('groups by the entry’s own scope labels, whatever the bank calls them', async () => {
+    // The labels are the bank's vocabulary, not Artemis's: a brand-first bank
+    // groups by brand and system, and this pane has no business translating
+    // that into org and project.
+    status = { ...NO_BANKS, masterEnabled: true, banks: [bank()] };
+    bankMemories = [
+      memory({ name: 'one', file: 'a/one.md', scope: { brand: 'cool-jams', system: 'ops' } }),
+      memory({ name: 'two', file: 'b/two.md', scope: {} }),
+    ];
+    await renderPane();
+    await open();
+
+    expect(screen.getByText(/cool-jams \/ ops/)).toBeTruthy();
+    // No labels at all is a real answer, and it is not "unknown" — it is
+    // unfiled.
+    expect(screen.getByText(/unfiled/)).toBeTruthy();
+  });
+
+  it('shows why an entry did not reach the agents', async () => {
+    status = { ...NO_BANKS, masterEnabled: true, banks: [bank()] };
+    bankMemories = [
+      memory({ name: 'broken', problems: ['metadata.type must be one of decision, feedback, reference, workflow'] }),
+    ];
+    await renderPane();
+    await open();
+
+    // Listed rather than hidden: the person who can fix it has to be able to
+    // find it, and the reason is the only useful part.
+    expect(screen.getByText('not installed')).toBeTruthy();
+    expect(screen.getByText(/metadata.type must be one of/)).toBeTruthy();
   });
 });
 
@@ -727,23 +1238,7 @@ describe('a bank whose credential lives in a key manager', () => {
     status = {
       ...NO_BANKS,
       masterEnabled: true,
-      banks: [
-        {
-          slug: 'team',
-          path: '/Users/demo/Documents/team',
-          remote: 'https://git.example.com/team/bank.git',
-          role: 'readwrite',
-          enabled: true,
-          isDefault: true,
-          exists: true,
-          source: 'cerebro@52a0a32',
-          memories: 3,
-          mirrored: 0,
-          validationErrors: 0,
-          projects: 2,
-          credential: { kind: 'ref' },
-        },
-      ],
+      banks: [bank({ credential: { kind: 'ref' } })],
     };
     await renderPane();
     expect(screen.getByText('key manager')).toBeTruthy();

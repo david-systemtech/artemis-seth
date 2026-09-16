@@ -68,6 +68,7 @@ export * from './forge.js';
 export * from './github.js';
 export * from './update.js';
 export * from './agentPrompts.js';
+export * from './describeBank.js';
 export * from './suggestedTasks.js';
 export * from './secretRefs.js';
 export * from './ipc.js';
