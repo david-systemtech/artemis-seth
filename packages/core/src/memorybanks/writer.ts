@@ -218,6 +218,22 @@ async function git(root: string, args: readonly string[], env: Readonly<Record<s
   return stdout;
 }
 
+/**
+ * `-c user.name=… -c user.email=…` when the checkout has no identity to commit
+ * with — a CI runner, a fresh container — and nothing otherwise, so a
+ * configured identity is never overridden. Asked per landing; cheap.
+ */
+async function gitIdentityArgs(root: string, env: Readonly<Record<string, string>>): Promise<string[]> {
+  if (env['GIT_COMMITTER_EMAIL'] !== undefined || env['GIT_AUTHOR_EMAIL'] !== undefined) return [];
+  try {
+    const email = (await git(root, ['config', '--get', 'user.email'], env)).trim();
+    if (email.length > 0) return [];
+  } catch {
+    // Unset: git exits 1. Fall through to the fallback.
+  }
+  return ['-c', 'user.name=Artemis memory banks', '-c', 'user.email=memory-banks@artemis.local'];
+}
+
 function gitAuthArgs(forge: Forge | null, credential: ForgeCredential | null): string[] {
   if (forge === null || credential === null) return [];
   // Sent for this command only, never written to the checkout's config.
@@ -263,17 +279,19 @@ export async function landChanges(
   const forge = remoteUrl === null ? null : detectForge(remoteUrl);
   const wantsPullRequest = bank.landing === 'pull-request' && remote;
 
+  const env = deps.gitEnv ?? {};
   if (!wantsPullRequest) {
     apply(bank.root);
     const paths = input.changes.map((change) => change.path);
-    await git(bank.root, ['add', '-A', '--', ...paths]);
-    await git(bank.root, ['commit', '-q', '-m', input.message, '--', ...paths]);
-    const sha = (await git(bank.root, ['rev-parse', '--short', 'HEAD'])).trim();
+    const identity = await gitIdentityArgs(bank.root, env);
+    await git(bank.root, ['add', '-A', '--', ...paths], env);
+    await git(bank.root, [...identity, 'commit', '-q', '-m', input.message, '--', ...paths], env);
+    const sha = (await git(bank.root, ['rev-parse', '--short', 'HEAD'], env)).trim();
     let detail = `committed ${sha}`;
     if (remote) {
       const credential = forge === null ? null : await resolveCredential(forge, deps);
       try {
-        await git(bank.root, [...gitAuthArgs(forge, credential), 'push', '-q'], deps.gitEnv ?? {}, 120_000);
+        await git(bank.root, [...gitAuthArgs(forge, credential), 'push', '-q'], env, 120_000);
         detail += ' and pushed';
       } catch (error) {
         detail += `; push failed: ${lastLine(error)}`;
@@ -287,7 +305,6 @@ export async function landChanges(
   const branch = `memory-${stamp}-${input.branchSlug}`.slice(0, 60);
   const credential = forge === null ? null : await resolveCredential(forge, deps);
   const auth = gitAuthArgs(forge, credential);
-  const env = deps.gitEnv ?? {};
 
   try {
     await git(bank.root, [...auth, 'fetch', '-q', 'origin', base], env, 120_000);
@@ -297,12 +314,13 @@ export async function landChanges(
   const scratch = mkdtempSync(join(tmpdir(), 'artemis-bank-land-'));
   const worktree = join(scratch, 'wt');
   try {
-    await git(bank.root, ['worktree', 'add', '-q', '--detach', worktree, `origin/${base}`]);
+    await git(bank.root, ['worktree', 'add', '-q', '--detach', worktree, `origin/${base}`], env);
     apply(worktree);
     const paths = input.changes.map((change) => change.path);
-    await git(worktree, ['add', '-A', '--', ...paths]);
-    await git(worktree, ['commit', '-q', '-m', input.message, '--', ...paths]);
-    const sha = (await git(worktree, ['rev-parse', '--short', 'HEAD'])).trim();
+    const identity = await gitIdentityArgs(worktree, env);
+    await git(worktree, ['add', '-A', '--', ...paths], env);
+    await git(worktree, [...identity, 'commit', '-q', '-m', input.message, '--', ...paths], env);
+    const sha = (await git(worktree, ['rev-parse', '--short', 'HEAD'], env)).trim();
     await git(worktree, [...auth, 'push', '-q', 'origin', `HEAD:refs/heads/${branch}`], env, 120_000);
 
     if (forge === null) {
@@ -352,7 +370,7 @@ export async function landChanges(
     };
   } finally {
     try {
-      await git(bank.root, ['worktree', 'remove', '--force', worktree]);
+      await git(bank.root, ['worktree', 'remove', '--force', worktree], env);
     } catch {
       // Best effort; the scratch directory goes regardless.
     }
