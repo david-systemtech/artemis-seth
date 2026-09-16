@@ -353,6 +353,95 @@ describe('a turn', () => {
     });
   });
 
+  /*
+   * The context reading is a separate measurement from the bill, and the whole
+   * reason these exist is that it used to be discarded: `toOpenAiUsage` took
+   * the two token counts off a usage event and dropped everything else, so a
+   * served conversation could report what it had spent and never how full it
+   * was. Every property below is one half of what "reported" has to mean.
+   */
+  it('puts the context reading on the wire as the run restates it', async () => {
+    const source = fakeRuns([
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 0 }, contextTokens: 4_000 },
+      },
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 0 }, contextTokens: 9_000 },
+      },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+
+    const readings = (await drain(source)).filter((event) => event.kind === 'context');
+    expect(readings).toMatchObject([{ reading: { tokens: 4_000 } }, { reading: { tokens: 9_000 } }]);
+  });
+
+  it('holds the two halves together when they arrive on different events', async () => {
+    // Claude's own shape: occupancy per assistant message with no window, and
+    // the window once on the result with no occupancy. Taking either snapshot
+    // wholesale leaves a gauge with a needle and no dial.
+    const source = fakeRuns([
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 0 }, contextTokens: 9_000 },
+      },
+      {
+        type: 'run.end',
+        reason: 'completed',
+        usage: {
+          scope: 'final',
+          tokens: { inputTokens: 100, outputTokens: 40 },
+          contextWindow: 200_000,
+        },
+      },
+    ] as Partial<AgentEvent>[]);
+
+    const done = (await drain(source)).at(-1) as {
+      result: { context?: Record<string, number> };
+    };
+    expect(done.result.context).toEqual({ tokens: 9_000, window: 200_000 });
+  });
+
+  it('says nothing at all when the run reports no context', async () => {
+    // A route that only bills must not start sending empty readings: the gauge
+    // renders "unknown" from an absent field, and `{}` is not absent.
+    const source = fakeRuns([
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 2 } },
+      },
+      {
+        type: 'run.end',
+        reason: 'completed',
+        usage: { scope: 'final', tokens: { inputTokens: 100, outputTokens: 40 } },
+      },
+    ] as Partial<AgentEvent>[]);
+
+    const events = await drain(source);
+    expect(events.filter((event) => event.kind === 'context')).toEqual([]);
+    expect((events.at(-1) as { result: { context?: unknown } }).result.context).toBeUndefined();
+  });
+
+  it('does not put a chunk on the wire for a reading that has not moved', async () => {
+    // Codex repeats the window on every update. Relaying each one would be a
+    // chunk per assistant message saying exactly what the last one said.
+    const source = fakeRuns([
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 5, outputTokens: 0 }, contextTokens: 7_000, contextWindow: 272_000 },
+      },
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 5, outputTokens: 0 }, contextTokens: 7_000, contextWindow: 272_000 },
+      },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+
+    const readings = (await drain(source)).filter((event) => event.kind === 'context');
+    expect(readings).toHaveLength(1);
+  });
+
   it('always disposes the run, so a reply never leaks a process', async () => {
     const source = fakeRuns([{ type: 'run.end', reason: 'completed' }]);
     await drain(source);
@@ -1177,6 +1266,61 @@ describe('POST /v1/chat/completions', () => {
         content: 'Yes.',
         reasoning_content: 'Weighing it up.',
       });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('puts the context reading on the wire, as the turn fills the window', async () => {
+    /*
+     * The whole point, end to end and through `chunkFor`: a client watching a
+     * served conversation can see how full it is *while* it runs. The reading
+     * cannot ride `usage` — that is a bill, and OpenAI has no field for an
+     * occupancy — so it rides an empty delta in the namespace, and an OpenAI
+     * client appends nothing from it.
+     */
+    const source = fakeRuns([
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 0 }, contextTokens: 4_000 },
+        seq: 0,
+      },
+      { type: 'text.delta', text: 'working', seq: 1 },
+      {
+        type: 'run.end',
+        reason: 'completed',
+        seq: 2,
+        usage: {
+          scope: 'final',
+          tokens: { inputTokens: 120, outputTokens: 40 },
+          contextTokens: 9_500,
+          contextWindow: 200_000,
+        },
+      },
+    ] as Partial<AgentEvent>[]);
+
+    const { server, url } = await serve(source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      });
+      const chunks = (await response.text())
+        .split('\n\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => line.slice(6))
+        .filter((chunk) => chunk !== '[DONE]')
+        .map((chunk) => JSON.parse(chunk) as { artemis?: { context?: unknown }; choices: { delta: unknown }[] });
+
+      const carrying = chunks.filter((chunk) => chunk.artemis?.context !== undefined);
+      expect(carrying.map((chunk) => chunk.artemis?.context)).toEqual([
+        { tokens: 4_000 },
+        { tokens: 9_500, window: 200_000 },
+      ]);
+      // Mid-turn it arrives on an empty delta, so no OpenAI client renders it
+      // as part of the answer.
+      expect(carrying[0]?.choices[0]?.delta).toEqual({});
     } finally {
       await server.close();
     }

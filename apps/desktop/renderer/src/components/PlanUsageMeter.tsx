@@ -21,14 +21,21 @@
  * the *only* budget such a run spends. See {@link ContextOnlyMeter}; the plan
  * path below is untouched by it.
  *
- * ## The trigger is three rings
+ * ## The trigger is the rings
  *
- *     5hr ⬤  Week ⬤  Fable ⬤
+ *     5hr ⬤  Week ⬤  Fable ⬤  Ctx ⬤
  *
- * The three limits worth watching without opening anything, each named in front
- * of the ring reporting it. See the comment on the trigger for why three rather
- * than one, and {@link meterSlots} for what happens on a plan that does not have
- * these particular windows.
+ * The limits worth watching without opening anything, each named in front of the
+ * ring reporting it. See the comment on the trigger for why three plan rings
+ * rather than one, and {@link meterSlots} for what happens on a plan that does
+ * not have these particular windows.
+ *
+ * The fourth is the context window — {@link ContextSlot} — and it is the only
+ * one that can be absent: it appears once a run has reported a reading and
+ * occupies no width before that. It was previously popover-only on a plan
+ * provider, on the reasoning that the rings were about the *plan*. That reading
+ * put the one number that ends a conversation without warning behind a click,
+ * while three that end it with hours of notice sat in the open.
  *
  * ## Stale-while-revalidate
  *
@@ -57,7 +64,7 @@ import { call, resolveBridge } from '../lib/bridge';
 import { formatTokens } from '@rx-artemis/transcript';
 import { useServedAccount } from '../hooks/useServedAccount';
 import { activeCapabilities, useApp } from '../state/store';
-import { useContextReading } from '../hooks/useContextReading';
+import { useContextReading, type ContextReading } from '../hooks/useContextReading';
 import { usePane, usePaneRef } from '../state/paneContext';
 import { paneState } from '../state/pane';
 import { WithReason } from './disabled-reason';
@@ -556,6 +563,12 @@ export function PlanUsageMeter(): ReactElement | null {
   const pane = usePaneRef();
   const profileId = usePane((s) => s.activeProfileId);
   const supported = usePane((s) => activeCapabilities(s).planUsageReporting);
+  /*
+   * Read here rather than inside {@link ContextSlot} because the trigger's
+   * `aria-label` needs it too, and because a hook below the early returns
+   * below would be a hook that runs conditionally.
+   */
+  const context = useContextReading();
 
   /*
    * At an Artemis Server profile the reading belongs to the *served account*
@@ -636,11 +649,21 @@ export function PlanUsageMeter(): ReactElement | null {
 
     The popover underneath is unchanged and still lists every window the plan
     reports, including the ones with no ring here.
+
+    A fourth ring joins them when the run's context is known — see
+    {@link ContextSlot}. A plan and a window are not alternatives: the plan says
+    when you must stop for the day, the window says when *this conversation*
+    stops, and the second is the one that arrives without warning.
   */
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
-        aria-label={`Plan usage — ${slots.map(describeSlot).join(', ')}`}
+        aria-label={[
+          `Plan usage — ${slots.map(describeSlot).join(', ')}`,
+          ...(context.reporting && context.tokens !== undefined
+            ? [`context ${describeContext(context)}`]
+            : []),
+        ].join(', ')}
         // Chrome only. `gap-2` between slots and `gap-1` inside one is 7D
         // `.meter`/`.meter .slot` verbatim, and the hover goes to the wash the
         // chips beside it wear rather than a tint of the hairline colour.
@@ -655,6 +678,7 @@ export function PlanUsageMeter(): ReactElement | null {
             />
           </span>
         ))}
+        <ContextSlot reading={context} />
       </PopoverTrigger>
 
       <PopoverContent align="start" side="top" className="w-72 p-3">
@@ -662,6 +686,64 @@ export function PlanUsageMeter(): ReactElement | null {
       </PopoverContent>
     </Popover>
   );
+}
+
+/**
+ * The context ring, beside the plan rings rather than instead of them.
+ * ============================================================================
+ *
+ * {@link ContextOnlyMeter} exists because a local server has no plan; this
+ * exists because having a plan was never a reason not to know how full the
+ * conversation is. The two readings are on different clocks and neither
+ * substitutes for the other — the same argument that put three rings on this
+ * bar instead of one. A weekly allowance at 30% tells you nothing about a
+ * conversation two turns from truncation, and truncation is the one that
+ * arrives without a warning banner.
+ *
+ * Rendered as one more slot in the row's own language: the label in front, the
+ * ring behind, no figures. The figures live in the popover's
+ * {@link ContextWindowRow}, which was already there and already right — 22px on
+ * a status bar is room for a proportion, and "of what" is a question with a
+ * place to be answered a click away.
+ *
+ * ## Absent, not empty, when there is nothing to say
+ *
+ * Nothing renders unless the provider reports context *and* something has run.
+ * An unfilled ring is indistinguishable from a ring at 0% — the same trap
+ * {@link ContextOnlyMeter} falls back to a glyph to avoid — and here there is
+ * no need for a placeholder at all: the plan rings hold the slot, so the honest
+ * thing is to occupy no width until there is a reading. An unknown *window* is
+ * different and does render: `utilization` is null, the ring draws its dash,
+ * and the popover says which provider declined to state a size.
+ */
+function ContextSlot({ reading }: { readonly reading: ContextReading }): ReactElement | null {
+  if (!reading.reporting || reading.tokens === undefined) return null;
+
+  return (
+    // Silent to a screen reader on purpose: the trigger's own `aria-label`
+    // overrides everything inside it, and this reading is named there by
+    // `describeContext` instead. `title` is what a pointer gets.
+    <span className="flex shrink-0 items-center gap-1" title={`Context — ${describeContext(reading)}`}>
+      <span className="font-mono text-2xs text-ink-faint">Ctx</span>
+      <UsageRing utilization={reading.utilization} />
+    </span>
+  );
+}
+
+/**
+ * The context reading as a sentence, for the trigger's label.
+ *
+ * Spelled out rather than left as "Ctx 38" for the same reason
+ * {@link describeSlot} spells the plan windows out: a percentage with no window
+ * attached is a number a screen-reader user has to guess the meaning of, and
+ * the one case where the percentage does not exist at all — an unstated window
+ * — has to say so rather than be announced as nothing.
+ */
+function describeContext(reading: ContextReading): string {
+  if (reading.tokens === undefined) return 'no run yet';
+  return reading.window === undefined
+    ? `${formatTokens(reading.tokens)} used, window size unknown`
+    : `${formatTokens(reading.tokens)} of ${formatTokens(reading.window)}`;
 }
 
 /**
