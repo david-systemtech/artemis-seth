@@ -53,3 +53,16 @@ minimumReleaseAgeExclude:
   - '@anthropic-ai/claude-agent-sdk-linux-x64-musl@0.3.258'
   - '@anthropic-ai/claude-agent-sdk-win32-arm64@0.3.258'
   - '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.258'
+
+# One zod for every host, pinned rather than ranged.
+#
+# `pnpm deploy --legacy --config.node-linker=hoisted` — how the server image is
+# built — re-resolves instead of honouring the lockfile, so a `^4.4.3` range
+# there fetched 4.6.5 while every developer machine ran 4.4.3. Under 4.6.5 the
+# Agent SDK's in-process tool server cannot convert its tools' schemas when a
+# client lists them, and the served container answered every run with
+# "artemisMemory is not available". The exact dependency in `packages/core` is
+# what fixes the build; this is the belt to that pair of braces, and it lives
+# here because pnpm 11 stopped reading `pnpm.overrides` from package.json.
+overrides:
+  zod: 4.4.3
