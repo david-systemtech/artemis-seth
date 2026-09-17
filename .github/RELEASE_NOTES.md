@@ -1,6 +1,16 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.17.1
+
+A conversation on an Artemis Server takes a screenshot or a file, and anything that cannot carry one says so rather than dropping it.
+
+**Attachments reach a served conversation.** The attach control was disabled against every served pane, under a tooltip reading "Artemis does not support file attachments" — a sentence about the product, for what was a missing field on a request body. Files and images now ride the request that starts a served run and the one that steers a turn already going, and the server stages them where the agent can read them on its own machine, exactly as a local run does. An OpenAI client can send a picture too: `image_url` parts on the message being asked are read as the same thing when they carry the image inline.
+
+**An image larger than a megabyte stops being a 400 about JSON.** The server read at most a megabyte of any request body and answered anything longer with "the request body must be a JSON object" — for a body that was perfectly good JSON and merely large. Base64 adds a third to a payload that is already megabytes, so that was every real screenshot, including on the remote-window path that had been sending attachments correctly all along. The routes that carry attachments now have room for everything the composer allows, and a body past the limit is answered with the limit.
+
+**Nothing is dropped in silence.** A prompt without its screenshot is not a shorter prompt; it is a question about nothing, answered confidently. So an account whose provider cannot see a picture refuses the prompt and names itself, a malformed attachment fails the request rather than running the prompt without it, and a desktop is told before it sends that a server is too old to carry attachments — instead of the file vanishing on the way. **Update the server before or with the app:** this release refuses those prompts against a server that has not been rebuilt on it.
+
 ## What's new in 2.17.0
 
 A served conversation shows the turn it is on, can be joined while it is going, and heals a stream that falls behind; and a memory bank on a server reaches the accounts you choose.
