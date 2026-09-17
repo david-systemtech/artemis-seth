@@ -68,7 +68,7 @@ describe('sharedIndexBudget', () => {
 });
 
 describe('installing across profiles', () => {
-  it('installs into the profiles the scope covers, plus the run\'s own project', () => {
+  it('installs into the profiles the scope covers, plus the run\'s own project', { timeout: 30_000 }, () => {
     const bank = readBankAt(bankWith(['one']), { slug: 'team' });
     const { dataDir, home, work } = dataDirWithProfiles();
     const record = { slug: 'team', path: bank!.root, role: 'readwrite' as const, enabled: true, profiles: { kind: 'profiles' as const, profileIds: ['p-work'] } };
@@ -82,7 +82,7 @@ describe('installing across profiles', () => {
     expect(existsSync(join(work, 'projects', freshKey, 'memory', 'banks', 'team', 'one.md'))).toBe(true);
   });
 
-  it('reconciles a narrowed scope by removing the copies it no longer covers', () => {
+  it('reconciles a narrowed scope by removing the copies it no longer covers', { timeout: 30_000 }, () => {
     const root = bankWith(['one']);
     const { dataDir, home, work } = dataDirWithProfiles();
     const everyone = { slug: 'team', path: root, role: 'readwrite' as const, enabled: true, profiles: { kind: 'all' as const } };
@@ -95,7 +95,7 @@ describe('installing across profiles', () => {
     expect(existsSync(join(work, 'projects', 'C--x-repo', 'memory', 'banks', 'team'))).toBe(false);
   });
 
-  it('uninstalls everywhere, whatever the scope was', () => {
+  it('uninstalls everywhere, whatever the scope was', { timeout: 30_000 }, () => {
     const root = bankWith(['one']);
     const { dataDir, home, work } = dataDirWithProfiles();
     reconcileBankInstalls({ slug: 'team', path: root, role: 'readwrite', enabled: true, profiles: { kind: 'all' } }, dataDir);
