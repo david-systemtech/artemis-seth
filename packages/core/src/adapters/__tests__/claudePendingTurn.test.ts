@@ -427,3 +427,231 @@ describe('a prompt sent to a process mid-turn', () => {
     await drain(adopted[0]!.events);
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* A CLI that narrates its commands                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What the bundled CLI actually puts on the wire, measured 2026-09-17: it never
+ * echoes the prompt. A uuid-stamped command is framed by `command_lifecycle`
+ * (`queued`, then `started` as its turn opens), the turn's messages carry
+ * `user_message_uuid`, and the only `user` messages are tool results. Waiting
+ * for an echo therefore read the first tool result as somebody else's turn and
+ * sent the whole turn to a continuation nobody was watching — five silent
+ * minutes on a served conversation — and, on a fresh spawn, took the harness's
+ * own turn about an orphaned task as the prompt's and closed the process on
+ * its `result` before the prompt ran.
+ */
+
+/** The CLI framing a uuid-stamped command, as `msg_lifecycle_v1` has it. */
+function lifecycle(
+  commandUuid: string,
+  state: 'queued' | 'started' | 'completed' | 'cancelled',
+): SDKMessage {
+  return {
+    type: 'command_lifecycle',
+    command_uuid: commandUuid,
+    state,
+    uuid: `lc-${commandUuid.slice(0, 8)}-${state}`,
+    session_id: 'sess-abc',
+  } as unknown as SDKMessage;
+}
+
+/** An `init` from such a CLI, which advertises the frames. */
+const NARRATED_INIT: SDKMessage = {
+  ...(INIT as unknown as Record<string, unknown>),
+  capabilities: ['interrupt_receipt_v1', 'msg_lifecycle_v1'],
+} as unknown as SDKMessage;
+
+/** An assistant message stamped with the prompt it answers. */
+function assistantFor(text: string, userUuid: string, id = 'msg-n'): SDKMessage {
+  return {
+    ...(assistantText(text, id) as unknown as Record<string, unknown>),
+    user_message_uuid: userUuid,
+  } as unknown as SDKMessage;
+}
+
+/** A tool call, and the tool result that is the only `user` message such a CLI writes. */
+function toolCall(id: string): SDKMessage {
+  return {
+    type: 'assistant',
+    message: {
+      id: `msg-${id}`,
+      role: 'assistant',
+      content: [{ type: 'tool_use', id, name: 'Bash', input: { command: 'true' } }],
+    },
+    session_id: 'sess-abc',
+    uuid: `u-${id}`,
+    parent_tool_use_id: null,
+  } as unknown as SDKMessage;
+}
+
+function toolResult(id: string): SDKMessage {
+  return {
+    type: 'user',
+    parent_tool_use_id: null,
+    uuid: `tr-${id}`,
+    session_id: 'sess-abc',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] },
+  } as unknown as SDKMessage;
+}
+
+function resultFor(userUuid: string): SDKMessage {
+  return {
+    ...(RESULT as unknown as Record<string, unknown>),
+    user_message_uuid: userUuid,
+  } as unknown as SDKMessage;
+}
+
+/** Read one event, then the rest, off a stream that may only be iterated once. */
+function firstThenRest(events: AsyncIterable<AgentEvent>): {
+  first: () => Promise<AgentEvent>;
+  rest: () => Promise<AgentEvent[]>;
+} {
+  const iterator = events[Symbol.asyncIterator]();
+  return {
+    first: async () => {
+      const next = await iterator.next();
+      if (next.done === true) throw new Error('the stream ended before its first event');
+      return next.value;
+    },
+    rest: async () => {
+      const out: AgentEvent[] = [];
+      for (;;) {
+        const next = await iterator.next();
+        if (next.done === true) return out;
+        out.push(next.value);
+      }
+    },
+  };
+}
+
+describe('a CLI that narrates its commands', () => {
+  it('opens the prompt turn on its lifecycle frame and streams it as it goes', async () => {
+    const { adapter, fake, prompts, adopted } = await processHoldingWork();
+    const second = await adapter.createRun(NEXT);
+    const pushed = await nextPrompt(prompts);
+    const uuid = pushed.uuid as string;
+    const stream = firstThenRest(second.events);
+
+    fake.messages.push(lifecycle(uuid, 'queued'));
+    fake.messages.push(lifecycle(uuid, 'started'));
+    fake.messages.push(NARRATED_INIT);
+    // Installed before a word is said: the first event lands ahead of any result.
+    expect(await stream.first()).toMatchObject({ type: 'session.started' });
+
+    fake.messages.push(toolCall('t-1'));
+    // The one `user` message on this wire. Not an echo, and not another turn.
+    fake.messages.push(toolResult('t-1'));
+    fake.messages.push(assistantFor('awake', uuid));
+    fake.messages.push(resultFor(uuid));
+    fake.messages.push(lifecycle(uuid, 'completed'));
+
+    const events = await stream.rest();
+    expect(events.map((e) => e.type)).toContain('tool.start');
+    expect((events.find((e) => e.type === 'text.complete') as { text: string }).text).toBe('awake');
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+    expect(adopted).toHaveLength(0);
+  });
+
+  it('keeps a turn that ended without naming the prompt off it, then serves the prompt', async () => {
+    const { adapter, fake, prompts, adopted } = await processHoldingWork();
+    const second = await adapter.createRun(NEXT);
+    const pushed = await nextPrompt(prompts);
+    const uuid = pushed.uuid as string;
+
+    // The CLI's own turn first: no user slot, no owner named, over in a beat.
+    fake.messages.push(lifecycle(uuid, 'queued'));
+    fake.messages.push(NARRATED_INIT);
+    fake.messages.push(assistantText('The subagent returned early.', 'msg-notif'));
+    fake.messages.push(RESULT);
+
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    const foreign = await drain(adopted[0]!.events);
+    expect((foreign.find((e) => e.type === 'text.complete') as { text: string }).text).toBe(
+      'The subagent returned early.',
+    );
+    expect(second.status).toBe('starting');
+    expect(fake.closed).toBe(false);
+
+    fake.messages.push(lifecycle(uuid, 'started'));
+    fake.messages.push(NARRATED_INIT);
+    fake.messages.push(assistantFor('awake', uuid));
+    fake.messages.push(resultFor(uuid));
+
+    const events = await drain(second.events);
+    expect((events.find((e) => e.type === 'text.complete') as { text: string }).text).toBe('awake');
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+  });
+
+  it('holds the opening turn of a fresh spawn behind the turn the CLI runs first', async () => {
+    // The two-second resend: a `--resume` of a conversation whose last process
+    // left a task behind runs the harness's notification turn before the prompt.
+    const adopted: Run[] = [];
+    let n = 0;
+    const adapter = createClaudeAdapter({
+      onContinuation: (run) => adopted.push(run),
+      newRunId: () => `run-c${String(++n)}` as RunId,
+    });
+    const query = installQuery();
+    const first = await adapter.createRun({ ...BASE_INPUT, resumeSessionId: 'sess-abc' });
+    const prompts = query.prompts()[Symbol.asyncIterator]();
+    const opening = await nextPrompt(prompts);
+    const uuid = opening.uuid as string;
+    expect(typeof uuid).toBe('string');
+    const fake = query.fake();
+
+    fake.messages.push(lifecycle(uuid, 'queued'));
+    fake.messages.push(NARRATED_INIT);
+    fake.messages.push(NOTIFICATION);
+    fake.messages.push(assistantText('That task had been stopped.', 'msg-notif'));
+    fake.messages.push(RESULT);
+
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    await drain(adopted[0]!.events);
+    // The prompt's run is untouched, and the process that holds it is still up.
+    expect(first.status).toBe('starting');
+    expect(fake.closed).toBe(false);
+
+    fake.messages.push(lifecycle(uuid, 'started'));
+    fake.messages.push(NARRATED_INIT);
+    fake.messages.push(assistantFor('hello', uuid));
+    fake.messages.push(resultFor(uuid));
+
+    const events = await drain(first.events);
+    expect((events.find((e) => e.type === 'text.complete') as { text: string }).text).toBe('hello');
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+  });
+
+  it('never reads a tool result as another turn echo, even without the frames', async () => {
+    const { adapter, fake, prompts, adopted } = await processHoldingWork();
+    const second = await adapter.createRun(NEXT);
+    await nextPrompt(prompts);
+
+    fake.messages.push(INIT);
+    fake.messages.push(toolCall('t-1'));
+    fake.messages.push(toolResult('t-1'));
+    fake.messages.push(assistantText('awake', 'msg-awake'));
+    fake.messages.push(RESULT);
+
+    const events = await drain(second.events);
+    expect(events.map((e) => e.type)).toContain('tool.start');
+    expect((events.find((e) => e.type === 'text.complete') as { text: string }).text).toBe('awake');
+    expect(adopted).toHaveLength(0);
+  });
+
+  it('ends the opening turn as interrupted when the CLI cancels the queued prompt', async () => {
+    const adapter = createClaudeAdapter();
+    const query = installQuery();
+    const run = await adapter.createRun(BASE_INPUT);
+    const opening = await nextPrompt(query.prompts()[Symbol.asyncIterator]());
+    const uuid = opening.uuid as string;
+
+    query.fake().messages.push(lifecycle(uuid, 'queued'));
+    query.fake().messages.push(lifecycle(uuid, 'cancelled'));
+
+    const events = await drain(run.events);
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'interrupted' });
+  });
+});

@@ -1958,6 +1958,48 @@ function ownedCompletionsRunAction(
 }
 
 /**
+ * Claim a run nobody owns for the connection whose conversation it is in.
+ *
+ * A run the provider started on its own — the turn it takes when a subagent
+ * settles — has no connection behind it, and until now no client could reach
+ * its stream: the route answered 404, the pane read idle, and the first thing
+ * that put the turn on screen was a message typed into it, which
+ * `steerLiveRun` claims on exactly these terms. The terms: the run is live,
+ * it names a session, and the caller's scope may access that session — which
+ * is what the resume gate checks before a completions request may continue
+ * it. Idempotent, and never for a run another connection holds: `claim`
+ * keeps the first owner, and the answer is read back rather than assumed.
+ *
+ * False for everything else, including a build with no ledger: a run without
+ * a conversation to be owned through stays exactly as unreachable as before.
+ */
+async function claimSessionRun(
+  context: ServerContext,
+  connection: ServerConnection,
+  runId: RunId,
+): Promise<boolean> {
+  const getRun = context.runs?.getRun;
+  const directory = context.runDirectory;
+  const ledger = context.ledger;
+  if (getRun === undefined || directory === undefined || ledger === undefined) return false;
+
+  let handle: RunHandle | undefined;
+  try {
+    handle = await getRun(runId);
+  } catch {
+    return false;
+  }
+  if (handle === undefined || handle.status === 'ended' || handle.sessionId === undefined) {
+    return false;
+  }
+  const profiles = visibleToConnection(connection, await context.catalogue.read({}));
+  if (!ledger.mayAccess(scopeFor(connection, profiles), String(handle.sessionId))) return false;
+
+  directory.claim({ runId, connectionId: connection.id, permissions: true });
+  return directory.owns(connection.id, runId);
+}
+
+/**
  * Steer, approve, or stop a run this connection started over completions.
  *
  * ---------------------------------------------------------------------------
@@ -1978,12 +2020,14 @@ async function handleOwnedRunAction(
   request: ServerRequestInfo,
   route: OwnedRunAction,
 ): Promise<ServerReply | ServerStreamReply> {
-  if (!route.owned) return unknownRun();
+  if (!route.owned && !(await claimSessionRun(context, connection, route.runId))) {
+    return unknownRun();
+  }
 
   const runs = context.runs;
   const directory = context.runDirectory;
   if (runs === undefined || directory === undefined) {
-    // Unreachable while `owned` is true — nothing can own a run without a
+    // Unreachable while the run is owned — nothing can own a run without a
     // directory — but written as a refusal rather than an assertion, because a
     // router that threw here would take out the socket.
     return unknownRun();
@@ -3526,6 +3570,13 @@ function chunkFor(
     // "queued" marker.
     case 'delivered':
       return chatChunk({ ...frame, delta: {}, ...stamped({ delivered: event.messageId }) });
+
+    // Nothing but the cursor: the run moved and the wire had no words for
+    // it. An OpenAI client appends nothing; an Artemis client advances the
+    // position it would resume from, and can tell a quiet agent from a
+    // stream that has stalled. See the kind's own comment.
+    case 'cursor':
+      return chatChunk({ ...frame, delta: {}, ...stamped({}) });
 
     case 'done': {
       const { result } = event;

@@ -799,6 +799,13 @@ const DISPOSE_GRACE_MS = 4_000;
 /** How long `interrupt()` waits for the control channel before forcing an abort. */
 const INTERRUPT_TIMEOUT_MS = 8_000;
 
+/**
+ * How long a control request waits for the pump to learn whose turn the CLI
+ * opened. Long enough for a buffered frame to be read, short enough that a
+ * stop on a CLI that has said nothing yet still lands promptly.
+ */
+const DECISION_SETTLE_MS = 500;
+
 /** Lines of provider stderr kept for diagnosing a failed run. */
 const STDERR_TAIL_LINES = 20;
 
@@ -1372,8 +1379,9 @@ export function createClaudeAdapter(options?: ClaudeAdapterOptions): ProviderAda
           { directory, staged },
         );
         // The turn before the transport: `canUseTool` and the pump both read the
-        // active turn, and `start()` is what lets either of them run.
-        const turn = agent.beginTurn(granted);
+        // active turn, and `start()` is what lets either of them run. Held
+        // rather than installed — see `beginOpeningTurn`.
+        const turn = agent.beginOpeningTurn(granted);
         agent.start();
         return turn;
       } catch (error) {
@@ -2549,6 +2557,54 @@ function echoedText(message: { readonly message: { readonly content: unknown } }
     .join('');
 }
 
+/**
+ * A `command_lifecycle` frame, read structurally: the SDK's message union does
+ * not name it, and the CLI emits it for every uuid-stamped command it runs.
+ */
+function readCommandLifecycle(
+  message: SDKMessage,
+): { readonly commandUuid: string | undefined; readonly state: string } | undefined {
+  const record = message as unknown as { type?: unknown; command_uuid?: unknown; state?: unknown };
+  if (record.type !== 'command_lifecycle' || typeof record.state !== 'string') return undefined;
+  return {
+    commandUuid: typeof record.command_uuid === 'string' ? record.command_uuid : undefined,
+    state: record.state,
+  };
+}
+
+/**
+ * The user messages a provider message answers, where the CLI says: assistant
+ * messages, partial ones, thinking-token counts and the result all carry
+ * `user_message_uuid` on a CLI that narrates, and an assistant message that
+ * folded a steer in carries every uuid it answers under `user_message_uuids`.
+ * Empty when the message names none.
+ */
+function ownerUuidsOf(message: SDKMessage): readonly string[] {
+  const record = message as unknown as { user_message_uuid?: unknown; user_message_uuids?: unknown };
+  const owners: string[] = [];
+  if (typeof record.user_message_uuid === 'string') owners.push(record.user_message_uuid);
+  if (Array.isArray(record.user_message_uuids)) {
+    for (const one of record.user_message_uuids) if (typeof one === 'string') owners.push(one);
+  }
+  return owners;
+}
+
+/** Does a user message carry words, or only tool results and attachments? */
+function carriesText(message: SDKUserMessage): boolean {
+  const content = message.message.content;
+  if (typeof content === 'string') return content.length > 0;
+  return (
+    Array.isArray(content) &&
+    content.some((block) => (block as { type?: unknown }).type === 'text')
+  );
+}
+
+/** Whether an `init` advertises command lifecycle frames. */
+function advertisesLifecycle(message: SDKMessage): boolean {
+  const capabilities = (message as unknown as { capabilities?: unknown }).capabilities;
+  return Array.isArray(capabilities) && capabilities.includes('msg_lifecycle_v1');
+}
+
 interface ClaudeRunDeps {
   readonly now: () => number;
   readonly hostEnv?: EnvBundle;
@@ -2768,15 +2824,51 @@ class ClaudeProcess {
    * stopped; the second message worked (reproduced 2026-09-08 on a served
    * session, and the same code serves a desktop one).
    *
-   * So the turn is held here until the CLI says whose turn it has opened, which
-   * it does with the user message it echoes: ours carries the uuid the prompt
-   * was stamped with (or its words), the harness's carries a notification. The
-   * messages of a turn whose owner is not yet known wait in {@link #undecided};
-   * see {@link #defer} for the decision and where each side's messages go.
+   * So the turn is held here until the CLI says whose turn it has opened. A CLI
+   * that narrates its commands says so outright: a `command_lifecycle` frame
+   * with the uuid the prompt was stamped with and `state: "started"`, and then
+   * `user_message_uuid` on the messages of the turn — see {@link #narrates}.
+   * One that does not is read the way it always was: a user message in a slot
+   * is ours if it carries the uuid or the words, the harness's if it carries a
+   * notification. The messages of a turn whose owner is not yet known wait in
+   * {@link #undecided}; see {@link #defer} for the decision and where each
+   * side's messages go.
+   *
+   * Held for the opening turn of a fresh spawn as well as for a
+   * {@link continueWith}, since 2026-09-17: a `--resume` of a conversation
+   * whose last process left a background task behind runs the harness's own
+   * turn about that task *first*, and installing ours ahead of it mapped that
+   * turn's messages onto our run and ended it on that turn's `result` — which
+   * closed the transport under a prompt the CLI was about to run. From the
+   * user's side: a resend that stopped after two seconds having said nothing.
    */
   #pendingTurn: PendingTurn | undefined;
   /** Messages of a CLI turn whose owner is not yet known. See {@link #pendingTurn}. */
   readonly #undecided: SDKMessage[] = [];
+  /**
+   * Whether this CLI narrates its commands.
+   *
+   * A CLI with `msg_lifecycle_v1` frames every uuid-stamped command it runs —
+   * `command_lifecycle` with the uuid and `queued`, `started`, `completed` or
+   * `cancelled` — and stamps the messages of the turn that follows with
+   * `user_message_uuid`. What it does *not* do is echo the prompt: the only
+   * `user` messages on its stream are tool results, which is why waiting for
+   * an echo read every turn with a tool call as somebody else's (the silent
+   * five minutes of 2026-09-17). Learned from the first frame or from the
+   * `init` capability list, and one-way, because a CLI that has narrated once
+   * narrates every command.
+   */
+  #narrates = false;
+  /**
+   * Whether any turn has been installed on this process. The one thing the
+   * opening turn of a CLI that does not narrate is decided by: its first
+   * `init` is the prompt's, because the process was spawned for it.
+   */
+  #opened = false;
+  /** A stop was asked of a turn the CLI had not opened yet. See {@link interrupt}. */
+  #stopRequested = false;
+  /** Callers waiting on the pending turn's decision. See {@link #settleDecision}. */
+  readonly #decisionWaiters: (() => void)[] = [];
 
   /**
    * Messages pushed at the CLI that it has not been seen to read yet.
@@ -2861,6 +2953,19 @@ class ClaudeProcess {
     // What the spawn is about to apply, so the first attached turn compares
     // against what is actually in force rather than against nothing.
     this.#settings = turnSettings(input);
+    /*
+     * Nothing is being served until a turn is installed. The opening turn
+     * waits in `#pendingTurn` until the CLI says it has begun — see `#defer` —
+     * and until then the process reads as between turns: an ended state that
+     * carries the run's id for the diagnostics, over a queue nothing can be
+     * pushed onto.
+     */
+    const idle = createClaudeMapperState(input.runId, { now: deps.now });
+    idle.ended = true;
+    this.#state = idle;
+    const closed = new AsyncQueue<AgentEvent>();
+    closed.close();
+    this.#eventQueue = closed;
   }
 
   /** The turn this process is serving, for the diagnostics that name one. */
@@ -2884,6 +2989,22 @@ class ClaudeProcess {
   beginTurn(input: ResolvedRunInput): ClaudeTurn {
     const prepared = this.#prepareTurn(input);
     this.#install(prepared);
+    return prepared.turn;
+  }
+
+  /**
+   * Prepare the process's opening turn, held until the CLI says it has begun.
+   *
+   * {@link beginTurn} installs on the spot, which is right for a continuation
+   * — the CLI is already speaking — and wrong for the prompt a spawn is about:
+   * the CLI may run a turn of its own before it, and the prompt then needs the
+   * same gate a {@link continueWith} prompt gets. See {@link #pendingTurn} for
+   * what went wrong without it; the uuid stamped here is what the CLI's
+   * lifecycle frames name, and what {@link start} puts on the opening message.
+   */
+  beginOpeningTurn(input: ResolvedRunInput): ClaudeTurn {
+    const prepared = this.#prepareTurn(input);
+    this.#pendingTurn = { ...prepared, uuid: randomUUID(), text: input.prompt };
     return prepared.turn;
   }
 
@@ -2911,6 +3032,7 @@ class ClaudeProcess {
   #install(turn: PreparedTurn): void {
     this.#state = turn.state;
     this.#eventQueue = turn.events;
+    this.#opened = true;
   }
 
   /** Is this the turn the process is serving right now? */
@@ -3639,9 +3761,15 @@ class ClaudeProcess {
    */
   start(): void {
     // Seed the input pump before the SDK starts pulling, so the first turn has
-    // its prompt waiting rather than racing for it.
+    // its prompt waiting rather than racing for it. Stamped with the opening
+    // turn's uuid, which is how the CLI's lifecycle frames will name it.
     this.#promptQueue.push(
-      this.#userMessage(this.#input.prompt, this.#input.attachments, this.#openingStaged),
+      this.#userMessage(
+        this.#input.prompt,
+        this.#input.attachments,
+        this.#openingStaged,
+        this.#pendingTurn?.uuid,
+      ),
     );
     // Released once consumed: the payloads are large, and the run has no reason
     // to keep the opening turn's attachments alive for its whole lifetime.
@@ -4120,10 +4248,27 @@ class ClaudeProcess {
   }
 
   async interrupt(): Promise<InterruptResult> {
+    // A stop that lands while the CLI's answer about whose turn it is sits in
+    // the buffer must not read the turn as unopened. See `#settleDecision`.
+    await this.#settleDecision(DECISION_SETTLE_MS);
     // "Stop" is idempotent by nature; a run that already stopped is not an error.
-    if (this.#state.ended) return { stillQueued: [] };
-
-    this.#state.interruptRequested = true;
+    if (this.#state.ended) {
+      /*
+       * A prompt still waiting for the CLI to open its turn. On a process that
+       * serves nothing else — the opening turn of a fresh spawn — the stop is
+       * forwarded exactly as it would be once the turn is open, and remembered
+       * on that turn's own state, so its ending reads as a stop whatever the
+       * provider calls it. A prompt queued behind a live process's other work
+       * is left in its queue, as before: the CLI keeps it across an interrupt
+       * by design, and the work is not this caller's to kill.
+       */
+      const pending = this.#pendingTurn;
+      if (pending === undefined || this.#opened) return { stillQueued: [] };
+      pending.state.interruptRequested = true;
+      this.#stopRequested = true;
+    } else {
+      this.#state.interruptRequested = true;
+    }
 
     const sdkQuery = this.#query;
     if (sdkQuery === undefined) {
@@ -4297,30 +4442,84 @@ class ClaudeProcess {
     const pending = this.#pendingTurn;
     if (pending === undefined || !this.#state.ended) return 'pass';
 
+    /*
+     * The CLI's own word, where it gives one. A `started` frame names the
+     * command whose turn is opening — ours, or one the CLI queued for itself
+     * — and nothing else on the stream is as direct. `queued` and
+     * `completed` are bookkeeping about a command, not part of any turn;
+     * `cancelled` on ours means the prompt was dropped from the CLI's queue
+     * by an interrupt and its turn will never open.
+     */
+    const lifecycle = readCommandLifecycle(message);
+    if (lifecycle !== undefined) {
+      this.#narrates = true;
+      if (lifecycle.state === 'started') {
+        return this.#decide(lifecycle.commandUuid === pending.uuid ? 'mine' : 'foreign', message);
+      }
+      if (lifecycle.state === 'cancelled' && lifecycle.commandUuid === pending.uuid) {
+        this.#abandonPending('interrupted');
+        return 'handled';
+      }
+      return 'handled';
+    }
+
+    // The turn's own messages say which prompt they answer.
+    const owners = ownerUuidsOf(message);
+    if (owners.length > 0) {
+      return this.#decide(owners.includes(pending.uuid) ? 'mine' : 'foreign', message);
+    }
+
     if (message.type === 'user') {
       const echo = message as SDKUserMessage;
+      /*
+       * A tool result belongs to whichever turn is running and says nothing
+       * about whose it is. Reading one as "not our echo" is what sent every
+       * turn with a tool call onto a continuation nobody was watching, and
+       * every turn without one to its consumer in a single burst at the end.
+       * Same for a replayed or synthetic slot: neither is the CLI opening a
+       * turn.
+       */
+      if (
+        !carriesText(echo) ||
+        echo.isSynthetic === true ||
+        ('isReplay' in echo && echo.isReplay === true)
+      ) {
+        this.#undecided.push(message);
+        return 'deferred';
+      }
       const mine =
         echo.uuid === pending.uuid ||
         (pending.text !== '' && echoedText(echo).includes(pending.text));
       return this.#decide(mine ? 'mine' : 'foreign', message);
     }
-    /*
-     * A turn that ended without echoing any user message is read as ours.
-     *
-     * The CLI echoes every user turn it opens — the prompt, or the harness's
-     * own notification — so a turn with no echo at all is one the SDK's
-     * wire has simply not narrated, and the only honest attribution is the
-     * one every turn had before this decision existed: the prompt that was
-     * queued. Reading it as foreign instead would strand the prompt on a
-     * turn that never opens.
-     */
-    if (message.type === 'result') return this.#decide('mine', message);
+
+    if (startsTurn(message)) {
+      if (advertisesLifecycle(message)) this.#narrates = true;
+      // The opening turn of a CLI that does not narrate: its first `init` is
+      // the prompt's, by construction — the process was spawned for it.
+      if (!this.#narrates && !this.#opened) return this.#decide('mine', message);
+    }
+
+    if (message.type === 'result') {
+      /*
+       * A turn ended without naming its owner.
+       *
+       * On a CLI that narrates, a turn that ended before `started` named our
+       * command was not ours — the harness's own turn about a task,
+       * typically — and reading it as ours would end the run on it, and with
+       * it the transport under a prompt the CLI was about to run. On one that
+       * does not narrate it is the reading every turn had before this
+       * decision existed: the prompt that was queued. Reading *that* as
+       * foreign would strand the prompt on a turn that never opens.
+       */
+      return this.#decide(this.#narrates ? 'foreign' : 'mine', message);
+    }
 
     this.#undecided.push(message);
     return 'deferred';
   }
 
-  #decide(owner: 'mine' | 'foreign', message: SDKMessage): 'handled' | 'exit' {
+  #decide(owner: 'mine' | 'foreign', message?: SDKMessage): 'handled' | 'exit' {
     const pending = this.#pendingTurn as PendingTurn;
     if (owner === 'mine') {
       this.#pendingTurn = undefined;
@@ -4334,11 +4533,13 @@ class ClaudeProcess {
       // the pump drops any events that have no turn. Ours is still waiting.
       if (!this.#ensureTurn()) {
         this.#undecided.length = 0;
+        this.#settleWaiters();
         return 'handled';
       }
     }
+    this.#settleWaiters();
 
-    const batch = [...this.#undecided.splice(0), message];
+    const batch = [...this.#undecided.splice(0), ...(message === undefined ? [] : [message])];
     let exit = false;
     for (const one of batch) {
       if (this.#handle(one)) exit = true;
@@ -4509,12 +4710,16 @@ class ClaudeProcess {
         if (this.#handle(message)) break;
       }
 
+      // A turn the CLI never opened ends here as the process's own: the
+      // transport is gone, and the turn's consumer is owed the real ending.
+      this.#claimOpeningTurn();
       if (!this.#state.ended) {
         // The stream ended without a `result` message — the transport closed
         // cleanly but early.
         this.#finalize(this.#exitReason('completed'));
       }
     } catch (error) {
+      this.#claimOpeningTurn();
       if (!this.#state.ended) {
         const agentError = toAgentError(error, 'transport');
         if (agentError.code === 'cancelled') {
@@ -4528,7 +4733,9 @@ class ClaudeProcess {
       // transport is on its way down, or the next message attaches to a CLI that
       // is about to stop reading it and waits for a turn that never starts.
       this.#closed = true;
-      this.#abandonPending();
+      this.#abandonPending(
+        this.#disposing !== undefined ? 'disposed' : this.#stopRequested ? 'interrupted' : 'error',
+      );
       this.#settling = false;
       clearTimeout(this.#settleTimer);
       this.#awaitingSuggestion = false;
@@ -4568,6 +4775,7 @@ class ClaudeProcess {
    */
   async #failToLaunch(error: unknown): Promise<void> {
     const explained = await this.#explainLaunchFailure(toAgentError(error, 'provider_not_found'));
+    this.#claimOpeningTurn();
     this.#finalize('error', this.#withStderr(explained));
     this.#eventQueue.close();
     // No process ever opened, so no pump `finally` will ever run — without this
@@ -4629,14 +4837,66 @@ class ClaudeProcess {
 
   /** Artemis's own intent outranks whatever the transport reports. */
   #exitReason(fallback: RunEndReason): RunEndReason {
-    if (this.#state.disposeRequested) return 'disposed';
-    if (this.#state.interruptRequested) return 'interrupted';
+    // The process's own flags first: a turn claimed at the end (see
+    // `#claimOpeningTurn`) was installed after the stop or the dispose that
+    // ended it, so its state never saw either.
+    if (this.#state.disposeRequested || this.#disposing !== undefined) return 'disposed';
+    if (this.#state.interruptRequested || this.#stopRequested) return 'interrupted';
     if (this.#state.permissionDenyInterrupted) return 'permission_denied';
     return fallback;
   }
 
   #finalize(reason: RunEndReason, error?: AgentError): void {
     for (const event of finalizeRun(this.#state, reason, { error })) this.#emit(event);
+  }
+
+  /**
+   * Take the opening turn as the process's own when the process ends before
+   * the CLI could open it: a launch that failed, a transport that closed.
+   *
+   * The failure is that turn's to report — with the real reason, not the
+   * generic "closed before it could start" an abandoned continuation gets —
+   * because nothing else was ever going to run on this process. False when
+   * there is no such turn, or the process has already served one.
+   */
+  #claimOpeningTurn(): boolean {
+    const pending = this.#pendingTurn;
+    if (pending === undefined || !this.#state.ended || this.#opened) return false;
+    this.#pendingTurn = undefined;
+    this.#install(pending);
+    this.#settleWaiters();
+    // Whatever the CLI said before it went is this turn's: nothing else was
+    // ever going to run here, and a tool call it opened is owed its cancel.
+    for (const one of this.#undecided.splice(0)) this.#handle(one);
+    return true;
+  }
+
+  /** Wake whoever was waiting on the pending turn's decision. */
+  #settleWaiters(): void {
+    for (const wake of this.#decisionWaiters.splice(0)) wake();
+  }
+
+  /**
+   * Give the pump a moment to read whose turn the CLI opened.
+   *
+   * A control request — a permission prompt, a stop — can reach this side
+   * ahead of the pump reading the frames the CLI wrote before it: the SDK
+   * handles a control request inline while the messages before it sit in the
+   * query's buffer. Waiting on the decision, bounded, lets that buffer drain
+   * so the request lands on the turn it belongs to. Resolves at once when
+   * nothing is pending.
+   */
+  #settleDecision(timeoutMs: number): Promise<void> {
+    if (this.#pendingTurn === undefined || !this.#state.ended) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(done, timeoutMs);
+      timer.unref();
+      this.#decisionWaiters.push(done);
+    });
   }
 
   /**
@@ -4654,6 +4914,7 @@ class ClaudeProcess {
     this.#pendingTurn = undefined;
     this.#undecided.length = 0;
     this.#install(pending);
+    this.#settleWaiters();
     this.#finalize(
       reason,
       reason === 'error'
@@ -4783,6 +5044,21 @@ class ClaudeProcess {
   readonly #canUseTool: CanUseTool = async (toolName, input, options) => {
     if (this.#disposing !== undefined) {
       return this.#denyResult(DISPOSED_DENY_MESSAGE, options.toolUseID);
+    }
+
+    /*
+     * A prompt while the turn is still being decided. Let the pump catch up
+     * on the frames the CLI wrote ahead of this request; if it is still
+     * undecided on a CLI that does not narrate, a tool call can only come
+     * from a running turn, and on such a CLI the only turn there is, is ours.
+     * On one that does narrate, an undecided prompt is the CLI's own turn
+     * asking, and `#ensureTurn` below gives it a continuation to land on.
+     */
+    if (this.#pendingTurn !== undefined && this.#state.ended) {
+      await this.#settleDecision(DECISION_SETTLE_MS);
+      if (this.#pendingTurn !== undefined && this.#state.ended && !this.#narrates) {
+        this.#decide('mine');
+      }
     }
 
     /*

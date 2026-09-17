@@ -511,6 +511,18 @@ type TurnEventBody =
       readonly kind: 'delivered';
       readonly messageId: string;
     }
+  | {
+      /**
+       * A run event that put nothing on the wire — a tool ending, a bill, a
+       * plan reading — passing by. Carries only its `seq`, so a client's
+       * cursor keeps up with everything the server has relayed rather than
+       * with the last thing it had words for: a resume then asks for exactly
+       * what was missed, and a client that measures its stream against the
+       * run's position on the server can tell "quiet because the agent is
+       * inside a tool" from "quiet because the stream has lost its place".
+       */
+      readonly kind: 'cursor';
+    }
   | { readonly kind: 'done'; readonly result: TurnResult };
 
 /**
@@ -1046,6 +1058,7 @@ export async function* runTurn(
       }
       if (event.type === 'run.end') ended = true;
       yield* events;
+      if (events.length === 0) yield { kind: 'cursor', seq: event.seq };
     }
   } finally {
     queue.unsubscribe();
@@ -1206,7 +1219,10 @@ export async function* resumeTurn(
     lastSeq = event.seq;
     const { events } = translator.translate(event);
     if (event.type === 'run.end') ended = true;
-    if (event.seq > after) yield* events;
+    if (event.seq > after) {
+      yield* events;
+      if (events.length === 0) yield { kind: 'cursor', seq: event.seq };
+    }
   };
 
   try {

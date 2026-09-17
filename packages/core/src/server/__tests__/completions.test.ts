@@ -321,7 +321,25 @@ describe('a turn', () => {
     ] as Partial<AgentEvent>[]);
 
     const events = await drain(source, turn({ extensions: { sessionId: 'sess-9' } }));
-    expect(events.map((event) => event.kind)).toEqual(['run', 'done']);
+    // The announcement rides no chunk of its own; only its cursor passes by.
+    expect(events.map((event) => event.kind)).toEqual(['run', 'cursor', 'done']);
+    expect(events.some((event) => event.kind === 'session')).toBe(false);
+  });
+
+  it('moves the cursor past an event that puts nothing on the wire', async () => {
+    // A tool ending, a bill, a plan reading: no words, but the run moved. The
+    // client's resume cursor follows it — so a resume asks for exactly what
+    // was missed — and a client measuring its stream against the run's
+    // position on the server can tell a quiet agent from a stream that has
+    // lost its place. See `#stallProbe` in the served adapter.
+    const source = fakeRuns([
+      { type: 'tool.end', toolCallId: 'call-1', name: 'Bash', status: 'ok', seq: 4 },
+      { type: 'run.end', reason: 'completed', seq: 5 },
+    ] as Partial<AgentEvent>[]);
+
+    const events = await drain(source);
+    expect(events.map((event) => event.kind)).toEqual(['run', 'cursor', 'done']);
+    expect(events[1]).toEqual({ kind: 'cursor', seq: 4 });
   });
 
   it('announces the new id when a resumed run lands in a different session', async () => {
@@ -558,7 +576,9 @@ describe('permission requests, with nobody to answer them', () => {
     ] as Partial<AgentEvent>[]);
 
     const kinds = (await drain(source)).map((event) => event.kind);
-    expect(kinds).toEqual(['run', 'done']);
+    // The request and its denial pass by as bare cursors: nothing about
+    // permissions reaches a caller that did not ask.
+    expect(kinds).toEqual(['run', 'cursor', 'cursor', 'done']);
   });
 });
 

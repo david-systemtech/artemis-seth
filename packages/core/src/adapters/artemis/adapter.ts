@@ -152,6 +152,11 @@ export const ARTEMIS_CAPABILITIES: Capabilities = {
   // The server stores real sessions; `artemis.sessionId` continues one. The
   // raw local endpoints cannot say this — their server remembers nothing.
   resumeSession: true,
+  // A conversation the server is still working on can be joined without a
+  // message: the run's stream route replays its retained events and follows
+  // it live. What a window that reloaded, or never started the turn, attaches
+  // to — see `RunInput.attachToLive`.
+  attachLive: true,
   // The server lists the sessions this connection's scope created — see its
   // ledger — and replays their stored messages. This is what makes the same
   // conversations reachable from every machine holding the token.
@@ -353,6 +358,11 @@ export interface ArtemisReconnectOptions {
   readonly watchdogMs?: number;
   /** Waits between reconnect attempts, the last one repeated for as long as it takes. */
   readonly backoffMs?: readonly number[];
+  /**
+   * How long a stream may carry nothing but heartbeats before the server is
+   * asked whether the run has moved past it. See `ArtemisRun.#stallProbe`.
+   */
+  readonly stallProbeMs?: number;
 }
 
 /** What a run tells the adapter that outlives the run. */
@@ -363,6 +373,13 @@ interface ArtemisRunHooks {
 
 const DEFAULT_WATCHDOG_MS = 45_000;
 const DEFAULT_BACKOFF_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
+/**
+ * Twenty seconds of heartbeats and nothing else before the server is asked
+ * whether the run has moved. Longer than the fifteen-second heartbeat, so a
+ * quiet tool call is asked about at most every third beat; short enough that
+ * a stream that has lost its place costs less than a minute.
+ */
+const DEFAULT_STALL_PROBE_MS = 20_000;
 /** How long a reconnect waits for the server's headers before trying again. */
 const RECONNECT_HANDSHAKE_MS = 15_000;
 
@@ -481,17 +498,96 @@ class ArtemisRun implements Run {
   readonly #steered: MessageId[] = [];
   /** Where the adapter keeps what the stream said the run delegated. */
   readonly #onTasks: ArtemisRunHooks['onTasks'];
+  /**
+   * The server run this one joins rather than starts. See {@link attach}:
+   * the id names the stream to follow, and the seam is what the server
+   * measured when that run began, which is the only honest `historyOffset`
+   * for a run that did not.
+   */
+  readonly #attach: { readonly runId: RunId; readonly historyOffset: number | undefined } | undefined;
 
   constructor(
     input: ResolvedRunInput,
     reconnect: Required<ArtemisReconnectOptions>,
     hooks: ArtemisRunHooks = {},
+    attach?: { readonly runId: RunId; readonly historyOffset: number | undefined },
   ) {
     this.runId = input.runId;
     this.#input = input;
     this.#reconnect = reconnect;
     this.#onTasks = hooks.onTasks;
+    this.#attach = attach;
     void this.#drive();
+  }
+
+  /**
+   * Join the run the server is already serving on a conversation.
+   *
+   * A window that reloaded, or never started the turn — another client did,
+   * or the provider took it on its own when a subagent settled — has a
+   * conversation the server reports as working and nothing to draw it with.
+   * Until now the first thing that put the work on screen was a message typed
+   * into it, which the server turned into a steer and answered with a replay.
+   * This asks for the replay without the message: the server's run list names
+   * the live run on the session, and the run's stream route — the one a
+   * dropped link is picked back up on — is followed from its retained start.
+   *
+   * Refused, not started, when nothing is serving the conversation: the poll
+   * that said so was seconds old, the run has ended since, and the caller's
+   * cure is to read the conversation as history.
+   */
+  static async attach(
+    input: ResolvedRunInput,
+    reconnect: Required<ArtemisReconnectOptions>,
+    hooks: ArtemisRunHooks = {},
+  ): Promise<ArtemisRun> {
+    const sessionId = input.resumeSessionId;
+    if (sessionId === undefined) {
+      throw adapterError(
+        'invalid_request',
+        'Attaching to a run already going needs the session it is serving.',
+      );
+    }
+    const root = baseUrl(input.env);
+    let response: Response;
+    try {
+      response = await fetch(`${root}${API_PREFIX}/runs`, {
+        headers: authHeaders(input.env),
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch (error) {
+      throw adapterError(
+        'provider_unavailable',
+        `Could not ask the Artemis server what it is running: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!response.ok) throw await refusalError(response, root);
+    const body = (await response.json()) as {
+      readonly runs?: readonly {
+        readonly runId?: string;
+        readonly status?: string;
+        readonly sessionId?: string;
+        readonly historyOffset?: number;
+      }[];
+    };
+    const live = body.runs?.find(
+      (run) => run.status !== 'ended' && run.sessionId === sessionId && typeof run.runId === 'string',
+    );
+    if (live === undefined) {
+      throw adapterError(
+        'invalid_request',
+        'The Artemis server is not working on this conversation right now.',
+        { details: { reason: 'run_ended' } },
+      );
+    }
+    return new ArtemisRun(input, reconnect, hooks, {
+      runId: live.runId as RunId,
+      historyOffset: typeof live.historyOffset === 'number' ? live.historyOffset : undefined,
+    });
+  }
+
+  get historyOffset(): number | undefined {
+    return this.#attach?.historyOffset;
   }
 
   get status(): RunStatus {
@@ -575,6 +671,21 @@ class ArtemisRun implements Run {
       }
 
       const root = baseUrl(this.#input.env);
+      const stream = this.#streamState();
+      let attempt = new AbortController();
+      let outcome: 'done' | 'broken';
+      if (this.#attach !== undefined) {
+        /*
+         * Joining a run in progress: no message goes out. The run's stream
+         * route replays what the server still holds of it and follows it
+         * live — the same route, and the same consumer, a dropped link is
+         * picked back up on, from the very start rather than from a cursor.
+         */
+        this.#remoteRunId = this.#attach.runId;
+        const joined = await this.#resume(root, { atOnce: true });
+        attempt = joined.attempt;
+        outcome = await this.#consume(joined.body, stream, attempt);
+      } else {
       const extensions = {
         ...(this.#input.resumeSessionId === undefined
           ? {}
@@ -618,8 +729,6 @@ class ArtemisRun implements Run {
           ? { systemPrompt: this.#input.systemPrompt.text }
           : {}),
       };
-      const stream = this.#streamState();
-      let attempt = new AbortController();
       const response = await fetch(`${root}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...authHeaders(this.#input.env) },
@@ -637,7 +746,8 @@ class ArtemisRun implements Run {
         throw await refusalError(response, root);
       }
 
-      let outcome = await this.#consume(response.body, stream, attempt);
+      outcome = await this.#consume(response.body, stream, attempt);
+      }
 
       /*
        * The stream died and the run did not.
@@ -814,6 +924,7 @@ class ArtemisRun implements Run {
     const decoder = new TextDecoder();
     let buffer = '';
     const watchdog = this.#watchdog(attempt);
+    const probe = this.#stallProbe(attempt);
     try {
       for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
         const text = decoder.decode(chunk, { stream: true });
@@ -821,6 +932,9 @@ class ArtemisRun implements Run {
         // the watchdog for the rest of this run; any byte at all resets it.
         if (!this.#heartbeats && /(^|\n):/.test(text)) this.#heartbeats = true;
         watchdog.touch();
+        // A heartbeat says the socket lives, not that the run has been heard
+        // from: only a data line counts for the stall probe.
+        if (/(^|\n)data:/.test(text)) probe.heard();
         buffer += text;
         const { lines, rest } = splitEvents(buffer);
         buffer = rest;
@@ -840,6 +954,75 @@ class ArtemisRun implements Run {
       return 'broken';
     } finally {
       watchdog.stop();
+      probe.stop();
+    }
+  }
+
+  /**
+   * Presume a stream that heartbeats but never speaks stuck.
+   *
+   * Observed 2026-09-17 on a served conversation: the socket stayed up, the
+   * server's keep-alive comments kept coming, and the run went on for three
+   * more minutes on the server — through a sentence cut in the middle, a
+   * merge, and a question the agent stopped to ask — while this side drew
+   * nothing. The byte watchdog cannot see that, because bytes were arriving.
+   *
+   * So while the stream has said nothing for a while, the server is asked
+   * how far the run has got. Its position is exact — every run event the
+   * server relays advances this side's cursor, the ones without words on a
+   * bare `cursor` chunk — so a run past the cursor means the stream has
+   * lost its place, and the attempt is aborted for the reconnect loop to pick
+   * the run back up from the cursor, which replays exactly what was missed.
+   * A run the server no longer lists is aborted the same way; the reconnect
+   * then learns whether it ended (its retained tail is replayed) or is gone.
+   *
+   * Only once the server has announced the run: before that there is nothing
+   * to ask about. Unref'd, like the watchdog it stands beside.
+   */
+  #stallProbe(attempt: AbortController): { heard(): void; stop(): void } {
+    const { stallProbeMs } = this.#reconnect;
+    let heardAt = Date.now();
+    let asking = false;
+    const timer = setInterval(() => {
+      if (asking || this.#remoteRunId === undefined) return;
+      if (Date.now() - heardAt < stallProbeMs) return;
+      asking = true;
+      void this.#serverPosition().then((position) => {
+        asking = false;
+        if (position === undefined || attempt.signal.aborted) return;
+        if (position === 'gone' || position > this.#lastSeq) attempt.abort();
+      });
+    }, Math.max(50, Math.floor(stallProbeMs / 2)));
+    timer.unref();
+    return {
+      heard: () => {
+        heardAt = Date.now();
+      },
+      stop: () => clearInterval(timer),
+    };
+  }
+
+  /**
+   * Where the server says this run is: its last retained `seq`, or `gone`
+   * when it no longer lists the run as live. `undefined` when the question
+   * could not be asked, which is not an answer — the next probe asks again.
+   */
+  async #serverPosition(): Promise<number | 'gone' | undefined> {
+    try {
+      const response = await fetch(`${baseUrl(this.#input.env)}${API_PREFIX}/runs`, {
+        headers: authHeaders(this.#input.env),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!response.ok) return undefined;
+      const body = (await response.json()) as {
+        readonly runs?: readonly { readonly runId?: string; readonly status?: string; readonly lastSeq?: number }[];
+      };
+      if (!Array.isArray(body.runs)) return undefined;
+      const mine = body.runs.find((run) => run.runId === this.#remoteRunId);
+      if (mine === undefined || mine.status === 'ended') return 'gone';
+      return typeof mine.lastSeq === 'number' ? mine.lastSeq : undefined;
+    } catch {
+      return undefined;
     }
   }
 
@@ -1001,10 +1184,16 @@ class ArtemisRun implements Run {
    * is the link still down, and the next try waits a little longer. The user's
    * own stop ends it too, from any wait.
    */
-  async #resume(root: string): Promise<{ body: ReadableStream<Uint8Array>; attempt: AbortController }> {
+  async #resume(
+    root: string,
+    options: { readonly atOnce?: boolean } = {},
+  ): Promise<{ body: ReadableStream<Uint8Array>; attempt: AbortController }> {
     const { backoffMs } = this.#reconnect;
     for (let tries = 0; ; tries += 1) {
-      await this.#pause(backoffMs[Math.min(tries, backoffMs.length - 1)] ?? 1_000);
+      // A first attempt at joining a run has no broken link to wait out.
+      if (!(options.atOnce === true && tries === 0)) {
+        await this.#pause(backoffMs[Math.min(tries, backoffMs.length - 1)] ?? 1_000);
+      }
       if (this.#abort.signal.aborted) throw adapterError('cancelled', 'The run was stopped.');
 
       const attempt = new AbortController();
@@ -1378,6 +1567,7 @@ export function createArtemisAdapter(
   const reconnect: Required<ArtemisReconnectOptions> = {
     watchdogMs: options.reconnect?.watchdogMs ?? DEFAULT_WATCHDOG_MS,
     backoffMs: options.reconnect?.backoffMs ?? DEFAULT_BACKOFF_MS,
+    stallProbeMs: options.reconnect?.stallProbeMs ?? DEFAULT_STALL_PROBE_MS,
   };
   /*
    * What served conversations are still doing, for the engine's poll. Fed by
@@ -1605,6 +1795,15 @@ export function createArtemisAdapter(
           ),
         );
       }
+      const hooks: ArtemisRunHooks = {
+        onTasks: (sessionId, tasks) => work.noteTasks(sessionId, tasks),
+      };
+      // Joining a run the server already has: no route is asked for, because
+      // nothing is started — the run over there is on whatever it is on.
+      if (input.attachToLive === true) {
+        known(input.env);
+        return ArtemisRun.attach(input, reconnect, hooks);
+      }
       if (input.model === undefined || input.model.trim() === '') {
         return Promise.reject(
           adapterError(
@@ -1614,11 +1813,7 @@ export function createArtemisAdapter(
         );
       }
       known(input.env);
-      return Promise.resolve(
-        new ArtemisRun(input, reconnect, {
-          onTasks: (sessionId, tasks) => work.noteTasks(sessionId, tasks),
-        }),
-      );
+      return Promise.resolve(new ArtemisRun(input, reconnect, hooks));
     },
   } as ProviderAdapter;
 }

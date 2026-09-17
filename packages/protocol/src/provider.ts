@@ -185,6 +185,14 @@ export interface Capabilities {
   readonly rewind: boolean;
 
   /**
+   * `RunInput.attachToLive` is honoured: a run can be opened onto a turn the
+   * provider is already serving elsewhere, replaying and then following it.
+   * Absent means no — the field is newer than most adapters, and only one
+   * whose work happens on another machine has anything to attach to.
+   */
+  readonly attachLive?: boolean;
+
+  /**
    * The provider reports token usage, so `usage` events carry meaningful
    * numbers and the UI can show a usage readout.
    */
