@@ -52,7 +52,7 @@
  * silently rather than hanging a container on a password prompt.
  */
 
-import type { RunInput } from '@rx-artemis/protocol';
+import type { RunInput, ServerMemoryBank, ServerMemoryBankScope } from '@rx-artemis/protocol';
 import {
   banksForProfile,
   pullBank,
@@ -61,7 +61,9 @@ import {
   registryPath,
   sharedIndexBudget,
   sourceStamp,
+  withBank,
   writeRegistryV2,
+  type BankProfileScope,
   type BankRecord,
   type IndexBudget,
 } from '@rx-artemis/core';
@@ -111,8 +113,49 @@ export interface ServerMemoryBanks {
    * rather than that it is not configured here.
    */
   reaches(profileId: string | undefined): boolean;
+  /**
+   * Every bank in the registry, scope included, for the administrative route.
+   *
+   * Unfiltered, unlike everything above it: this is the operator's view of the
+   * file rather than a run's view of the machine, and a bank that is disabled
+   * or scoped away from every account still has to appear in the pane that
+   * would put it back.
+   */
+  list(): readonly ServerMemoryBank[];
+  /**
+   * Replace which accounts one bank reaches, and write the registry.
+   *
+   * `undefined` when no bank has that slug. The write goes through the same
+   * `writeRegistryV2` the desktop uses, so the CLI's own file is mirrored and
+   * a machine that also runs `cerebro` stays in step — the CLI has no field
+   * for the scope and simply keeps its half.
+   *
+   * Nothing is cached, so the next run picks the new scope up: every reader
+   * here re-reads the file (see {@link inScope}), which is what lets a change
+   * made over the wire take effect without restarting the server.
+   */
+  setScope(slug: string, scope: ServerMemoryBankScope): ServerMemoryBank | undefined;
   /** Wait for the background pulls, for a test or an orderly shutdown. */
   settle(): Promise<void>;
+}
+
+/** A registry record as the wire describes it. The scope is the whole point. */
+function toWire(record: BankRecord): ServerMemoryBank {
+  return {
+    slug: record.slug,
+    path: record.path,
+    role: record.role,
+    enabled: record.enabled,
+    profiles:
+      record.profiles.kind === 'all'
+        ? { kind: 'all' }
+        : { kind: 'profiles', profileIds: [...record.profiles.profileIds] },
+  };
+}
+
+/** …and back. Same two shapes; the copy keeps the registry's arrays its own. */
+function fromWire(scope: ServerMemoryBankScope): BankProfileScope {
+  return scope.kind === 'all' ? { kind: 'all' } : { kind: 'profiles', profileIds: [...scope.profileIds] };
 }
 
 /**
@@ -319,6 +362,31 @@ export function createServerMemoryBanks(options: ServerMemoryBanksOptions): Serv
 
     reaches(profileId) {
       return inScope(profileId).length > 0;
+    },
+
+    list() {
+      try {
+        return readRegistryV2(where).registry.banks.map(toWire);
+      } catch (error) {
+        // An unreadable registry is an empty pane, not a failed request: the
+        // caller is being shown what this machine carries, and "nothing" is a
+        // truthful answer for a machine whose file cannot be parsed.
+        warn('could not read the registry', error);
+        return [];
+      }
+    },
+
+    setScope(slug, scope) {
+      // Deliberately *not* caught. Every other path here swallows, because a
+      // run must not fail over a memory bank; this one is a request whose
+      // whole purpose is the write, and a caller told "done" by a server that
+      // could not write the file would go on believing the scope had changed.
+      const { registry } = readRegistryV2(where);
+      const record = registry.banks.find((bank) => bank.slug === slug);
+      if (record === undefined) return undefined;
+      const updated: BankRecord = { ...record, profiles: fromWire(scope) };
+      writeRegistryV2(where, withBank(registry, updated));
+      return toWire(updated);
     },
 
     settle: () => inFlight,

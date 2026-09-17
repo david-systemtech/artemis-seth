@@ -155,6 +155,7 @@ import {
   type ServerAccountsUpdateRequest,
   type ServerAccountSignInRequest,
   type ServerAccountSubmitCodeRequest,
+  type ServerMemoryBanksSetProfilesRequest,
   type ServerRoutinesRequest,
   type ServerRoutinesCreateRequest,
   type ServerRoutinesUpdateRequest,
@@ -1996,6 +1997,46 @@ export function validateAuthSignOut(raw: unknown): AuthSignOutRequest {
 export function validateServerAccounts(raw: unknown): ServerAccountsRequest {
   const request = requireRequest(raw);
   return { profileId: requireId(request['profileId'], 'profileId') };
+}
+
+/**
+ * Rescoping one of a *server's* banks.
+ *
+ * {@link validateMemoryBankSetProfiles}'s twin, and deliberately a separate
+ * function rather than a shared one: the ids in this scope are the *server's*
+ * account ids, not this machine's, and a validator that took either would be
+ * the one place where the two registries could be confused. They are checked
+ * as strings for the same reason `accountId` is above — their shape is that
+ * server's business.
+ *
+ * Whether an id names an account that exists is the *server's* check, not
+ * this boundary's: it holds the list, and its route refuses a stranger with a
+ * sentence naming it.
+ */
+export function validateServerMemoryBanksSetProfiles(
+  raw: unknown,
+): ServerMemoryBanksSetProfilesRequest {
+  const request = requireRequest(raw);
+  const profileId = requireId(request['profileId'], 'profileId');
+  const slug = requireBankSlug(request['slug'], 'slug');
+  const scope = requireObject(request['profiles'], 'profiles');
+  const kind = requireString(scope['kind'], 'profiles.kind', 20);
+  if (kind === 'all') return { profileId, slug, profiles: { kind: 'all' } };
+  if (kind !== 'profiles') {
+    throw new ValidationError('profiles.kind', 'must be "all" or "profiles"');
+  }
+  const profileIds =
+    optionalStringArray(
+      scope['profileIds'],
+      'profiles.profileIds',
+      MEMORY_BANK_SCOPE_PROFILES,
+      MEMORY_BANK_PROFILE_ID_MAX,
+    ) ?? [];
+  return {
+    profileId,
+    slug,
+    profiles: { kind: 'profiles', profileIds: [...new Set(profileIds)] },
+  };
 }
 
 export function validateServerAccountsCreate(raw: unknown): ServerAccountsCreateRequest {

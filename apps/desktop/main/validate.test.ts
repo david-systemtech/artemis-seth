@@ -19,6 +19,7 @@ import {
   validateMemoryBankWireClaudeCode,
   validateMemoryBanksSetMasterEnabled,
   validateMemoryBanksVerifyRemote,
+  validateServerMemoryBanksSetProfiles,
   validateSecretsConnectionDelete,
   validateSecretsConnectionSave,
   validateSecretsConnectionVerify,
@@ -1128,6 +1129,81 @@ describe('validateMemoryBankSetProfiles', () => {
       validateMemoryBankSetProfiles({
         slug: 'cortex',
         profiles: { kind: 'profiles', profileIds: ['x'.repeat(65)] },
+      }),
+    ).toThrow(ValidationError);
+  });
+});
+
+/**
+ * The same scope, one machine further away.
+ *
+ * Its own validator rather than a shared one, because the ids in it are the
+ * *server's* account ids and not this machine's: one function taking either
+ * would be the single place where two registries could be confused. So the
+ * shape rules are checked here in full rather than assumed from the twin
+ * above, and the extra field — which server — is required.
+ */
+describe('validateServerMemoryBanksSetProfiles', () => {
+  it('takes the two scopes, and names which server', () => {
+    expect(
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: 'cortex',
+        profiles: { kind: 'all' },
+      }),
+    ).toEqual({ profileId: 'prof_server', slug: 'cortex', profiles: { kind: 'all' } });
+    expect(
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: 'cortex',
+        // The server's own ids, which are that server's business and are
+        // checked as strings rather than against this machine's grammar.
+        profiles: { kind: 'profiles', profileIds: ['remote-work', 'remote-work', 'remote-home'] },
+      }),
+    ).toEqual({
+      profileId: 'prof_server',
+      slug: 'cortex',
+      profiles: { kind: 'profiles', profileIds: ['remote-work', 'remote-home'] },
+    });
+  });
+
+  it('reads an empty list as a bank that reaches nobody, not as `all`', () => {
+    expect(
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: 'cortex',
+        profiles: { kind: 'profiles' },
+      }),
+    ).toEqual({
+      profileId: 'prof_server',
+      slug: 'cortex',
+      profiles: { kind: 'profiles', profileIds: [] },
+    });
+  });
+
+  it('refuses a request with no server, a bad scope, or a slug outside the grammar', () => {
+    expect(() =>
+      validateServerMemoryBanksSetProfiles({ slug: 'cortex', profiles: { kind: 'all' } }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: 'cortex',
+        profiles: { kind: 'some' },
+      }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: '../etc',
+        profiles: { kind: 'all' },
+      }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: 'cortex',
+        profiles: { kind: 'profiles', profileIds: [42] },
       }),
     ).toThrow(ValidationError);
   });

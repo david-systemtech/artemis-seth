@@ -41,6 +41,8 @@ import type {
   MemoryBankWireClaudeCodeRequest,
   MemoryBanksStatus,
   SecretConnectionState,
+  ServerMemoryBank,
+  ServerMemoryBanksSetProfilesRequest,
   SecretProviderDescriptor,
   SecretRefTestResult,
   SecretsRefTestRequest,
@@ -167,6 +169,45 @@ const wireCalls: MemoryBankWireClaudeCodeRequest[] = [];
 let bankMemories: readonly MemoryBankMemory[] = [];
 
 /* -------------------------------------------------------------------------- */
+/* The banks on an Artemis Server                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A server carrying two banks, one of each scope.
+ *
+ * Both branches of the picker — the "every account" tick and the checklist
+ * under it — are reachable without a test having to click one into existence,
+ * and the ids are deliberately unlike the local profiles' so a test that
+ * confused the two registries could not pass by accident.
+ */
+const SERVER_ACCOUNTS = [
+  { id: 'acct-1', slug: 'remote-work', label: 'Remote work' },
+  { id: 'acct-2', slug: 'remote-side', label: 'Remote side' },
+];
+
+const SERVER_BANKS: readonly ServerMemoryBank[] = [
+  {
+    slug: 'cortex',
+    path: '/data/banks/cortex',
+    role: 'readwrite',
+    enabled: true,
+    profiles: { kind: 'all' },
+  },
+  {
+    slug: 'client-notes',
+    path: '/data/banks/client-notes',
+    role: 'readonly',
+    enabled: true,
+    profiles: { kind: 'profiles', profileIds: ['acct-1'] },
+  },
+];
+
+let serverBanks: readonly ServerMemoryBank[] = SERVER_BANKS;
+/** False is every reason a server has nothing to offer here. See the group. */
+let serverBanksAvailable = true;
+const serverScopeCalls: ServerMemoryBanksSetProfilesRequest[] = [];
+
+/* -------------------------------------------------------------------------- */
 /* The key managers this machine has                                          */
 /* -------------------------------------------------------------------------- */
 
@@ -267,6 +308,23 @@ const testRefCalls: SecretsRefTestRequest[] = [];
     forget: async () => ok({ message: '' }),
     setMasterEnabled: async () => ok({ message: '' }),
   },
+  serverMemoryBanks: {
+    list: async () =>
+      ok({
+        manageProfiles: true,
+        available: serverBanksAvailable,
+        banks: serverBanksAvailable ? serverBanks : [],
+        accounts: serverBanksAvailable ? SERVER_ACCOUNTS : [],
+      }),
+    setProfiles: async (request: ServerMemoryBanksSetProfilesRequest) => {
+      serverScopeCalls.push(request);
+      serverBanks = serverBanks.map((entry) =>
+        entry.slug === request.slug ? { ...entry, profiles: request.profiles } : entry,
+      );
+      const changed = serverBanks.find((entry) => entry.slug === request.slug);
+      return ok({ bank: changed as ServerMemoryBank });
+    },
+  },
 };
 
 /*
@@ -303,6 +361,8 @@ beforeEach(() => {
   connections = CONNECTIONS;
   refTestAnswer = { found: true, keysAtPath: ['git_token', 'username'] };
   bankMemories = [];
+  serverBanks = SERVER_BANKS;
+  serverBanksAvailable = true;
   seedApp({ profiles: PROFILES as never });
 });
 
@@ -313,6 +373,7 @@ afterEach(() => {
   testRefCalls.length = 0;
   profileCalls.length = 0;
   wireCalls.length = 0;
+  serverScopeCalls.length = 0;
   describeMemoryBank.mockClear();
 });
 
@@ -665,7 +726,6 @@ describe('a bank card', () => {
     await renderPane();
     expect(screen.queryByLabelText('Attach “team” to Work')).toBeNull();
   });
-
   it('folds what the reader refused, with the count on the summary', async () => {
     withBanks(
       bank({
@@ -695,6 +755,80 @@ describe('a bank card', () => {
     withBanks(bank());
     await renderPane();
     expect(screen.queryByText(/entries have problems/)).toBeNull();
+  });
+});
+
+/**
+ * The banks on an Artemis Server, and the accounts *there* each one reaches.
+ *
+ * The pane's second registry. A server wears every one of its accounts behind
+ * a single local profile, so the checklist above — which ticks this machine's
+ * profiles — could never name them, and until this group existed the only
+ * thing that could set a served bank's scope was a text editor on the serving
+ * machine. What is pinned here is that the rows are the *server's* accounts,
+ * that a tick sends the server's own ids, and that a server with nothing to
+ * say renders nothing rather than an error.
+ */
+describe('banks on an Artemis Server', () => {
+  /** The local profile that *is* the server, beside the two local ones. */
+  const WITH_SERVER = [
+    ...PROFILES,
+    { id: 'srv', label: 'Big Iron', providerId: 'artemis', configDir: '/home/u/.srv' },
+  ];
+
+  it('lists the server\'s banks with the server\'s own accounts to tick', async () => {
+    seedApp({ profiles: WITH_SERVER as never });
+    await renderPane();
+
+    expect(screen.getByText('Banks on Big Iron (2)')).toBeTruthy();
+    // The scoped bank's rows are the server's accounts, not this machine's.
+    expect(screen.getByLabelText('Attach “client-notes” to Remote work')).toBeTruthy();
+    expect(screen.queryByLabelText('Attach “client-notes” to Work')).toBeNull();
+  });
+
+  it('sends the server\'s own account ids when a bank is narrowed', async () => {
+    seedApp({ profiles: WITH_SERVER as never });
+    await renderPane();
+
+    await act(async () => {
+      screen.getByLabelText('Attach “cortex” to every account on this server').click();
+    });
+    expect(serverScopeCalls).toEqual([
+      {
+        profileId: 'srv',
+        slug: 'cortex',
+        profiles: { kind: 'profiles', profileIds: ['acct-1', 'acct-2'] },
+      },
+    ]);
+  });
+
+  it('draws what the server answered, not what was clicked', async () => {
+    // A checkbox that moved because it was clicked rather than because the
+    // write landed would show a scope the server does not have.
+    seedApp({ profiles: WITH_SERVER as never });
+    await renderPane();
+
+    await act(async () => {
+      screen.getByLabelText('Attach “client-notes” to Remote side').click();
+    });
+    expect(
+      screen.getByLabelText('Attach “client-notes” to Remote side').getAttribute('data-state'),
+    ).toBe('checked');
+  });
+
+  it('renders nothing for a machine with no server, and for a server with nothing to say', async () => {
+    // No Artemis-Server profile at all.
+    await renderPane();
+    expect(screen.queryByText(/^Banks on /)).toBeNull();
+    cleanup();
+
+    // A server too old for the surface, one with no registry, and a token
+    // without the grant all arrive as `available: false`, and all three mean
+    // there is nothing here to edit.
+    serverBanksAvailable = false;
+    seedApp({ profiles: WITH_SERVER as never });
+    await renderPane();
+    expect(screen.queryByText(/^Banks on /)).toBeNull();
   });
 });
 

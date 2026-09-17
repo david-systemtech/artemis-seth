@@ -82,6 +82,9 @@ import type {
   RunInput,
   RunStatus,
   ServerAccountsListResponse,
+  ServerMemoryBank,
+  ServerMemoryBankScope,
+  ServerMemoryBanksListResponse,
   ServerProfileCreatedBody,
   ServerSignInStatus,
   SessionDelegatedWork,
@@ -12601,6 +12604,47 @@ export async function readServerAccounts(
   if (!bridge) return { error: 'This build cannot reach the main process.' };
   const result = await call(() => bridge.serverAccounts.list({ profileId }));
   return result.ok ? result.value : { error: result.error.message };
+}
+
+/**
+ * The memory banks on that server, and the accounts a scope may name.
+ *
+ * Uncached and silent on failure for the same two reasons {@link
+ * readServerAccounts} is, one line above: it is another machine's state, one
+ * pane renders it, and a server that happens to be asleep must not fire a
+ * banner because a settings dialog was opened.
+ */
+export async function readServerMemoryBanks(
+  profileId: ProfileId,
+): Promise<ServerMemoryBanksListResponse | { readonly error: string }> {
+  const { bridge } = resolveBridge();
+  if (!bridge) return { error: 'This build cannot reach the main process.' };
+  const result = await call(() => bridge.serverMemoryBanks.list({ profileId }));
+  return result.ok ? result.value : { error: result.error.message };
+}
+
+/**
+ * Attach one of that server's banks to every account there, or to exactly
+ * these.
+ *
+ * Loud on failure: a tick someone made is a thing they expect to have taken
+ * effect, and a scope that silently did not change is worse than none.
+ */
+export async function setServerMemoryBankProfiles(
+  profileId: ProfileId,
+  slug: string,
+  profiles: ServerMemoryBankScope,
+): Promise<ServerMemoryBank | null> {
+  const { bridge } = resolveBridge();
+  if (!bridge) return null;
+  const result = await call(() =>
+    bridge.serverMemoryBanks.setProfiles({ profileId, slug, profiles }),
+  );
+  if (!result.ok) {
+    reportFailure('Could not change which accounts that bank reaches', result.error);
+    return null;
+  }
+  return result.value.bank;
 }
 
 /**
