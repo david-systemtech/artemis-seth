@@ -3,13 +3,14 @@
  * Real directories, as in the other bank tests.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
 import { readBankAt } from '../formats.js';
+import type { BankRegistryV2 } from '../registryV2.js';
 import { hasRemote, installBankEverywhere, pullBank, reconcileBankInstalls, sharedIndexBudget, uninstallBankEverywhere } from '../sync.js';
 
 function scratch(): string {
@@ -101,5 +102,39 @@ describe('installing across profiles', () => {
     expect(uninstallBankEverywhere('team', dataDir)).toBe(2);
     expect(existsSync(join(home, 'projects', 'C--x-repo', 'memory', 'MEMORY.md'))).toBe(false);
     expect(existsSync(join(work, 'projects', 'C--x-repo', 'memory', 'MEMORY.md'))).toBe(false);
+  });
+});
+
+describe('each profile gets its own share of its memory file', () => {
+  it('does not halve a single-bank account for a bank attached to another account', () => {
+    // The defect this pins: the budget used to be the count of *enabled*
+    // banks, so a machine with two banks halved the index of every profile —
+    // including the ones carrying only one.
+    const many = bankWith(Array.from({ length: 120 }, (_, i) => `entry-${String(i).padStart(3, '0')}`));
+    const other = bankWith(['theirs']);
+    const { dataDir, home, work } = dataDirWithProfiles();
+    const registry: BankRegistryV2 = {
+      version: 2,
+      banks: [
+        { slug: 'team', path: many, role: 'readwrite', enabled: true, profiles: { kind: 'all' } },
+        { slug: 'client', path: other, role: 'readwrite', enabled: true, profiles: { kind: 'profiles', profileIds: ['p-work'] } },
+      ],
+      defaultSlug: 'team',
+    };
+    const bank = readBankAt(many, { slug: 'team' })!;
+    installBankEverywhere(bank, { record: registry.banks[0]!, dataDir, registry, today: '2026-09-17' });
+
+    const listed = (root: string): number =>
+      readFileSync(join(root, 'projects', 'C--x-repo', 'memory', 'MEMORY.md'), 'utf8')
+        .split('\n')
+        .filter((line) => line.startsWith('- [')).length;
+
+    // `home` carries only `team`, so it keeps the whole allowance; `work`
+    // carries both and shares it.
+    // One bank: the whole 170-line allowance, so every entry is listed.
+    expect(listed(home)).toBe(120);
+    // Two banks: half of it, and the block says how many it left on disk.
+    expect(listed(work)).toBe(85);
+    expect(readFileSync(join(work, 'projects', 'C--x-repo', 'memory', 'MEMORY.md'), 'utf8')).toContain('plus 35 more on disk');
   });
 });

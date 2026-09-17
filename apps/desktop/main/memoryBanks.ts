@@ -850,8 +850,9 @@ function installBankNow(
   cwd?: string,
 ): InstallEverywhereReport | null {
   if (artemisRoot === null) return null;
-  const sharing = registry.banks.filter((bank) => bank.enabled).length;
-  return reconcileBankInstalls(record, artemisRoot, cwd, sharedIndexBudget(sharing));
+  // The registry rather than a number: each profile's share is the banks that
+  // profile carries, and one number cannot be right for all of them.
+  return reconcileBankInstalls(record, artemisRoot, cwd, registry);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -926,7 +927,9 @@ export function promptBanks(
     registry,
     ...(profileId === undefined ? {} : { profileId }),
     ...(cwd === undefined ? {} : { cwd }),
-    budget: sharedIndexBudget(registry.banks.filter((bank) => bank.enabled).length),
+    budget: sharedIndexBudget(
+      registry.banks.filter((bank) => bank.enabled && scopeCoversProfile(bank.profiles, profileId)).length,
+    ),
     toolsAvailable,
     fallbackCli: null,
   });
