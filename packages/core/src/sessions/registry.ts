@@ -642,7 +642,14 @@ export class RunRegistry {
        * reload; a run must never fail to start because history could not be
        * measured.
        */
-      if (input.resumeSessionId !== undefined && adapter.countSessionMessages !== undefined) {
+      // Not for a run joining a turn in progress: the count now would include
+      // that turn's own messages, and the seam it wants is the one the serving
+      // side measured when the turn began — see `Run.historyOffset`.
+      if (
+        input.resumeSessionId !== undefined &&
+        input.attachToLive !== true &&
+        adapter.countSessionMessages !== undefined
+      ) {
         try {
           historyOffset = await adapter.countSessionMessages({
             sessionId: input.resumeSessionId,
@@ -656,6 +663,7 @@ export class RunRegistry {
 
       const resolved: ResolvedRunInput = { ...input, ...resolution, runId };
       run = await adapter.createRun(resolved);
+      if (run.historyOffset !== undefined) historyOffset = run.historyOffset;
     } catch (error) {
       throw asRunError(error, 'transport', `Could not start a ${input.providerId} run`);
     } finally {
@@ -1438,6 +1446,20 @@ function assertRunnable(input: RunInput, adapter: ProviderAdapter): void {
   }
   if (input.rewindToMessageId !== undefined && input.resumeSessionId !== undefined && !caps.rewind) {
     throw new RunError('invalid_request', `Provider "${adapter.id}" cannot rewind sessions`);
+  }
+  if (input.attachToLive === true) {
+    if (input.resumeSessionId === undefined) {
+      throw new RunError(
+        'invalid_request',
+        'Attaching to a run already going needs the session it is serving (resumeSessionId)',
+      );
+    }
+    if (caps.attachLive !== true) {
+      throw new RunError(
+        'invalid_request',
+        `Provider "${adapter.id}" cannot attach to a run already going`,
+      );
+    }
   }
   // Refused rather than dropped, like every other unsupported setting here.
   // The composer will not let a user attach to a provider that cannot take

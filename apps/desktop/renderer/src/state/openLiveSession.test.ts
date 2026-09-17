@@ -78,6 +78,8 @@ let steeredRuns: string[] = [];
 let startedRuns: string[] = [];
 /** What the live-work poll says is actively running. */
 let workingSessions: string[] = [];
+/** Runs the composer asked the engine to attach to a served conversation with. */
+let attachedInputs: { runId: string; resumeSessionId?: string; attachToLive?: boolean }[] = [];
 
 function liveRun(runId: string, sessionId: string, status = 'running') {
   return {
@@ -122,8 +124,21 @@ function session(id: string) {
       steeredRuns.push(runId);
       return { ok: true, value: { runId, deliveredImmediately: true } };
     },
-    start: async ({ runId }: { runId: string }) => {
-      startedRuns.push(runId);
+    start: async (request: {
+      runId?: string;
+      input?: { runId: string; resumeSessionId?: string; attachToLive?: boolean };
+    }) => {
+      const input = request.input;
+      startedRuns.push(input?.runId ?? request.runId ?? '?');
+      // Joining a served run: the engine answers with the handle it minted,
+      // carrying the seam the server measured. See `attachServedRun`.
+      if (input?.attachToLive === true && input.resumeSessionId !== undefined) {
+        attachedInputs.push(input);
+        return {
+          ok: true,
+          value: { run: { ...liveRun(input.runId, input.resumeSessionId), providerId: 'artemis' } },
+        };
+      }
       return { ok: false, error: { code: 'unknown', message: 'unexpected rival run' } };
     },
     liveWork: async () => ({
@@ -197,6 +212,7 @@ beforeEach(() => {
   steeredRuns = [];
   startedRuns = [];
   workingSessions = [];
+  attachedInputs = [];
 });
 
 afterEach(() => {
@@ -335,6 +351,45 @@ describe('opening a conversation from the sidebar', () => {
     expect(eventsAsked).toEqual(['r-live']);
     expect(paneState(focusedPane()).run).toMatchObject({ runId: 'r-live', status: 'running' });
     expect(useApp.getState().runningSessions).toContain('s1');
+  });
+
+  it('joins a served conversation the server is working on when this registry has no run for it', async () => {
+    /*
+     * Reported 2026-09-17: the desktop restarted while the server was
+     * mid-turn. The poll said the conversation was working, the pane showed a
+     * static transcript, and only a typed message — steered, and answered
+     * with a replay — put the work on screen. Nothing in this registry serves
+     * a served run, so the pane asks the engine to attach to the server's.
+     */
+    setPaneState(focusedPane(), {
+      resumeSessionId: 'sv1',
+      run: null,
+      activeProviderId: 'artemis',
+      activeProfileId: 'p-served',
+    } as never);
+    mainProcessRuns = [];
+    workingSessions = ['sv1'];
+
+    await refreshLiveWork();
+
+    expect(attachedInputs).toHaveLength(1);
+    expect(attachedInputs[0]).toMatchObject({
+      resumeSessionId: 'sv1',
+      attachToLive: true,
+      prompt: '',
+    });
+    const attached = attachedInputs[0]?.runId;
+    expect(eventsAsked).toEqual([attached]);
+    expect(paneState(focusedPane()).run).toMatchObject({
+      runId: attached,
+      sessionId: 'sv1',
+      status: 'running',
+    });
+
+    // Still attached on the next poll: nothing asks the engine twice.
+    await refreshLiveWork();
+    expect(attachedInputs).toHaveLength(1);
+    setPaneState(focusedPane(), { activeProviderId: 'claude', activeProfileId: 'p1' } as never);
   });
 
   it('reveals the live owner when a stale duplicate names the same session', () => {

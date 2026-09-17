@@ -289,6 +289,15 @@ export interface Run {
   readonly sessionId: SessionId | undefined;
 
   /**
+   * How many stored messages predate the turn this run follows, for a run
+   * attached to one already going (`RunInput.attachToLive`). The registry
+   * measures that seam for a run it starts; one that joins a turn in progress
+   * can only be told by the side serving it. Absent when the run is its own
+   * turn.
+   */
+  readonly historyOffset?: number;
+
+  /**
    * The normalized event stream.
    *
    * Contract, in addition to the ordering rules documented on `AgentEvent`:

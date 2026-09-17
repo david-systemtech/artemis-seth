@@ -1252,6 +1252,7 @@ function validateRunInput(value: unknown, field: string): RunInput {
     runId: optionalId(input['runId'], `${field}.runId`),
     resumeSessionId: optionalId(input['resumeSessionId'], `${field}.resumeSessionId`),
     forkSession: optionalBoolean(input['forkSession'], `${field}.forkSession`),
+    attachToLive: optionalBoolean(input['attachToLive'], `${field}.attachToLive`),
     /*
      * An opaque provider id, not one of Artemis's own — Claude names stored
      * messages by chain uuid — so this is `optionalString` where its

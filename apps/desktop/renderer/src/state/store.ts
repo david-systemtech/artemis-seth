@@ -10842,7 +10842,14 @@ async function restoreLiveRunBindings(working: readonly SessionId[]): Promise<vo
       const handle = listed.value.runs.find(
         (run) => run.status !== 'ended' && run.sessionId === sessionId,
       );
-      if (handle === undefined) return;
+      if (handle === undefined) {
+        // Nothing local serves it. A served conversation can still be working
+        // on the server with no run in this registry to bind — a window that
+        // restarted, a turn another client or the provider itself started.
+        // See `attachServedRun`.
+        if (paneState(pane).activeProviderId === 'artemis') await attachServedRun(pane, sessionId);
+        return;
+      }
 
       // The selection or state may have moved while the registry answered.
       // Never overwrite a new live run or a different conversation with an old
@@ -10859,6 +10866,77 @@ async function restoreLiveRunBindings(working: readonly SessionId[]): Promise<vo
       await attachRun(pane, handle);
     }),
   );
+}
+
+/** Sessions with a served attach in flight, so two polls cannot open two runs. */
+const servedAttaching = new Set<SessionId>();
+/** When a served attach was last refused per session, so a run the server no longer has is not asked for on every tick. */
+const servedAttachDeclined = new Map<SessionId, number>();
+const SERVED_ATTACH_RETRY_MS = 60_000;
+
+/**
+ * Join the run the server is still working on for a served conversation.
+ *
+ * A served run lives on the server, and this window's registry knows nothing
+ * of it whenever the turn was started by something other than this window:
+ * this window before a restart, another machine holding the same token, or
+ * the provider itself when a subagent settled. The live-work poll reports the
+ * session working, but until now the pane could only draw a static transcript
+ * over it, and the first thing that put the work on screen was the user
+ * typing a message into it — which the server turned into a steer and
+ * answered with a replay of everything so far. Reported 2026-09-17 as "it
+ * should have loaded live before sending a new prompt".
+ *
+ * This asks for that replay without the message: the engine starts an
+ * `attachToLive` run, the adapter joins the server's stream from its retained
+ * start, and the pane attaches to it exactly as it attaches to a run this
+ * registry started — history above the seam, the run's own events below it,
+ * and a live route for steering, stopping and answering from then on.
+ *
+ * Quiet when it cannot: the conversation stays readable as history, and the
+ * refusal is remembered for a while so a run the server has since finished is
+ * not asked for on every poll. True when the pane is now attached.
+ */
+async function attachServedRun(pane: Pane, sessionId: SessionId): Promise<boolean> {
+  const state = paneState(pane);
+  if (state.activeProviderId !== 'artemis' || state.activeProfileId === null) return false;
+  if (servedAttaching.has(sessionId)) return false;
+  const declined = servedAttachDeclined.get(sessionId);
+  if (declined !== undefined && Date.now() - declined < SERVED_ATTACH_RETRY_MS) return false;
+  const { bridge } = resolveBridge();
+  if (!bridge) return false;
+
+  servedAttaching.add(sessionId);
+  try {
+    const runId = newId('run');
+    const input: RunInput = {
+      providerId: state.activeProviderId,
+      profileId: state.activeProfileId,
+      cwd: state.cwd,
+      prompt: '',
+      runId,
+      resumeSessionId: sessionId,
+      attachToLive: true,
+      ...(state.model ? { model: state.model } : {}),
+    };
+    const result = await call(() => bridge.runs.start({ input }));
+    if (!result.ok) {
+      servedAttachDeclined.set(sessionId, Date.now());
+      return false;
+    }
+    // The column may have moved on while the server was asked. A run nobody
+    // will draw is let go rather than left streaming into a buffer.
+    const current = paneState(pane);
+    if (isLive(current) || !sessionIdsOf(current).includes(sessionId)) {
+      void call(() => bridge.runs.dispose({ runId }));
+      return false;
+    }
+    servedAttachDeclined.delete(sessionId);
+    await attachRun(pane, result.value.run);
+    return true;
+  } finally {
+    servedAttaching.delete(sessionId);
+  }
 }
 
 /** Re-read history once the provider has had a moment to flush its own writes. */
@@ -11404,6 +11482,17 @@ async function openSessionContents(session: SessionSummary, pane: Pane): Promise
       await attachRun(pane, live);
       return;
     }
+  }
+
+  // A served conversation the server reports as working is joined rather than
+  // read as a snapshot; see `attachServedRun`. A poll that has not answered yet
+  // leaves this to `restoreLiveRunBindings` on its next tick.
+  if (
+    session.providerId === 'artemis' &&
+    useApp.getState().sessionsWorking.includes(session.id) &&
+    (await attachServedRun(pane, session.id))
+  ) {
+    return;
   }
 
   await loadSessionHistory(session, pane);
