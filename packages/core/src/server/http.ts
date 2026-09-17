@@ -61,6 +61,8 @@ import type { PlanUsage } from '@rx-artemis/protocol';
 import type {
   AgentEvent,
   ArtemisChatExtensions,
+  Attachment,
+  Capabilities,
   OpenAiChatChunk,
   OpenAiChatRequest,
   OpenAiModelList,
@@ -97,6 +99,9 @@ import type {
   SessionSummary,
 } from '@rx-artemis/protocol';
 import {
+  ATTACHMENT_WIRE_BYTES,
+  AttachmentError,
+  CHAT_EXTENSIONS_FIELD,
   SERVER_API_VERSION,
   SERVER_HEALTH_PATH,
   SERVER_HOST,
@@ -104,7 +109,11 @@ import {
   SSE_HEARTBEAT,
   connectionHasExpired,
   describeConnection,
+  isFileAttachment,
+  isImageAttachment,
+  mergeAttachments,
   parseModelRoute,
+  readAttachments,
   readChatExtensions,
   reviewParameters,
   sseEvent,
@@ -113,6 +122,7 @@ import {
 
 import type { Catalogue } from './catalogue.js';
 import {
+  attachmentsFromMessages,
   chatChunk,
   chatResponse,
   promptFromMessages,
@@ -166,6 +176,18 @@ export interface ServerRequestInfo {
    * stream.
    */
   readonly body?: unknown;
+  /**
+   * The body was refused for its size before it was ever parsed.
+   *
+   * Carried as its own flag rather than left to be inferred from a missing
+   * `body`, because the two need different answers and for years got the same
+   * one: a body that is not JSON is a caller who sent the wrong thing, and a
+   * body that is too large is a caller who sent the right thing and too much of
+   * it. Both arrived here as `body: undefined` and were answered `400 The
+   * request body must be a JSON object`, which sent everyone who ever attached
+   * a screenshot to a served conversation looking for a bug in their JSON.
+   */
+  readonly bodyOversize?: boolean;
   /** Aborts when the client hangs up mid-turn. */
   readonly signal?: { readonly aborted: boolean };
 }
@@ -477,6 +499,38 @@ const CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
 const MAX_BODY_BYTES = 1_000_000;
 
 /**
+ * The routes that may carry attachments, and so may be larger.
+ *
+ * A megabyte is not "far more than a conversation needs" once a conversation
+ * can include a screenshot: base64 adds a third to a payload that is already
+ * megabytes, so under the flat cap every real image was answered with `400 The
+ * request body must be a JSON object` — a message about JSON, for a body that
+ * was perfectly good JSON and merely large. Nothing in the reply said so, which
+ * is why this was read as "the server cannot take attachments" rather than as a
+ * limit.
+ *
+ * Listed rather than derived from the method, because the widening should be
+ * exactly as wide as the feature that needs it: these four routes hand their
+ * bodies to `readAttachments`, and every other route on this server keeps the
+ * cap it has always had.
+ */
+const ATTACHMENT_BODY_PATHS: readonly string[] = [
+  CHAT_COMPLETIONS_PATH,
+  `/api/${SERVER_API_VERSION}/runs`,
+];
+
+/** The cap for one request: the wide one only where attachments may ride. */
+function bodyCapFor(path: string): number {
+  const route = path.split('?')[0] ?? path;
+  const wide =
+    ATTACHMENT_BODY_PATHS.includes(route) ||
+    // `POST /api/v0/runs/{id}/messages` and the bridge's `/send`: the same
+    // attachments, into a run that is already going.
+    /^\/api\/[^/]+\/runs\/[^/]+\/(?:messages|send)$/.test(route);
+  return wide ? ATTACHMENT_WIRE_BYTES : MAX_BODY_BYTES;
+}
+
+/**
  * Answer one request.
  *
  * Never throws: a fault becomes a 500 with an error body, because a rejected
@@ -510,6 +564,30 @@ export async function handleServerRequest(
     return fail(400, 'invalid_request_error', 'invalid_url', 'The request path could not be parsed.');
   }
   const path = normalizePath(url.pathname);
+
+  /*
+   * Too large, answered before the route is even found.
+   *
+   * Ahead of authentication on purpose, and it gives nothing away: the socket
+   * layer has already refused to read the body, so there is nothing left to do
+   * with this request whoever sent it, and a caller who has to guess whether
+   * their token or their payload was the problem is a caller who will guess
+   * wrong. The cap named in the message is the one this route actually has,
+   * which is how a client learns that the wide one exists.
+   */
+  if (request.bodyOversize === true) {
+    const cap = bodyCapFor(path);
+    return fail(
+      413,
+      'invalid_request_error',
+      'payload_too_large',
+      `The request body is larger than this route accepts (${String(cap)} bytes). ${
+        cap === MAX_BODY_BYTES
+          ? 'Only the routes that start or steer a run carry attachments, and only they are given more room.'
+          : 'Attachments are sent base64-encoded, which adds a third to their size.'
+      }`,
+    );
+  }
 
   if (path === SERVER_HEALTH_PATH) {
     const health: ServerHealthBody = {
@@ -1562,15 +1640,32 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
    * the router answers `400` with a message, which is a better failure than a
    * parse exception with no route context.
    */
-  async function readJsonBody(request: IncomingMessage): Promise<{ body?: unknown }> {
+  async function readJsonBody(
+    request: IncomingMessage,
+  ): Promise<{ body?: unknown; bodyOversize?: boolean }> {
     if (request.method !== 'POST' && request.method !== 'PATCH') return {};
 
+    /*
+     * Per route, because only the routes that carry attachments have a reason
+     * to be large. `request.url` is a path here, read the same way the router
+     * will read it; a path so malformed that `URL` will not have it gets the
+     * narrow cap, and then the router's own `invalid_url`.
+     */
+    let cap = MAX_BODY_BYTES;
+    try {
+      cap = bodyCapFor(normalizePath(new URL(request.url ?? '/', 'http://localhost').pathname));
+    } catch {
+      // Left at the narrow cap.
+    }
     const chunks: Buffer[] = [];
     let size = 0;
     for await (const chunk of request) {
       const buffer = chunk as Buffer;
       size += buffer.length;
-      if (size > MAX_BODY_BYTES) return { body: undefined };
+      // Reading stops here and the router answers; the rest of the upload is
+      // abandoned, exactly as it was under the single flat cap. What changed is
+      // only what the caller is told about it — see `bodyOversize`.
+      if (size > cap) return { bodyOversize: true };
       chunks.push(buffer);
     }
 
@@ -2142,6 +2237,44 @@ function unknownRun(): ServerReply {
 }
 
 /**
+ * An attachment this server will not take, as a reply.
+ *
+ * `AttachmentError` already carries the field and the reason, and both are
+ * safe to repeat: every string in it was written here, about a value the caller
+ * sent. Anything else caught where one of these was expected is a fault in the
+ * reader rather than a fact about the request, so it becomes a 500 with nothing
+ * in it — the same discipline `runFailure` keeps one function below.
+ */
+function attachmentFailure(error: unknown): ServerReply {
+  return error instanceof AttachmentError
+    ? fail(400, 'invalid_request_error', 'invalid_body', error.message)
+    : fail(500, 'server_error', 'internal_error', 'The attachments could not be read.');
+}
+
+/**
+ * Name the kind of attachment an account cannot carry, if any.
+ *
+ * Per kind rather than as one flag, because the two travel by different
+ * mechanisms and a provider can plausibly have one and not the other — an image
+ * needs a place on the wire, a file needs the adapter to stage it and say
+ * where. The registry behind the run applies exactly this test again; doing it
+ * here is what turns "the run failed" into a 400 that names the account.
+ *
+ * An account whose capabilities this build could not read answers `undefined`
+ * — unknown is not a refusal, and the registry is still there.
+ */
+function unsupportedAttachment(
+  attachments: readonly Attachment[] | undefined,
+  capabilities: Capabilities | undefined,
+): 'images' | 'files' | undefined {
+  if (attachments === undefined || attachments.length === 0) return undefined;
+  if (capabilities === undefined) return undefined;
+  if (!capabilities.imageInput && attachments.some(isImageAttachment)) return 'images';
+  if (!capabilities.fileInput && attachments.some(isFileAttachment)) return 'files';
+  return undefined;
+}
+
+/**
  * A run that would not do what it was asked.
  *
  * `RunError`'s message is passed through and nothing else's is. The caller has
@@ -2160,12 +2293,16 @@ function runFailure(error: unknown): ServerReply {
 /**
  * Another message into a run that is already going.
  *
- * Attachments are deliberately not read from the wire. `RunSource.send` carries
- * them because the desktop's own IPC path needs them, but nothing on this
- * boundary validates a base64 blob, and an unchecked one would travel from a
- * bearer token straight into an adapter's argument encoder. Text is the whole
- * of what a remote steer needs today; images can be added when there is a
- * validator to put in front of them.
+ * Attachments used to be deliberately dropped here, on the reasoning that
+ * nothing on this boundary validated a base64 blob and an unchecked one would
+ * travel from a bearer token straight into an adapter's argument encoder. That
+ * was the right call for as long as it was true. `readAttachments` is now that
+ * validator — the same one the IPC boundary and the bridge's own start route
+ * use, stated once in protocol — so the reason has gone and the drop with it.
+ *
+ * The drop was never cheap. A steer is how a person mid-conversation says "here
+ * is the screenshot I meant", and the text arriving alone made the agent answer
+ * about a picture it had not been given.
  */
 async function sendToOwnedRun(
   runs: RunSource,
@@ -2184,10 +2321,16 @@ async function sendToOwnedRun(
   if (typeof text !== 'string' || text.trim().length === 0) {
     return fail(400, 'invalid_request_error', 'invalid_body', '`text` must be a non-empty string.');
   }
+  let attachments: readonly Attachment[] | undefined;
+  try {
+    attachments = readAttachments((body as { attachments?: unknown }).attachments, 'attachments');
+  } catch (error) {
+    return attachmentFailure(error);
+  }
 
   try {
     record();
-    const outcome = await runs.send(runId, text);
+    const outcome = await runs.send(runId, text, attachments);
     const reply: RunsSendResponse = {
       runId,
       deliveredImmediately: outcome.deliveredImmediately,
@@ -3090,7 +3233,14 @@ async function handleChatCompletions(
     );
   }
 
-  const extensions = readChatExtensions(body);
+  let extensions: ArtemisChatExtensions;
+  try {
+    // The one field in here that throws rather than dropping: an attachment is
+    // the subject of the message, not a setting on it. See its own note.
+    extensions = readChatExtensions(body);
+  } catch (error) {
+    return attribute(attachmentFailure(error));
+  }
   // Bounded where the request is validated, per the wire type's promise. The
   // whole body is already capped, but a system prompt is the one caller-supplied
   // string large enough to be worth its own limit — mirroring `runInput.ts`'s
@@ -3170,6 +3320,54 @@ async function handleChatCompletions(
   const { model, redirected } = resumed;
 
   /*
+   * The account behind the route, needed here rather than further down because
+   * the steer branch below returns before ever reaching that point and carries
+   * attachments of its own.
+   */
+  const account = profiles.find((profile) => String(profile.id) === String(model.profileId));
+
+  /*
+   * Attachments, from both places one request can name them.
+   *
+   * `artemis.attachments` is what an Artemis client sends; `image_url` content
+   * parts are what every off-the-shelf OpenAI client sends, and neither is more
+   * correct than the other. They are merged and then held to the ceilings
+   * *together*, because each list can be legal on its own while the pair is
+   * four images too many.
+   */
+  let attachments: readonly Attachment[] | undefined;
+  try {
+    attachments = mergeAttachments(
+      extensions.attachments,
+      attachmentsFromMessages(chat.messages),
+      `${CHAT_EXTENSIONS_FIELD}.attachments`,
+    );
+  } catch (error) {
+    return attribute(attachmentFailure(error));
+  }
+
+  /*
+   * Refused rather than dropped, like the fork and the rewind below and for the
+   * same reason — only more so. A setting quietly not applied costs the caller
+   * a feature; a screenshot quietly not delivered costs them the question, and
+   * the answer comes back confident and about nothing. The account's own
+   * `imageInput` and `fileInput` decide it, because a server fronts several
+   * providers and they do not agree.
+   */
+  const unsupported = unsupportedAttachment(attachments, account?.capabilities);
+  if (unsupported !== undefined) {
+    return attribute(
+      fail(
+        400,
+        'invalid_request_error',
+        'unsupported_parameter',
+        `The account behind ${model.route} cannot accept ${unsupported} in a prompt.`,
+      ),
+    );
+  }
+  if (attachments !== undefined) extensions = { ...extensions, attachments };
+
+  /*
    * A message to a conversation the server is still working on is a steer,
    * not a second run.
    *
@@ -3215,8 +3413,9 @@ async function handleChatCompletions(
    * instruction the model never saw is not an outcome, it is a client that
    * believes it was heard. So the field is dropped *and reported*, under
    * `artemis.ignored` beside any lenient parameter, and a client can say so.
+   *
+   * `account` itself is resolved above, before the steer branch returns.
    */
-  const account = profiles.find((profile) => String(profile.id) === String(model.profileId));
 
   /*
    * Forking and rewinding, refused rather than dropped.
@@ -3819,6 +4018,9 @@ async function steerLiveRun(input: {
   const steer: SteerRequest = {
     runId: live.runId,
     prompt: promptFromMessages(input.chat.messages, { resuming: true }),
+    // Already read, merged and refused-if-unsupported by the route above; a
+    // steer into a live run stages them beside what its opening prompt staged.
+    ...(extensions.attachments === undefined ? {} : { attachments: extensions.attachments }),
     ...(extensions.sessionId === undefined ? {} : { sessionId: extensions.sessionId }),
     ...(input.request.signal === undefined ? {} : { signal: input.request.signal }),
     onDetach: (id: RunId) => directory.noteDetached(id),

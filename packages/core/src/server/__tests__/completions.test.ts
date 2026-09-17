@@ -11,9 +11,15 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AgentEvent, RunHandle, ServerModel } from '@rx-artemis/protocol';
-import { NO_CAPABILITIES } from '@rx-artemis/protocol';
+import { ATTACHMENT_LIMITS, AttachmentError, NO_CAPABILITIES } from '@rx-artemis/protocol';
 
-import { promptFromMessages, resumeTurn, runTurn, type RunSource } from '../completions.js';
+import {
+  attachmentsFromMessages,
+  promptFromMessages,
+  resumeTurn,
+  runTurn,
+  type RunSource,
+} from '../completions.js';
 
 const MODEL: ServerModel = {
   route: 'work-max/opus',
@@ -868,23 +874,123 @@ describe('promptFromMessages', () => {
     }
   });
 
-  it('reads content given as parts, and names an image it cannot forward', () => {
+  it('reads content given as parts, and leaves a carried image out of the text', () => {
     const prompt = promptFromMessages(
       [
         {
           role: 'user',
           content: [
             { type: 'text', text: 'what is this' },
-            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
           ],
         },
       ],
       { resuming: false },
     );
     expect(prompt).toContain('what is this');
-    // Named rather than dropped: the model should know something was meant to
-    // be there.
+    // The model is about to be shown it, so there is nothing to say about it.
+    expect(prompt).not.toContain('image omitted');
+  });
+
+  it('names an image it will not carry, rather than dropping it in silence', () => {
+    const prompt = promptFromMessages(
+      [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'what is this' },
+            { type: 'image_url', image_url: { url: 'https://example.test/shot.png' } },
+          ],
+        },
+      ],
+      { resuming: false },
+    );
+    // Nothing here fetches a URL on a caller's behalf, so the answer would have
+    // been about nothing. The reader of the reply gets to know that.
     expect(prompt).toContain('image omitted');
+    expect(prompt).toContain('data:');
+  });
+
+  it('carries only the turn its own images, never the history above it', () => {
+    const prompt = promptFromMessages(
+      [
+        {
+          role: 'user',
+          content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }],
+        },
+        { role: 'assistant', content: 'a cat' },
+        { role: 'user', content: 'and now?' },
+      ],
+      { resuming: false },
+    );
+    expect(prompt).toContain('only the newest message carries images');
+  });
+});
+
+describe('attachmentsFromMessages', () => {
+  const dataUrl = (type = 'image/png'): string => `data:${type};base64,AAAA`;
+
+  it('reads the trailing user message\'s data URLs as image attachments', () => {
+    const attachments = attachmentsFromMessages([
+      { role: 'user', content: 'earlier' },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'why is this misaligned' },
+          { type: 'image_url', image_url: { url: dataUrl() } },
+        ],
+      },
+    ]);
+    expect(attachments).toEqual([
+      { kind: 'image', id: 'image-url-1', mediaType: 'image/png', data: 'AAAA' },
+    ]);
+  });
+
+  it('ignores an image on a message that is not the turn', () => {
+    expect(
+      attachmentsFromMessages([
+        {
+          role: 'user',
+          content: [{ type: 'image_url', image_url: { url: dataUrl() } }],
+        },
+        { role: 'user', content: 'and now?' },
+      ]),
+    ).toBeUndefined();
+  });
+
+  it('ignores a link and a format no provider reads as an image', () => {
+    expect(
+      attachmentsFromMessages([
+        {
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: 'https://example.test/shot.png' } },
+            { type: 'image_url', image_url: { url: dataUrl('image/heic') } },
+          ],
+        },
+      ]),
+    ).toBeUndefined();
+  });
+
+  it('refuses a data URL whose payload is not base64', () => {
+    expect(() =>
+      attachmentsFromMessages([
+        {
+          role: 'user',
+          content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,not base64!' } }],
+        },
+      ]),
+    ).toThrow(AttachmentError);
+  });
+
+  it('holds the parts to the same ceiling as an Artemis client', () => {
+    const parts = Array.from({ length: ATTACHMENT_LIMITS.images + 1 }, () => ({
+      type: 'image_url' as const,
+      image_url: { url: dataUrl() },
+    }));
+    expect(() => attachmentsFromMessages([{ role: 'user', content: parts }])).toThrow(
+      /at most 4 images/,
+    );
   });
 });
 

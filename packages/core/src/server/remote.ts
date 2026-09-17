@@ -37,6 +37,7 @@ import { resolve, sep } from 'node:path';
 
 import type { FeedEvent, FeedScope, PushFeed } from './feed.js';
 import type {
+  Attachment,
   PermissionDecision,
   RunHandle,
   RunInput,
@@ -55,9 +56,11 @@ import type {
   ServerTerminalsBody,
 } from '@rx-artemis/protocol';
 import {
+  AttachmentError,
   connectionAllowsModel,
   connectionAllowsProfile,
   connectionHasExpired,
+  readAttachments,
   visibleToConnection,
   parseRemoteResourcePath,
   REMOTE_EVENTS_PATH,
@@ -804,9 +807,23 @@ async function handleRunAction(
         if (typeof body['text'] !== 'string' || body['text'].length === 0) {
           return fail(400, 'invalid_request_error', 'invalid_body', '`text` must be a non-empty string.');
         }
-        const attachments = Array.isArray(body['attachments'])
-          ? (body['attachments'] as never)
-          : undefined;
+        /*
+         * Read rather than trusted. This used to cast the array straight
+         * through, which put an unbounded base64 blob from a bearer token into
+         * an adapter's argument encoder without anything in between; the same
+         * reader the start route uses is the thing that was missing.
+         */
+        let attachments: readonly Attachment[] | undefined;
+        try {
+          attachments = readAttachments(body['attachments'], 'attachments');
+        } catch (error) {
+          return fail(
+            400,
+            'invalid_request_error',
+            'invalid_body',
+            error instanceof AttachmentError ? error.message : 'The attachments could not be read.',
+          );
+        }
         record();
         const outcome = await runs.send(runId, body['text'], attachments);
         const reply: ServerRunSendBody = {

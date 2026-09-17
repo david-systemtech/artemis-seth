@@ -90,6 +90,7 @@ import type {
   SessionDelegatedWork,
   TokenUsage,
 } from '@rx-artemis/protocol';
+import { isImageMediaType, readAttachments } from '@rx-artemis/protocol';
 import type { RouteRedirect } from './sessionHome.js';
 
 /* -------------------------------------------------------------------------- */
@@ -152,6 +153,19 @@ export interface RunSource {
     readonly permissionMode?: string;
     /** Standing instructions to append to the provider's preset. Append-only. */
     readonly systemPrompt?: string;
+    /**
+     * Files and images the prompt is about.
+     *
+     * The third field to join this shape, and on firmer ground than the other
+     * two: an attachment is not a *setting* a caller might not be entitled to,
+     * it is part of the message. Refusing to carry it would not narrow what an
+     * HTTP caller may choose, it would silently change what they asked.
+     *
+     * Already read and bounded by the route — see `readAttachments` — so a host
+     * hands these straight to the registry, which refuses them once more
+     * against the serving provider's own `imageInput` and `fileInput`.
+     */
+    readonly attachments?: readonly Attachment[];
   }): Promise<RunHandle>;
 
   /** Every event from every run. Filtered by `runId` here. */
@@ -309,7 +323,10 @@ export function promptFromMessages(
   let trailing = '';
 
   messages.forEach((message, index) => {
-    const text = flattenContent(message.content);
+    // Only the trailing user message's images are carried, so only its parts
+    // are read with that in mind. See {@link attachmentsFromMessages}.
+    const carried = index === messages.length - 1 && message.role === 'user';
+    const text = flattenContent(message.content, carried);
     if (text.length === 0) return;
 
     if (message.role === 'system' || message.role === 'developer') {
@@ -342,20 +359,108 @@ export function promptFromMessages(
   return parts.join('\n\n').trim();
 }
 
-/** OpenAI allows a string or an array of parts; both have to be read. */
-function flattenContent(content: OpenAiChatMessage['content']): string {
+/**
+ * OpenAI allows a string or an array of parts; both have to be read.
+ *
+ * `carried` says whether this message's images are the ones
+ * {@link attachmentsFromMessages} is turning into attachments — true for the
+ * trailing user message, which is the turn. An image that *is* being carried
+ * leaves nothing behind in the text: the model is about to be shown it. One
+ * that is not says so, because an image named nowhere is an image the reader
+ * of the answer will never know was missing.
+ */
+function flattenContent(content: OpenAiChatMessage['content'], carried: boolean): string {
   if (typeof content === 'string') return content.trim();
   if (!Array.isArray(content)) return '';
   return content
-    .map((part) =>
-      part.type === 'text'
-        ? part.text
-        : // An image the transport cannot carry yet. Named rather than dropped
-          // silently, so the model knows something was meant to be here.
-          '[image omitted: the Artemis server does not forward images yet]',
-    )
+    .map((part) => {
+      if (part.type === 'text') return part.text;
+      if (!carried) {
+        // History. Carrying these would show the model a picture from three
+        // turns ago as though it were part of the question being asked now.
+        return '[image omitted: only the newest message carries images]';
+      }
+      return imageFromPart(part, 0) === undefined
+        ? // A link, or a format no provider reads as an image. Nothing here
+          // fetches a URL on a caller's behalf — that is a request this server
+          // would be making to an address the caller chose.
+          '[image omitted: inline it as a base64 `data:` URL; a link is not fetched]'
+        : '';
+    })
+    .filter((text) => text.length > 0)
     .join('\n')
     .trim();
+}
+
+/* -------------------------------------------------------------------------- */
+/* Images the OpenAI way                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `data:image/png;base64,iVBOR…` → an image attachment, or nothing.
+ *
+ * Nothing for a link (`https://…`), for a `data:` URL that is not base64, and
+ * for a media type no provider reads as an image — each of which is a part this
+ * server will not carry rather than a request it will fail, because an OpenAI
+ * client that sent one has done nothing wrong by its own API's rules. The text
+ * says what happened; see {@link flattenContent}.
+ *
+ * The payload itself is *not* checked here. `readAttachments` does that, once,
+ * over the whole list — so a `data:` URL that parses but holds forty megabytes
+ * of something that is not base64 is refused with the same message, naming the
+ * same field, as one that arrived on `artemis.attachments`.
+ */
+function imageFromPart(
+  part: { readonly type: 'image_url'; readonly image_url: { readonly url: string } },
+  index: number,
+): Attachment | undefined {
+  const url = part.image_url?.url;
+  if (typeof url !== 'string') return undefined;
+  const match = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+  if (match === null) return undefined;
+  const [, mediaType, data] = match;
+  if (!isImageMediaType(mediaType) || data === undefined || data.length === 0) return undefined;
+  return {
+    kind: 'image',
+    // Minted here because OpenAI's shape has nowhere to put one. Positional, so
+    // two parts on one message cannot collide and trip the duplicate-id check.
+    id: `image-url-${String(index)}`,
+    mediaType,
+    data,
+  };
+}
+
+/**
+ * The images an OpenAI-shaped request carries, as attachments.
+ *
+ * Only the trailing user message's, and only when it is a user message: the
+ * rule the whole request is read by is that **that message is the turn**, and
+ * everything before it is history the caller is re-sending because their API is
+ * stateless. Carrying history's images would show the model a picture from
+ * three turns ago as though it were part of the question being asked now, and
+ * would do it again on every subsequent request.
+ *
+ * @throws {AttachmentError} for a `data:` URL this will not accept.
+ */
+export function attachmentsFromMessages(
+  messages: readonly OpenAiChatMessage[],
+): readonly Attachment[] | undefined {
+  const last = messages[messages.length - 1];
+  if (last === undefined || last.role !== 'user' || !Array.isArray(last.content)) {
+    return undefined;
+  }
+
+  const images: Attachment[] = [];
+  last.content.forEach((part, index) => {
+    if (part.type !== 'image_url') return;
+    const image = imageFromPart(part, index);
+    if (image !== undefined) images.push(image);
+  });
+
+  // Through the same reader as everything else, so the ceilings, the base64
+  // alphabet check and the per-kind arithmetic are the ones stated in protocol
+  // rather than a second opinion written here.
+  return readAttachments(images, 'messages[].content[].image_url');
 }
 
 /* -------------------------------------------------------------------------- */
@@ -997,6 +1102,11 @@ export async function* runTurn(
         ...(turn.extensions.systemPrompt === undefined
           ? {}
           : { systemPrompt: turn.extensions.systemPrompt }),
+        // Read off `artemis.attachments` and off the trailing message's
+        // `image_url` parts, merged and bounded together by the route.
+        ...(turn.extensions.attachments === undefined
+          ? {}
+          : { attachments: turn.extensions.attachments }),
       });
     } catch (error) {
       yield {
@@ -1134,6 +1244,15 @@ export interface ResumeRequest {
 export interface SteerRequest extends ResumeRequest {
   /** The message, already flattened the way {@link promptFromMessages} does. */
   readonly prompt: string;
+  /**
+   * Files and images this message is about.
+   *
+   * A steer carries them for the same reason an opening prompt does — the
+   * message is about them — and the adapters already take them on `Run.send`,
+   * staging them into the same directory the run's first prompt staged into,
+   * numbered on from what is already there.
+   */
+  readonly attachments?: readonly Attachment[];
 }
 
 /**
@@ -1165,8 +1284,8 @@ export async function* steerTurn(
   if (source.send === undefined) {
     throw new Error('This Artemis build cannot send into a running turn.');
   }
-  await source.send(request.runId, request.prompt);
-  const { prompt: _prompt, ...resume } = request;
+  await source.send(request.runId, request.prompt, request.attachments);
+  const { prompt: _prompt, attachments: _attachments, ...resume } = request;
   yield* resumeTurn(source, resume);
 }
 

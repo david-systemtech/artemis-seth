@@ -76,6 +76,7 @@ import type {
   RunEndReason,
   RunId,
   RunsSendResponse,
+  ServerConnectionInfo,
   ServerRunInterruptBody,
   RunStatus,
   ServerSessionDeletedBody,
@@ -208,7 +209,78 @@ export const ARTEMIS_CAPABILITIES: Capabilities = {
   // server drops the field, degrading to a run with no standing instructions —
   // the behaviour before this existed.
   systemPromptAppend: true,
+  /*
+   * Both true, and both are statements about *this transport* rather than about
+   * whatever is at the other end — which is what these two flags have always
+   * meant. The wire has somewhere to put an image (`artemis.attachments` on the
+   * request) and somewhere to put a file, and the server stages both into a
+   * directory it grants the agent, on its own machine, exactly as a local run
+   * stages them here.
+   *
+   * They were false for as long as that was not true, and the cost of leaving
+   * them false one release too long is worth recording: the composer's attach
+   * control was disabled against every served conversation with the tooltip
+   * "Artemis does not support file attachments", which reads as a statement
+   * about the product rather than about a missing field on a request body.
+   *
+   * What this cannot say is whether the *account the server routes to* can see
+   * a picture — a llama.cpp endpoint behind a served route cannot. That is the
+   * server's answer to give, per route, and it gives it: the completions route
+   * refuses an attachment the serving account's own `imageInput` or `fileInput`
+   * cannot honour, with a 400 naming the account, rather than dropping it.
+   */
+  imageInput: true,
+  fileInput: true,
 };
+
+/**
+ * Does the server at the other end read attachments off the wire at all?
+ *
+ * Asked before a prompt that carries one is sent, and only then. Every other
+ * field this adapter sends degrades honestly against an older server — it is
+ * dropped, and the run opens with the serving user's setting, which is a real
+ * outcome the client can live with. An attachment has no such degradation. A
+ * server that predates the field drops it, the prompt arrives as text alone,
+ * and the agent answers a question about a screenshot it was never given:
+ * confidently, at length, and with nothing anywhere reporting that a file went
+ * missing.
+ *
+ * So the one round trip. `GET /api/v0/connection` is the cheapest authenticated
+ * read on the server — it is what `checkAvailability` already probes — and a
+ * build that carries attachments says so on it. A build that does not says
+ * nothing, which is read as no: `acceptsAttachments` is a capability line, and
+ * "the field was missing" and "the answer is no" must reach the same branch.
+ *
+ * Not cached. An attachment-bearing prompt is rare, the probe is one small GET
+ * on a link that is about to carry megabytes, and a cache here would have to be
+ * invalidated by a server upgrade that this process has no way to hear about.
+ */
+async function assertServerTakesAttachments(
+  env: Readonly<Record<string, string | undefined>>,
+  count: number,
+): Promise<void> {
+  const root = baseUrl(env);
+  let info: Partial<ServerConnectionInfo> | undefined;
+  try {
+    const response = await fetch(`${root}${API_PREFIX}/connection`, {
+      headers: authHeaders(env),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (response.ok) info = (await response.json()) as Partial<ServerConnectionInfo>;
+  } catch {
+    // Unreachable is not "too old". Left undefined, and the refusal below says
+    // what it honestly knows: this send could not be shown to be safe.
+  }
+  if (info?.acceptsAttachments === true) return;
+
+  const noun = count === 1 ? 'attachment' : 'attachments';
+  throw adapterError(
+    'invalid_request',
+    info === undefined
+      ? `Could not reach the Artemis server at ${root} to check whether it accepts ${noun}. The ${noun} would have been dropped in silence, so nothing was sent.`
+      : `The Artemis server at ${root} is too old to accept ${noun}: it would take the message and drop ${count === 1 ? 'the file' : 'the files'} without saying so. Update the server, or send the prompt without ${noun}.`,
+  );
+}
 
 /**
  * The thinking levels a run may ask for, as one static descriptor list.
@@ -728,6 +800,21 @@ class ArtemisRun implements Run {
         ...(this.#input.systemPrompt?.kind === 'append'
           ? { systemPrompt: this.#input.systemPrompt.text }
           : {}),
+        /*
+         * The files and images this prompt is about, carried whole. The server
+         * stages them into a directory of its own and names them to the agent
+         * in the prompt, which is the same mechanism a local run uses and the
+         * reason this is a field rather than a second request: a prompt and its
+         * subject arriving separately is a window in which the turn can start
+         * without them.
+         *
+         * Never sent to a server that would drop them: `createRun` refused the
+         * run before this object was ever built. See
+         * `assertServerTakesAttachments`.
+         */
+        ...(this.#input.attachments === undefined || this.#input.attachments.length === 0
+          ? {}
+          : { attachments: this.#input.attachments }),
       };
       const response = await fetch(`${root}/v1/chat/completions`, {
         method: 'POST',
@@ -1296,10 +1383,24 @@ class ArtemisRun implements Run {
 
   async send(
     text: string,
-    _attachments?: readonly Attachment[],
+    attachments?: readonly Attachment[],
     messageId?: MessageId,
   ): Promise<SendResult> {
-    const response = await this.#post(this.#runRoute('messages'), { text });
+    /*
+     * Checked again on a steer, and not because the opening prompt's check
+     * could have gone stale. This run may never have had an opening prompt on
+     * this side at all: a pane that attached to a run the server was already
+     * working on (`attachToLive`) reaches this method without ever having built
+     * a request body, and a pane whose first prompt carried no attachment never
+     * asked. Neither has anything to go on but this.
+     */
+    if (attachments !== undefined && attachments.length > 0) {
+      await assertServerTakesAttachments(this.#input.env, attachments.length);
+    }
+    const response = await this.#post(this.#runRoute('messages'), {
+      text,
+      ...(attachments === undefined || attachments.length === 0 ? {} : { attachments }),
+    });
     if (!response.ok) throw await runRouteError(response, 'steer this run');
     // Remembered only once the server has it: a refused send is not in any
     // queue, and an id for it would steal the next delivery.
@@ -1779,7 +1880,7 @@ export function createArtemisAdapter(
       return body.tagged === true;
     },
 
-    createRun(input: ResolvedRunInput): Promise<Run> {
+    async createRun(input: ResolvedRunInput): Promise<Run> {
       // Strict about what the wire cannot carry — the same rule every adapter
       // follows, and doubly important where the run happens on another
       // machine: silently dropping a setting here means it is silently
@@ -1812,8 +1913,18 @@ export function createArtemisAdapter(
           ),
         );
       }
+      /*
+       * The third refusal, and the only one that has to ask the server a
+       * question to make it. It is here rather than inside the run for the
+       * reason the other two are: a refusal before the run exists is a message
+       * still sitting in the composer with an error beside it, where the same
+       * refusal a moment later is a conversation with a dead turn in it.
+       */
+      if (input.attachments !== undefined && input.attachments.length > 0) {
+        await assertServerTakesAttachments(input.env, input.attachments.length);
+      }
       known(input.env);
-      return Promise.resolve(new ArtemisRun(input, reconnect, hooks));
+      return new ArtemisRun(input, reconnect, hooks);
     },
   } as ProviderAdapter;
 }
