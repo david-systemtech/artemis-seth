@@ -69,6 +69,8 @@ import type {
   AuthStatusResponse,
   AgentPromptsDocument,
   BuiltInPromptId,
+  ServerMemoryBank,
+  ServerMemoryBankScope,
   ServerProfileCreatedBody,
   ServerSignInStatus,
   RoutineDraft,
@@ -99,6 +101,8 @@ import {
   ProfileStore,
   profileConfigDir,
   readRemoteAccounts,
+  readRemoteMemoryBanks,
+  setRemoteMemoryBankScope,
   readRemoteUsage,
   readRemoteSignIn,
   resolveEnv,
@@ -115,6 +119,7 @@ import {
   submitRemoteSignInCode,
   type EnvBundle,
   type RemoteAccounts,
+  type RemoteMemoryBanks,
   type LocalPlugin,
   type ProviderCredentialSpec,
   type ProviderRegistry,
@@ -527,6 +532,17 @@ export interface ArtemisEngine {
    * the *server's* id for it as well.
    */
   remoteAccounts(profileId: ProfileId): Promise<RemoteAccounts>;
+  /**
+   * The server's memory banks, its accounts, and whether this token may
+   * rescope one. The client half of `/api/v0/memory-banks`.
+   */
+  remoteMemoryBanks(profileId: ProfileId): Promise<RemoteMemoryBanks>;
+  /** Attach one of the server's banks to every account there, or to exactly these. */
+  setRemoteMemoryBankScope(
+    profileId: ProfileId,
+    slug: string,
+    scope: ServerMemoryBankScope,
+  ): Promise<ServerMemoryBank>;
   createRemoteAccount(
     profileId: ProfileId,
     request: { readonly label: string; readonly provider?: string },
@@ -1760,6 +1776,9 @@ function createEngine(options: EngineOptions): ArtemisEngine {
      * place for the address to be wrong.
      */
     remoteAccounts: async (profileId) => readRemoteAccounts(await remoteEnvFor(profileId)),
+    remoteMemoryBanks: async (profileId) => readRemoteMemoryBanks(await remoteEnvFor(profileId)),
+    setRemoteMemoryBankScope: async (profileId, slug, scope) =>
+      (await setRemoteMemoryBankScope(await remoteEnvFor(profileId), slug, scope)).bank,
 
     createRemoteAccount: async (profileId, request) =>
       createRemoteAccount(await remoteEnvFor(profileId), request),

@@ -33,6 +33,11 @@ import type {
   ServerProfile,
   ServerProfileCreatedBody,
   ServerProfilesBody,
+  ServerMemoryBank,
+  ServerMemoryBankAccount,
+  ServerMemoryBankBody,
+  ServerMemoryBankScope,
+  ServerMemoryBanksBody,
   ServerRoutineBody,
   ServerRoutineDeletedBody,
   ServerRoutinesBody,
@@ -136,6 +141,78 @@ export async function updateRemoteAccount(
     `${API_PREFIX}/profiles/${encodeURIComponent(accountId)}`,
     options,
     { method: 'PATCH', body: patch },
+  );
+}
+
+/** The server's memory banks as a client has to meet them. */
+export interface RemoteMemoryBanks {
+  /**
+   * This profile's token was granted account administration, which is the same
+   * grant that scopes a bank. False is the ordinary answer for a token pasted
+   * from `connection create` without `--manage-profiles`.
+   */
+  readonly manageProfiles: boolean;
+  /**
+   * The server answers this surface at all.
+   *
+   * False for a server too old to have the routes and for one that keeps no
+   * registry — which the wire cannot tell apart, by design, and which a client
+   * has no reason to: both mean there is nothing here to edit. Distinct from
+   * `manageProfiles` because the sentences a pane should show differ: "this
+   * server cannot" against "this token may not".
+   */
+  readonly available: boolean;
+  readonly banks: readonly ServerMemoryBank[];
+  /** The accounts a scope may name, for the checklist. */
+  readonly profiles: readonly ServerMemoryBankAccount[];
+}
+
+/**
+ * The server's memory banks, the accounts a scope may name, and whether this
+ * token may change either.
+ *
+ * Shaped like {@link readRemoteAccounts} and for the same reason: a pane needs
+ * the grant and the rows together or it will render controls it cannot use.
+ * The banks read is allowed to be absent — a 404 is what both an older server
+ * and an unprivileged token get, and neither is an error worth a banner.
+ */
+export async function readRemoteMemoryBanks(
+  env: ArtemisProfileEnv,
+  options?: { readonly signal?: AbortSignal },
+): Promise<RemoteMemoryBanks> {
+  const [connection, banks] = await Promise.all([
+    call<{ manageProfiles?: unknown }>(env, `${API_PREFIX}/connection`, options),
+    absentOnUnavailable(
+      call<ServerMemoryBanksBody>(env, `${API_PREFIX}/memory-banks`, options),
+    ),
+  ]);
+  return {
+    manageProfiles: connection.manageProfiles === true,
+    available: banks !== null,
+    banks: Array.isArray(banks?.banks) ? banks.banks : [],
+    profiles: Array.isArray(banks?.profiles) ? banks.profiles : [],
+  };
+}
+
+/**
+ * Choose which of the server's accounts one of its banks reaches.
+ *
+ * The scope is sent whole rather than as a diff — the same shape the desktop
+ * stores for its own banks — so a client that has just drawn a checklist sends
+ * what the checklist says, and two clients editing at once do not interleave
+ * into a scope neither asked for.
+ */
+export async function setRemoteMemoryBankScope(
+  env: ArtemisProfileEnv,
+  slug: string,
+  profiles: ServerMemoryBankScope,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerMemoryBankBody> {
+  return call<ServerMemoryBankBody>(
+    env,
+    `${API_PREFIX}/memory-banks/${encodeURIComponent(slug)}`,
+    options,
+    { method: 'PATCH', body: { profiles } },
   );
 }
 
@@ -280,6 +357,24 @@ export async function runRemoteRoutine(
 /** An account id is opaque and may be anything the server minted. Encode it. */
 function signInPath(accountId: ProfileId | string): string {
   return `${API_PREFIX}/profiles/${encodeURIComponent(String(accountId))}/signin`;
+}
+
+/**
+ * `null` for a surface this server does not offer.
+ *
+ * {@link absentOnMissing}'s 404 plus the `501` a build that serves accounts but
+ * keeps no memory-bank registry answers. Both are "nothing to show here" and
+ * neither is worth an error in a pane the user merely opened.
+ */
+async function absentOnUnavailable<T>(pending: Promise<T>): Promise<T | null> {
+  try {
+    return await pending;
+  } catch (error) {
+    if (!isAdapterError(error)) throw error;
+    const status = error.agentError.httpStatus;
+    if (status === 404 || status === 501) return null;
+    throw error;
+  }
 }
 
 async function absentOnMissing<T>(pending: Promise<T>): Promise<T | null> {

@@ -23,7 +23,9 @@ import {
   cancelRemoteSignIn,
   createRemoteAccount,
   readRemoteAccounts,
+  readRemoteMemoryBanks,
   readRemoteSignIn,
+  setRemoteMemoryBankScope,
   submitRemoteSignInCode,
 } from '../artemis/admin.js';
 
@@ -101,6 +103,92 @@ describe('readRemoteAccounts', () => {
     );
 
     expect((await readRemoteAccounts(ENV)).manageProfiles).toBe(false);
+  });
+});
+
+describe('readRemoteMemoryBanks', () => {
+  it('asks both questions at once, and reports the accounts a scope may name', async () => {
+    const seen = stubFetch((path) =>
+      path.endsWith('/connection')
+        ? jsonResponse({ id: 'c1', manageProfiles: true })
+        : jsonResponse({
+            object: 'artemis.memory-banks',
+            banks: [
+              {
+                slug: 'cortex',
+                path: '/data/banks/cortex',
+                role: 'readwrite',
+                enabled: true,
+                profiles: { kind: 'all' },
+              },
+            ],
+            profiles: [{ id: 'p1', slug: 'work', label: 'Work' }],
+          }),
+    );
+
+    const answer = await readRemoteMemoryBanks(ENV);
+
+    expect(answer).toMatchObject({ manageProfiles: true, available: true });
+    expect(answer.banks.map((bank) => bank.slug)).toEqual(['cortex']);
+    // The labels come with the ids, because a list of opaque ids is not a
+    // checklist anybody can tick.
+    expect(answer.profiles).toEqual([{ id: 'p1', slug: 'work', label: 'Work' }]);
+    expect(seen.map((call) => call.url).sort()).toEqual([
+      'http://server.tail:6472/api/v0/connection',
+      'http://server.tail:6472/api/v0/memory-banks',
+    ]);
+  });
+
+  it('reads a refusal or a missing route as nothing to edit, not as a fault', async () => {
+    /*
+     * 404 is what an older server, a build with no registry, and a token
+     * without the grant all get — the server refuses to tell them apart on
+     * purpose — and 501 is what an administrator gets from a build that serves
+     * accounts and keeps no banks. All three mean the pane renders nothing, and
+     * a throw here would put a banner on a settings screen somebody merely
+     * opened.
+     */
+    for (const status of [404, 501]) {
+      stubFetch((path) =>
+        path.endsWith('/connection')
+          ? jsonResponse({ id: 'c1', manageProfiles: true })
+          : jsonResponse({ error: { message: 'no' } }, status),
+      );
+      const answer = await readRemoteMemoryBanks(ENV);
+      expect(answer.available).toBe(false);
+      expect(answer.banks).toEqual([]);
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('setRemoteMemoryBankScope', () => {
+  it('PATCHes the whole scope, with the slug on the path', async () => {
+    // Whole rather than a diff: a client that has just drawn a checklist sends
+    // what the checklist says, and two clients editing at once cannot
+    // interleave into a scope neither asked for.
+    const seen = stubFetch(() =>
+      jsonResponse({
+        object: 'artemis.memory-bank',
+        bank: {
+          slug: 'cortex',
+          path: '/data/banks/cortex',
+          role: 'readwrite',
+          enabled: true,
+          profiles: { kind: 'profiles', profileIds: ['p1'] },
+        },
+      }),
+    );
+
+    const answer = await setRemoteMemoryBankScope(ENV, 'cortex', {
+      kind: 'profiles',
+      profileIds: ['p1'],
+    });
+
+    expect(answer.bank.profiles).toEqual({ kind: 'profiles', profileIds: ['p1'] });
+    expect(seen[0]?.method).toBe('PATCH');
+    expect(seen[0]?.url).toBe('http://server.tail:6472/api/v0/memory-banks/cortex');
+    expect(seen[0]?.body).toBe('{"profiles":{"kind":"profiles","profileIds":["p1"]}}');
   });
 });
 

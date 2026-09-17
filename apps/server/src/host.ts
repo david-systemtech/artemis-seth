@@ -40,6 +40,7 @@ import type {
   RunId,
   RunInput,
   ServerConnection,
+  ServerMemoryBankScope,
   SessionDelegatedWork,
 } from '@rx-artemis/protocol';
 import {
@@ -65,6 +66,7 @@ import {
   SessionLifecycleLog,
   SESSION_LIFECYCLE_LOG_FILE,
   type Catalogue,
+  type MemoryBankAdmin,
   type ProfileAdmin,
   type ProviderRegistry,
   type PushFeed,
@@ -118,6 +120,11 @@ export interface HeadlessHost {
   readonly routines: ServerRoutineStore;
   /** What the account-administration routes act through. See `signin.ts`. */
   readonly profileAdmin: ProfileAdmin;
+  /**
+   * What the memory-bank routes act through: the registry this process keeps,
+   * read and rescoped over the wire. See `memoryBanks.ts`.
+   */
+  readonly memoryBankAdmin: MemoryBankAdmin;
   /** Every push the server can stream to a remote client. See `server/feed.ts`. */
   readonly feed: PushFeed;
   /** Interrupt-on-disconnect for bridge-started runs. See `server/guard.ts`. */
@@ -844,6 +851,13 @@ export function createHeadlessHost(
     usageSource,
     routines,
     profileAdmin,
+    memoryBankAdmin: {
+      // Synchronous underneath — the registry is one small file — and promised
+      // here because the seam is shaped for a host whose store is not.
+      list: () => Promise.resolve(banks.list()),
+      setScope: (slug: string, scope: ServerMemoryBankScope) =>
+        Promise.resolve(banks.setScope(slug, scope)),
+    },
     feed,
     guard,
     recordAccess: (event) => accessLog.record(event),

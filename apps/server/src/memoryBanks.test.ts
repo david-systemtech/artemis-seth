@@ -176,6 +176,52 @@ describe('the server keeping its banks', () => {
   });
 });
 
+describe('scoping a bank to some of the server\'s accounts', () => {
+  it('lists every bank unfiltered, and narrows what a run then reaches', async () => {
+    const banks = createServerMemoryBanks({ dataDir, cliRegistryPath: nowhere(), log: () => undefined });
+
+    // The operator's view of the file, not a run's view of the machine: scope
+    // included, and nothing filtered out.
+    expect(banks.list()).toEqual([
+      { slug: 'cortex', path: bank, role: 'readwrite', enabled: true, profiles: { kind: 'all' } },
+    ]);
+    expect(banks.reaches('prof_work')).toBe(true);
+    expect(banks.reaches('prof_other')).toBe(true);
+
+    const updated = banks.setScope('cortex', { kind: 'profiles', profileIds: ['prof_work'] });
+    expect(updated?.profiles).toEqual({ kind: 'profiles', profileIds: ['prof_work'] });
+
+    // Read afresh on every call, so the change takes effect without a restart.
+    expect(banks.reaches('prof_work')).toBe(true);
+    expect(banks.reaches('prof_other')).toBe(false);
+    expect(banks.directoriesFor('prof_work')).toEqual([bank]);
+    expect(banks.directoriesFor('prof_other')).toEqual([]);
+
+    // And an account out of scope gets no install, which is the half a run
+    // cannot recover from later: the provider reads the project's memory file
+    // on the first turn.
+    banks.prepare({ profileId: 'prof_other', cwd });
+    expect(existsSync(join(configDir, 'projects', projectKey(cwd), 'memory', 'MEMORY.md'))).toBe(false);
+
+    // Persisted, not merely remembered.
+    const written = JSON.parse(await readFile(join(dataDir, REGISTRY_V2_FILE), 'utf8')) as {
+      banks: { slug: string; profiles: unknown }[];
+    };
+    expect(written.banks[0]?.profiles).toEqual({ kind: 'profiles', profileIds: ['prof_work'] });
+  });
+
+  it('widens back to every account, and answers nothing for a bank it does not have', () => {
+    const banks = createServerMemoryBanks({ dataDir, cliRegistryPath: nowhere(), log: () => undefined });
+    banks.setScope('cortex', { kind: 'profiles', profileIds: [] });
+    expect(banks.reaches('prof_work')).toBe(false);
+
+    expect(banks.setScope('cortex', { kind: 'all' })?.profiles).toEqual({ kind: 'all' });
+    expect(banks.reaches('prof_work')).toBe(true);
+
+    expect(banks.setScope('no-such-bank', { kind: 'all' })).toBeUndefined();
+  });
+});
+
 describe('folding the banks into a run', () => {
   it('keeps the caller\'s own directories first, deduplicates, and no-ops by reference', () => {
     const own = ['/work/extra'];

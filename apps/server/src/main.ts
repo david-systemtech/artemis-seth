@@ -182,6 +182,10 @@ async function serve(): Promise<void> {
     // not per deployment, so a build that wired it and a connection that was
     // never granted it produce the same 404 — which is the point.
     profileAdmin: host.profileAdmin,
+    // Likewise per connection, not per deployment: a server with no banks
+    // answers an administrator with an empty list rather than a 501, which is
+    // the truthful answer — the registry is there, and it is empty.
+    memoryBanks: host.memoryBankAdmin,
     ...(signInTimeoutMs() === undefined ? {} : { signInTimeoutMs: signInTimeoutMs() as number }),
     // No `terminals`: this process has no PTY surface — see the file header on
     // what a headless deployment gives up — so the terminal routes answer 501

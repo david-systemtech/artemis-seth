@@ -56,9 +56,14 @@
  * answer after the write is what the next render draws.
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ReactElement } from 'react';
 import type {
+  ProfileId,
+  ServerMemoryBank,
+  ServerMemoryBankAccount,
+  ServerMemoryBankScope,
+  ServerMemoryBanksListResponse,
   MemoryBankAuthInput,
   MemoryBankFormat,
   MemoryBankInfo,
@@ -74,7 +79,12 @@ import { secretRefProblem } from '@rx-artemis/protocol';
 
 import { useMemoryBanks, type MemoryBanksPane } from '../../hooks/useMemoryBanks';
 import { useSecretManagers } from '../../hooks/useSecretManagers';
-import { describeMemoryBank, useApp } from '../../state/store';
+import {
+  describeMemoryBank,
+  readServerMemoryBanks,
+  setServerMemoryBankProfiles,
+  useApp,
+} from '../../state/store';
 import { ReasonButton } from '../disabled-reason';
 import { CodeBlock, Fold, Row, StatusDot, ToneBadge } from '../primitives';
 import { SettingsGroup, SettingsPane } from './pane';
@@ -156,6 +166,7 @@ export function MemoryBankGroups({ pane }: { readonly pane: MemoryBanksPane }): 
 
       {pane.status !== null && hasBanks ? <MasterGroup pane={pane} /> : null}
       {pane.status !== null && hasBanks ? <BanksGroup pane={pane} /> : null}
+      <ServerBanksGroups />
       {pane.status !== null ? <AddGroup pane={pane} first={!hasBanks} /> : null}
 
       {pane.lastAction !== null ? (
@@ -166,6 +177,219 @@ export function MemoryBankGroups({ pane }: { readonly pane: MemoryBanksPane }): 
         />
       ) : null}
     </>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Banks on an Artemis Server                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The banks on every Artemis Server this machine holds a profile for.
+ * ============================================================================
+ *
+ * A group per server, below this machine's own banks, because they are a
+ * different registry on a different computer: a bank on a server is a checkout
+ * *there*, scoped by *its* account ids, and the checklist above — which ticks
+ * this machine's profiles — can no more name them than a run here can read
+ * them. A server wears every one of its accounts behind one local profile, so
+ * without this the only thing this pane could have said about a served bank is
+ * that it reached all of them.
+ *
+ * Which is what it did. A served run has always honoured a bank's scope — the
+ * server filters on it before attaching a checkout, before composing the
+ * prompt, and before the memory tools list anything — but nothing could ever
+ * set one: `memory-banks.json` on the serving machine had a single writer, a
+ * text editor over SSH. These checkboxes are the writer that was missing.
+ *
+ * Only the scope is editable here, deliberately. Adding, cloning and pulling a
+ * bank touch the serving machine's disk and its git credentials, and belong to
+ * whoever administers it; what a person at this end is missing is the one
+ * field nothing on the wire could reach.
+ *
+ * A server that cannot answer the surface renders nothing — no row, no error.
+ * That covers an older server, one with no registry, and a token without
+ * account administration, which the server refuses to tell apart on purpose.
+ * All three mean there is nothing here to edit, and a settings pane that grew
+ * an error line for every sleeping server would be unusable.
+ */
+function ServerBanksGroups(): ReactElement | null {
+  const profiles = useApp((s) => s.profiles);
+  const servers = useMemo(
+    () =>
+      profiles.filter((profile) => profile.providerId === 'artemis' && profile.disabled !== true),
+    [profiles],
+  );
+  if (servers.length === 0) return null;
+  return (
+    <>
+      {servers.map((profile) => (
+        <ServerBanksGroup key={profile.id} profileId={profile.id} label={profile.label} />
+      ))}
+    </>
+  );
+}
+
+function ServerBanksGroup({
+  profileId,
+  label,
+}: {
+  readonly profileId: ProfileId;
+  readonly label: string;
+}): ReactElement | null {
+  const [listing, setListing] = useState<ServerMemoryBanksListResponse | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  /*
+   * Read into this component rather than into the store, the rule every pane
+   * that renders another machine's state keeps — see `readServerAccounts`:
+   * one pane looks at it, so caching it would mean inventing an invalidation
+   * rule for a thing nobody else reads. The profile is the server, so it is
+   * the whole dependency list: repointing one at a different address is a
+   * different set of banks.
+   */
+  useEffect(() => {
+    let live = true;
+    setListing(null);
+    void readServerMemoryBanks(profileId).then((answer) => {
+      if (live && !('error' in answer)) setListing(answer);
+    });
+    return () => {
+      live = false;
+    };
+  }, [profileId]);
+
+  if (listing === null || !listing.available || listing.banks.length === 0) return null;
+
+  /*
+   * The server's answer is what the next render draws, exactly as the local
+   * cards draw the registry's: a checkbox that moved because it was clicked
+   * rather than because the write landed would show a scope the server does
+   * not have. A refused write leaves the box where it was and reports itself
+   * through the store's own failure banner.
+   */
+  const apply = (slug: string, profiles: ServerMemoryBankScope): void => {
+    setBusy(slug);
+    void setServerMemoryBankProfiles(profileId, slug, profiles)
+      .then((bank) => {
+        if (bank === null) return;
+        setListing((current) =>
+          current === null
+            ? current
+            : {
+                ...current,
+                banks: current.banks.map((entry) => (entry.slug === bank.slug ? bank : entry)),
+              },
+        );
+      })
+      .finally(() => setBusy(null));
+  };
+
+  return (
+    <SettingsGroup label={`Banks on ${label} (${listing.banks.length})`}>
+      <div className="flex flex-col divide-y divide-hairline">
+        {listing.banks.map((bank) => (
+          <ServerBankCard
+            key={bank.slug}
+            bank={bank}
+            accounts={listing.accounts}
+            busy={busy === bank.slug || !listing.manageProfiles}
+            onChange={(profiles) => apply(bank.slug, profiles)}
+          />
+        ))}
+      </div>
+    </SettingsGroup>
+  );
+}
+
+function ServerBankCard({
+  bank,
+  accounts,
+  busy,
+  onChange,
+}: {
+  readonly bank: ServerMemoryBank;
+  readonly accounts: readonly ServerMemoryBankAccount[];
+  readonly busy: boolean;
+  readonly onChange: (profiles: ServerMemoryBankScope) => void;
+}): ReactElement {
+  const scope = bank.profiles;
+  const all = scope.kind === 'all';
+
+  const toggle = (id: string, on: boolean): void => {
+    const current = scope.kind === 'profiles' ? scope.profileIds : [];
+    onChange({
+      kind: 'profiles',
+      profileIds: on ? [...current, id] : current.filter((entry) => entry !== id),
+    });
+  };
+
+  return (
+    <div className="flex flex-col gap-2 px-3 py-2.5">
+      <div className="flex items-center gap-2">
+        <StatusDot tone={bank.enabled ? 'mint' : 'amber'} />
+        <span className="font-mono text-xs text-ink">{bank.slug}</span>
+        {bank.role === 'readonly' ? <ToneBadge tone="neutral">read-only</ToneBadge> : null}
+        {bank.enabled ? null : <ToneBadge tone="amber">off</ToneBadge>}
+      </div>
+      <Row label="Repo">{bank.path}</Row>
+
+      <div className="flex flex-col gap-1.5 pt-1">
+        <span className="chrome-label text-ink-faint">Accounts</span>
+
+        {/*
+          "Every account" above the list rather than beside it, the same
+          argument the local picker makes: it is the default, and the list
+          underneath is what narrowing looks like. Unticking it hands back
+          every account ticked, so narrowing does not first detach the bank
+          from everything and make the user re-tick what they already had.
+        */}
+        <label className="flex cursor-pointer items-center gap-2">
+          <Checkbox
+            checked={all}
+            disabled={busy}
+            onCheckedChange={(next) =>
+              onChange(
+                next === true
+                  ? { kind: 'all' }
+                  : { kind: 'profiles', profileIds: accounts.map((account) => String(account.id)) },
+              )
+            }
+            aria-label={`Attach “${bank.slug}” to every account on this server`}
+          />
+          <span className="flex flex-col">
+            <span className="text-xs leading-snug text-ink">Every account</span>
+            <span className="text-2xs leading-snug text-ink-faint">
+              Including accounts added later.
+            </span>
+          </span>
+        </label>
+
+        {all ? null : (
+          <div className="flex flex-col gap-1 border-t border-hairline pt-2">
+            {accounts.length === 0 ? (
+              <span className="text-2xs text-ink-faint">
+                This server serves no accounts yet — add one under Profiles and it will appear here.
+              </span>
+            ) : null}
+            {accounts.map((account) => (
+              <label key={String(account.id)} className="flex cursor-pointer items-center gap-2">
+                <Checkbox
+                  checked={
+                    scope.kind === 'profiles' && scope.profileIds.includes(String(account.id))
+                  }
+                  disabled={busy}
+                  onCheckedChange={(next) => toggle(String(account.id), next === true)}
+                  aria-label={`Attach “${bank.slug}” to ${account.label}`}
+                />
+                <span className="text-xs leading-snug text-ink">{account.label}</span>
+                <span className="text-2xs text-ink-faint">{account.slug}</span>
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
