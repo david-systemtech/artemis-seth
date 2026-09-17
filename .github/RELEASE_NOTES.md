@@ -1,6 +1,18 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.17.0
+
+A served conversation shows the turn it is on, can be joined while it is going, and heals a stream that falls behind; and a memory bank on a server reaches the accounts you choose.
+
+**A message to a conversation kept alive by background work streams as it goes.** Sent to a session whose process was holding a subagent, a message produced nothing on screen for minutes while the agent worked the whole time. The adapter was waiting for the CLI to echo the prompt, and the CLI never does: it announces each command's turn with a lifecycle frame and stamps the turn's messages with the prompt's id, and the only user messages on its stream are tool results. The adapter reads those frames and stamps now, and treats a tool result as evidence of nothing, so the turn lands on the run that asked for it. The same gate now holds a fresh spawn's opening turn: a resume that found an orphaned task ran the harness's own turn about it first, and the run ended on that turn's result with the prompt still queued behind it. That was the resend that stopped after two seconds having said nothing.
+
+**A served conversation the server is still working on is joined when you open it.** Restart the desktop mid-turn, open the conversation, and the pane attaches to the server's run: history above the seam, the run's own events below it, live from there on, rather than a snapshot that stays still until you type something. The same attach reaches a turn the provider took on its own when a subagent settled, which no client could see before. Steering, stopping and answering go to that run.
+
+**A stream that falls behind the run picks itself back up.** A pane froze mid-sentence while the server ran on for minutes and stopped to ask a question; the socket was up and the heartbeats kept coming, so nothing noticed. Every run event now advances the client's cursor, the wordless ones on a bare chunk, and a served run asks the server where it is whenever its stream has been silent for twenty seconds. A run past the cursor means the stream has lost its place; the link is remade from the cursor, which replays exactly what was missed.
+
+**A memory bank on an Artemis Server reaches the accounts you choose.** The Memory banks settings list each server's banks with that server's accounts as the checklist, and the server enforces the scope on every path that attaches a bank to a served run or lists banks for one. Until now a served bank reached every account, because nothing but a hand edit on the serving machine could say otherwise. The scope is read and written over `GET /api/v0/memory-banks` and `PATCH /api/v0/memory-banks/{slug}`, for a connection that manages profiles.
+
 ## What's new in 2.16.2
 
 Artemis installs on Arch again, and updates itself there.
