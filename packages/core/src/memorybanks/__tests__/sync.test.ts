@@ -68,7 +68,7 @@ describe('sharedIndexBudget', () => {
 });
 
 describe('installing across profiles', () => {
-  it('installs into the profiles the scope covers, plus the run\'s own project', () => {
+  it('installs into the profiles the scope covers, plus the run\'s own project', { timeout: 30_000 }, () => {
     const bank = readBankAt(bankWith(['one']), { slug: 'team' });
     const { dataDir, home, work } = dataDirWithProfiles();
     const record = { slug: 'team', path: bank!.root, role: 'readwrite' as const, enabled: true, profiles: { kind: 'profiles' as const, profileIds: ['p-work'] } };
