@@ -67,6 +67,7 @@
  * "yes, something is listening" and nothing else.
  */
 
+import { readAttachments, type Attachment } from './attachment.js';
 import type { AuthStatusInfo } from './ipc.js';
 import type { PlanUsage } from './usage.js';
 import type { AgentEvent } from './events.js';
@@ -1269,6 +1270,28 @@ export interface ServerConnectionInfo {
    */
   readonly manageProfiles: boolean;
   /**
+   * This server reads attachments off the wire.
+   *
+   * A capability line in the same class as {@link manageProfiles}, and present
+   * for the same reason: a client reads it to decide whether to offer a whole
+   * control, and "the field was missing" and "the answer is no" must not be two
+   * things it has to tell apart. A server older than attachments sends neither,
+   * and a client reading `=== true` lands on the safe answer either way.
+   *
+   * It exists because attachments are the one part of a request whose silent
+   * loss cannot be recovered from downstream. Every other setting an old server
+   * drops costs the caller a feature; a dropped screenshot costs them the
+   * question — the agent answers the text alone, confidently, about nothing,
+   * and no signal anywhere says a file was meant to be there. So a client with
+   * something to attach asks this first and refuses the prompt on its own side
+   * rather than sending it.
+   *
+   * Says nothing about whether the *account* being run can see a picture: that
+   * is `ServerProfile.capabilities.imageInput` and `.fileInput`, published per
+   * account, and enforced per run when the route starts one.
+   */
+  readonly acceptsAttachments: boolean;
+  /**
    * Epoch ms this token stops working, when it has one. Absent means never.
    *
    * Told to the client rather than merely enforced, because the difference
@@ -1291,6 +1314,10 @@ export function describeConnection(connection: ServerConnection): ServerConnecti
       : { allow: connection.allow }),
     canRunTurns: workspaceCanRunTurns(connection.workspace),
     manageProfiles: connection.manageProfiles === true,
+    // A property of the build rather than of the token: every connection on a
+    // server that has this line can send attachments, and the per-route and
+    // per-account refusals happen later, where the account is known.
+    acceptsAttachments: true,
     ...(connection.expiresAt === undefined ? {} : { expiresAt: connection.expiresAt }),
   };
 }
@@ -1578,6 +1605,30 @@ export interface ArtemisChatExtensions {
    * left whole.
    */
   readonly rewindToMessageId?: string;
+  /**
+   * Files and images the prompt is about.
+   *
+   * The one field here that is **not** a setting for the run: it is part of the
+   * message. "Why is this button misaligned?" without its screenshot is not a
+   * shorter question, it is a question about nothing, and the answer will be
+   * confident and useless — which is why an attachment this server cannot
+   * honour is refused rather than dropped, and why the serving account's
+   * `capabilities.imageInput` and `capabilities.fileInput` decide the refusal
+   * per route rather than the whole server answering for every provider it
+   * fronts.
+   *
+   * Images may instead arrive the OpenAI way, as `image_url` content parts on
+   * the trailing user message, and an off-the-shelf client has no other option.
+   * The two are read into the same list and held to the same ceilings
+   * together — see `mergeAttachments`.
+   *
+   * An Artemis server older than this field drops it, and that drop is the one
+   * this surface cannot make loud from its own side. What it can do is *say so
+   * in advance*: `ServerConnectionInfo.acceptsAttachments` is the flag a client
+   * reads before it sends, and the desktop's served adapter refuses the prompt
+   * locally rather than posting a question whose subject will never arrive.
+   */
+  readonly attachments?: readonly Attachment[];
 }
 
 /**
@@ -1683,6 +1734,10 @@ export const CHAT_EXTENSIONS_FIELD = 'artemis';
  * newer client talking to an older server degrades instead of failing. The
  * *values* are type-checked, because a `thinking: 5` is a caller bug worth
  * surfacing rather than coercing.
+ *
+ * @throws {import('./attachment.js').AttachmentError} for an `attachments`
+ * field this will not accept. The only way out of here that is not a return,
+ * and deliberately so: see the field's own note.
  */
 export function readChatExtensions(body: unknown): ArtemisChatExtensions {
   if (typeof body !== 'object' || body === null) return {};
@@ -1728,8 +1783,26 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
     extensions['rewindToMessageId'].length > 0
       ? { rewindToMessageId: extensions['rewindToMessageId'] as string }
       : {}),
+    // The exception to "unknown keys drop, wrong types drop". Everything else
+    // here is a setting, and a setting the caller spelled wrong is best treated
+    // as one they did not send; an attachment is the *subject* of the message,
+    // and one dropped for being malformed turns the prompt into a question
+    // about nothing. So this throws, and the route answers 400 naming the
+    // field. See `readAttachments`.
+    ...(extensions['attachments'] === undefined
+      ? {}
+      : attachmentsOrNothing(
+          readAttachments(extensions['attachments'], `${CHAT_EXTENSIONS_FIELD}.attachments`),
+        )),
     ...readRemoteOptions(extensions['remote']),
   };
+}
+
+/** Spreadable: the field when there is one, nothing when the list was empty. */
+function attachmentsOrNothing(value: readonly Attachment[] | undefined): {
+  attachments?: readonly Attachment[];
+} {
+  return value === undefined ? {} : { attachments: value };
 }
 
 /**

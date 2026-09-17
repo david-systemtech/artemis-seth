@@ -65,10 +65,11 @@
 
 import type { Attachment, JsonObject, RunInput, SystemPromptSpec } from '@rx-artemis/protocol';
 import {
-  isImageMediaType,
+  AttachmentError,
   isPermissionMode,
   isProviderEffort,
   isProviderId,
+  readAttachments,
 } from '@rx-artemis/protocol';
 
 /**
@@ -92,8 +93,9 @@ const LIMITS = {
   maxBudgetUsd: 10_000,
   metadataNodes: 256,
   metadataDepth: 8,
-  attachments: 32,
-  attachmentBytes: 20 * 1024 * 1024,
+  // Attachments are bounded by `ATTACHMENT_LIMITS` in protocol, which is where
+  // the composer and the IPC boundary read them from too. A second opinion here
+  // is the drift this file's header is about.
 } as const;
 
 /** Raised for a body this route will not build a run out of. */
@@ -274,71 +276,28 @@ function optionalSystemPrompt(value: unknown, field: string): SystemPromptSpec |
 }
 
 /**
- * Attachments, discriminated and bounded.
+ * Attachments, read by the one reader every boundary uses.
  *
- * Both arms of the union are admitted, because both are things a person
- * legitimately attaches to a prompt from a remote window. What is checked is
- * the discriminant, the media type on the arm that has a closed one, and the
- * size of the payload — the base64 itself is decoded by the adapter, and a body
- * that fails to decode is its refusal to give.
+ * This used to be its own validator, and being its own validator is how it
+ * ended up wrong in a way nobody noticed: it admitted thirty-two entries of
+ * twenty megabytes each with no per-kind ceiling, no request total and no check
+ * that the payload was base64 at all, while the IPC boundary a few files away
+ * enforced all four. Both are doors onto the same adapters. The only reason the
+ * gap never mattered is that a one-megabyte body cap made every attachment on
+ * this route impossible, which is a defence that stopped being one the moment
+ * the cap was widened for exactly this feature.
  *
- * `name` on a file attachment is deliberately *not* treated as safe here: it is
- * load-bearing (the staged file is named after it) and is sanitized to a single
- * path component by `safeFileName` downstream. This bounds its length and
- * nothing more, exactly as the local boundary does.
+ * So the rules live in `readAttachments`, in protocol, next to the limits they
+ * enforce, and this is the two lines that re-throw its refusal as this route's
+ * own error type.
  */
 function optionalAttachments(value: unknown, field: string): readonly Attachment[] | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (!Array.isArray(value)) throw new RunInputError(field, 'must be an array');
-  if (value.length > LIMITS.attachments) {
-    throw new RunInputError(field, `must hold at most ${LIMITS.attachments} entries`);
+  try {
+    return readAttachments(value, field);
+  } catch (error) {
+    if (error instanceof AttachmentError) throw new RunInputError(error.field, error.detail);
+    throw error;
   }
-
-  const read = value.map((entry, index): Attachment => {
-    const at = `${field}[${index}]`;
-    const attachment = requireObject(entry, at);
-    const id = requireString(attachment['id'], `${at}.id`, LIMITS.id);
-    const data = requireString(attachment['data'], `${at}.data`, LIMITS.attachmentBytes);
-    const kind = requireString(attachment['kind'], `${at}.kind`, 16);
-
-    if (kind === 'image') {
-      const mediaType = attachment['mediaType'];
-      if (!isImageMediaType(mediaType)) {
-        throw new RunInputError(`${at}.mediaType`, 'is not an image type Artemis sends');
-      }
-      const name = optionalString(attachment['name'], `${at}.name`, LIMITS.label);
-      const width = optionalInteger(attachment['width'], `${at}.width`, 1, 100_000);
-      const height = optionalInteger(attachment['height'], `${at}.height`, 1, 100_000);
-      return {
-        kind: 'image',
-        id,
-        mediaType,
-        data,
-        ...(name === undefined ? {} : { name }),
-        ...(width === undefined ? {} : { width }),
-        ...(height === undefined ? {} : { height }),
-      };
-    }
-
-    if (kind === 'file') {
-      const mediaType = optionalString(attachment['mediaType'], `${at}.mediaType`, LIMITS.label);
-      return {
-        kind: 'file',
-        id,
-        name: requireString(attachment['name'], `${at}.name`, LIMITS.label),
-        data,
-        ...(mediaType === undefined ? {} : { mediaType }),
-      };
-    }
-
-    throw new RunInputError(`${at}.kind`, 'must be "image" or "file"');
-  });
-
-  const ids = new Set(read.map((attachment) => attachment.id));
-  if (ids.size !== read.length) {
-    throw new RunInputError(field, 'must not name two attachments with the same id');
-  }
-  return read;
 }
 
 /* -------------------------------------------------------------------------- */

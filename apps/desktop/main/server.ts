@@ -361,6 +361,9 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         ...(input.systemPrompt === undefined
           ? {}
           : { systemPrompt: { kind: 'append', text: input.systemPrompt } as const }),
+        // Read and bounded by the route before it got here; the registry checks
+        // them again against this profile's provider.
+        ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
       } as never);
     },
     subscribe: (listener) => options.engine.require().subscribe(listener),

@@ -351,6 +351,10 @@ describe('a connection is the identity', () => {
       // always a boolean — a client reading it decides whether to draw a whole
       // surface, and "the field was missing" must not be a third answer.
       manageProfiles: false,
+      // The same class of line, and the one a client with a screenshot in its
+      // composer reads before it sends: a server without it drops attachments
+      // in silence, so its absence has to mean no.
+      acceptsAttachments: true,
     });
     // The caller already has it; putting it in a body puts it in every log and
     // proxy between here and them.

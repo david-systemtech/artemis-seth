@@ -622,6 +622,10 @@ export function createHeadlessHost(
         ...(instructions === undefined
           ? {}
           : { systemPrompt: { kind: 'append', text: instructions } as const }),
+        // Already read and bounded by the route. The registry refuses them once
+        // more against this account's own `imageInput` and `fileInput`, which
+        // is the check that knows which provider is behind the route.
+        ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
       } as never);
     },
     subscribe: (listener) => runs.subscribe(listener),
