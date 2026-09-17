@@ -617,6 +617,74 @@ export interface ServerCreateProfileRequest {
   readonly provider?: ProviderId;
 }
 
+/* -------------------------------------------------------------------------- */
+/* The serving machine's memory banks, and which of its accounts each reaches  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which of a server's accounts one memory bank reaches.
+ *
+ * The wire shape of core's `BankProfileScope`, restated here because the
+ * protocol package is the one both ends may depend on. `all` covers accounts
+ * added later; a list means exactly those, and an account not on it never
+ * learns the bank exists — the run is not told about it, its checkout is not
+ * attached, and the memory tools will not name it.
+ */
+export type ServerMemoryBankScope =
+  | { readonly kind: 'all' }
+  | { readonly kind: 'profiles'; readonly profileIds: readonly string[] };
+
+/**
+ * One bank in the serving machine's registry.
+ *
+ * `path` is a directory on the *serving* machine, published for the same
+ * reason {@link ServerProfileCreatedBody.configDir} is: a caller holding the
+ * administrative grant is looking at a thing on that machine and needs to be
+ * able to tell two checkouts apart. Nothing here is a credential — the bank's
+ * git credential lives in the host's key manager and never crosses the wire.
+ */
+export interface ServerMemoryBank {
+  readonly slug: string;
+  readonly path: string;
+  readonly role: 'readwrite' | 'readonly';
+  /** The registry's own on/off switch, which scope is orthogonal to. */
+  readonly enabled: boolean;
+  readonly profiles: ServerMemoryBankScope;
+}
+
+/** The body of `GET /api/v0/memory-banks`. */
+export interface ServerMemoryBanksBody {
+  readonly object: 'artemis.memory-banks';
+  readonly banks: readonly ServerMemoryBank[];
+  /**
+   * The accounts a scope may name.
+   *
+   * Carried on the same read as the banks so a client can draw the checklist
+   * from one request: without it, a list of opaque ids is all a scope is, and
+   * the client would have to join it against the catalogue itself.
+   */
+  readonly profiles: readonly ServerMemoryBankAccount[];
+}
+
+/** One account on the serving machine, as the bank scope picker needs it. */
+export interface ServerMemoryBankAccount {
+  readonly id: ProfileId;
+  /** The left half of a model route, which is how a served run is addressed. */
+  readonly slug: string;
+  readonly label: string;
+}
+
+/** The body of `PATCH /api/v0/memory-banks/{slug}`. */
+export interface ServerMemoryBankScopeRequest {
+  readonly profiles: ServerMemoryBankScope;
+}
+
+/** What `PATCH /api/v0/memory-banks/{slug}` answers: the bank as it now stands. */
+export interface ServerMemoryBankBody {
+  readonly object: 'artemis.memory-bank';
+  readonly bank: ServerMemoryBank;
+}
+
 /**
  * One stored server conversation, as `GET /api/v0/sessions` reports it.
  *

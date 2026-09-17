@@ -984,6 +984,13 @@ export function createRemoteBridge(
       cancelSignIn: async () => absent(SERVER_ACCOUNTS_REASON),
     },
 
+    // And the banks on such a server, for the same reason: `profileId` names a
+    // local Artemis-Server profile, and a remote window has none.
+    serverMemoryBanks: {
+      list: async () => absent(SERVER_ACCOUNTS_REASON),
+      setProfiles: async () => absent(SERVER_ACCOUNTS_REASON),
+    },
+
     // Managing a *third* server's routines from inside a remote window is a
     // machine-to-machine hop this bridge does not make — the same rule that
     // makes `serverAccounts` absent here. A remote window drives its own host,

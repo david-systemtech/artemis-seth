@@ -71,6 +71,11 @@ import type {
   RunsRespondPermissionResponse,
   RunsSendResponse,
   ServerHealthBody,
+  ServerMemoryBank,
+  ServerMemoryBankAccount,
+  ServerMemoryBankBody,
+  ServerMemoryBankScope,
+  ServerMemoryBanksBody,
   ServerModel,
   ServerModelsBody,
   ServerConnection,
@@ -323,6 +328,12 @@ export interface ServerContext {
   /** The one sign-in this server will drive at a time. See `signin.ts`. */
   readonly signIns?: SignInDirector;
   /**
+   * This machine's memory-bank registry, for the surface that scopes a bank to
+   * some of its accounts. Absent answers `501` to an administrator and `404`
+   * to everyone else, exactly as {@link profileAdmin} does.
+   */
+  readonly memoryBanks?: MemoryBankAdmin;
+  /**
    * Where a run that failed is recorded on the serving machine.
    *
    * Separate from a transport fault: this one *did* reach its caller, as a
@@ -396,6 +407,30 @@ export interface UsageSource {
   read(query: {
     readonly profileIds: readonly string[];
   }): Promise<readonly { readonly profileId: string; readonly label: string; readonly usage: PlanUsage }[]>;
+}
+
+/**
+ * The serving machine's memory-bank registry, reduced to what the routes make
+ * of it: read every bank, and change which accounts one of them reaches.
+ *
+ * Deliberately not the whole of `memory-banks.json`. Adding, forgetting,
+ * cloning and pulling a bank are jobs for whoever administers the serving
+ * machine — they touch its disk and its git credentials — and none of them is
+ * what a remote client is missing. What it *is* missing is the one field the
+ * CLI registry has no room for and nothing on the wire could reach: the scope.
+ * So this seam is a read and one write.
+ */
+export interface MemoryBankAdmin {
+  /** Every bank in the registry, in registry order, scope included. */
+  list(): Promise<readonly ServerMemoryBank[]>;
+  /**
+   * Replace one bank's account scope and persist it.
+   *
+   * `undefined` when no bank has that slug, which the route turns into the
+   * same 404 an unknown account gets — said only to a caller who already holds
+   * the administrative grant.
+   */
+  setScope(slug: string, scope: ServerMemoryBankScope): Promise<ServerMemoryBank | undefined>;
 }
 
 /** True when this reply is written incrementally rather than as one body. */
@@ -675,6 +710,21 @@ export async function handleServerRequest(
     path === `${apiPrefix}/profiles` ? method === 'POST' : path.startsWith(`${apiPrefix}/profiles/`)
   ) {
     const reply = await handleProfileAdminRoute(request, context, connection, path, method);
+    return { ...reply, connectionId: connection.id };
+  }
+
+  /*
+   * Which of this machine's memory banks reaches which of its accounts.
+   *
+   * Dispatched beside the account surface above, under the same grant and with
+   * the same enumeration-proof 404, because it is the same kind of act: a
+   * token deciding what the accounts on somebody else's machine may see. It
+   * owns `/memory-banks` and nothing else, so it cannot shadow the bridge or
+   * the account routes however this block is reordered. Above the read-only
+   * gate below because its write is a PATCH.
+   */
+  if (path === `${apiPrefix}/memory-banks` || path.startsWith(`${apiPrefix}/memory-banks/`)) {
+    const reply = await handleMemoryBankRoute(request, context, connection, path, method);
     return { ...reply, connectionId: connection.id };
   }
 
@@ -989,6 +1039,7 @@ export async function handleServerRequest(
 function indexBody(context: ServerContext, connection: ServerConnection): Record<string, unknown> {
   const apiPrefix = `/api/${SERVER_API_VERSION}`;
   const managesProfiles = connection.manageProfiles === true && context.profileAdmin !== undefined;
+  const managesBanks = connection.manageProfiles === true && context.memoryBanks !== undefined;
   return {
     object: 'artemis.server',
     version: context.version,
@@ -1056,6 +1107,21 @@ function indexBody(context: ServerContext, connection: ServerConnection): Record
               method: 'POST',
               path: `${apiPrefix}/profiles/{id}/signin/code`,
               description: 'Hand the code the user pasted to the login that is waiting for it.',
+            },
+          ]
+        : []),
+      ...(managesBanks
+        ? [
+            {
+              method: 'GET',
+              path: `${apiPrefix}/memory-banks`,
+              description:
+                "This machine's memory banks, and the accounts each reaches, with the accounts to choose from.",
+            },
+            {
+              method: 'PATCH',
+              path: `${apiPrefix}/memory-banks/{slug}`,
+              description: 'Choose which accounts one bank reaches, or all of them.',
             },
           ]
         : []),
@@ -1317,6 +1383,12 @@ export interface ArtemisServerOptions {
   /** How long an unfinished sign-in lives. See `signin.ts`. */
   readonly signInTimeoutMs?: number;
   /**
+   * This machine's memory-bank registry. Omit for a deployment that carries no
+   * banks — the surface then answers `501` to an administrator and `404` to
+   * everyone else, exactly as {@link profileAdmin} does.
+   */
+  readonly memoryBanks?: MemoryBankAdmin;
+  /**
    * Called once per answered request, so the UI can show that something is
    * talking — and so the connection that asked can have its `lastUsedAt`
    * stamped. `connectionId` is absent when nothing authenticated.
@@ -1421,6 +1493,7 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
             : { onRemoteAccess: options.onRemoteAccess }),
           ...(profileAdmin === undefined ? {} : { profileAdmin }),
           ...(signIns === undefined ? {} : { signIns }),
+          ...(options.memoryBanks === undefined ? {} : { memoryBanks: options.memoryBanks }),
           // Same sink as a transport fault: a host that wanted one stream of
           // things-that-went-wrong should not have to subscribe twice, and the
           // notice is already a sentence naming the route it belongs to.
@@ -2477,6 +2550,209 @@ async function handleProfileAdminRoute(
       'The sign-in could not be started on this server.',
     );
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Memory banks: which of this machine's accounts each one reaches             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `GET /api/v0/memory-banks` and `PATCH /api/v0/memory-banks/{slug}`.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS IS FOR
+ * ---------------------------------------------------------------------------
+ *
+ * A served run has always been given only the banks its account is in scope
+ * for — every path that attaches or lists one filters on `scopeCoversProfile`.
+ * What was missing was any way to *say* which accounts that is. The desktop
+ * writes the scope into its own `memory-banks.json` through its settings pane;
+ * a headless server's copy of that file had one writer, a text editor on the
+ * serving machine, so in practice every bank on a server was `{kind:'all'}`
+ * and reached every account it served.
+ *
+ * These two routes are the missing writer. The read carries the server's
+ * accounts alongside the banks so a client can draw the checklist from one
+ * request rather than joining ids against the catalogue itself.
+ *
+ * ---------------------------------------------------------------------------
+ * WHO MAY
+ * ---------------------------------------------------------------------------
+ *
+ * {@link ServerConnection.manageProfiles}, and the enumeration-proof 404 for
+ * everyone else — `handleProfileAdminRoute`'s rule, adopted wholesale because
+ * the reasoning transfers exactly. Scoping a bank decides what the accounts on
+ * this machine may read and write, which is an administrative act on the
+ * serving machine and not a thing a connection that merely runs turns should
+ * be able to discover, let alone do. The order is the same too: grant first,
+ * then the seam, then the body, so a build with no registry answers `501` to
+ * an administrator and `404` to everyone else.
+ *
+ * The write is attributed as `remote.profile.updated`: the line carries ids
+ * and never values (see `RemoteAccessEvent`), and what it records is that this
+ * token changed what an account on this machine reaches. One line per bank
+ * touched would be a second kind saying the same thing about the same act.
+ */
+async function handleMemoryBankRoute(
+  request: ServerRequestInfo,
+  context: ServerContext,
+  connection: ServerConnection,
+  path: string,
+  method: string,
+): Promise<ServerReply> {
+  const missing = (): ServerReply =>
+    fail(404, 'invalid_request_error', 'unknown_endpoint', `No route for ${path}.`);
+
+  if (connection.manageProfiles !== true) return missing();
+
+  const banks = context.memoryBanks;
+  if (banks === undefined) {
+    return fail(
+      501,
+      'invalid_request_error',
+      'not_implemented',
+      'This Artemis build serves accounts but keeps no memory-bank registry.',
+    );
+  }
+
+  const apiPrefix = `/api/${SERVER_API_VERSION}`;
+
+  if (path === `${apiPrefix}/memory-banks`) {
+    if (method !== 'GET' && method !== 'HEAD') {
+      return fail(
+        405,
+        'invalid_request_error',
+        'method_not_allowed',
+        'The bank list is a GET. Scope one with PATCH /api/v0/memory-banks/{slug}.',
+      );
+    }
+    // A read, and so not attributed — the section comment on the account
+    // surface says why: a client polls this to draw a pane.
+    const body: ServerMemoryBanksBody = {
+      object: 'artemis.memory-banks',
+      banks: await banks.list(),
+      profiles: await serverAccounts(context),
+    };
+    return ok(body);
+  }
+
+  let slug: string;
+  try {
+    slug = decodeURIComponent(path.slice(`${apiPrefix}/memory-banks/`.length));
+  } catch {
+    return fail(400, 'invalid_request_error', 'invalid_url', 'The bank slug could not be parsed.');
+  }
+  // A slug with a slash in it is a sub-path this surface does not have, not a
+  // bank with an odd name: the registry's own slugs are `[a-z0-9-]`.
+  if (slug.length === 0 || slug.includes('/')) return missing();
+
+  if (method !== 'PATCH') {
+    return fail(
+      405,
+      'invalid_request_error',
+      'method_not_allowed',
+      "A bank's accounts are changed with PATCH.",
+    );
+  }
+
+  const body = request.body;
+  if (typeof body !== 'object' || body === null) {
+    return fail(400, 'invalid_request_error', 'invalid_body', 'The request body must be a JSON object.');
+  }
+  const scope = parseBankScope((body as Record<string, unknown>)['profiles']);
+  if (typeof scope === 'string') {
+    return fail(400, 'invalid_request_error', 'invalid_body', scope);
+  }
+  if (scope.kind === 'profiles') {
+    /*
+     * Every named account has to exist on this machine.
+     *
+     * Refused rather than stored, because the failure it prevents is silent:
+     * a scope naming an id this server has never had is a bank that reaches
+     * nothing, and nothing anywhere would say so — the run would simply start
+     * without its memory, which is indistinguishable from the feature being
+     * off. A caller told which id is wrong can fix it.
+     */
+    const known = new Set((await serverAccounts(context)).map((account) => String(account.id)));
+    const stranger = scope.profileIds.find((id) => !known.has(id));
+    if (stranger !== undefined) {
+      return fail(
+        400,
+        'invalid_request_error',
+        'unknown_profile',
+        `No account on this server has the id "${stranger}". List them at ${apiPrefix}/profiles.`,
+      );
+    }
+  }
+
+  let updated: ServerMemoryBank | undefined;
+  try {
+    updated = await banks.setScope(slug, scope);
+  } catch (error) {
+    return fail(
+      500,
+      'server_error',
+      'registry_write_failed',
+      error instanceof Error ? error.message : 'The bank registry could not be written.',
+    );
+  }
+  if (updated === undefined) {
+    return fail(
+      404,
+      'invalid_request_error',
+      'unknown_bank',
+      `No memory bank called "${slug}" is registered on this server.`,
+    );
+  }
+  context.onRemoteAccess?.({
+    kind: 'remote.profile.updated',
+    connectionId: connection.id,
+  });
+  const reply: ServerMemoryBankBody = { object: 'artemis.memory-bank', bank: updated };
+  return ok(reply);
+}
+
+/**
+ * Every account on the serving machine, as the scope picker needs it.
+ *
+ * The *whole* catalogue rather than {@link visibleToConnection}'s narrowing,
+ * which is the same choice the account-administration routes make: they too
+ * act on the store rather than on what this token may run turns against. A
+ * connection restricted to one account but granted administration is still
+ * administering the machine, and a picker that hid the accounts it is allowed
+ * to scope a bank to would produce scopes nobody could explain.
+ */
+async function serverAccounts(context: ServerContext): Promise<readonly ServerMemoryBankAccount[]> {
+  const profiles = await context.catalogue.read();
+  return profiles.map((profile) => ({ id: profile.id, slug: profile.slug, label: profile.label }));
+}
+
+/**
+ * Read a scope off the wire. A sentence on refusal, so the caller can correct
+ * it — this is a body an administrator wrote, not a value from a stranger.
+ *
+ * Nothing is coerced. An unparsable scope used to become `{kind:'all'}` in the
+ * registry's own reader, which is the right default for a file somebody edited
+ * by hand and exactly the wrong one here: a typo in a PATCH would widen a bank
+ * to every account on the machine.
+ */
+function parseBankScope(value: unknown): ServerMemoryBankScope | string {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return '`profiles` must be `{ "kind": "all" }` or `{ "kind": "profiles", "profileIds": [...] }`.';
+  }
+  const record = value as Record<string, unknown>;
+  if (record['kind'] === 'all') return { kind: 'all' };
+  if (record['kind'] !== 'profiles') {
+    return '`profiles.kind` must be "all" or "profiles".';
+  }
+  const ids = record['profileIds'];
+  if (!Array.isArray(ids)) return '`profiles.profileIds` must be an array of account ids.';
+  if (ids.some((id) => typeof id !== 'string' || id.length === 0)) {
+    return '`profiles.profileIds` must hold non-empty account ids.';
+  }
+  // Duplicates are the caller's, not an error: a checklist that sent one twice
+  // means the same thing once, and the registry stores what it is given.
+  return { kind: 'profiles', profileIds: [...new Set(ids as string[])] };
 }
 
 /** No flow for this account. Not an error state — nobody has started one. */

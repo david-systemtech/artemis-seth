@@ -58,6 +58,9 @@ import type {
 import type { UpdateProgress } from './update.js';
 import type {
   ServerAllowance,
+  ServerMemoryBank,
+  ServerMemoryBankAccount,
+  ServerMemoryBankScope,
   ServerProfile,
   ServerProfileCreatedBody,
   ServerSignInStatus,
@@ -377,6 +380,22 @@ export const IPC = {
   serverAccountsSubmitCode: 'artemis:server-accounts:submit-code',
   /** Give up: the server kills the login subprocess. */
   serverAccountsCancelSignIn: 'artemis:server-accounts:cancel-sign-in',
+
+  /**
+   * The memory banks a *remote* server carries, and which of its accounts each
+   * one reaches.
+   *
+   * Distinct from the `memoryBank*` channels above, which are this machine's
+   * own registry: a bank on a server is a checkout on that machine, scoped by
+   * that machine's account ids, and the two registries never meet. Reached the
+   * same way the account channels are — through the local Artemis-Server
+   * profile whose token names the server — and gated by the same grant, so a
+   * token without account administration sees the pane report that rather than
+   * a refusal.
+   */
+  serverMemoryBanksList: 'artemis:server-memory-banks:list',
+  /** Choose which of the server's accounts one of its banks reaches. */
+  serverMemoryBanksSetProfiles: 'artemis:server-memory-banks:set-profiles',
 
   /**
    * Routines that live on a *remote* server: the appointments that fire there
@@ -2003,6 +2022,36 @@ export interface ServerAccountsListResponse {
   readonly accounts: readonly ServerProfile[];
 }
 
+/**
+ * What one of a server's banks reaches, on the wire between renderer and main.
+ *
+ * `ServerMemoryBankScope` from the server protocol rather than
+ * {@link MemoryBankProfileScope}, which is this machine's: the ids in it are
+ * the *server's* account ids, and typing them as local {@link ProfileId}s
+ * would invite a renderer to hand one registry the other's ids.
+ */
+export interface ServerMemoryBanksListResponse {
+  /** This profile's token may change what a bank reaches. See the channel. */
+  readonly manageProfiles: boolean;
+  /** The server answers this surface at all — an older build does not. */
+  readonly available: boolean;
+  readonly banks: readonly ServerMemoryBank[];
+  /** The accounts a scope may name, for the checklist. */
+  readonly accounts: readonly ServerMemoryBankAccount[];
+}
+
+export interface ServerMemoryBanksSetProfilesRequest extends ServerAccountsRequest {
+  /** The bank on the server, by the slug its registry files it under. */
+  readonly slug: string;
+  /** Sent whole, not as a diff — the checklist says what it says. */
+  readonly profiles: ServerMemoryBankScope;
+}
+
+export interface ServerMemoryBanksSetProfilesResponse {
+  /** The bank as the server now has it, so a pane can render the answer. */
+  readonly bank: ServerMemoryBank;
+}
+
 export interface ServerAccountsCreateRequest extends ServerAccountsRequest {
   readonly label: string;
   /**
@@ -3219,6 +3268,8 @@ export type IpcRequestMap = {
   [IPC.serverAccountsSignInStatus]: ServerAccountSignInRequest;
   [IPC.serverAccountsSubmitCode]: ServerAccountSubmitCodeRequest;
   [IPC.serverAccountsCancelSignIn]: ServerAccountSignInRequest;
+  [IPC.serverMemoryBanksList]: ServerAccountsRequest;
+  [IPC.serverMemoryBanksSetProfiles]: ServerMemoryBanksSetProfilesRequest;
   [IPC.serverRoutinesList]: ServerRoutinesRequest;
   [IPC.serverRoutinesCreate]: ServerRoutinesCreateRequest;
   [IPC.serverRoutinesUpdate]: ServerRoutinesUpdateRequest;
@@ -3330,6 +3381,8 @@ export type IpcResponseMap = {
   [IPC.serverAccountsSignInStatus]: ServerAccountSignInResponse;
   [IPC.serverAccountsSubmitCode]: ServerAccountSignInResponse;
   [IPC.serverAccountsCancelSignIn]: ServerAccountSignInResponse;
+  [IPC.serverMemoryBanksList]: ServerMemoryBanksListResponse;
+  [IPC.serverMemoryBanksSetProfiles]: ServerMemoryBanksSetProfilesResponse;
   [IPC.serverRoutinesList]: ServerRoutinesListResponse;
   [IPC.serverRoutinesCreate]: ServerRoutineResponse;
   [IPC.serverRoutinesUpdate]: ServerRoutineResponse;
@@ -3945,6 +3998,24 @@ export interface ArtemisBridge {
     cancelSignIn(
       request: ServerAccountSignInRequest,
     ): Promise<IpcResult<ServerAccountSignInResponse>>;
+  };
+
+  /**
+   * The memory banks a *remote* server carries.
+   *
+   * Two calls, not the eight {@link memoryBanks} has. Adding, cloning and
+   * pulling a bank touch the serving machine's disk and its git credentials,
+   * which is a job for whoever administers it; what a client is missing is the
+   * one field nothing on the wire could reach — which of the server's accounts
+   * each bank is attached to.
+   */
+  readonly serverMemoryBanks: {
+    /** The server's banks, its accounts, and whether this token may rescope. */
+    list(request: ServerAccountsRequest): Promise<IpcResult<ServerMemoryBanksListResponse>>;
+    /** Attach one bank to every account, or to exactly these. */
+    setProfiles(
+      request: ServerMemoryBanksSetProfilesRequest,
+    ): Promise<IpcResult<ServerMemoryBanksSetProfilesResponse>>;
   };
 
   /**

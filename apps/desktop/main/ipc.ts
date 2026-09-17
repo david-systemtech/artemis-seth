@@ -177,6 +177,7 @@ import {
   validateServerAccountsUpdate,
   validateServerAccountSignIn,
   validateServerAccountSubmitCode,
+  validateServerMemoryBanksSetProfiles,
   validateServerRoutines,
   validateServerRoutinesCreate,
   validateServerRoutinesUpdate,
@@ -1291,6 +1292,31 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
         const remote = await engine.require().remoteAccounts(request.profileId);
         return { manageProfiles: remote.manageProfiles, accounts: remote.profiles };
       },
+    },
+
+    [IPC.serverMemoryBanksList]: {
+      validate: validateServerAccounts,
+      handle: async (request) => {
+        // `profiles` on the wire, `accounts` here, for the same reason the
+        // account list above renames them: "profile" already means a local one
+        // in every other channel.
+        const remote = await engine.require().remoteMemoryBanks(request.profileId);
+        return {
+          manageProfiles: remote.manageProfiles,
+          available: remote.available,
+          banks: remote.banks,
+          accounts: remote.profiles,
+        };
+      },
+    },
+
+    [IPC.serverMemoryBanksSetProfiles]: {
+      validate: validateServerMemoryBanksSetProfiles,
+      handle: async (request) => ({
+        bank: await engine
+          .require()
+          .setRemoteMemoryBankScope(request.profileId, request.slug, request.profiles),
+      }),
     },
 
     [IPC.serverAccountsCreate]: {

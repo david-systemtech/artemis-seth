@@ -40,6 +40,7 @@ import type {
   SecretProviderDescriptor,
   SecretVerifyResult,
   ServerProfile,
+  ServerMemoryBank,
   ServerSignInStatus,
   ServerState,
   SharedConfigEntryState,
@@ -386,6 +387,23 @@ let mockRemoteAccounts: readonly ServerProfile[] = [
   { ...mockServerProfile('remote-work', 'work'), live: true },
 ];
 let mockSignIn: ServerSignInStatus | null = null;
+/**
+ * Banks that pretend to live on the server this profile points at.
+ *
+ * One of each scope, because the pane's two branches — the "every account"
+ * tick and the checklist under it — are both worth seeing in dev without
+ * having to click one into existence.
+ */
+let mockServerBanks: readonly ServerMemoryBank[] = [
+  { slug: 'cortex', path: '/data/banks/cortex', role: 'readwrite', enabled: true, profiles: { kind: 'all' } },
+  {
+    slug: 'client-notes',
+    path: '/data/banks/client-notes',
+    role: 'readonly',
+    enabled: true,
+    profiles: { kind: 'profiles', profileIds: ['remote-work'] },
+  },
+];
 /** Routines that pretend to live on a server this profile points at. */
 let mockServerRoutines: readonly RoutineSnapshot[] = [];
 
@@ -2594,6 +2612,30 @@ export function createMockBridge(): ArtemisBridge {
       cancelSignIn: async () => {
         mockSignIn = mockSignIn === null ? null : { ...mockSignIn, state: 'cancelled' };
         return ok({ signIn: mockSignIn });
+      },
+    },
+
+    /** The server's banks, and which of its accounts each one reaches. */
+    serverMemoryBanks: {
+      list: async () =>
+        ok({
+          manageProfiles: true,
+          available: true,
+          banks: mockServerBanks,
+          accounts: mockRemoteAccounts.map((account) => ({
+            id: account.id,
+            slug: account.slug,
+            label: account.label,
+          })),
+        }),
+      setProfiles: async ({ slug, profiles }) => {
+        mockServerBanks = mockServerBanks.map((bank) =>
+          bank.slug === slug ? { ...bank, profiles } : bank,
+        );
+        const changed = mockServerBanks.find((bank) => bank.slug === slug);
+        return changed === undefined
+          ? ({ ok: false, error: { code: 'invalid_request', message: 'No such bank.' } } as never)
+          : ok({ bank: changed });
       },
     },
 

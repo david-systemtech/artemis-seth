@@ -119,6 +119,7 @@ import {
   type ServerAccountsUpdateRequest,
   type ServerAccountSignInRequest,
   type ServerAccountSubmitCodeRequest,
+  type ServerMemoryBanksSetProfilesRequest,
   type ServerRoutinesRequest,
   type ServerRoutinesCreateRequest,
   type ServerRoutinesUpdateRequest,
@@ -854,6 +855,16 @@ const bridge: ArtemisBridge = Object.freeze({
       invoke(IPC.serverAccountsSubmitCode, request),
     cancelSignIn: (request: ServerAccountSignInRequest) =>
       invoke(IPC.serverAccountsCancelSignIn, request),
+  }),
+
+  /**
+   * The memory banks on a remote server, and which of its accounts each
+   * reaches. One machine further away than `memoryBanks`, which is this one's.
+   */
+  serverMemoryBanks: Object.freeze({
+    list: (request: ServerAccountsRequest) => invoke(IPC.serverMemoryBanksList, request),
+    setProfiles: (request: ServerMemoryBanksSetProfilesRequest) =>
+      invoke(IPC.serverMemoryBanksSetProfiles, request),
   }),
 
   /**
