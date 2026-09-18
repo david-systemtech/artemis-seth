@@ -37,8 +37,9 @@
 # ## When it runs: once, and then when asked
 #
 # When a pull request opens, reopens or leaves draft - and after that only when
-# somebody adds the `ai-review` label, which the job takes off again when it is
-# done so the label can be added a second time.
+# somebody adds the `ai-review` label. The label comes off again after every
+# run that found it on, so that it can be added a second time; see the job at
+# the bottom of this file for why that is more careful than it sounds.
 #
 # It used to run on every push. A review of a large diff takes the model most
 # of half an hour, and a pull request that is being worked on is pushed to many
@@ -79,9 +80,17 @@ permissions:
   contents: read
   pull-requests: write
 
-# A force-push should not leave two reviews racing to rewrite one comment.
+# Two requests for a review should not leave two reviews racing to rewrite one
+# comment: the newer one cancels the older.
+#
+# Subscribing to `labeled` means this workflow now also wakes for every OTHER
+# label anyone adds, and a run that wakes only to find it has nothing to do
+# must not cancel a review on its way out. So those runs get a group of their
+# own, which cancels nothing but each other.
 concurrency:
-  group: ai-review-${{ github.event.pull_request.number }}
+  group: >-
+    ai-review-${{ github.event.pull_request.number }}-${{
+    (github.event.action == 'labeled' && github.event.label.name != 'ai-review') && 'some-other-label' || 'review' }}
   cancel-in-progress: true
 
 jobs:
@@ -156,15 +165,44 @@ jobs:
           REVIEW_SKIP: docs/design/* .github/RELEASE_NOTES.md
         run: python3 .github/scripts/ai_review.py
 
-      # The label is a button, not a state: taken off once the review it asked
-      # for has been written (or abandoned), so the next request is adding it
-      # again. `always()` because the step above is allowed to fail and this
-      # still has to run; its own failure costs nothing but a label left on.
-      - name: Take the request label back off
-        if: always() && github.event.action == 'labeled'
+  # The label is a button, not a state, and a button that stays pressed cannot
+  # be pressed again: GitHub sends `labeled` only when a label goes ON, so
+  # adding one a pull request already carries does nothing at all, silently.
+  # So the label comes off after every run that found it on - whatever the
+  # event was, and whether or not the review above ran. That second half is the
+  # reason this is a job of its own and not a last step of `review`: a request
+  # made of a draft, of a pull request marked `no-ai-review`, or of an outside
+  # contributor's, is declined by that job's `if`, and a label left behind by a
+  # declined request would look armed and be dead.
+  #
+  # `needs` only so it waits for the review; `always()` so it runs when the
+  # review was skipped or failed.
+  take-the-request-label-off:
+    needs: review
+    # Not for some other label being added: that run has nothing to do with a
+    # request, and one may be in flight whose label is not this run's to take.
+    if: >-
+      always() &&
+      contains(github.event.pull_request.labels.*.name, 'ai-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ai-review')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Tried three times, and green even then, by this file's one rule: a red
+      # X that means "the robot's housekeeping failed" teaches people to ignore
+      # red Xs. What a failure does cost is said where it will be read - a
+      # warning on the run - and the way out is the one a person would try
+      # anyway: take the label off by hand, then add it.
+      - name: Take the label off
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh api -X DELETE
-          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/ai-review"
+          LABEL_URL: repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/ai-review
+        run: |
+          for attempt in 1 2 3; do
+            if out=$(gh api -X DELETE "$LABEL_URL" 2>&1); then exit 0; fi
+            # Already gone - somebody took it off by hand - is the same success.
+            case "$out" in *"Label does not exist"*|*"HTTP 404"*) exit 0 ;; esac
+            sleep $((attempt * 10))
+          done
+          echo "::warning::The ai-review label could not be removed. Remove it by hand, then add it again to ask for a review."
