@@ -1396,7 +1396,7 @@ class ArtemisRun implements Run {
   }
 
   /** The address of a native route on this run, or the reason there is none yet. */
-  #runRoute(action: 'messages' | 'interrupt' | 'permission'): string {
+  #runRoute(action: 'messages' | 'interrupt' | 'permission' | 'stop-task'): string {
     const runId = this.#remoteRunId;
     if (runId === undefined) {
       throw adapterError(
@@ -1485,6 +1485,24 @@ class ArtemisRun implements Run {
     }
     this.#abort.abort();
     return { stillQueued: [] };
+  }
+
+  /**
+   * Stop one piece of delegated work on the server's run.
+   *
+   * The server has taken `POST /api/v0/runs/{id}/stop-task` on its bridge
+   * surface since the delegated-work rows first crossed the wire, and the
+   * rows themselves arrive here as `artemis.tasks` — so the pane drew a stop
+   * button on every one of them, and every press ended in the registry's
+   * "cannot stop delegated tasks", because this run never had the method the
+   * registry looks for (reported 2026-09-18: a served session waiting on a
+   * task that had already finished, with nothing to press). Not gated on the
+   * run being active, for the reason the Claude turn's is not: the task worth
+   * stopping is the one that outlived the turn that launched it.
+   */
+  async stopTask(taskId: string): Promise<void> {
+    const response = await this.#post(this.#runRoute('stop-task'), { taskId });
+    if (!response.ok) throw await runRouteError(response, 'stop this task');
   }
 
   async respondToPermission(
