@@ -468,8 +468,8 @@ export const DEFAULT_SKILL_SOURCE_SUBDIR = 'skills';
  *    in every log line that names the source. The machine's own git credentials
  *    are what a private repository is reached with.
  */
-const CREDENTIAL_IN_URL =
-  'Leave the username and token out of the URL. A private repository is reached with this machine’s own git credentials.';
+const MACHINE_CREDENTIALS = 'A private repository is reached with this machine’s own git credentials.';
+const CREDENTIAL_IN_URL = `Leave the username and token out of the URL. ${MACHINE_CREDENTIALS}`;
 
 export function skillSourceUrlProblem(url: string): string | null {
   const trimmed = url.trim();
@@ -478,6 +478,10 @@ export function skillSourceUrlProblem(url: string): string | null {
   // eslint-disable-next-line no-control-regex
   if (/[\s\u0000-\u001f]/.test(trimmed)) return 'A URL cannot contain spaces or control characters.';
   if (trimmed.startsWith('-')) return 'A URL cannot start with a hyphen.';
+  // The other place a credential rides in a URL (`?private_token=…`), and
+  // nothing a git remote needs: the URL is stored in a settings file, drawn in
+  // the pane and named in log lines, all in plain text.
+  if (/[?#]/.test(trimmed)) return `A repository URL has no "?" or "#" part. ${MACHINE_CREDENTIALS}`;
 
   if (/^https:\/\//i.test(trimmed)) {
     if (/^https:\/\/[^/]*@/i.test(trimmed)) return CREDENTIAL_IN_URL;
@@ -566,7 +570,6 @@ export function skillSourceLabel(url: string): string {
   return segments.length === 0 ? url.trim() : segments.slice(-2).join('/');
 }
 
-/** The library with a source added. The same repository twice is one source. */
 /**
  * Why one more source cannot be added, or `null` when it can.
  *
@@ -583,6 +586,7 @@ export function skillSourceLimitProblem(document: SkillLibraryDocument, url: str
   return `Artemis keeps at most ${String(SKILL_LIMITS.sources)} skill repositories. Remove one before adding another.`;
 }
 
+/** The library with a source added. The same repository twice is one source. */
 export function withSkillSource(
   document: SkillLibraryDocument,
   url: string,
