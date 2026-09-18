@@ -48,6 +48,7 @@ import {
   buildContentBridge,
   discoverMarketplacePlugins,
   linkSkillsIntoCodexHome,
+  marketplaceSkillOffers,
   resolveContentPlugins,
 } from './bridge.js';
 
@@ -658,11 +659,51 @@ describeIfSymlinks('linkSkillsIntoCodexHome', () => {
  * bridge is what yields.
  */
 describeIfSymlinks('resolveContentPlugins', () => {
-  /** A marketplace plugin that ships skills, nested the way a real one does. */
+  /**
+   * A skill the plugin *publishes*, nested and declared the way a real one is.
+   *
+   * `mattpocock-skills` files its skills under a category and names each one in
+   * its manifest's `skills` list, because the CLI reads a plugin's `skills/`
+   * one level deep and would otherwise find none of them. The fixture does
+   * both halves; {@link seedUnpublishedSkill} does only the first.
+   */
   function seedPluginSkill(installPath: string, category: string, name: string): void {
+    seedUnpublishedSkill(installPath, category, name);
+    const manifestFile = path.join(installPath, '.claude-plugin', 'plugin.json');
+    const manifest = JSON.parse(readFileSync(manifestFile, 'utf8')) as { skills?: string[] };
+    manifest.skills = [...(manifest.skills ?? []), `./skills/${category}/${name}`];
+    writeFileSync(manifestFile, JSON.stringify(manifest));
+  }
+
+  /** A skill that sits in the plugin's checkout and that its manifest never names. */
+  function seedUnpublishedSkill(
+    installPath: string,
+    category: string,
+    name: string,
+    declaredName: string | null = name,
+  ): string {
     const dir = path.join(installPath, 'skills', category, name);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: From the plugin.\n---\n`);
+    const nameLine = declaredName === null ? '' : `name: ${declaredName}\n`;
+    writeFileSync(path.join(dir, 'SKILL.md'), `---\n${nameLine}description: From the plugin.\n---\n`);
+    return dir;
+  }
+
+  function rewriteManifest(installPath: string, change: (manifest: Record<string, unknown>) => void): void {
+    const manifestFile = path.join(installPath, '.claude-plugin', 'plugin.json');
+    const manifest = JSON.parse(readFileSync(manifestFile, 'utf8')) as Record<string, unknown>;
+    change(manifest);
+    writeFileSync(manifestFile, JSON.stringify(manifest));
+  }
+
+  function pluginAt(home: string): string {
+    return path.join(home, '.claude', 'plugins', 'cache', 'mattpocock', '1.2.3');
+  }
+
+  async function bridgedBy(options: Parameters<typeof resolveContentPlugins>[0]): Promise<readonly string[]> {
+    const plugins = await resolveContentPlugins(options);
+    const bridge = plugins.find((plugin) => plugin.path.startsWith(options.dataDir));
+    return bridge === undefined ? [] : listSkills(path.join(bridge.path, 'skills'));
   }
 
   function seedEnabledPlugin(configDir: string, home: string, installPath: string): void {
@@ -751,6 +792,119 @@ describeIfSymlinks('resolveContentPlugins', () => {
     // at all — either way it offers `tdd` no longer.
     const offered = bridge === undefined ? [] : listSkills(path.join(bridge.path, 'skills'));
     expect(offered).toEqual([]);
+  });
+
+  /*
+   * What a plugin offers, as the CLI reads it. Each rule below was measured
+   * with `supportedCommands()` against a plugin built for the purpose; the
+   * direction of every one of them is the same, and deliberate: a name missed
+   * is a skill offered twice, a name wrongly collected is a skill nobody offers.
+   */
+
+  it('keeps bridging a skill the plugin carries in its checkout but does not publish', async () => {
+    // The real case: `mattpocock-skills` publishes `skills/engineering/*` and
+    // leaves `skills/in-progress/*` and `skills/misc/*` out of its manifest. A
+    // hand-installed `setup-pre-commit` exists nowhere else.
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedPluginSkill(pluginAt(home), 'engineering', 'tdd');
+    seedUnpublishedSkill(pluginAt(home), 'misc', 'setup-pre-commit');
+    seedSkill(path.join(home, '.agents', 'skills'), 'tdd');
+    seedSkill(path.join(home, '.agents', 'skills'), 'setup-pre-commit');
+
+    expect(await bridgedBy({ configDir, dataDir, home })).toEqual(['setup-pre-commit']);
+  });
+
+  it('counts a skill directly under the plugin\u2019s skills folder with no manifest entry', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedSkill(path.join(pluginAt(home), 'skills'), 'review');
+    seedSkill(path.join(configDir, 'skills'), 'review');
+    seedSkill(path.join(configDir, 'skills'), 'ask-matt');
+
+    expect(await bridgedBy({ configDir, dataDir, home })).toEqual(['ask-matt']);
+  });
+
+  it('reads a declared folder of skills one level deep, and still reads the default one', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedUnpublishedSkill(pluginAt(home), 'engineering', 'tdd');
+    seedUnpublishedSkill(pluginAt(home), path.join('engineering', 'deeper'), 'buried');
+    seedSkill(path.join(pluginAt(home), 'skills'), 'review');
+    // A single string is the other form the field takes.
+    rewriteManifest(pluginAt(home), (manifest) => {
+      manifest['skills'] = './skills/engineering';
+    });
+    for (const name of ['tdd', 'buried', 'review']) seedSkill(path.join(configDir, 'skills'), name);
+
+    // `tdd` by the declared folder, `review` by the default one, and `buried`
+    // by neither: two levels down is not somewhere the CLI looks.
+    expect(await bridgedBy({ configDir, dataDir, home })).toEqual(['buried']);
+  });
+
+  it('knows a skill by the name its frontmatter gives, on both sides', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    // Published from a folder called `tdd-v2`, offered as `tdd`.
+    seedUnpublishedSkill(pluginAt(home), 'engineering', 'tdd-v2', 'tdd');
+    // Published with no `name` at all, so offered under its folder's.
+    seedUnpublishedSkill(pluginAt(home), 'engineering', 'grilling', null);
+    rewriteManifest(pluginAt(home), (manifest) => {
+      manifest['skills'] = ['./skills/engineering/tdd-v2', './skills/engineering/grilling'];
+    });
+    // The person's copies: one in a folder of another name, offered as `tdd`.
+    seedSkill(path.join(configDir, 'skills'), 'my-tdd');
+    writeFileSync(
+      path.join(configDir, 'skills', 'my-tdd', 'SKILL.md'),
+      '---\nname: tdd\ndescription: Mine.\n---\n',
+    );
+    seedSkill(path.join(configDir, 'skills'), 'grilling');
+    seedSkill(path.join(configDir, 'skills'), 'tdd-v2');
+
+    // `my-tdd` and `grilling` would each be offered twice. `tdd-v2` would not:
+    // nothing is offered under that name, whatever the plugin's folder is called.
+    expect(await bridgedBy({ configDir, dataDir, home })).toEqual(['tdd-v2']);
+  });
+
+  it('does not count a manifest path that leaves the plugin, or is not written as one', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedSkill(path.join(home, 'elsewhere'), 'outside');
+    seedUnpublishedSkill(pluginAt(home), 'engineering', 'bare');
+    rewriteManifest(pluginAt(home), (manifest) => {
+      manifest['skills'] = ['./../../../../../elsewhere', 'skills/engineering', 7, './'];
+    });
+    seedSkill(path.join(configDir, 'skills'), 'outside');
+    seedSkill(path.join(configDir, 'skills'), 'bare');
+
+    expect(await bridgedBy({ configDir, dataDir, home })).toEqual(['bare', 'outside']);
+  });
+
+  it('applies to a synced source\u2019s skills as it does to a hand-installed one', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedPluginSkill(pluginAt(home), 'engineering', 'tdd');
+    const source = path.join(dataDir, 'skill-sources', 'agent-skills', 'skills');
+    seedSkill(source, 'tdd');
+    seedSkill(source, 'unslop');
+
+    expect(await bridgedBy({ configDir, dataDir, home, extraSkillDirs: [source] })).toEqual(['unslop']);
+  });
+
+  it('says which plugin offers which name, for the settings pane', async () => {
+    const { configDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedPluginSkill(pluginAt(home), 'engineering', 'tdd');
+    seedUnpublishedSkill(pluginAt(home), 'misc', 'setup-pre-commit');
+
+    const offers = await marketplaceSkillOffers({ configDir, home });
+
+    expect([...offers]).toEqual([['tdd', 'mattpocock-skills']]);
+  });
+
+  it('offers nothing for an account with no plugins', async () => {
+    const { configDir, home } = sandbox();
+    expect((await marketplaceSkillOffers({ configDir, home })).size).toBe(0);
   });
 });
 
