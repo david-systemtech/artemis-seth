@@ -1,0 +1,132 @@
+# A cheap model reads the pull request before we do.
+# ============================================================================
+#
+# It leaves one comment, rewritten on every push, ending in a JSON block: the
+# prose is for whichever of us reviews the pull request, the JSON for an agent
+# that re-checks the findings before anyone acts on them. A finding is a lead,
+# never a verdict - the model costs about a cent a review and is wrong often
+# enough that acting on it unchecked would be worse than not running it. It
+# approves nothing and is not a required check.
+#
+# The work is `.github/scripts/ai_review.py`. This file says when it runs,
+# with what, and what it is told about the project.
+#
+# ## Why this can never fail a pull request
+#
+# A rate-limited provider, a malformed answer or a model that runs out of time
+# all end in a logged line, a comment that says there is no review, and a green
+# check. A red X that means "the robot was busy" teaches people to ignore red
+# Xs, and the next one is `pnpm test`.
+#
+# ## Why `pull_request_target`, and why that is safe here
+#
+# The reason `request-review.yml` gives, and one more: under `pull_request` a
+# fork's pull request gets a read-only token and none of the repository's
+# secrets, so the review could neither call the model nor post what it said.
+#
+# `_target` is dangerous for a workflow that runs the pull request's code with
+# those in hand. This one never does. It checks out the BASE commit, so the
+# script, its prompt and the rules it quotes are code already on the trunk, and
+# the pull request's changes arrive as text through the API. Nothing from the
+# pull request executes, and nothing in it can rewrite the rules it is judged
+# by. The flip side: a pull request that changes this file or the script is
+# reviewed by the version already merged - and the one that adds them, not at
+# all.
+#
+# ## Why only maintainers' pull requests
+#
+# Every review is paid for, through an OpenRouter key one of us funds, and on a
+# public repository `pull_request_target` would let anyone's pull request spend
+# it. So a review runs when the author owns the repository or collaborates on
+# it - which, while CONTRIBUTING.md keeps the door closed, is everyone whose
+# pull request can be merged. `author_association` is GitHub's statement of
+# that, not something an author can set.
+
+name: AI review
+
+on:
+  pull_request_target:
+    # `ready_for_review` is what makes skipping drafts safe: a draft gets no
+    # review (see the job's `if`), and the moment it is marked ready this fires
+    # and it gets one - without waiting for another push.
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Read the code, write one comment.
+permissions:
+  contents: read
+  pull-requests: write
+
+# A force-push should not leave two reviews racing to rewrite one comment.
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Drafts are unfinished by declaration; `no-ai-review` is the escape hatch
+    # for the pull request where the review would only be noise.
+    if: >-
+      !github.event.pull_request.draft &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      !contains(github.event.pull_request.labels.*.name, 'no-ai-review')
+    # GitHub-hosted, and it must stay that way: this job holds a secret while it
+    # reads pull requests from forks, and a machine of our own is no place for
+    # that. Hosted minutes are free on a public repository. Ubuntu ships the
+    # Python 3 the script needs, and the script needs nothing else.
+    runs-on: ubuntu-latest
+    # A backstop only. The script abandons a review at REVIEW_DEADLINE_S on its
+    # own and exits green, and the step has a timeout of its own under
+    # `continue-on-error`. This is the one timeout here that turns the check
+    # red, which is why it must never be the one that fires.
+    timeout-minutes: 55
+    steps:
+      # The base commit, never the head - see the top of this file. Pinned to a
+      # commit rather than a tag, because this job holds a secret.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      # The script swallows its own failures and exits 0; `continue-on-error`
+      # swallows the interpreter's.
+      - name: Review the diff
+        continue-on-error: true
+        # Longer than the script's own deadline, shorter than the job's.
+        timeout-minutes: 50
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_MODEL: z-ai/glm-5.3-flash
+          # max, high or low - the only three this model accepts. max was the
+          # one level that reliably found the bugs needing real thought (6 of 8
+          # planted, against 1 of 6 at high), and on a fast provider it takes
+          # about a minute and a half for an ordinary pull request.
+          REVIEW_EFFORT: max
+          # Seconds before the script gives up, says so on the pull request,
+          # and exits green. This is the ceiling: the script sizes its own
+          # deadline to the diff - twelve minutes for an ordinary pull request,
+          # up to this for one large enough to need the model's whole
+          # 131k-token budget.
+          REVIEW_DEADLINE_S: 2700
+          # What the model is told the project is. The rules below tell it how
+          # the project holds itself.
+          REVIEW_PROJECT: >-
+            Artemis, an open-source Electron desktop UI for agentic coding CLIs
+            (Claude, Codex and OpenCode). A pnpm monorepo: packages/protocol is
+            the shared contract and typed IPC surface, packages/core the
+            headless engine (provider adapters, env resolution, sessions, the
+            HTTP server), packages/transcript the transcript model every front
+            end shares, packages/sdk a typed client for the server;
+            apps/desktop is the Electron main process, preload and React
+            renderer, apps/server the headless server, apps/tui the terminal
+            front end.
+          # Read from the base commit. A change that breaks one of these rules
+          # is a better finding than anything generic.
+          REVIEW_RULES: CONTRIBUTING.md SECURITY.md CONTEXT.md
+          # Noise here in particular, on top of the lockfile, images and fonts
+          # the script always leaves out: the design mockups are explorations,
+          # not code, and the release notes restate a change in prose.
+          REVIEW_SKIP: docs/design/* .github/RELEASE_NOTES.md
+        run: python3 .github/scripts/ai_review.py
