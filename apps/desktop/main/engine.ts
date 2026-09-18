@@ -450,7 +450,10 @@ export interface ArtemisEngine {
    * person is shown has to come from the same reading of the disk.
    */
   listSkills(): Promise<readonly SkillInfo[]>;
-  /** Which skills are always on, as stored. */
+  /**
+   * Which skills are always on, as stored. For the pane: rejects when the
+   * file cannot be read, rather than handing it a guess it would save over.
+   */
   readSkillLibrary(): Promise<SkillLibraryDocument>;
   /** Replace those choices. Answers with what was actually stored. */
   writeSkillLibrary(document: SkillLibraryDocument): Promise<SkillLibraryDocument>;
@@ -1649,7 +1652,7 @@ function createEngine(options: EngineOptions): ArtemisEngine {
         .map((profile) => ({ profileId: profile.id, configDir: profileConfigDir(profile) }));
       return listSkills({ accounts });
     },
-    readSkillLibrary: () => skillLibrary.read(),
+    readSkillLibrary: () => skillLibrary.load(),
     writeSkillLibrary: (document) => skillLibrary.write(document),
 
     startRun: async (input) => {

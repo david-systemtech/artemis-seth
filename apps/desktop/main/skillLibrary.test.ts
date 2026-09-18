@@ -7,7 +7,7 @@
  * about real files.
  */
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -67,6 +67,43 @@ describe('SkillLibraryStore', () => {
     writeFileSync(path.join(dir, SKILL_LIBRARY_FILE), '{ not json');
 
     expect(await new SkillLibraryStore({ userDataDir: dir }).read()).toEqual({ version: 1, alwaysOn: [] });
+  });
+
+  it('does not remember a guess: the next read tries the file again', async () => {
+    const dir = sandbox();
+    const store = new SkillLibraryStore({ userDataDir: dir });
+    writeFileSync(path.join(dir, SKILL_LIBRARY_FILE), '{ not json');
+    expect(await store.read()).toEqual({ version: 1, alwaysOn: [] });
+
+    // Fixed by hand, or a lock that lifted: the next run gets the real choices,
+    // not the guess the first one had to make.
+    writeFileSync(path.join(dir, SKILL_LIBRARY_FILE), JSON.stringify(ON));
+    expect(await store.read()).toEqual(ON);
+  });
+
+  it('refuses the pane a file it cannot parse, rather than a guess it would save over', async () => {
+    const dir = sandbox();
+    writeFileSync(path.join(dir, SKILL_LIBRARY_FILE), '{ not json');
+
+    await expect(new SkillLibraryStore({ userDataDir: dir }).load()).rejects.toThrow(/not valid JSON/);
+  });
+
+  it('refuses the pane a file it cannot read, and runs still start', async () => {
+    const dir = sandbox();
+    // A directory where the file should be: unreadable as a file even to root,
+    // which is what an unreadable file cannot be made to be in every sandbox.
+    mkdirSync(path.join(dir, SKILL_LIBRARY_FILE));
+    const store = new SkillLibraryStore({ userDataDir: dir });
+
+    await expect(store.load()).rejects.toThrow(/Could not read/);
+    expect(await store.read()).toEqual({ version: 1, alwaysOn: [] });
+  });
+
+  it('gives the pane an absent file as nothing on, like a run, without creating it', async () => {
+    const dir = sandbox();
+
+    expect(await new SkillLibraryStore({ userDataDir: dir }).load()).toEqual({ version: 1, alwaysOn: [] });
+    expect(readdirSync(dir)).toEqual([]);
   });
 
   it('leaves no temp file behind, and writes something a person can read', async () => {

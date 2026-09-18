@@ -73,30 +73,53 @@ export class SkillLibraryStore {
   }
 
   /**
-   * The choices. Never throws for an absent or unreadable file: a run that
-   * refused to start because a settings document was corrupt would be Artemis
-   * failing at its actual job over a feature the user may never have touched.
+   * The choices, for a run. Never throws: an absent file is nothing on, and so
+   * is one that cannot be read or parsed — a run that refused to start because
+   * a settings document was corrupt would be Artemis failing at its actual job
+   * over a feature the user may never have touched.
+   *
+   * But a guess is not remembered. Caching it would keep every later run on
+   * "nothing on" after a lock that lifted a second later, and hand the pane a
+   * guess to save over the real file; the next read tries the file again.
    */
   async read(): Promise<SkillLibraryDocument> {
+    try {
+      return await this.load();
+    } catch (error) {
+      log.warn(`${error instanceof Error ? error.message : String(error)}; composing no always-on skills`);
+      return defaultSkillLibraryDocument();
+    }
+  }
+
+  /**
+   * The choices, for the pane that edits them — which, unlike a run, must not
+   * be handed a guess: switches drawn over "nothing on" for a file that could
+   * not be read would, on the first click, save that guess over it. Throws for
+   * anything but an absent file, and the pane shows why instead of switches.
+   */
+  async load(): Promise<SkillLibraryDocument> {
     if (this.#cache) return this.#cache;
 
     let raw: string;
     try {
       raw = await readFile(this.#file, 'utf8');
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        log.warn(`Could not read ${this.#file}; using defaults`, error);
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.#cache = defaultSkillLibraryDocument();
+        return this.#cache;
       }
-      this.#cache = defaultSkillLibraryDocument();
-      return this.#cache;
+      throw new WorkspaceError(
+        `Could not read ${this.#file}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
 
+    let parsed: unknown;
     try {
-      this.#cache = parseSkillLibraryDocument(JSON.parse(raw) as unknown);
-    } catch (error) {
-      log.warn(`${this.#file} is not valid JSON; using defaults`, error);
-      this.#cache = defaultSkillLibraryDocument();
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      throw new WorkspaceError(`${this.#file} is not valid JSON. Fix it, or delete it to start over.`);
     }
+    this.#cache = parseSkillLibraryDocument(parsed);
     return this.#cache;
   }
 
