@@ -16,6 +16,7 @@ import {
   defaultSkillLibraryDocument,
   isAlwaysOn,
   parseSkillLibraryDocument,
+  planAlwaysOnSkills,
   skillSlashCommand,
   skillSourceIdFor,
   skillSourceLabel,
@@ -301,5 +302,48 @@ describe('the sources in the library', () => {
 
     expect(parsed.alwaysOn).toEqual([]);
     expect(parsed.sources).toHaveLength(1);
+  });
+});
+
+describe('planAlwaysOnSkills', () => {
+  it('composes this machine’s choice where the run executes here', () => {
+    expect(planAlwaysOnSkills({ providerId: 'claude', systemPromptAppend: true, own: ['unslop'] })).toEqual({
+      kind: 'compose',
+      names: ['unslop'],
+    });
+  });
+
+  it('sends the names with a run an Artemis server executes, for it to read its own copies', () => {
+    // Composed here, the text would hand an agent on another machine the paths
+    // of this one.
+    expect(planAlwaysOnSkills({ providerId: 'artemis', systemPromptAppend: true, own: ['unslop', 'tdd'] })).toEqual({
+      kind: 'send',
+      names: ['unslop', 'tdd'],
+    });
+  });
+
+  it('tells a provider that cannot take an append nothing, whoever asked', () => {
+    expect(
+      planAlwaysOnSkills({ providerId: 'codex', systemPromptAppend: false, own: ['unslop'], asked: ['tdd'] }),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('applies a served caller’s names after this machine’s own, each once', () => {
+    // A desktop serving a client: both have a say, as with standing instructions.
+    expect(
+      planAlwaysOnSkills({
+        providerId: 'claude',
+        systemPromptAppend: true,
+        own: ['unslop'],
+        asked: ['tdd', 'unslop'],
+      }),
+    ).toEqual({ kind: 'compose', names: ['unslop', 'tdd'] });
+  });
+
+  it('is nothing at all when nobody chose anything', () => {
+    expect(planAlwaysOnSkills({ providerId: 'claude', systemPromptAppend: true, own: [] })).toEqual({ kind: 'none' });
+    expect(planAlwaysOnSkills({ providerId: 'artemis', systemPromptAppend: true, own: [], asked: [] })).toEqual({
+      kind: 'none',
+    });
   });
 });

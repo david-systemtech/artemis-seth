@@ -69,8 +69,46 @@ const added: SkillsSourceAddRequest[] = [];
 const removed: string[] = [];
 const pulled: (string | undefined)[] = [];
 
+/** What the server answers, or why it cannot be asked. `null` state means "too old to list". */
+let server: {
+  skills: readonly SkillInfo[];
+  sources: readonly SkillSourceStatus[];
+  manage: boolean;
+  available: boolean;
+} = { skills: [], sources: [], manage: true, available: true };
+let serverFails: string | null = null;
+const serverCalls: { what: string; request: unknown }[] = [];
+const serverState = () => ({
+  available: server.available,
+  manage: server.manage,
+  skills: server.skills,
+  sources: server.sources,
+  accounts: [{ id: 'srv-work', slug: 'work-max', label: 'Work Max' }],
+});
+
 /** Installed before the first render: `resolveBridge` memoises on first use. */
 (globalThis.window as unknown as { artemis: unknown }).artemis = {
+  serverSkills: {
+    list: async (request: unknown) => {
+      serverCalls.push({ what: 'list', request });
+      return serverFails === null ? ok(serverState()) : failed(serverFails);
+    },
+    addSource: async (request: { url: string }) => {
+      serverCalls.push({ what: 'add', request });
+      if (serverFails !== null) return failed(serverFails);
+      server = { ...server, sources: [...server.sources, sourceStatus(request.url, { skillCount: 3 })] };
+      return ok(serverState());
+    },
+    removeSource: async (request: { id: string }) => {
+      serverCalls.push({ what: 'remove', request });
+      server = { ...server, sources: server.sources.filter((status) => status.source.id !== request.id) };
+      return ok(serverState());
+    },
+    syncSources: async (request: unknown) => {
+      serverCalls.push({ what: 'sync', request });
+      return ok(serverState());
+    },
+  },
   skills: {
     list: async () => (listFails === null ? ok({ skills, document: stored, sources }) : failed(listFails)),
     save: async (request: SkillsSaveRequest) => {
@@ -127,6 +165,9 @@ const toggle = (name: string): HTMLElement => screen.getByRole('switch', { name:
 const isOn = (name: string): boolean => toggle(name).getAttribute('aria-checked') === 'true';
 
 beforeEach(() => {
+  server = { skills: [], sources: [], manage: true, available: true };
+  serverFails = null;
+  serverCalls.length = 0;
   sources = [];
   sourceFails = null;
   added.length = 0;
@@ -476,5 +517,112 @@ describe('skill repositories', () => {
 
     expect(isOn('tdd')).toBe(true);
     expect(saves).toEqual([]);
+  });
+});
+
+/**
+ * A conversation on an Artemis server runs there, with the server's skills.
+ * The pane has to show what those are, because the switch travels by name and
+ * a name the server does not carry adds nothing to a run over there.
+ */
+describe('an Artemis server', () => {
+  const withServer = (): void => {
+    seedApp({
+      profiles: [
+        { id: 'p-work', label: 'Work', providerId: 'claude', configDir: '/home/u/.claude-work' },
+        { id: 'p-server', label: 'Home Server', providerId: 'artemis', configDir: '/home/u/.artemis/server' },
+      ],
+      providers: [],
+    });
+  };
+
+  it('draws no server group on a machine with no server profile, and asks no server anything', async () => {
+    await renderPane();
+    // "On this machine" is the only place there is.
+    expect(screen.queryByText(/^On (?!this machine)/)).toBeNull();
+    expect(serverCalls).toEqual([]);
+  });
+
+  it('lists what the server carries, under its own name, with its own switch', async () => {
+    withServer();
+    skills = [skill({ name: 'unslop' })];
+    server = { ...server, skills: [skill({ name: 'unslop' }), skill({ name: 'deploy-checklist' })] };
+    await renderPane();
+
+    expect(screen.getByText('On Home Server')).toBeTruthy();
+    expect(serverCalls[0]).toEqual({ what: 'list', request: { profileId: 'p-server' } });
+    // The same skill on both machines is two rows and one choice.
+    fireEvent.click(screen.getByRole('switch', { name: 'Always on: unslop, on Home Server' }));
+    await act(async () => {});
+    expect(isOn('unslop')).toBe(true);
+    expect(screen.getByRole('switch', { name: 'Always on: unslop, on Home Server' }).getAttribute('aria-checked')).toBe('true');
+    // Both of the server's rows say where they are, and neither says "this machine".
+    expect(screen.getAllByText(/Every account on Home Server\./)).toHaveLength(2);
+  });
+
+  it('does not call a choice missing when only the server has the skill', async () => {
+    withServer();
+    skills = [];
+    stored = { version: 1, alwaysOn: [{ name: 'deploy-checklist', scope: { kind: 'all' } }] };
+    server = { ...server, skills: [skill({ name: 'deploy-checklist' })] };
+    await renderPane();
+
+    expect(screen.queryByText(/not installed anywhere/)).toBeNull();
+    expect(screen.getByRole('switch', { name: 'Always on: deploy-checklist, on Home Server' }).getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('adds, pulls and removes the server’s repositories through the server', async () => {
+    withServer();
+    server = { ...server, sources: [sourceStatus('https://github.com/demo/ops-skills')] };
+    await renderPane();
+
+    fireEvent.change(screen.getByLabelText('Repository URL, for Home Server'), {
+      target: { value: 'https://github.com/demo/agent-skills' },
+    });
+    // The local form has an Add of its own; the server's is the last on the page.
+    fireEvent.click(screen.getAllByRole('button', { name: 'Add' }).at(-1)!);
+    await act(async () => {});
+    expect(serverCalls.at(-1)).toEqual({
+      what: 'add',
+      request: { profileId: 'p-server', url: 'https://github.com/demo/agent-skills', subdir: 'skills' },
+    });
+    expect(screen.getByText('demo/agent-skills')).toBeTruthy();
+    // Nothing was cloned on this machine.
+    expect(added).toEqual([]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pull now: demo/ops-skills' }));
+    await act(async () => {});
+    expect(serverCalls.at(-1)?.what).toBe('sync');
+    fireEvent.click(screen.getByRole('button', { name: 'Remove: demo/ops-skills' }));
+    await act(async () => {});
+    expect(screen.queryByText('demo/ops-skills')).toBeNull();
+  });
+
+  it('shows a token without the grant the repositories, and says why it cannot change them', async () => {
+    withServer();
+    server = { ...server, manage: false, sources: [sourceStatus('https://github.com/demo/ops-skills')] };
+    await renderPane();
+
+    expect(screen.getByText('demo/ops-skills')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Pull now: demo/ops-skills' })).toBeNull();
+    expect(screen.queryByLabelText('Repository URL, for Home Server')).toBeNull();
+    expect(screen.getByText(/can see the server’s repositories but not change them/)).toBeTruthy();
+  });
+
+  it('says so when the server is too old to read always-on skills, or cannot be reached', async () => {
+    withServer();
+    server = { ...server, available: false };
+    await renderPane();
+    expect(screen.getByText(/too old to read always-on skills/)).toBeTruthy();
+
+    cleanup();
+    serverFails = 'Could not reach the Artemis server at https://home.example.';
+    await renderPane();
+    expect(screen.getByText(/Could not ask Home Server for its skills: Could not reach/)).toBeTruthy();
+  });
+
+  it('tells a person that the switch travels by name and the server adds its own copy', async () => {
+    await renderPane();
+    expect(screen.getByText(/the switch travels with it by name/)).toBeTruthy();
   });
 });

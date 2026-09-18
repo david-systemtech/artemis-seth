@@ -23,8 +23,12 @@ import {
   cancelRemoteSignIn,
   createRemoteAccount,
   readRemoteAccounts,
+  addRemoteSkillSource,
   readRemoteMemoryBanks,
   readRemoteSignIn,
+  readRemoteSkills,
+  removeRemoteSkillSource,
+  syncRemoteSkillSources,
   setRemoteMemoryBankScope,
   submitRemoteSignInCode,
 } from '../artemis/admin.js';
@@ -266,5 +270,78 @@ describe('the sign-in calls', () => {
     );
 
     await expect(readRemoteSignIn(ENV, 'p1')).rejects.toThrow(/server\.tail:6472/);
+  });
+});
+
+describe('a server’s skills', () => {
+  const BODY = {
+    object: 'artemis.skills',
+    skills: [
+      {
+        name: 'unslop',
+        description: 'De-slop prose.',
+        origin: { kind: 'machine' },
+        dir: '/data/agent/.agents/skills/unslop',
+        modelInvocable: true,
+        userInvocable: true,
+        bodyChars: 6100,
+      },
+    ],
+    sources: [],
+    profiles: [{ id: 'p1', slug: 'work', label: 'Work' }],
+    manage: true,
+  };
+
+  it('reads what the server carries, and whether this token may change it', async () => {
+    const seen = stubFetch(() => jsonResponse(BODY));
+    const remote = await readRemoteSkills(ENV);
+    expect(seen).toMatchObject([{ url: 'http://server.tail:6472/api/v0/skills', auth: 'Bearer tok-123' }]);
+    expect(remote).toMatchObject({ available: true, manage: true, profiles: [{ label: 'Work' }] });
+    expect(remote.skills.map((skill) => skill.name)).toEqual(['unslop']);
+  });
+
+  it('treats a server with no such surface as one that carries nothing, not as a fault', async () => {
+    // An older server answers 404 and a host with no skills 501. Neither is a
+    // banner: the pane says the server cannot, and the names it sends go unread.
+    for (const status of [404, 501]) {
+      stubFetch(() => jsonResponse({ error: { message: 'no' } }, status));
+      expect(await readRemoteSkills(ENV)).toEqual({
+        available: false,
+        manage: false,
+        skills: [],
+        sources: [],
+        profiles: [],
+      });
+    }
+  });
+
+  it('adds, pulls and removes through the routes, and answers with the state each one returns', async () => {
+    const seen = stubFetch(() => jsonResponse(BODY));
+    await addRemoteSkillSource(ENV, { url: 'https://github.com/demo/agent-skills', subdir: 'skills' });
+    await syncRemoteSkillSources(ENV);
+    await syncRemoteSkillSources(ENV, 'agent skills/1');
+    const after = await removeRemoteSkillSource(ENV, 'agent-skills-1a2b3c4d');
+
+    expect(seen.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ['POST', '/api/v0/skills/sources'],
+      ['POST', '/api/v0/skills/sync'],
+      // An id is a path segment, so it is encoded as one.
+      ['POST', '/api/v0/skills/sources/agent%20skills%2F1/sync'],
+      ['DELETE', '/api/v0/skills/sources/agent-skills-1a2b3c4d'],
+    ]);
+    expect(JSON.parse(seen[0]?.body ?? '{}')).toEqual({
+      url: 'https://github.com/demo/agent-skills',
+      subdir: 'skills',
+    });
+    expect(after.available).toBe(true);
+  });
+
+  it('passes the server’s own sentence on when a write is refused', async () => {
+    stubFetch(() =>
+      jsonResponse({ error: { message: 'This connection may read the skills on this server but not change its repositories.' } }, 403),
+    );
+    await expect(addRemoteSkillSource(ENV, { url: 'https://github.com/demo/agent-skills' })).rejects.toThrow(
+      /may read the skills on this server but not change/,
+    );
   });
 });

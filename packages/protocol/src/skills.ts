@@ -351,6 +351,40 @@ export function composesAlwaysOnSkillsHere(providerId: string, systemPromptAppen
   return systemPromptAppend && providerId !== 'artemis';
 }
 
+/** What a host does about always-on skills for one run. See {@link planAlwaysOnSkills}. */
+export type AlwaysOnSkillsPlan =
+  | { readonly kind: 'none' }
+  /** The run executes elsewhere: the names cross, and that machine reads the bodies. */
+  | { readonly kind: 'send'; readonly names: readonly string[] }
+  /** The run executes here: read each body off this disk and append it. */
+  | { readonly kind: 'compose'; readonly names: readonly string[] };
+
+/**
+ * Decide what one run is given for the always-on skills.
+ *
+ * `own` is this machine's choice for the run's account. `asked` is what a
+ * caller sent when this machine is *serving* the run — a desktop that serves a
+ * client applies both, the way it already does standing instructions, and the
+ * caller's come second so this machine's own order is kept.
+ *
+ * A pure function so the three outcomes can be pinned without an engine: a
+ * provider that cannot take an append is told nothing; a run on an Artemis
+ * server carries the names; everything else is composed where it runs.
+ */
+export function planAlwaysOnSkills(run: {
+  readonly providerId: string;
+  readonly systemPromptAppend: boolean;
+  readonly own: readonly string[];
+  readonly asked?: readonly string[];
+}): AlwaysOnSkillsPlan {
+  if (!run.systemPromptAppend) return { kind: 'none' };
+  const names = [...new Set([...run.own, ...(run.asked ?? [])])];
+  if (names.length === 0) return { kind: 'none' };
+  return composesAlwaysOnSkillsHere(run.providerId, run.systemPromptAppend)
+    ? { kind: 'compose', names }
+    : { kind: 'send', names };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Composition                                                                */
 /* -------------------------------------------------------------------------- */

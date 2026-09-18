@@ -63,7 +63,7 @@
  * a token in it is refused here, before it can be saved anywhere.
  */
 
-import { useState, type ReactElement } from 'react';
+import { useCallback, useEffect, useState, type ReactElement } from 'react';
 import { SparklesIcon } from 'lucide-react';
 import { formatRelative } from '@rx-artemis/transcript';
 import {
@@ -75,9 +75,11 @@ import {
   skillSourceSubdirProblem,
   skillSourceUrlProblem,
   type SkillInfo,
+  type SkillLibraryDocument,
   type SkillSourceStatus,
 } from '@rx-artemis/protocol';
 
+import { useServerSkills } from '../../hooks/useServerSkills';
 import { useSkills } from '../../hooks/useSkills';
 import { useApp } from '../../state/store';
 import { SettingsGroup, SettingsPane } from './pane';
@@ -122,8 +124,15 @@ function SkillRow({
   profileLabel,
   sourceLabel,
   onToggle,
+  remote,
 }: {
   readonly skill: SkillInfo;
+  /**
+   * The server this row is about, when it is not this machine: its profile's
+   * id and the label a person knows it by. The same skill can be on both, so
+   * the row's id and its switch's name have to say which one they are.
+   */
+  readonly remote?: { readonly id: string; readonly label: string };
   readonly on: boolean;
   /** Whether any account the skill reaches is given its always-on skills. */
   readonly told: boolean;
@@ -132,12 +141,13 @@ function SkillRow({
   readonly sourceLabel: (sourceId: string) => string;
   readonly onToggle: (on: boolean) => void;
 }): ReactElement {
+  const everyAccount = remote === undefined ? 'Every account on this machine' : `Every account on ${remote.label}`;
   const where =
     skill.origin.kind === 'profile'
       ? `Only on ${skill.origin.profileIds.map(profileLabel).join(', ')}`
       : skill.origin.kind === 'source'
-        ? `Every account on this machine, from ${sourceLabel(skill.origin.sourceId)}`
-        : 'Every account on this machine';
+        ? `${everyAccount}, from ${sourceLabel(skill.origin.sourceId)}`
+        : everyAccount;
 
   return (
     <Item size="sm" className="items-start">
@@ -176,8 +186,10 @@ function SkillRow({
       </ItemContent>
       <ItemActions>
         <Switch
-          id={`settings-skill-${skill.name}`}
-          aria-label={`Always on: ${skill.name}`}
+          id={remote === undefined ? `settings-skill-${skill.name}` : `settings-skill-${remote.id}-${skill.name}`}
+          aria-label={
+            remote === undefined ? `Always on: ${skill.name}` : `Always on: ${skill.name}, on ${remote.label}`
+          }
           checked={on}
           onCheckedChange={onToggle}
         />
@@ -193,6 +205,7 @@ function SourceRow({
   disabled,
   onSync,
   onRemove,
+  readOnly = false,
 }: {
   readonly status: SkillSourceStatus;
   /** This row's own action is running. */
@@ -201,6 +214,8 @@ function SourceRow({
   readonly disabled: boolean;
   readonly onSync: () => void;
   readonly onRemove: () => void;
+  /** Drawn without its buttons: a server's repository, seen through a token that may not change it. */
+  readonly readOnly?: boolean;
 }): ReactElement {
   const label = skillSourceLabel(status.source.url);
   const count = `${String(status.skillCount)} skill${status.skillCount === 1 ? '' : 's'}`;
@@ -231,28 +246,30 @@ function SourceRow({
           </ItemDescription>
         )}
       </ItemContent>
-      <ItemActions>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="text-2xs"
-          disabled={disabled}
-          aria-label={`Pull now: ${label}`}
-          onClick={onSync}
-        >
-          {busy ? 'Working…' : 'Pull now'}
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="text-2xs text-ink-faint"
-          disabled={disabled}
-          aria-label={`Remove: ${label}`}
-          onClick={onRemove}
-        >
-          Remove
-        </Button>
-      </ItemActions>
+      {readOnly ? null : (
+        <ItemActions>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-2xs"
+            disabled={disabled}
+            aria-label={`Pull now: ${label}`}
+            onClick={onSync}
+          >
+            {busy ? 'Working…' : 'Pull now'}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-2xs text-ink-faint"
+            disabled={disabled}
+            aria-label={`Remove: ${label}`}
+            onClick={onRemove}
+          >
+            Remove
+          </Button>
+        </ItemActions>
+      )}
     </Item>
   );
 }
@@ -269,10 +286,13 @@ function AddSourceForm({
   busy,
   disabled,
   onAdd,
+  remote,
 }: {
   readonly busy: boolean;
   readonly disabled: boolean;
   readonly onAdd: (url: string, subdir: string) => Promise<boolean>;
+  /** The server the repository is cloned on, when it is not this machine. */
+  readonly remote?: string;
 }): ReactElement {
   const [url, setUrl] = useState('');
   const [subdir, setSubdir] = useState<string>(DEFAULT_SKILL_SOURCE_SUBDIR);
@@ -296,7 +316,7 @@ function AddSourceForm({
     >
       <div className="flex items-center gap-1.5">
         <Input
-          aria-label="Repository URL"
+          aria-label={remote === undefined ? 'Repository URL' : `Repository URL, for ${remote}`}
           placeholder="https://github.com/you/agent-skills.git"
           value={url}
           onChange={(event) => setUrl(event.target.value)}
@@ -305,7 +325,9 @@ function AddSourceForm({
           autoComplete="off"
         />
         <Input
-          aria-label="Folder that holds the skills"
+          aria-label={
+            remote === undefined ? 'Folder that holds the skills' : `Folder that holds the skills, for ${remote}`
+          }
           value={subdir}
           onChange={(event) => setSubdir(event.target.value)}
           className="h-7 w-24 font-mono text-2xs"
@@ -322,12 +344,146 @@ function AddSourceForm({
         </p>
       ) : (
         <p className="text-2xs leading-relaxed text-ink-faint">
-          A git repository with one folder per skill. Artemis clones it under its own data folder and keeps
-          it pulled, so the same skills are on every machine you add it to. A private repository is reached
-          with this machine&rsquo;s own git credentials.
+          {remote === undefined ? (
+            <>
+              A git repository with one folder per skill. Artemis clones it under its own data folder and
+              keeps it pulled, so the same skills are on every machine you add it to. A private repository is
+              reached with this machine&rsquo;s own git credentials.
+            </>
+          ) : (
+            <>
+              Cloned on {remote}, under its own data folder, and kept pulled there. A private repository is
+              reached with that server&rsquo;s git credentials, not this machine&rsquo;s.
+            </>
+          )}
         </p>
       )}
     </form>
+  );
+}
+
+/**
+ * What one Artemis server carries.
+ *
+ * A conversation on a server runs there, so it is offered *these* skills and
+ * the switches on these rows are what reach it: the choice is the one kept on
+ * this machine, sent by name when a run starts, and the server reads the body
+ * off its own disk. A name switched on here and absent there adds nothing to a
+ * served run, which is why the list is worth drawing at all.
+ *
+ * The repositories are the server's own, cloned on its disk with its
+ * credentials. A token with the administrative grant keeps them in step from
+ * here; any other sees them and is told why it cannot.
+ */
+function ServerSkillsGroup({
+  profileId,
+  label,
+  document,
+  onToggle,
+  onNames,
+}: {
+  readonly profileId: string;
+  readonly label: string;
+  readonly document: SkillLibraryDocument;
+  readonly onToggle: (name: string, on: boolean) => void;
+  /** Tells the pane which names exist here, so a choice is not called missing. */
+  readonly onNames: (profileId: string, names: readonly string[]) => void;
+}): ReactElement | null {
+  const server = useServerSkills(profileId);
+  const state = server.state;
+
+  useEffect(() => {
+    onNames(profileId, state === null ? [] : state.skills.map((skill) => skill.name));
+  }, [onNames, profileId, state]);
+
+  if (server.loading) return null;
+  const anchor = `skills-server-${profileId}`;
+
+  if (server.error !== null || state === null) {
+    return (
+      <SettingsGroup label={`On ${label}`} anchor={anchor}>
+        <p role="alert" className="px-3 py-2.5 text-2xs leading-relaxed text-danger-text">
+          Could not ask {label} for its skills: {server.error ?? 'it did not answer.'}
+        </p>
+      </SettingsGroup>
+    );
+  }
+  if (!state.available) {
+    return (
+      <SettingsGroup label={`On ${label}`} anchor={anchor}>
+        <p className="px-3 py-2.5 text-2xs leading-relaxed text-ink-faint">
+          This server does not list its skills, so it is too old to read always-on skills either.
+          Conversations there start without them until it is updated.
+        </p>
+      </SettingsGroup>
+    );
+  }
+
+  const accountLabel = (id: string): string =>
+    state.accounts.find((account) => account.id === id)?.label ?? 'an account that is no longer there';
+  const sourceLabel = (sourceId: string): string => {
+    const status = state.sources.find((candidate) => candidate.source.id === sourceId);
+    return status === undefined ? 'a repository that is no longer there' : skillSourceLabel(status.source.url);
+  };
+
+  return (
+    <SettingsGroup label={`On ${label}`} anchor={anchor}>
+      {state.skills.length > 0 ? (
+        <ItemGroup className="gap-0 divide-y divide-hairline">
+          {state.skills.map((skill) => (
+            <SkillRow
+              key={skill.name}
+              skill={skill}
+              remote={{ id: profileId, label }}
+              on={isAlwaysOn(document, skill.name)}
+              told
+              profileLabel={accountLabel}
+              sourceLabel={sourceLabel}
+              onToggle={(on) => onToggle(skill.name, on)}
+            />
+          ))}
+        </ItemGroup>
+      ) : (
+        <p className="px-3 py-2.5 text-2xs leading-relaxed text-ink-faint">
+          No skills on this server yet. Add a repository below and conversations there are offered what it
+          holds from the next message on.
+        </p>
+      )}
+
+      {server.actionError !== null ? (
+        <p role="alert" className="px-3 pt-2.5 text-2xs leading-relaxed text-danger-text">
+          {server.actionError}
+        </p>
+      ) : null}
+      {state.sources.length > 0 ? (
+        <ItemGroup className="gap-0 divide-y divide-hairline border-t border-hairline">
+          {state.sources.map((status) => (
+            <SourceRow
+              key={status.source.id}
+              status={status}
+              readOnly={!state.manage}
+              busy={server.busy === status.source.id || server.busy === 'all'}
+              disabled={server.busy !== null}
+              onSync={() => server.syncSources(status.source.id)}
+              onRemove={() => server.removeSource(status.source.id)}
+            />
+          ))}
+        </ItemGroup>
+      ) : null}
+      {state.manage ? (
+        <AddSourceForm
+          busy={server.busy === 'add'}
+          disabled={server.busy !== null}
+          onAdd={server.addSource}
+          remote={label}
+        />
+      ) : (
+        <p className="px-3 py-2.5 text-2xs leading-relaxed text-ink-faint">
+          This connection can see the server&rsquo;s repositories but not change them. One created with{' '}
+          <code className="font-mono">--manage-profiles</code> can.
+        </p>
+      )}
+    </SettingsGroup>
   );
 }
 
@@ -346,6 +502,9 @@ export function SkillsSection(): ReactElement {
     const profile = profiles.find((candidate) => candidate.id === profileId);
     if (profile === undefined) return false;
     const provider = providers.find((candidate) => candidate.id === profile.providerId);
+    // A served account is told too, but by name and from the *server's* copy:
+    // a skill on this machine's disk adds nothing to a run over there, so a
+    // local row is priced only by the accounts that read this disk.
     return provider === undefined || composesAlwaysOnSkillsHere(provider.id, provider.capabilities.systemPromptAppend);
   };
   const sourceLabel = (sourceId: string): string => {
@@ -355,9 +514,26 @@ export function SkillsSection(): ReactElement {
   const told = (skill: SkillInfo): boolean =>
     (skill.origin.kind === 'profile' ? skill.origin.profileIds : profiles.map((profile) => profile.id)).some(toldOn);
 
-  // Choices whose skill is not on this machine right now. Kept in view: see the
-  // file header.
-  const present = new Set(pane.skills.map((skill) => skill.name));
+  // One group per Artemis server this machine has a profile for. A served
+  // conversation runs there, with that server's skills.
+  const servers = profiles.filter((profile) => profile.providerId === 'artemis');
+  const [serverNames, setServerNames] = useState<Readonly<Record<string, readonly string[]>>>({});
+  const noteServerNames = useCallback((profileId: string, names: readonly string[]): void => {
+    setServerNames((held) => {
+      const before = held[profileId];
+      if (before !== undefined && before.length === names.length && before.every((name, index) => name === names[index])) {
+        return held;
+      }
+      return { ...held, [profileId]: names };
+    });
+  }, []);
+
+  // Choices whose skill is nowhere right now: not on this machine, and not on
+  // a server a conversation could run on. Kept in view: see the file header.
+  const present = new Set([
+    ...pane.skills.map((skill) => skill.name),
+    ...servers.flatMap((server) => serverNames[server.id] ?? []),
+  ]);
   const missing = pane.document.alwaysOn.filter((entry) => !present.has(entry.name));
 
   return (
@@ -413,7 +589,7 @@ export function SkillsSection(): ReactElement {
       ) : null}
 
       {missing.length > 0 ? (
-        <SettingsGroup label="Always on, but not on this machine" anchor="skills-missing">
+        <SettingsGroup label={servers.length > 0 ? 'Always on, but not installed anywhere' : 'Always on, but not on this machine'} anchor="skills-missing">
           <ItemGroup className="gap-0 divide-y divide-hairline">
             {missing.map((entry) => (
               <Item key={entry.name} size="sm" className="items-start">
@@ -469,13 +645,29 @@ export function SkillsSection(): ReactElement {
         </SettingsGroup>
       ) : null}
 
+      {/* After everything about this machine: a server is another place, with its
+          own skills and its own repositories. */}
+      {!pane.loading && pane.error === null
+        ? servers.map((server) => (
+            <ServerSkillsGroup
+              key={server.id}
+              profileId={server.id}
+              label={server.label}
+              document={pane.document}
+              onToggle={pane.setAlwaysOn}
+              onNames={noteServerNames}
+            />
+          ))
+        : null}
+
       {pane.skills.length > 0 || missing.length > 0 ? (
         <p className="text-2xs leading-relaxed text-ink-faint">
           Type <code className="font-mono">/</code> and the skill&rsquo;s own name in a conversation: the menu
           finds it and fills in the full command. <em>Always on</em> appends the skill to the system prompt,
           the way a standing instruction is, so it reaches Claude accounts and local models. A Codex or
-          OpenCode account cannot take an appended prompt and is not told; a conversation on an Artemis
-          Server runs on the server, with the server&rsquo;s skills, and these switches do not reach it yet.
+          OpenCode account cannot take an appended prompt and is not told. A conversation on an Artemis
+          Server runs on the server: the switch travels with it by name, and the server adds its own copy of
+          the skill, so one that is not installed there adds nothing.
         </p>
       ) : null}
     </SettingsPane>

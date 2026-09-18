@@ -80,6 +80,9 @@ import {
   type SkillsSourceAddRequest,
   type SkillsSourceRemoveRequest,
   type SkillsSourceSyncRequest,
+  type ServerSkillsSourceAddRequest,
+  type ServerSkillsSourceRemoveRequest,
+  type ServerSkillsSourceSyncRequest,
   type Attachment,
   type BuiltInPromptId,
   type MemoryBankAddRequest,
@@ -2753,6 +2756,28 @@ export function validateSkillsSourceRemove(raw: unknown): SkillsSourceRemoveRequ
 export function validateSkillsSourceSync(raw: unknown): SkillsSourceSyncRequest {
   const request = requireRequest(raw);
   return request['id'] === undefined ? {} : { id: requireSkillSourceId(request['id'], 'id') };
+}
+
+/**
+ * The same three, aimed at an Artemis server through one of its profiles.
+ *
+ * Held to exactly the rules above, and on purpose before the request leaves:
+ * the server refuses the same URLs in the same words, but a URL refused here
+ * never crosses a network at all.
+ */
+export function validateServerSkillsSourceAdd(raw: unknown): ServerSkillsSourceAddRequest {
+  const request = requireRequest(raw);
+  return { profileId: requireId(request['profileId'], 'profileId'), ...validateSkillsSourceAdd(raw) };
+}
+
+export function validateServerSkillsSourceRemove(raw: unknown): ServerSkillsSourceRemoveRequest {
+  const request = requireRequest(raw);
+  return { profileId: requireId(request['profileId'], 'profileId'), ...validateSkillsSourceRemove(raw) };
+}
+
+export function validateServerSkillsSourceSync(raw: unknown): ServerSkillsSourceSyncRequest {
+  const request = requireRequest(raw);
+  return { profileId: requireId(request['profileId'], 'profileId'), ...validateSkillsSourceSync(raw) };
 }
 
 /* -------------------------------------------------------------------------- */

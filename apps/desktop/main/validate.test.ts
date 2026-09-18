@@ -7,6 +7,9 @@ import {
   validateSkillsSourceAdd,
   validateSkillsSourceRemove,
   validateSkillsSourceSync,
+  validateServerSkillsSourceAdd,
+  validateServerSkillsSourceRemove,
+  validateServerSkillsSourceSync,
   validatePreviewOpen,
   validateProfilesCreate,
   validateProfilesSuggestDir,
@@ -1988,5 +1991,32 @@ describe('validateWorkspaceCreateWorktree', () => {
       cwd: '/somewhere/else',
     });
     expect(request).toEqual({ path: ROOT, branch: 'task/x' });
+  });
+});
+
+describe('a server’s skill repositories', () => {
+  const profileId = 'prof_server';
+
+  it('holds a URL bound for a server to the rules a local one is held to', () => {
+    expect(
+      validateServerSkillsSourceAdd({ profileId, url: ' https://github.com/demo/agent-skills ' }),
+    ).toEqual({ profileId, url: 'https://github.com/demo/agent-skills', subdir: 'skills' });
+    // Refused here, so it never crosses a network to be refused there.
+    expect(() =>
+      validateServerSkillsSourceAdd({ profileId, url: 'https://user:token@github.com/demo/agent-skills' }),
+    ).toThrow(/username and token/);
+    expect(() => validateServerSkillsSourceAdd({ profileId, url: '--upload-pack=x' })).toThrow();
+    expect(() => validateServerSkillsSourceAdd({ url: 'https://github.com/demo/agent-skills' })).toThrow(/profileId/);
+  });
+
+  it('takes a source id only in the alphabet ids are written in, and needs the server named', () => {
+    expect(validateServerSkillsSourceRemove({ profileId, id: 'github-com-demo-agent-skills-1a2b3c4d' })).toEqual({
+      profileId,
+      id: 'github-com-demo-agent-skills-1a2b3c4d',
+    });
+    expect(() => validateServerSkillsSourceRemove({ profileId, id: '../etc' })).toThrow();
+    expect(validateServerSkillsSourceSync({ profileId })).toEqual({ profileId });
+    expect(validateServerSkillsSourceSync({ profileId, id: 'abc-123' })).toEqual({ profileId, id: 'abc-123' });
+    expect(() => validateServerSkillsSourceSync({ id: 'abc-123' })).toThrow(/profileId/);
   });
 });
