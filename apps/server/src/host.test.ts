@@ -690,13 +690,19 @@ describe('the usage cache', () => {
     fake.messages.push(rateLimited('seven_day', 97));
 
     release();
-    await reading;
+    const answered = await reading;
 
-    await vi.waitFor(async () => {
-      const rows = await host.usageSource.read({ profileIds: ['prof_work'] });
-      expect(windowOf(rows, 'seven_day')?.status).toBe('rejected');
-    });
+    /*
+      The client that *caused* the read is told about the refusal too. It is the
+      one client that cannot be served from the cache — it is the reason there
+      is one — so without following the cache forward it would be the only
+      client shown the un-corrected gauge, which is the symptom in miniature.
+    */
+    expect(windowOf(answered, 'seven_day')?.status).toBe('rejected');
+    expect(windowOf(answered, 'five_hour')?.utilization).toBe(40);
+
     const rows = await host.usageSource.read({ profileIds: ['prof_work'] });
+    expect(windowOf(rows, 'seven_day')?.status).toBe('rejected');
     expect(windowOf(rows, 'five_hour')?.utilization).toBe(40);
     // One CLI for the whole exchange: the correction cost nothing.
     expect(usageCalls).toBe(1);

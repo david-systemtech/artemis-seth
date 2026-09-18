@@ -555,6 +555,16 @@ export function createHeadlessHost(
     );
   };
 
+  /**
+   * How many times a read will follow the cache forward before answering.
+   *
+   * Each hop is a merge that landed while the caller was waiting — in practice
+   * one, from a verdict folded in mid-read. The cap is there because the loop
+   * reads a map that other requests are writing, and a bound is cheaper to
+   * reason about than an argument that it cannot go round for ever.
+   */
+  const USAGE_CHAIN_HOPS = 8;
+
   const usageSource: UsageSource = {
     read: async (query) => {
       const rows: { profileId: string; label: string; usage: PlanUsage }[] = [];
@@ -562,10 +572,29 @@ export function createHeadlessHost(
         const cached = usageCache.get(profileId);
         const fresh = cached !== undefined && Date.now() - cached.at < USAGE_CACHE_MS;
         try {
-          const { label, usage } = await (fresh && cached !== undefined
-            ? cached.value
-            : readUsage(profileId));
-          rows.push({ profileId, label, usage });
+          let awaited = fresh && cached !== undefined ? cached.value : readUsage(profileId);
+          let row = await awaited;
+          /*
+            The cache, not the read — the same rule the desktop's refresh handler
+            answers by, and for the same reason.
+
+            A verdict folded in while this read was out replaces the entry with a
+            promise chained off the one being awaited here, so what the caller
+            was waiting on is a reading the cache has already superseded. Without
+            this the client whose request *caused* the read would be the one
+            client shown the un-corrected gauge — a served account refusing
+            requests, reported at its polled percentage, to exactly the client
+            that asked. Every entry this follows is either chained off the
+            promise just resolved or belongs to a later read, so neither can be
+            waiting on this caller.
+          */
+          for (let hop = 0; hop < USAGE_CHAIN_HOPS; hop += 1) {
+            const current = usageCache.get(profileId);
+            if (current === undefined || current.value === awaited) break;
+            awaited = current.value;
+            row = await awaited;
+          }
+          rows.push({ profileId, label: row.label, usage: row.usage });
         } catch {
           // An unreadable gauge is a row that does not appear; the account
           // itself is untouched, and the next request past the cache retries.
