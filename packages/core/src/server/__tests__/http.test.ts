@@ -1035,7 +1035,9 @@ describe('the skills surface', () => {
         return { skills: [UNSLOP], sources };
       },
       addSource: async ({ url, subdir }) => {
+        if (url.endsWith('/one-too-many')) return 'Artemis keeps at most 20 skill repositories. Remove one before adding another.';
         sources = [...sources, { source: { id: 'agent-skills-1a2b3c4d', url, subdir }, cloned: true, skillCount: 40 }];
+        return null;
       },
       removeSource: async (id) => {
         const had = sources.some((entry) => entry.source.id === id);
@@ -1136,6 +1138,12 @@ describe('the skills surface', () => {
     expect((await skills('/api/v0/skills/sources', 'POST', { url: REPO, subdir: '../up' }, { skills: seam })).status).toBe(400);
     expect((await skills('/api/v0/skills/sources', 'POST', { url: REPO, subdir: 7 }, { skills: seam })).status).toBe(400);
     expect(((await skills('/api/v0/skills', 'GET', undefined, { skills: seam })).body as ServerSkillsBody).sources).toEqual([]);
+  });
+
+  it('says so when the host cannot store one more, rather than answering as though it had', async () => {
+    const reply = await skills('/api/v0/skills/sources', 'POST', { url: 'https://github.com/demo/one-too-many' });
+    expect(reply.status).toBe(400);
+    expect(JSON.stringify(reply.body)).toMatch(/at most 20 skill repositories/);
   });
 
   it('pulls and removes by id, and says so when there is no such repository', async () => {

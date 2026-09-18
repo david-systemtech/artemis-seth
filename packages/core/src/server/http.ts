@@ -528,8 +528,14 @@ export interface SkillsAdmin {
     readonly skills: readonly SkillInfo[];
     readonly sources: readonly SkillSourceStatus[];
   }>;
-  /** Store a source and clone it. The URL and folder are already validated. */
-  addSource(source: { readonly url: string; readonly subdir: string }): Promise<void>;
+  /**
+   * Store a source and clone it. The URL and folder are already validated.
+   *
+   * Answers a sentence when the source cannot be *stored* — the list is full —
+   * and `null` otherwise. A clone that fails is not that: the source is kept
+   * and the reason is reported against its row.
+   */
+  addSource(source: { readonly url: string; readonly subdir: string }): Promise<string | null>;
   /** False when no source has that id. */
   removeSource(id: string): Promise<boolean>;
   /** Pull one source, or all of them. False when an id was given and is unknown. */
@@ -3268,7 +3274,8 @@ async function handleSkillsRoute(
     if (problem !== null || subdir === null) {
       return fail(400, 'invalid_request_error', 'invalid_body', problem ?? '`subdir` must be a string.');
     }
-    await admin.addSource({ url, subdir });
+    const refused = await admin.addSource({ url, subdir });
+    if (refused !== null) return fail(400, 'invalid_request_error', 'source_limit', refused);
     return attributed();
   }
 

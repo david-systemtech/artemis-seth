@@ -43,7 +43,13 @@ import type {
   ServerMemoryBankScope,
   SessionDelegatedWork,
 } from '@rx-artemis/protocol';
-import { composeAlwaysOnSkills, withSkillSource, withoutSkillSource } from '@rx-artemis/protocol';
+import {
+  composeAlwaysOnSkills,
+  skillSourceIdFor,
+  skillSourceLimitProblem,
+  withSkillSource,
+  withoutSkillSource,
+} from '@rx-artemis/protocol';
 import {
   RunError,
   checkAuthStatus,
@@ -1045,12 +1051,21 @@ export function createHeadlessHost(
         };
       },
       addSource: async ({ url, subdir }) => {
-        const document = await skillRegistry.update((current) => withSkillSource(current, url, subdir));
-        const added = (document.sources ?? []).find((source) => source.url === url);
+        // Decided inside the update, against what is stored at this call's
+        // turn: the parser would otherwise keep the first twenty and drop the
+        // one just added, and the reply would call that a success.
+        let full: string | null = null;
+        const document = await skillRegistry.update((current) => {
+          full = skillSourceLimitProblem(current, url);
+          return full === null ? withSkillSource(current, url, subdir) : current;
+        });
+        if (full !== null) return full;
+        const added = (document.sources ?? []).find((source) => source.id === skillSourceIdFor(url));
         // Cloned before answering, so the reply lists what it brought — and a
         // clone that fails is reported against the row, not as a failed request.
         if (added !== undefined) await skillSources.sync(added, { force: true });
         commandCache.clear();
+        return null;
       },
       removeSource: async (id) => {
         const source = (await skillRegistry.sources()).find((entry) => entry.id === id);

@@ -636,7 +636,7 @@ describe('the skills this machine carries', () => {
       for (const key of Object.keys(gitConfig)) delete process.env[key];
     });
 
-    await host.skillsAdmin.addSource({ url, subdir: 'skills' });
+    expect(await host.skillsAdmin.addSource({ url, subdir: 'skills' })).toBeNull();
 
     const listed = await host.skillsAdmin.list({ profileIds: ['prof_work', 'prof_personal'] });
     expect(listed.skills.map((skill) => [skill.name, skill.origin.kind])).toEqual([
@@ -657,6 +657,29 @@ describe('the skills this machine carries', () => {
     expect(await host.skillsAdmin.removeSource(id)).toBe(false);
     expect((await host.skillsAdmin.list({ profileIds: [] })).skills).toEqual([]);
   }, 60_000);
+
+  it('refuses a twenty-first repository in a sentence, and stores nothing for it', async () => {
+    // Written straight into the registry: twenty clones would prove nothing
+    // about the limit and take a minute doing it.
+    await writeFile(
+      join(dataDir, 'skills.json'),
+      JSON.stringify({
+        version: 1,
+        alwaysOn: [],
+        sources: Array.from({ length: 20 }, (_, index) => ({
+          url: `https://skills.test/repo-${String(index)}`,
+          subdir: 'skills',
+        })),
+      }),
+    );
+
+    const refused = await host.skillsAdmin.addSource({ url: 'https://skills.test/one-more', subdir: 'skills' });
+
+    expect(refused).toMatch(/at most 20 skill repositories/);
+    const kept = (await host.skillsAdmin.list({ profileIds: [] })).sources.map((status) => status.source.url);
+    expect(kept).toHaveLength(20);
+    expect(kept).not.toContain('https://skills.test/one-more');
+  });
 
   it('answers nothing for a provider that cannot enumerate commands', async () => {
     installQuery();
