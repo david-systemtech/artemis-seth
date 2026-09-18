@@ -653,6 +653,145 @@ export function liftSessionGroups(
 }
 
 /* -------------------------------------------------------------------------- */
+/* Arranging the groups                                                       */
+/* -------------------------------------------------------------------------- */
+
+/** Which side of its anchor a moved group lands on. */
+export type GroupEdge = 'before' | 'after';
+
+/**
+ * The group list with one group moved to sit directly beside another.
+ *
+ * The stored order is the order the headings are drawn in, and it is the
+ * user's to arrange. It is never derived — not from names, which would move a
+ * shelf every time its label was corrected, and not from recency, which is the
+ * reshuffling the project headings were cured of (see the file header). A new
+ * group starts at the bottom and stays where it is put.
+ *
+ * Named by an anchor and a side rather than by an index, because that is what
+ * both callers know: a drop lands *next to* the heading under the pointer, and
+ * "Move up" means *before the one above*. An index would have to be an index
+ * into this list, and a filtered sidebar draws only some of it.
+ *
+ * Returns the **same array** when nothing moved — an unknown id, a group moved
+ * beside itself, one that already sits there — so the caller can tell a real
+ * move from a drag that ended where it began, and write nothing for the latter.
+ */
+export function moveGroup(
+  groups: readonly CustomGroup[],
+  id: string,
+  anchorId: string,
+  edge: GroupEdge,
+): readonly CustomGroup[] {
+  if (id === anchorId) return groups;
+  const from = groups.findIndex((group) => group.id === id);
+  const moved = groups[from];
+  if (moved === undefined) return groups;
+
+  const rest = groups.filter((group) => group.id !== id);
+  const anchor = rest.findIndex((group) => group.id === anchorId);
+  if (anchor === -1) return groups;
+
+  // An index into `rest` is also the index the group ends up at, so landing on
+  // the index it came from is the list it already was.
+  const to = edge === 'before' ? anchor : anchor + 1;
+  if (to === from) return groups;
+  return [...rest.slice(0, to), moved, ...rest.slice(to)];
+}
+
+/** Where a dragged group would land, and where to draw the line that says so. */
+export interface GroupDrop {
+  readonly anchorId: string;
+  readonly edge: GroupEdge;
+  /**
+   * The boundary the group would land on, in list pixels.
+   *
+   * The top of the anchor's heading, or the bottom of the *last row drawn under
+   * it* — not the bottom of its heading. An open group is its heading and its
+   * rows, and a line drawn between the two would promise a position inside the
+   * group that does not exist.
+   */
+  readonly lineY: number;
+  /** False when dropping here would leave the order exactly as it is. */
+  readonly changes: boolean;
+}
+
+/**
+ * Resolve a point in the list to the place a dragged group would land.
+ *
+ * Pure geometry over the flattened rows and their offsets, so the one rule is
+ * stated once and can be tested without a pointer: every group is a **block** —
+ * its heading plus whatever rows are drawn under it — and the upper half of a
+ * block means *before* that group, the lower half *after* it. A point above the
+ * whole stack means before the first group and a point below it means after the
+ * last, so a heading dragged anywhere in the sidebar lands at the nearest end
+ * rather than being refused: the shelves above and below the stack are not
+ * places a group can go, but they are an unambiguous direction.
+ *
+ * `offsets` is the virtualiser's own array — `offsets[i]` is where row `i`
+ * starts and `offsets[i + 1]` where it ends — passed in rather than recomputed
+ * so this cannot disagree with where the rows were actually drawn.
+ *
+ * `draggedId` is optional because a drop target cannot read a drag's payload
+ * until the drop (see `groupDrag.ts`); the list remembers which heading it
+ * handed out and passes it when it knows. It only ever decides
+ * {@link GroupDrop.changes}.
+ *
+ * `null` when there is nothing to arrange: fewer than two groups on screen.
+ */
+export function groupDropAt(
+  rows: readonly ListRow[],
+  offsets: readonly number[],
+  y: number,
+  draggedId?: string | null,
+): GroupDrop | null {
+  const blocks: { readonly id: string; readonly top: number; bottom: number }[] = [];
+  rows.forEach((row, index) => {
+    const bottom = offsets[index + 1] ?? 0;
+    if (row.kind === 'group-header') {
+      blocks.push({ id: row.groupId, top: offsets[index] ?? 0, bottom });
+      return;
+    }
+    // A group's rows directly follow its heading, so the open block is theirs.
+    const open = blocks[blocks.length - 1];
+    if (row.kind === 'session' && open !== undefined && row.groupId === open.id) open.bottom = bottom;
+  });
+
+  const first = blocks[0];
+  const last = blocks[blocks.length - 1];
+  if (first === undefined || last === undefined || blocks.length < 2) return null;
+
+  let at: number;
+  let edge: GroupEdge;
+  if (y < first.top) {
+    at = 0;
+    edge = 'before';
+  } else if (y >= last.bottom) {
+    at = blocks.length - 1;
+    edge = 'after';
+  } else {
+    // The blocks tile the stretch between those two ends, so the first one
+    // whose bottom is past the point is the one holding it.
+    const found = blocks.findIndex((block) => y < block.bottom);
+    at = found === -1 ? blocks.length - 1 : found;
+    const block = blocks[at] ?? last;
+    edge = y < (block.top + block.bottom) / 2 ? 'before' : 'after';
+  }
+
+  const target = blocks[at] ?? last;
+  const from = draggedId == null ? -1 : blocks.findIndex((block) => block.id === draggedId);
+  const stays =
+    from !== -1 &&
+    (at === from || (edge === 'before' && at === from + 1) || (edge === 'after' && at === from - 1));
+  return {
+    anchorId: target.id,
+    edge,
+    lineY: edge === 'before' ? target.top : target.bottom,
+    changes: !stays,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Flattening, for the virtualised list                                       */
 /* -------------------------------------------------------------------------- */
 
@@ -721,6 +860,17 @@ export interface GroupHeaderRow {
   /** Sessions in the group — the full count, even when it is folded shut. */
   readonly count: number;
   readonly collapsed: boolean;
+  /**
+   * The groups drawn directly above and below this one, when there are any.
+   *
+   * What the heading's "Move up" and "Move down" name as their anchor. Taken
+   * from the sections actually being drawn rather than from the stored list, so
+   * while a filter hides some groups a move still lands somewhere the reader
+   * can see it land. Absent at either end of the stack, which is what disables
+   * the item.
+   */
+  readonly previousGroupId?: string;
+  readonly nextGroupId?: string;
 }
 
 export interface SessionRow {
@@ -842,8 +992,8 @@ export function flattenGroups(
   }
 
   /*
-   * The user's groups, in the order they were created, each one always drawing
-   * its heading.
+   * The user's groups, in the order the user arranged them (see
+   * {@link moveGroup}), each one always drawing its heading.
    *
    * Their section indices start two past the end of the project array, after
    * the two the flat sections took. The number identifies a section rather than
@@ -854,6 +1004,8 @@ export function flattenGroups(
   const custom = sections?.groups ?? [];
   custom.forEach((section, index) => {
     const folded = section.group.collapsed === true;
+    const previous = custom[index - 1]?.group.id;
+    const next = custom[index + 1]?.group.id;
     rows.push({
       kind: 'group-header',
       // Prefixed and keyed on the id rather than the name: two groups may
@@ -864,6 +1016,8 @@ export function flattenGroups(
       name: section.group.name,
       count: section.sessions.length,
       collapsed: folded,
+      ...(previous === undefined ? {} : { previousGroupId: previous }),
+      ...(next === undefined ? {} : { nextGroupId: next }),
     });
     if (folded) return;
     for (const session of section.sessions) {

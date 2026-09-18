@@ -34,11 +34,12 @@
 
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, createEvent, fireEvent, render, screen, within } from '@testing-library/react';
 import type { SessionSummary } from '@rx-artemis/protocol';
 
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { SessionList } from '@/components/SessionList';
+import { GROUP_DRAG_TYPE } from '@/lib/groupDrag';
 import { SESSION_DRAG_TYPE } from '@/lib/sessionDrag';
 import { useApp } from '@/state/store';
 import { ALL_CAPABILITIES, seedApp } from '@/state/testkit';
@@ -574,5 +575,317 @@ describe('a group in the list', () => {
     // The group's rows are filtered by the same query as everything else, and
     // the group that matches nothing goes with the unmatched projects.
     expect(strip()).toEqual(['Billing', 'Adapter seam']);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Putting the groups in order                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The order of the group stack is the user's: a heading is picked up and
+ * dropped between two others, or moved a step from its menu.
+ *
+ * The list takes the drop, not the headings, and resolves the pointer against
+ * its own row geometry — so these drive real `clientY` values. jsdom lays
+ * nothing out: the scroller's rectangle is all zeros and it never scrolls, which
+ * makes a `clientY` exactly a position in list pixels. Headings are 24 tall and
+ * rows 54, so three empty groups made in order sit at
+ *
+ *       0  Billing      24  Docs      48  Ops      72  api …
+ *
+ * What is worth asserting: that the *halves* mean before and after, that an open
+ * group's rows belong to its block, that the line is drawn on the boundary the
+ * group would really land on and not at all where nothing would change — and
+ * that neither drag answers for the other on the elements they share.
+ */
+describe('arranging the groups', () => {
+  function makeThree(): void {
+    mount();
+    makeGroup('Billing');
+    makeGroup('Docs');
+    makeGroup('Ops');
+  }
+
+  /** The group headings, top to bottom, as drawn. */
+  function groupOrder(): (string | null)[] {
+    return screen
+      .getAllByTitle(/^A group you made/)
+      .map((button) => within(button).getByText(/^(Billing|Docs|Ops)$/).textContent);
+  }
+
+  /** The stored order, which is what survives a restart. */
+  function storedOrder(): string[] {
+    return useApp.getState().sessionGroups.map((group) => group.name);
+  }
+
+  /**
+   * A drag the heading's own `dragstart` fills in.
+   *
+   * Stateful where `sessionDrag` above is canned, because this end of the
+   * contract is under test too: the types the list reads mid-drag are whatever
+   * the heading really wrote.
+   */
+  function pickUp(name: string): object {
+    const data = new Map<string, string>();
+    const transfer = {
+      get types(): string[] {
+        return [...data.keys()];
+      },
+      setData: (type: string, value: string): void => {
+        data.set(type, value);
+      },
+      getData: (type: string): string => data.get(type) ?? '',
+    };
+    fireEvent.dragStart(heading(name), { dataTransfer: transfer });
+    return transfer;
+  }
+
+  /**
+   * A drag event that knows where the pointer is.
+   *
+   * jsdom has no `DragEvent`, so Testing Library builds a plain `Event` and the
+   * `clientY` in its init is dropped without a word — the handler would read
+   * `undefined` and resolve every position to the bottom of the stack. Defined
+   * on the event instead, which is all the list ever reads off it.
+   */
+  function at(
+    kind: 'dragOver' | 'drop',
+    target: HTMLElement,
+    transfer: object,
+    clientY: number,
+  ): boolean {
+    const event = createEvent[kind](target, { dataTransfer: transfer });
+    Object.defineProperty(event, 'clientY', { value: clientY });
+    return fireEvent(target, event);
+  }
+
+  /** Hold a drag over an element at a height. False means the list accepted it. */
+  function holdOver(target: HTMLElement, transfer: object, clientY: number): boolean {
+    return at('dragOver', target, transfer, clientY);
+  }
+
+  function release(target: HTMLElement, transfer: object, clientY: number): void {
+    at('drop', target, transfer, clientY);
+  }
+
+  /** Where the insertion line is drawn, or `null` when there is none. */
+  function line(): string | null {
+    const element = document.querySelector<HTMLElement>('[data-slot="group-drop-line"]');
+    return element === null ? null : element.style.top;
+  }
+
+  it('lands a heading before the group whose upper half it is dropped on', () => {
+    makeThree();
+    const drag = pickUp('Ops');
+
+    // The top of Billing, which is the top of the list: the line is held a
+    // pixel inside the scroller rather than half clipped by it.
+    expect(holdOver(heading('Billing'), drag, 5)).toBe(false);
+    expect(line()).toBe('1px');
+    release(heading('Billing'), drag, 5);
+
+    expect(groupOrder()).toEqual(['Ops', 'Billing', 'Docs']);
+    expect(storedOrder()).toEqual(['Ops', 'Billing', 'Docs']);
+    expect(line()).toBeNull();
+  });
+
+  it('lands it after the group whose lower half it is dropped on', () => {
+    makeThree();
+    const drag = pickUp('Billing');
+
+    holdOver(heading('Docs'), drag, 40);
+    expect(line()).toBe('48px');
+    release(heading('Docs'), drag, 40);
+
+    expect(groupOrder()).toEqual(['Docs', 'Billing', 'Ops']);
+  });
+
+  it('counts an open group’s rows as the group, and draws the line under the last of them', () => {
+    makeThree();
+    dropOn(heading('Billing'), sessionDrag('p1', 'Adapter seam'));
+    const drag = pickUp('Ops');
+
+    // Over the row filed under Billing, past the middle of Billing's block
+    // (heading 0–24, row 24–78). "After Billing" is under that row — a line
+    // under the heading would promise a place inside the group.
+    const row = screen.getByText('Adapter seam');
+    holdOver(row, drag, 60);
+    expect(line()).toBe('78px');
+    release(row, drag, 60);
+
+    expect(groupOrder()).toEqual(['Billing', 'Ops', 'Docs']);
+    // And nothing was filed: the row is where it was, in the group it was in.
+    expect(Object.keys(useApp.getState().sessionGroupOf)).toEqual(['p1:Adapter seam']);
+  });
+
+  it('sends a heading dropped below the stack to the bottom of it', () => {
+    makeThree();
+    const drag = pickUp('Billing');
+
+    // A project heading is not a place a group can go, but it is a direction.
+    holdOver(heading('api'), drag, 300);
+    expect(line()).toBe('72px');
+    release(heading('api'), drag, 300);
+
+    expect(groupOrder()).toEqual(['Docs', 'Ops', 'Billing']);
+  });
+
+  it('draws no line where nothing would change, and writes nothing on the drop', () => {
+    makeThree();
+    const before = useApp.getState().sessionGroups;
+    const drag = pickUp('Docs');
+
+    // Over itself, and over the near edge of each neighbour: all three are the
+    // place it already is. Accepted — a refusal would play the snap-back — but
+    // promising no move.
+    for (const [target, y] of [
+      ['Docs', 30],
+      ['Billing', 20],
+      ['Ops', 50],
+    ] as const) {
+      expect(holdOver(heading(target), drag, y)).toBe(false);
+      expect(line()).toBeNull();
+    }
+    release(heading('Docs'), drag, 30);
+
+    // The same array, not an equal one: nothing was set, so nothing was saved.
+    expect(useApp.getState().sessionGroups).toBe(before);
+  });
+
+  it('dims the heading in the air, and puts everything down when the drag ends', () => {
+    makeThree();
+    const drag = pickUp('Ops');
+    holdOver(heading('Billing'), drag, 5);
+    const source = (): Element | null => heading('Ops').closest('[draggable="true"]');
+
+    expect(source()?.className).toContain('opacity-50');
+    expect(line()).not.toBeNull();
+
+    // Escape, or a drop somewhere that refused it: `dragend` still arrives on
+    // the heading that was picked up.
+    fireEvent.dragEnd(heading('Ops'), { dataTransfer: drag });
+
+    expect(source()?.className).not.toContain('opacity-50');
+    expect(line()).toBeNull();
+    expect(storedOrder()).toEqual(['Billing', 'Docs', 'Ops']);
+  });
+
+  it('takes the line away when the drag leaves the list, but not between rows', () => {
+    makeThree();
+    const drag = pickUp('Ops');
+    holdOver(heading('Billing'), drag, 5);
+
+    // `relatedTarget` — what the pointer moved *into* — is dropped from the
+    // init for the reason `clientY` is, so it is defined on the event too.
+    const leave = (into: Element): void => {
+      const event = createEvent.dragLeave(heading('Billing'), { dataTransfer: drag });
+      Object.defineProperty(event, 'relatedTarget', { value: into });
+      fireEvent(heading('Billing'), event);
+    };
+
+    // Crossing from one heading to the next is a `dragleave` too, and it
+    // bubbles to the list — but the pointer is still inside it.
+    leave(heading('Docs'));
+    expect(line()).not.toBeNull();
+
+    leave(document.body);
+    expect(line()).toBeNull();
+  });
+
+  it('does not file anything when a group is dropped on a heading', () => {
+    makeThree();
+    const drag = pickUp('Ops');
+
+    holdOver(heading('Billing'), drag, 5);
+    release(heading('Billing'), drag, 5);
+
+    // The heading's own drop handler is for sessions, and a group is not one:
+    // the drop went past it to the list, which moved the group and filed nothing.
+    expect(storedOrder()).toEqual(['Ops', 'Billing', 'Docs']);
+    expect(useApp.getState().sessionGroupOf).toEqual({});
+  });
+
+  it('does not reorder anything for a session drag, and still files it', () => {
+    makeThree();
+
+    const transfer = sessionDrag('p1', 'Adapter seam');
+    holdOver(heading('Docs'), transfer, 40);
+    expect(line()).toBeNull();
+    release(heading('Docs'), transfer, 40);
+
+    expect(storedOrder()).toEqual(['Billing', 'Docs', 'Ops']);
+    expect(within(heading('Docs')).getByText('1')).toBeTruthy();
+  });
+
+  it('declines a drag from anywhere else', () => {
+    makeThree();
+
+    // Not default-prevented, which is how an element says "not a drop target".
+    expect(holdOver(heading('Docs'), foreignDrag(), 40)).toBe(true);
+    expect(line()).toBeNull();
+  });
+
+  it('has nothing to arrange with one group, so it declines the drag', () => {
+    mount();
+    makeGroup('Billing');
+    const drag = pickUp('Billing');
+
+    expect(holdOver(heading('api'), drag, 100)).toBe(true);
+    expect(line()).toBeNull();
+  });
+
+  it('resolves the id against the live list: a group that has gone moves nothing', () => {
+    makeThree();
+    const before = useApp.getState().sessionGroups;
+    const stale = {
+      types: [GROUP_DRAG_TYPE],
+      getData: (type: string) => (type === GROUP_DRAG_TYPE ? 'grp-deleted-elsewhere' : ''),
+    };
+
+    holdOver(heading('Billing'), stale, 5);
+    release(heading('Billing'), stale, 5);
+
+    expect(useApp.getState().sessionGroups).toBe(before);
+  });
+
+  it('moves a group a step from its menu, for anyone who does not drag', async () => {
+    makeThree();
+
+    fireEvent.contextMenu(heading('Docs'));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Move up' }));
+    expect(storedOrder()).toEqual(['Docs', 'Billing', 'Ops']);
+  });
+
+  it('moves it down the same way', async () => {
+    makeThree();
+
+    fireEvent.contextMenu(heading('Docs'));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Move down' }));
+    expect(storedOrder()).toEqual(['Billing', 'Ops', 'Docs']);
+  });
+
+  it('answers to the letters on the items', async () => {
+    makeThree();
+
+    fireEvent.contextMenu(heading('Ops'));
+    fireEvent.keyDown(await screen.findByRole('menu'), { key: 'u' });
+
+    expect(storedOrder()).toEqual(['Billing', 'Ops', 'Docs']);
+  });
+
+  it('disables the move that has nowhere to go, at each end of the stack', async () => {
+    makeThree();
+
+    fireEvent.contextMenu(heading('Billing'));
+    const up = await screen.findByRole('menuitem', { name: 'Move up' });
+    const down = await screen.findByRole('menuitem', { name: 'Move down' });
+
+    // Disabled rather than hidden: the menu keeps its shape, and the letters
+    // keep their places.
+    expect(up.getAttribute('aria-disabled')).toBe('true');
+    expect(down.getAttribute('aria-disabled')).not.toBe('true');
+    fireEvent.click(up);
+    expect(storedOrder()).toEqual(['Billing', 'Docs', 'Ops']);
   });
 });
