@@ -109,9 +109,9 @@ export interface SkillInfo {
 
 /**
  * The plugin name bridged skills are delivered under, and therefore the prefix
- * of the command a Claude session knows them by. Core's content bridge owns the
- * value; it is restated here because the renderer draws the command and cannot
- * import core.
+ * of the command a Claude session knows them by. Its one home: core's content
+ * bridge delivers skills under it, and the renderer — which cannot import core
+ * — draws the command with it, so the two cannot drift apart.
  */
 export const BRIDGED_SKILL_PLUGIN = 'artemis-skills';
 

@@ -156,6 +156,8 @@ import {
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 
+import { BRIDGED_SKILL_PLUGIN } from '@rx-artemis/protocol';
+
 import type { LocalPlugin } from '../adapters/types.js';
 
 /**
@@ -183,8 +185,11 @@ export type ContentWarning = (message: string, error: unknown) => void;
  *
  * Codex needs no equivalent — its links land in a directory it already reads, so
  * those skills keep their bare names.
+ *
+ * The value lives in the protocol, beside the command the settings pane draws
+ * with it, so what a person is told to type cannot drift from what is served.
  */
-const PLUGIN_NAME = 'artemis-skills';
+const PLUGIN_NAME = BRIDGED_SKILL_PLUGIN;
 
 /** Where all Claude bridges live, under Artemis's own data directory. */
 const BRIDGES_DIR = 'content-bridges';
