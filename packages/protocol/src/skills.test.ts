@@ -17,8 +17,14 @@ import {
   isAlwaysOn,
   parseSkillLibraryDocument,
   skillSlashCommand,
+  skillSourceIdFor,
+  skillSourceLabel,
+  skillSourceSubdirProblem,
+  skillSourceUrlProblem,
   SKILL_LIMITS,
+  withoutSkillSource,
   withSkillAlwaysOn,
+  withSkillSource,
 } from './skills.js';
 
 const WORK = 'prof-work' as ProfileId;
@@ -168,5 +174,132 @@ describe('composeAlwaysOnSkills', () => {
 describe('skillSlashCommand', () => {
   it('is the command a Claude session knows a bridged skill by', () => {
     expect(skillSlashCommand('unslop')).toBe('/artemis-skills:unslop');
+  });
+});
+
+describe('a skill source’s URL', () => {
+  it('accepts the three shapes a forge hands out', () => {
+    for (const url of [
+      'https://github.com/david-systemtech/agent-skills.git',
+      'https://git.example.com/team/skills',
+      'ssh://git@github.com/david-systemtech/agent-skills.git',
+      'git@github.com:david-systemtech/agent-skills.git',
+    ]) {
+      expect(skillSourceUrlProblem(url), url).toBeNull();
+    }
+  });
+
+  it('refuses every other transport, because this string is handed to git by the main process', () => {
+    // `ext::` runs a command. An allowlist is the only rule that does not need
+    // updating when git grows another transport.
+    for (const url of ['ext::sh -c touch%20/tmp/x', 'file:///etc', '/home/me/skills', '../skills', 'http://insecure.example/x', 'github.com/a/b']) {
+      expect(skillSourceUrlProblem(url), url).not.toBeNull();
+    }
+  });
+
+  it('refuses a leading hyphen, whitespace, and a host with no repository', () => {
+    expect(skillSourceUrlProblem('--upload-pack=touch /tmp/x')).not.toBeNull();
+    expect(skillSourceUrlProblem('https://github.com/a/b c')).not.toBeNull();
+    expect(skillSourceUrlProblem('https://github.com/')).not.toBeNull();
+    expect(skillSourceUrlProblem('   ')).not.toBeNull();
+  });
+
+  it('refuses a credential in the URL, and says what to use instead', () => {
+    // It would work, which is the problem: a secret in a settings file in plain
+    // text, and in every log line that names the source.
+    const problem = skillSourceUrlProblem('https://me:secret-token-value@github.com/a/b.git');
+
+    expect(problem).toContain('git credentials');
+  });
+});
+
+describe('a skill source’s folder', () => {
+  it('is a path inside the repository', () => {
+    expect(skillSourceSubdirProblem('skills')).toBeNull();
+    expect(skillSourceSubdirProblem('packs/writing/skills')).toBeNull();
+    for (const subdir of ['', '/etc', '../outside', 'skills/../..', 'C:\\Users', 'a//b']) {
+      expect(skillSourceSubdirProblem(subdir), subdir).not.toBeNull();
+    }
+  });
+});
+
+describe('skillSourceIdFor', () => {
+  it('names the folder readably, and the same for every spelling of one repository', () => {
+    const https = skillSourceIdFor('https://github.com/David-Systemtech/agent-skills.git');
+
+    expect(https).toMatch(/^github-com-david-systemtech-agent-skills-[0-9a-f]{8}$/);
+    // One repository is one source on every machine, whichever URL was pasted.
+    expect(skillSourceIdFor('git@github.com:david-systemtech/agent-skills.git')).toBe(https);
+    expect(skillSourceIdFor('ssh://git@github.com/david-systemtech/agent-skills')).toBe(https);
+    expect(skillSourceIdFor(' https://github.com/david-systemtech/agent-skills/ ')).toBe(https);
+  });
+
+  it('tells apart two repositories that flatten to the same words', () => {
+    expect(skillSourceIdFor('https://example.com/a/b-c')).not.toBe(skillSourceIdFor('https://example.com/a-b/c'));
+  });
+
+  it('is only ever safe to use as a folder name', () => {
+    expect(skillSourceIdFor('https://example.com/../../etc/passwd')).toMatch(/^[a-z0-9-]+$/);
+  });
+});
+
+describe('skillSourceLabel', () => {
+  it('is how a person says the repository', () => {
+    expect(skillSourceLabel('https://github.com/david-systemtech/agent-skills.git')).toBe('david-systemtech/agent-skills');
+    expect(skillSourceLabel('git@github.com:david-systemtech/agent-skills.git')).toBe('david-systemtech/agent-skills');
+    expect(skillSourceLabel('https://git.example.com/group/sub/skills')).toBe('sub/skills');
+  });
+});
+
+describe('the sources in the library', () => {
+  const URL = 'https://github.com/david-systemtech/agent-skills.git';
+
+  it('adds a source once, however many times the same repository is added', () => {
+    const once = withSkillSource(defaultSkillLibraryDocument(), URL);
+    const twice = withSkillSource(once, 'git@github.com:david-systemtech/agent-skills.git', 'packs');
+
+    expect(once.sources).toEqual([{ id: skillSourceIdFor(URL), url: URL, subdir: 'skills' }]);
+    // The later spelling and folder win; it is still one source, one clone.
+    expect(twice.sources).toHaveLength(1);
+    expect(twice.sources?.[0]).toMatchObject({ id: skillSourceIdFor(URL), subdir: 'packs' });
+  });
+
+  it('removes a source and leaves no empty list behind', () => {
+    const withOne = withSkillSource(defaultSkillLibraryDocument(), URL);
+
+    const without = withoutSkillSource(withOne, skillSourceIdFor(URL));
+
+    // Byte-identical to a library that never had one.
+    expect(without).toEqual(defaultSkillLibraryDocument());
+    expect('sources' in without).toBe(false);
+  });
+
+  it('keeps the sources when a skill is switched on or off', () => {
+    const library = withSkillSource(defaultSkillLibraryDocument(), URL);
+
+    expect(withSkillAlwaysOn(library, 'unslop', true).sources).toEqual(library.sources);
+    expect(withSkillAlwaysOn(withSkillAlwaysOn(library, 'unslop', true), 'unslop', false).sources).toEqual(library.sources);
+  });
+
+  it('re-derives a stored id, so a hand-edited file cannot aim the clone folder elsewhere', () => {
+    const parsed = parseSkillLibraryDocument({
+      alwaysOn: [],
+      sources: [
+        { id: '../../somewhere-else', url: URL, subdir: 'skills' },
+        { id: 'x', url: 'ext::sh -c boom' },
+        { id: 'y', url: URL, subdir: '../outside' },
+        'not a source',
+      ],
+    });
+
+    expect(parsed.sources).toEqual([{ id: skillSourceIdFor(URL), url: URL, subdir: 'skills' }]);
+  });
+
+  it('reads the sources even when the always-on half is unreadable', () => {
+    // A machine's sources are the more expensive half to lose.
+    const parsed = parseSkillLibraryDocument({ alwaysOn: 'broken', sources: [{ url: URL }] });
+
+    expect(parsed.alwaysOn).toEqual([]);
+    expect(parsed.sources).toHaveLength(1);
   });
 });

@@ -88,6 +88,9 @@ import {
   type AgentPromptsSaveRequest,
   type SkillsListRequest,
   type SkillsSaveRequest,
+  type SkillsSourceAddRequest,
+  type SkillsSourceRemoveRequest,
+  type SkillsSourceSyncRequest,
   type MemoryBankAddRequest,
   type MemoryBankForgetRequest,
   type MemoryBankMemoriesRequest,
@@ -775,6 +778,9 @@ const bridge: ArtemisBridge = Object.freeze({
   skills: Object.freeze({
     list: (request: SkillsListRequest) => invoke(IPC.skillsList, request),
     save: (request: SkillsSaveRequest) => invoke(IPC.skillsSave, request),
+    addSource: (request: SkillsSourceAddRequest) => invoke(IPC.skillsSourceAdd, request),
+    removeSource: (request: SkillsSourceRemoveRequest) => invoke(IPC.skillsSourceRemove, request),
+    syncSources: (request: SkillsSourceSyncRequest) => invoke(IPC.skillsSourceSync, request),
   }),
 
   preview: Object.freeze({

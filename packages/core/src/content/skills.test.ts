@@ -220,3 +220,46 @@ describe('resolveSkills', () => {
     expect(resolved).toEqual([]);
   });
 });
+
+describe('synced sources', () => {
+  it('lists a source’s skills with where they came from, after everything installed by hand', async () => {
+    const source = join(root, 'data', 'skill-sources', 'team', 'skills');
+    await skill(source, 'unslop', '---\ndescription: Synced.\n---\nSynced body.\n');
+    await skill(source, 'tdd', '---\ndescription: Red, green.\n---\nTest first.\n');
+    await skill(join(home, '.agents', 'skills'), 'unslop', '---\ndescription: By hand.\n---\nHand body.\n');
+
+    const skills = await listSkills({
+      accounts: [{ profileId: WORK, configDir: work }],
+      home,
+      sources: [{ id: 'team', dir: source }],
+    });
+
+    expect(skills.map((entry) => [entry.name, entry.origin, entry.description])).toEqual([
+      ['tdd', { kind: 'source', sourceId: 'team' }, 'Red, green.'],
+      // Installed by hand as well: the hand-installed copy keeps the name.
+      ['unslop', { kind: 'machine' }, 'By hand.'],
+    ]);
+  });
+
+  it('resolves an always-on name to the synced copy when nothing by hand claims it', async () => {
+    const source = join(root, 'data', 'skill-sources', 'team', 'skills');
+    const dir = await skill(source, 'tdd', '---\ndescription: T.\n---\nTest first.\n');
+
+    const resolved = await resolveSkills(
+      ['tdd'],
+      skillRootsFor({ profileId: WORK, configDir: work }, home, [{ id: 'team', dir: source }]),
+    );
+
+    expect(resolved).toEqual([{ name: 'tdd', dir, body: 'Test first.\n' }]);
+  });
+
+  it('lists nothing for a source that has not been cloned yet', async () => {
+    const skills = await listSkills({
+      accounts: [],
+      home,
+      sources: [{ id: 'pending', dir: join(root, 'data', 'skill-sources', 'pending', 'skills') }],
+    });
+
+    expect(skills).toEqual([]);
+  });
+});

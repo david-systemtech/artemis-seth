@@ -148,6 +148,17 @@ export interface AlwaysOnSkill {
 export interface SkillLibraryDocument {
   readonly version: 1;
   readonly alwaysOn: readonly AlwaysOnSkill[];
+  /**
+   * The repositories Artemis keeps cloned on this machine. See {@link SkillSource}.
+   *
+   * Absent rather than empty when there are none, so a library written before
+   * sources existed is byte-identical to one written after by a user who has
+   * none. In the same document as the choices above because they are one
+   * setting from a person's side — "my skills" — but never written by the same
+   * path: a save from the pane replaces `alwaysOn` and cannot touch this list,
+   * which only main edits, because an entry here is a URL main will clone.
+   */
+  readonly sources?: readonly SkillSource[];
 }
 
 export const SKILL_LIBRARY_VERSION = 1;
@@ -167,6 +178,12 @@ export const SKILL_LIMITS = {
    * says so, rather than being dropped — most of a skill is better than none.
    */
   body: 60_000,
+  /** A remote URL. Long enough for any forge; short enough to be a URL. */
+  url: 2_000,
+  /** The folder inside a repository that holds its skills. */
+  subdir: 200,
+  /** Sources on one machine. A guard against a corrupt file, not a design limit. */
+  sources: 20,
 } as const;
 
 export function defaultSkillLibraryDocument(): SkillLibraryDocument {
@@ -207,11 +224,14 @@ function parseScope(value: unknown): AgentPromptScope {
  * nothing in it at all is refused.
  */
 export function parseSkillLibraryDocument(value: unknown): SkillLibraryDocument {
-  if (!isRecord(value) || !Array.isArray(value['alwaysOn'])) return defaultSkillLibraryDocument();
+  if (!isRecord(value)) return defaultSkillLibraryDocument();
 
+  // The two halves are read independently: a hand-edit that broke one must not
+  // cost the other, and a machine's sources are the more expensive to lose.
+  const sources = parseSkillSources(value['sources']);
   const alwaysOn: AlwaysOnSkill[] = [];
   const seen = new Set<string>();
-  for (const raw of value['alwaysOn']) {
+  for (const raw of Array.isArray(value['alwaysOn']) ? value['alwaysOn'] : []) {
     if (!isRecord(raw)) continue;
     const name = typeof raw['name'] === 'string' ? raw['name'] : '';
     if (name.trim().length === 0 || name.length > SKILL_LIMITS.name || seen.has(name)) continue;
@@ -219,7 +239,31 @@ export function parseSkillLibraryDocument(value: unknown): SkillLibraryDocument 
     alwaysOn.push({ name, scope: parseScope(raw['scope']) });
     if (alwaysOn.length >= SKILL_LIMITS.count) break;
   }
-  return { version: SKILL_LIBRARY_VERSION, alwaysOn };
+  return {
+    version: SKILL_LIBRARY_VERSION,
+    alwaysOn,
+    ...(sources.length === 0 ? {} : { sources }),
+  };
+}
+
+function parseSkillSources(value: unknown): readonly SkillSource[] {
+  if (!Array.isArray(value)) return [];
+  const sources: SkillSource[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (!isRecord(raw) || typeof raw['url'] !== 'string') continue;
+    const url = raw['url'].trim();
+    const subdir = typeof raw['subdir'] === 'string' ? raw['subdir'].trim() : DEFAULT_SKILL_SOURCE_SUBDIR;
+    if (skillSourceUrlProblem(url) !== null || skillSourceSubdirProblem(subdir) !== null) continue;
+    // The id is derived, never trusted: it names a folder main will create and
+    // delete, and a stored one could be edited to name somebody else's.
+    const id = skillSourceIdFor(url);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    sources.push({ id, url, subdir });
+    if (sources.length >= SKILL_LIMITS.sources) break;
+  }
+  return sources;
 }
 
 /** Is this skill switched on for anyone? */
@@ -243,7 +287,7 @@ export function withSkillAlwaysOn(
   const present = isAlwaysOn(document, name);
   if (on === present) return document;
   return {
-    version: document.version,
+    ...document,
     alwaysOn: on
       ? [...document.alwaysOn, { name, scope: { kind: 'all' } }]
       : document.alwaysOn.filter((entry) => entry.name !== name),
@@ -343,20 +387,168 @@ export function composeAlwaysOnSkills(skills: readonly ResolvedSkill[]): string 
  * The point is that the list of skills a person wants is one thing, kept in one
  * place, and every machine they work on should simply have it — without an
  * installer run by hand on each one and a scheduled task to keep it fresh. The
- * repository is the source of truth; a machine's copy is a cache of it.
+ * repository is the source of truth; a machine's copy is a cache of it, which
+ * is why the copy is reset to the remote on every sync rather than merged.
  *
  * The clone lives under Artemis's own data directory, never in the user's home:
  * identical on every platform, any number of sources, and nothing of the user's
  * is moved aside to make room.
  */
 export interface SkillSource {
-  /** Stable for the source's life; what {@link SkillOrigin} points at. */
+  /**
+   * Derived from {@link url} by {@link skillSourceIdFor}, and the name of the
+   * folder the clone lives in. Derived rather than minted so the same
+   * repository is the same source on every machine, and rather than stored so
+   * a hand-edited file cannot point the folder main creates — and deletes —
+   * somewhere else.
+   */
   readonly id: string;
-  /** The remote, as given. `https://…` or `git@…`. */
+  /** The remote, as given. `https://…`, `ssh://…` or `git@host:path`. */
   readonly url: string;
   /**
    * The folder inside the repository that holds the skills, one per
    * sub-folder. `skills` unless the repository is laid out differently.
    */
   readonly subdir: string;
+}
+
+export const DEFAULT_SKILL_SOURCE_SUBDIR = 'skills';
+
+/**
+ * Why a URL cannot be a source, or `null` when it can.
+ *
+ * One rule for the pane's disabled Add button and the IPC validator, so the two
+ * cannot drift. Three shapes are accepted, which are the three a forge hands
+ * out. What is refused, and why:
+ *
+ *  - **Anything else**, including `file:` and a bare path: this string is handed
+ *    to `git clone` by the main process on the say-so of a renderer, and git's
+ *    `ext::` transport runs a command. An allowlist of transports is the only
+ *    rule that does not need updating when git grows another one.
+ *  - **A leading hyphen**, which git would read as an option.
+ *  - **A credential in the URL.** `https://user:token@host/…` works, which is
+ *    the problem: it would put a secret in a settings file in plain text, and
+ *    in every log line that names the source. The machine's own git credentials
+ *    are what a private repository is reached with.
+ */
+export function skillSourceUrlProblem(url: string): string | null {
+  const trimmed = url.trim();
+  if (trimmed.length === 0) return 'Enter the repository’s URL.';
+  if (trimmed.length > SKILL_LIMITS.url) return 'That URL is too long to be one.';
+  // eslint-disable-next-line no-control-regex
+  if (/[\s\u0000-\u001f]/.test(trimmed)) return 'A URL cannot contain spaces or control characters.';
+  if (trimmed.startsWith('-')) return 'A URL cannot start with a hyphen.';
+
+  if (/^https:\/\//i.test(trimmed)) {
+    if (/^https:\/\/[^/]*@/i.test(trimmed)) {
+      return 'Leave the username and token out of the URL. A private repository is reached with this machine’s own git credentials.';
+    }
+    return /^https:\/\/[^/]+\/.+/i.test(trimmed) ? null : 'That URL names a host but no repository.';
+  }
+  if (/^ssh:\/\/[^/]+\/.+/i.test(trimmed)) return null;
+  if (/^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^:].*$/.test(trimmed)) return null;
+  return 'Use an https://, ssh:// or git@host:owner/repo URL.';
+}
+
+/** Why a folder cannot be a source's skills folder, or `null` when it can. */
+export function skillSourceSubdirProblem(subdir: string): string | null {
+  const trimmed = subdir.trim();
+  if (trimmed.length === 0) return 'Name the folder that holds the skills.';
+  if (trimmed.length > SKILL_LIMITS.subdir) return 'That folder name is too long.';
+  if (trimmed.startsWith('/') || trimmed.startsWith('\\') || /^[A-Za-z]:/.test(trimmed)) {
+    return 'The folder is relative to the repository, not to the disk.';
+  }
+  if (trimmed.split(/[\\/]/).some((segment) => segment === '..' || segment === '')) {
+    return 'The folder has to be inside the repository.';
+  }
+  return null;
+}
+
+/**
+ * The folder name a source's clone lives under, from its URL.
+ *
+ * Readable first — `github.com-david-systemtech-agent-skills` tells a person
+ * looking in the data directory what they are looking at — and unique second:
+ * two URLs that flatten to the same words (`a/b-c` and `a-b/c`) are told apart
+ * by the hash of the URL itself. The scheme, any user name and a trailing
+ * `.git` are dropped first, so the https and ssh spellings of one repository
+ * are one source rather than two clones of it.
+ *
+ * FNV-1a rather than a real digest because this package may not import one —
+ * it is loaded in a renderer — and nothing here is a security boundary: the
+ * worst a collision does is make two repositories share a folder name, and
+ * they would have to collide on the readable half as well.
+ */
+export function skillSourceIdFor(url: string): string {
+  const canonical = url
+    .trim()
+    .toLowerCase()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//, '')
+    .replace(/^[^@/]+@/, '')
+    .replace(/:/, '/')
+    .replace(/\.git\/?$/, '')
+    .replace(/\/+$/, '');
+
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < canonical.length; index += 1) {
+    hash ^= canonical.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  const words = canonical.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
+  return `${words.length === 0 ? 'source' : words}-${hash.toString(16).padStart(8, '0')}`;
+}
+
+/**
+ * What to call a source in a sentence: `david-systemtech/agent-skills`.
+ *
+ * The last two path segments, which is how a forge names a repository and how a
+ * person says it. The host is left out because it is nearly always the same one
+ * and the row has the full URL beside it for when it is not.
+ */
+export function skillSourceLabel(url: string): string {
+  const path = url
+    .trim()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
+    .replace(/^[^@/]+@/, '')
+    .replace(/^[^/:]+[/:]/, '')
+    .replace(/\.git\/?$/i, '')
+    .replace(/\/+$/, '');
+  const segments = path.split('/').filter((segment) => segment.length > 0);
+  return segments.length === 0 ? url.trim() : segments.slice(-2).join('/');
+}
+
+/** The library with a source added. The same repository twice is one source. */
+export function withSkillSource(
+  document: SkillLibraryDocument,
+  url: string,
+  subdir: string = DEFAULT_SKILL_SOURCE_SUBDIR,
+): SkillLibraryDocument {
+  const source: SkillSource = { id: skillSourceIdFor(url), url: url.trim(), subdir: subdir.trim() };
+  const others = (document.sources ?? []).filter((entry) => entry.id !== source.id);
+  return { ...document, sources: [...others, source] };
+}
+
+/** The library without a source. The always-on choices are left alone. */
+export function withoutSkillSource(document: SkillLibraryDocument, id: string): SkillLibraryDocument {
+  const remaining = (document.sources ?? []).filter((entry) => entry.id !== id);
+  const { sources: _dropped, ...rest } = document;
+  return remaining.length === 0 ? rest : { ...rest, sources: remaining };
+}
+
+/** One source, and how its copy on this machine is doing. */
+export interface SkillSourceStatus {
+  readonly source: SkillSource;
+  /** The clone exists. False between adding a source and its first sync landing. */
+  readonly cloned: boolean;
+  /** The commit the copy is at, abbreviated. */
+  readonly head?: string;
+  /** When it last synced successfully, in epoch milliseconds. */
+  readonly syncedAt?: number;
+  /**
+   * Why the last sync failed, in git's own last line. Absent when it did not.
+   * A source that fails to sync keeps serving the copy it has.
+   */
+  readonly error?: string;
+  /** How many skills its folder holds right now. */
+  readonly skillCount: number;
 }

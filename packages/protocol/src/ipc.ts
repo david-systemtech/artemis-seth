@@ -28,7 +28,7 @@
 import type { AgentPromptsDocument,
   MemoryBankPromptInfo,
 } from './agentPrompts.js';
-import type { SkillInfo, SkillLibraryDocument } from './skills.js';
+import type { SkillInfo, SkillLibraryDocument, SkillSourceStatus } from './skills.js';
 import type { RepositoryOrigin } from './forge.js';
 import type { PullRequestRef, PullRequestResult } from './github.js';
 import type { AgentEvent, BackgroundTask } from './events.js';
@@ -589,6 +589,20 @@ export const IPC = {
    */
   skillsList: 'artemis:skills:list',
   skillsSave: 'artemis:skills:save',
+
+  /**
+   * The repositories of skills this machine keeps cloned.
+   *
+   * Their own channels rather than part of the save, and the split is the
+   * security boundary of the feature: a source is a URL the main process will
+   * hand to `git clone`, so it crosses IPC through a validator written for a
+   * URL, on a channel that does nothing else — never as a field a save about
+   * switches happened to carry. All three answer with the whole skills state,
+   * because each of them changes what the list holds.
+   */
+  skillsSourceAdd: 'artemis:skills:source:add',
+  skillsSourceRemove: 'artemis:skills:source:remove',
+  skillsSourceSync: 'artemis:skills:source:sync',
 
   /**
    * The machine's key managers.
@@ -3063,6 +3077,26 @@ export type SkillsListRequest = Record<string, never>;
 export interface SkillsListResponse {
   readonly skills: readonly SkillInfo[];
   readonly document: SkillLibraryDocument;
+  /** The repositories kept cloned here, and how each copy is doing. */
+  readonly sources: readonly SkillSourceStatus[];
+}
+
+/** Subscribe to a repository of skills. Cloned before the answer comes back. */
+export interface SkillsSourceAddRequest {
+  /** `https://…`, `ssh://…` or `git@host:path`. See `skillSourceUrlProblem`. */
+  readonly url: string;
+  /** The folder inside it that holds the skills. Defaults to `skills`. */
+  readonly subdir?: string;
+}
+
+/** Unsubscribe, and delete this machine's copy. */
+export interface SkillsSourceRemoveRequest {
+  readonly id: string;
+}
+
+/** Pull now: the named source, or every one when none is named. */
+export interface SkillsSourceSyncRequest {
+  readonly id?: string;
 }
 
 /** Replace the always-on choices. */
@@ -3350,6 +3384,9 @@ export type IpcRequestMap = {
   [IPC.agentPromptsSave]: AgentPromptsSaveRequest;
   [IPC.skillsList]: SkillsListRequest;
   [IPC.skillsSave]: SkillsSaveRequest;
+  [IPC.skillsSourceAdd]: SkillsSourceAddRequest;
+  [IPC.skillsSourceRemove]: SkillsSourceRemoveRequest;
+  [IPC.skillsSourceSync]: SkillsSourceSyncRequest;
   [IPC.serverStatus]: ServerStatusRequest;
   [IPC.serverStart]: ServerStartRequest;
   [IPC.serverStop]: ServerStopRequest;
@@ -3465,6 +3502,9 @@ export type IpcResponseMap = {
   [IPC.agentPromptsSave]: AgentPromptsSaveResponse;
   [IPC.skillsList]: SkillsListResponse;
   [IPC.skillsSave]: SkillsSaveResponse;
+  [IPC.skillsSourceAdd]: SkillsListResponse;
+  [IPC.skillsSourceRemove]: SkillsListResponse;
+  [IPC.skillsSourceSync]: SkillsListResponse;
   [IPC.serverStatus]: ServerStateResponse;
   [IPC.serverStart]: ServerStateResponse;
   [IPC.serverStop]: ServerStateResponse;
@@ -3815,6 +3855,12 @@ export interface ArtemisBridge {
     list(request: SkillsListRequest): Promise<IpcResult<SkillsListResponse>>;
     /** Replace the always-on choices. Answers with what landed. */
     save(request: SkillsSaveRequest): Promise<IpcResult<SkillsSaveResponse>>;
+    /** Subscribe to a repository of skills. Answers once the clone was tried. */
+    addSource(request: SkillsSourceAddRequest): Promise<IpcResult<SkillsListResponse>>;
+    /** Unsubscribe and delete the copy. */
+    removeSource(request: SkillsSourceRemoveRequest): Promise<IpcResult<SkillsListResponse>>;
+    /** Pull now. */
+    syncSources(request: SkillsSourceSyncRequest): Promise<IpcResult<SkillsListResponse>>;
   };
 
   /**

@@ -985,6 +985,9 @@ export function createRemoteBridge(
     skills: {
       list: async () => absent('Skills are read on the serving machine, where runs start.'),
       save: async () => absent('Skills are read on the serving machine, where runs start.'),
+      addSource: async () => absent('Skills are read on the serving machine, where runs start.'),
+      removeSource: async () => absent('Skills are read on the serving machine, where runs start.'),
+      syncSources: async () => absent('Skills are read on the serving machine, where runs start.'),
     },
 
     preview: {

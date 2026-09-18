@@ -4,6 +4,9 @@ import { ValidationError } from './errors.js';
 import {
   validateAgentPromptsSave,
   validateSkillsSave,
+  validateSkillsSourceAdd,
+  validateSkillsSourceRemove,
+  validateSkillsSourceSync,
   validatePreviewOpen,
   validateProfilesCreate,
   validateProfilesSuggestDir,
@@ -1552,6 +1555,62 @@ describe('validateSkillsSave', () => {
 
   it('accepts an empty list, which is every skill switched off', () => {
     expect(save([]).document.alwaysOn).toEqual([]);
+  });
+
+  it('keeps a name exactly as it was sent, because it is a folder’s name', () => {
+    // The store and the pane match by equality; a name tidied here would split
+    // one skill into a row that reads "off" and a phantom that reads "missing".
+    expect(save([{ name: ' notes ', scope: { kind: 'all' } }]).document.alwaysOn[0]?.name).toBe(' notes ');
+  });
+
+  it('carries no sources, whatever the renderer sent with the switches', () => {
+    // A source is a URL main will clone. It has a channel and a validator of
+    // its own, and cannot ride in on a save about switches.
+    const saved = validateSkillsSave({
+      document: { alwaysOn: [], sources: [{ id: 'x', url: 'ext::sh -c boom', subdir: 'skills' }] },
+    });
+
+    expect('sources' in saved.document).toBe(false);
+  });
+});
+
+/**
+ * A repository to subscribe to: the one string on this surface that becomes an
+ * argument to a program. The rule is the protocol's and is tested there; what
+ * is pinned here is that the boundary applies it, and answers with its words.
+ */
+describe('the skill source validators', () => {
+  it('accepts a forge URL, trims it, and defaults the folder', () => {
+    expect(validateSkillsSourceAdd({ url: '  https://github.com/david-systemtech/agent-skills.git ' })).toEqual({
+      url: 'https://github.com/david-systemtech/agent-skills.git',
+      subdir: 'skills',
+    });
+    expect(validateSkillsSourceAdd({ url: 'git@github.com:a/b.git', subdir: 'packs/skills' }).subdir).toBe('packs/skills');
+  });
+
+  it('refuses what git must never be handed, in the rule’s own words', () => {
+    for (const url of ['ext::sh -c boom', '--upload-pack=x', 'file:///etc', '/home/me/skills']) {
+      expect(() => validateSkillsSourceAdd({ url }), url).toThrow(ValidationError);
+    }
+    expect(() => validateSkillsSourceAdd({ url: 'https://me:token-value@github.com/a/b.git' })).toThrow(
+      /git credentials/,
+    );
+    expect(() => validateSkillsSourceAdd({ url: 'https://github.com/a/b.git', subdir: '../outside' })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('holds a source id to the alphabet ids are written in, since it names a folder main deletes', () => {
+    expect(validateSkillsSourceRemove({ id: 'github-com-a-b-0a1b2c3d' })).toEqual({ id: 'github-com-a-b-0a1b2c3d' });
+    for (const id of ['../x', 'a/b', 'A-B', '', 'a--b', '-a']) {
+      expect(() => validateSkillsSourceRemove({ id }), id).toThrow(ValidationError);
+    }
+  });
+
+  it('pulls everything when no source is named', () => {
+    expect(validateSkillsSourceSync({})).toEqual({});
+    expect(validateSkillsSourceSync({ id: 'github-com-a-b-0a1b2c3d' })).toEqual({ id: 'github-com-a-b-0a1b2c3d' });
+    expect(() => validateSkillsSourceSync({ id: '../x' })).toThrow(ValidationError);
   });
 });
 
