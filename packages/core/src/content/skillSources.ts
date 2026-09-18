@@ -83,6 +83,13 @@ export interface SkillSourceSyncResult {
   readonly head?: string;
   /** One line for a log, a receipt, or the pane. */
   readonly detail: string;
+  /**
+   * Nothing was tried: the source was synced, or failed to, too recently to
+   * try again, and `ok` and `detail` restate how that earlier attempt went.
+   * Told apart so a failure is reported once per attempt rather than once per
+   * question about it.
+   */
+  readonly throttled?: true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -233,7 +240,12 @@ export function createSkillSources(options: SkillSourcesOptions): SkillSources {
 
     const last = attempts.get(source.id);
     if (syncOptions?.force !== true && last !== undefined && now() - last.at < throttleMs) {
-      return Promise.resolve({ ok: last.error === undefined, moved: false, detail: last.error ?? 'synced recently' });
+      return Promise.resolve({
+        ok: last.error === undefined,
+        moved: false,
+        detail: last.error ?? 'synced recently',
+        throttled: true,
+      });
     }
 
     // Stamped before the work rather than after, so a second caller arriving
@@ -295,13 +307,27 @@ export function createSkillSources(options: SkillSourcesOptions): SkillSources {
       for (const source of sources) {
         void sync(source)
           .then((result) => {
-            if (!result.ok) options.onWarning?.(`Could not sync the skills from ${source.url}: ${result.detail}`);
+            // Once per attempt. A throttled answer restates the last failure,
+            // and logging it again on every run start for fifteen minutes would
+            // bury the one line that said something. The pane carries it meanwhile.
+            if (!result.ok && result.throttled !== true) {
+              options.onWarning?.(`Could not sync the skills from ${source.url}: ${result.detail}`);
+            }
           })
           .catch(() => undefined);
       }
     },
 
     remove: async (source) => {
+      /*
+       * After any sync of it that is still running, not beside it. A first
+       * clone works in a scratch folder and renames into place when it is
+       * done, which can be two minutes after it started: deleting the folder
+       * first deletes nothing, and the clone then lands for a source nobody
+       * lists any more, where nothing offers it and nothing would clean it up.
+       * The sync never rejects, so neither does this wait.
+       */
+      await inFlight.get(source.id);
       attempts.delete(source.id);
       await rm(skillSourceCloneDir(options.dataDir, source), { recursive: true, force: true });
     },
