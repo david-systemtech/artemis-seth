@@ -1,6 +1,26 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.18.0
+
+Skills get a home: a Settings pane, repositories Artemis keeps cloned for you, always-on switches that reach every conversation including served ones, and a server that carries the same skills as your desktop. Also: one plan-usage reading per account, sidebar groups you can reorder, and four served-conversation fixes.
+
+**Settings > Skills.** Every skill a conversation on this machine is offered, with the command to type, what it says it is for, and where it came from. Switch one to *Always on* and it is appended to the system prompt of every run that can take it, the way a standing instruction is, with its cost in tokens shown before you throw the switch.
+
+**Skill repositories.** Name a git repository of skills and Artemis keeps it cloned and pulled under its own data folder, on every machine you add it to: when it is added, on request, and in the background before a run. Its skills are offered like hand-installed ones, to Claude and Codex accounts alike. A private repository uses the machine's own git credentials; a URL with a credential in it is refused.
+
+**Skills on an Artemis Server.** A served run gets the server's skills, slash commands and marketplace plugins, and a remote pane's `/` menu lists them (`GET /api/v0/commands`). The server keeps skill repositories of its own, managed from Settings > Skills on the desktop with an administrative connection (`GET /api/v0/skills`). Always-on switches reach a served conversation by name, and the server adds its own copy of each skill. **Update the server with the app.**
+
+**A skill is offered once.** A skill that an enabled marketplace plugin also publishes is no longer offered twice, under `artemis-skills:` and again under the plugin's name. The plugin's copy wins, the Skills pane says what it is typed as on those accounts, and a skill the plugin carries but does not publish is left alone.
+
+**Skills on Windows.** The bridge that hands a local run its skills used directory symlinks, which an ordinary Windows account may not create, so without Developer Mode no skill reached a local conversation and nothing said so. It lays down junctions now, which need no privilege, and a Codex skill link that has become redundant is cleaned up on Windows as it is elsewhere.
+
+**One plan-usage reading per account.** The same account could show different limits in different panes, and a reset window could stay at its old number until it flipped. A reading is now held once per account and every pane, window and conversation reads it; a newer answer is never replaced by an older one; a window whose reset time has passed is no longer drawn at its old value, in the gauges or on a model's row; and one failed read no longer blanks a gauge that was right a moment ago. The server's usage cache shares in-flight reads and keeps the newer of two answers.
+
+**The sidebar's groups can be reordered.** Drag a group heading between two others, or use "Move up" and "Move down" (`U` and `N`) from its menu.
+
+**Served conversations.** A delegated task in a served conversation can be stopped. A window hears the server again after the server restarts, instead of going quiet until something else opened a stream, and a conversation that changed directory no longer loses its queued messages. Settings > Instructions no longer fails with a credential-safety error when a memory's name happens to look like a key, and a question whose text looks like one is no longer dropped before it reaches you.
+
 ## What's new in 2.17.3
 
 A served conversation keeps everything above the turn it is on.
