@@ -63,6 +63,7 @@ import {
   PaletteIcon,
   ServerIcon,
   ShieldIcon,
+  SparklesIcon,
   VaultIcon,
 } from 'lucide-react';
 
@@ -73,6 +74,7 @@ import { AppearanceSection } from './AppearanceSection';
 import { InstructionsSection } from './InstructionsSection';
 import { KeyManagersSection } from './KeyManagersSection';
 import { MemoryBanksSection } from './MemoryBanksSection';
+import { SkillsSection } from './SkillsSection';
 import { ModelsSection } from './ModelsSection';
 import { PermissionsSection } from './PermissionsSection';
 import { RemoteSection } from './RemoteSection';
@@ -169,6 +171,16 @@ export const SETTINGS_NAV: readonly NavBand[] = [
         label: 'Instructions',
         hint: 'Standing prompts',
         icon: <BotIcon aria-hidden="true" />,
+      },
+      // Between the prompts and the banks, because it sits between them in
+      // kind: a skill is an instruction someone else wrote, which the agent
+      // loads when it applies — and which the switch in this pane can make as
+      // standing as anything in the pane above.
+      {
+        id: 'skills',
+        label: 'Skills',
+        hint: 'Procedures agents can load',
+        icon: <SparklesIcon aria-hidden="true" />,
       },
       // Directly under Instructions, because it is the same question answered
       // by a repository instead of by a paragraph: the prompts are what the
@@ -442,6 +454,8 @@ function SectionBody({ section }: { readonly section: SettingsSection }): ReactE
       return <PermissionsSection />;
     case 'agents':
       return <InstructionsSection />;
+    case 'skills':
+      return <SkillsSection />;
     case 'memory-banks':
     case 'cerebro':
       return <MemoryBanksSection />;

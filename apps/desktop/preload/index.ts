@@ -86,6 +86,8 @@ import {
   type SessionsListRequest,
   type AgentPromptsListRequest,
   type AgentPromptsSaveRequest,
+  type SkillsListRequest,
+  type SkillsSaveRequest,
   type MemoryBankAddRequest,
   type MemoryBankForgetRequest,
   type MemoryBankMemoriesRequest,
@@ -767,6 +769,12 @@ const bridge: ArtemisBridge = Object.freeze({
   agentPrompts: Object.freeze({
     list: (request: AgentPromptsListRequest) => invoke(IPC.agentPromptsList, request),
     save: (request: AgentPromptsSaveRequest) => invoke(IPC.agentPromptsSave, request),
+  }),
+
+  /** This machine's skills, and which are always on. Same two verbs; see {@link IPC}. */
+  skills: Object.freeze({
+    list: (request: SkillsListRequest) => invoke(IPC.skillsList, request),
+    save: (request: SkillsSaveRequest) => invoke(IPC.skillsSave, request),
   }),
 
   preview: Object.freeze({

@@ -856,6 +856,14 @@ export function createRemoteBridge(
         absent('Standing instructions are composed on the serving machine, where runs start.'),
     },
 
+    // A skill is a folder on the machine a run executes on, and which of them
+    // are always on is that machine's own setting. A window onto another
+    // machine shows that machine's Settings for it, not a copy kept here.
+    skills: {
+      list: async () => absent('Skills are read on the serving machine, where runs start.'),
+      save: async () => absent('Skills are read on the serving machine, where runs start.'),
+    },
+
     preview: {
       open: async () => absent(FILES_REASON),
     },

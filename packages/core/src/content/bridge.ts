@@ -262,6 +262,21 @@ async function readSource(sourceDir: string): Promise<readonly DiscoveredSkill[]
 }
 
 /**
+ * {@link readSource}, for `skills.ts`.
+ *
+ * Exported so that the list a person is shown and the set a run is offered are
+ * decided by one test of "is this folder a skill" rather than by two that agree
+ * today. Under a name that says what it is, because `export *` puts it on
+ * core's surface.
+ */
+export const skillFoldersIn = readSource;
+
+/** `~/.agents/skills` for a given home — the folder both providers read. */
+export function neutralSkillsDir(home: string = homedir()): string {
+  return join(home, ...NEUTRAL_SKILLS);
+}
+
+/**
  * Merge sources into one skill per name, earlier sources winning.
  *
  * The de-duplication that makes a single bridge the right shape — see the header.
