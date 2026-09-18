@@ -101,7 +101,7 @@ export function installBank(bank: Bank, options: InstallOptions): InstallReport 
   const shadowed: string[] = [];
   for (const entry of entries) {
     if (existsSync(join(options.memoryDir, `${entry.name}.md`))) shadowed.push(entry.name);
-    writeFileSync(join(home, `${entry.name}.md`), renderInstalledEntry(entry, extra), 'utf8');
+    writeIfChanged(join(home, `${entry.name}.md`), renderInstalledEntry(entry, extra));
   }
 
   const block = renderIndexBlock({
@@ -115,9 +115,29 @@ export function installBank(bank: Bank, options: InstallOptions): InstallReport 
   });
   const indexFile = join(options.memoryDir, 'MEMORY.md');
   const current = existsSync(indexFile) ? readFileSync(indexFile, 'utf8') : '';
-  writeFileSync(indexFile, replaceBlock(current, block.text, beginMarker(options.slug), endMarker(options.slug)), 'utf8');
+  const next = replaceBlock(current, block.text, beginMarker(options.slug), endMarker(options.slug));
+  if (next !== current) writeFileSync(indexFile, next, 'utf8');
 
   return { installed: entries.length, pruned, indexed: block.indexed, shadowed, refused: null };
+}
+
+/**
+ * Write a file only when its text would change.
+ *
+ * The install runs at every run start, into every project of every profile,
+ * and almost always finds exactly what it wrote last time. Rewriting it
+ * anyway cost a disk write per entry per project — tens of thousands on a
+ * machine with many projects — and, wherever a watcher or a scanner sits on
+ * the memory directory, a rescan for each. A read and a compare is the
+ * cheaper thing, and it leaves an unchanged file's mtime alone.
+ */
+function writeIfChanged(path: string, text: string): void {
+  try {
+    if (readFileSync(path, 'utf8') === text) return;
+  } catch {
+    // Absent or unreadable: written below.
+  }
+  writeFileSync(path, text, 'utf8');
 }
 
 /** Remove one bank's copies and its block from one project's memory directory. */

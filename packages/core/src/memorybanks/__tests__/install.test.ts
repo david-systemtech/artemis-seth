@@ -4,7 +4,7 @@
  * index — so the assertions double as the compatibility contract.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -195,6 +195,32 @@ describe('installBank', () => {
     uninstallBank('team', memoryDir);
     expect(existsSync(join(memoryDir, 'banks'))).toBe(false);
     expect(existsSync(join(memoryDir, 'MEMORY.md'))).toBe(false);
+  });
+
+  it('leaves a file it would write unchanged alone', () => {
+    // The install runs at every run start into every project; almost every
+    // file it meets is exactly what it wrote last time, and rewriting those
+    // was a disk write per entry per project, plus a rescan for whatever
+    // watches the directory. An unchanged file keeps its mtime.
+    const dir = bankDir();
+    const bank = readBankAt(dir, { slug: 'team' });
+    const memoryDir = join(scratch(), 'memory');
+    const options = { slug: 'team', memoryDir, projectKey: 'k', source: 's', today: 'd' };
+    installBank(bank!, options);
+    const copy = join(memoryDir, 'banks', 'team', 'one.md');
+    const index = join(memoryDir, 'MEMORY.md');
+    const then = new Date('2020-01-01T00:00:00Z');
+    utimesSync(copy, then, then);
+    utimesSync(index, then, then);
+
+    installBank(bank!, options);
+    expect(statSync(copy).mtimeMs).toBe(then.getTime());
+    expect(statSync(index).mtimeMs).toBe(then.getTime());
+
+    // A change is still a write.
+    installBank(bank!, { ...options, today: 'e' });
+    expect(statSync(copy).mtimeMs).not.toBe(then.getTime());
+    expect(readFileSync(copy, 'utf8')).toContain('synced: e');
   });
 });
 
