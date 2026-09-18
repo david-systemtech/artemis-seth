@@ -1569,11 +1569,15 @@ describe('validateSkillsSave', () => {
   it('carries no sources, whatever the renderer sent with the switches', () => {
     // A source is a URL main will clone. It has a channel and a validator of
     // its own, and cannot ride in on a save about switches.
-    const saved = validateSkillsSave({
-      document: { alwaysOn: [], sources: [{ id: 'x', url: 'ext::sh -c boom', subdir: 'skills' }] },
-    });
-
-    expect('sources' in saved.document).toBe(false);
+    //
+    // A well-formed source on purpose: a malformed one is dropped by any
+    // parser, and would pass here whether or not this validator strips them.
+    for (const url of ['https://github.com/demo/agent-skills', 'ext::sh -c boom']) {
+      const saved = validateSkillsSave({
+        document: { alwaysOn: [], sources: [{ id: 'x', url, subdir: 'skills' }] },
+      });
+      expect('sources' in saved.document).toBe(false);
+    }
   });
 });
 

@@ -20,6 +20,7 @@ import {
   skillSlashCommand,
   skillSourceIdFor,
   skillSourceLabel,
+  skillSourceLimitProblem,
   skillSourceSubdirProblem,
   skillSourceUrlProblem,
   SKILL_LIMITS,
@@ -345,5 +346,49 @@ describe('planAlwaysOnSkills', () => {
     expect(planAlwaysOnSkills({ providerId: 'artemis', systemPromptAppend: true, own: [], asked: [] })).toEqual({
       kind: 'none',
     });
+  });
+});
+
+describe('what the review of the first cut found', () => {
+  it('refuses a password in an ssh URL, the one other transport with somewhere to put one', () => {
+    expect(skillSourceUrlProblem('ssh://me:secret-token@github.com/a/b.git')).toMatch(/username and token/);
+    expect(skillSourceUrlProblem('ssh://:secret@github.com/a/b.git')).toMatch(/username and token/);
+    // A bare user is how ssh is addressed, and stays legal in both spellings.
+    expect(skillSourceUrlProblem('ssh://git@github.com/a/b.git')).toBeNull();
+    expect(skillSourceUrlProblem('ssh://github.com:2222/a/b.git')).toBeNull();
+    expect(skillSourceUrlProblem('git@github.com:a/b.git')).toBeNull();
+    // And a document on disk that holds one is read without it.
+    expect(
+      parseSkillLibraryDocument({ version: 1, alwaysOn: [], sources: [{ url: 'ssh://me:secret@github.com/a/b' }] })
+        .sources,
+    ).toBeUndefined();
+  });
+
+  it('never derives an id the validators would refuse, wherever the cut lands', () => {
+    // Main holds an id to this alphabet before it removes or pulls a source,
+    // so an id outside it would name a row that can be neither.
+    const guarded = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+    for (let pad = 60; pad <= 90; pad += 1) {
+      const url = `https://example.com/${'a'.repeat(pad)}-/-b/${'c'.repeat(12)}`;
+      expect(skillSourceIdFor(url)).toMatch(guarded);
+    }
+    expect(skillSourceIdFor('https://-/-')).toMatch(guarded);
+  });
+
+  it('refuses control characters in the folder, as it does in the URL', () => {
+    expect(skillSourceSubdirProblem('skills\u0000')).toMatch(/control characters/);
+    expect(skillSourceSubdirProblem('ski\tlls')).toMatch(/control characters/);
+    expect(skillSourceSubdirProblem('skills/engineering')).toBeNull();
+  });
+
+  it('says when the list is full, rather than dropping the source just added', () => {
+    let document = defaultSkillLibraryDocument();
+    for (let index = 0; index < 20; index += 1) {
+      expect(skillSourceLimitProblem(document, `https://example.com/o/r${String(index)}`)).toBeNull();
+      document = withSkillSource(document, `https://example.com/o/r${String(index)}`);
+    }
+    expect(skillSourceLimitProblem(document, 'https://example.com/o/one-more')).toMatch(/at most 20/);
+    // Re-adding one already held replaces it, which is never over the limit.
+    expect(skillSourceLimitProblem(document, 'https://example.com/o/r3.git')).toBeNull();
   });
 });
