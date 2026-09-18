@@ -106,6 +106,28 @@ export interface SkillInfo {
    * is thrown rather than after the bill arrives.
    */
   readonly bodyChars: number;
+  /**
+   * Accounts that get a skill of this name from a marketplace plugin instead.
+   *
+   * A Claude run is handed an enabled marketplace plugin whole, so when one
+   * offers this name Artemis leaves its own copy out of that account's runs
+   * rather than offer the skill twice. There it is typed under the plugin's
+   * name, not under {@link BRIDGED_SKILL_PLUGIN}. Absent when no account's
+   * plugins offer it, which is the usual case.
+   *
+   * Always-on is untouched by this: that reads the person's own copy by name.
+   */
+  readonly pluginOffers?: readonly SkillPluginOffer[];
+}
+
+/** One marketplace plugin offering a skill's name, and the accounts it does so on. */
+export interface SkillPluginOffer {
+  /** The plugin's own name, as its manifest gives it. */
+  readonly plugin: string;
+  /** What to type on those accounts: `/mattpocock-skills:tdd`. */
+  readonly command: string;
+  /** The accounts that have the plugin enabled and would otherwise get this skill. */
+  readonly profileIds: readonly ProfileId[];
 }
 
 /**
@@ -116,9 +138,12 @@ export interface SkillInfo {
  */
 export const BRIDGED_SKILL_PLUGIN = 'artemis-skills';
 
-/** What to type for a skill in a Claude session: `/artemis-skills:unslop`. */
-export function skillSlashCommand(name: string): string {
-  return `/${BRIDGED_SKILL_PLUGIN}:${name}`;
+/**
+ * What to type for a skill in a Claude session: `/artemis-skills:unslop`, or
+ * `/<plugin>:<name>` for one a marketplace plugin offers.
+ */
+export function skillSlashCommand(name: string, plugin: string = BRIDGED_SKILL_PLUGIN): string {
+  return `/${plugin}:${name}`;
 }
 
 /* -------------------------------------------------------------------------- */

@@ -193,6 +193,26 @@ describe('the list', () => {
     expect(screen.getByText(/Only on Work\./)).toBeTruthy();
   });
 
+  it('says so when a plugin offers the name on some accounts, and what to type there', async () => {
+    skills = [
+      skill({
+        name: 'tdd',
+        pluginOffers: [
+          { plugin: 'mattpocock-skills', command: '/mattpocock-skills:tdd', profileIds: ['p-work' as never] },
+        ],
+      }),
+      skill({ name: 'unslop' }),
+    ];
+    await renderPane();
+
+    expect(screen.getByText(/On Work the mattpocock-skills plugin offers a skill of this name/)).toBeTruthy();
+    expect(screen.getByText('/mattpocock-skills:tdd')).toBeTruthy();
+    // Its own command is still drawn: every other account types that one.
+    expect(screen.getByText('/artemis-skills:tdd')).toBeTruthy();
+    // And a row no plugin touches says nothing of the kind.
+    expect(screen.getAllByText(/plugin offers a skill of this name/)).toHaveLength(1);
+  });
+
   it('says where to put a skill when there are none, rather than drawing an empty card', async () => {
     skills = [];
     await renderPane();

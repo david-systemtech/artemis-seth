@@ -76,6 +76,7 @@ describe('readSkillDocument', () => {
 
   it('answers the defaults for a file it cannot read, rather than throwing', async () => {
     expect(await readSkillDocument(join(home, 'not-there'))).toEqual({
+      declaredName: null,
       description: '',
       modelInvocable: true,
       userInvocable: true,
@@ -218,6 +219,68 @@ describe('resolveSkills', () => {
     );
 
     expect(resolved).toEqual([]);
+  });
+});
+
+describe('a name a marketplace plugin offers', () => {
+  /** Enable a plugin for `configDir` that publishes `skills/<category>/<name>`. */
+  async function enablePlugin(configDir: string, plugin: string, published: readonly string[]): Promise<void> {
+    const key = `${plugin}@claude-plugins-official`;
+    const installPath = join(root, 'plugin-cache', plugin);
+    await mkdir(join(installPath, '.claude-plugin'), { recursive: true });
+    await writeFile(
+      join(installPath, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: plugin, skills: published.map((name) => `./skills/engineering/${name}`) }),
+    );
+    for (const name of published) {
+      await skill(join(installPath, 'skills', 'engineering'), name, `---\nname: ${name}\ndescription: Theirs.\n---\nBody.\n`);
+    }
+    await mkdir(join(configDir, 'plugins'), { recursive: true });
+    await writeFile(
+      join(configDir, 'plugins', 'installed_plugins.json'),
+      JSON.stringify({ version: 2, plugins: { [key]: [{ scope: 'user', installPath }] } }),
+    );
+    await writeFile(join(configDir, 'settings.json'), JSON.stringify({ enabledPlugins: { [key]: true } }));
+  }
+
+  const accounts = () => [
+    { profileId: WORK, configDir: work },
+    { profileId: HOME, configDir: personal },
+  ];
+
+  it('says which accounts get the name from the plugin, and what it is typed as there', async () => {
+    await skill(join(home, '.agents', 'skills'), 'tdd', '---\ndescription: Mine.\n---\nBody.\n');
+    await skill(join(home, '.agents', 'skills'), 'unslop', '---\ndescription: De-slop.\n---\nEdit.\n');
+    await enablePlugin(work, 'mattpocock-skills', ['tdd']);
+
+    const listed = await listSkills({ accounts: accounts(), home });
+
+    // Still listed: it is the person's own copy, and always-on reads it.
+    expect(listed.find((entry) => entry.name === 'tdd')?.pluginOffers).toEqual([
+      { plugin: 'mattpocock-skills', command: '/mattpocock-skills:tdd', profileIds: [WORK] },
+    ]);
+    // The usual row carries nothing at all, rather than an empty list.
+    expect(listed.find((entry) => entry.name === 'unslop')).not.toHaveProperty('pluginOffers');
+  });
+
+  it('leaves out an account the skill never reached', async () => {
+    // Only the personal account has the skill; only the work account has the plugin.
+    await skill(join(personal, 'skills'), 'tdd', '---\ndescription: Mine.\n---\nBody.\n');
+    await enablePlugin(work, 'mattpocock-skills', ['tdd']);
+
+    const [row] = await listSkills({ accounts: accounts(), home });
+
+    expect(row).not.toHaveProperty('pluginOffers');
+  });
+
+  it('matches on the name a session knows the skill by, not the folder it sits in', async () => {
+    await skill(join(home, '.agents', 'skills'), 'my-tdd', '---\nname: tdd\ndescription: Mine.\n---\nBody.\n');
+    await enablePlugin(work, 'mattpocock-skills', ['tdd']);
+
+    const [row] = await listSkills({ accounts: accounts(), home });
+
+    expect(row?.name).toBe('my-tdd');
+    expect(row?.pluginOffers?.[0]?.command).toBe('/mattpocock-skills:tdd');
   });
 });
 
