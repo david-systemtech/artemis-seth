@@ -1,6 +1,16 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.17.2
+
+A served conversation survives its own Stop button, and typing no longer freezes while a memory bank is written.
+
+**Stop on a served conversation no longer ends it on this side while the server carries on.** Pressed with a message queued behind the turn — the "read it now" gesture — Stop told the server, and then the desktop tore down its own stream unless the server named at least one message as still queued. A Claude server names only the queued ids it can match to a steer of this client's, so the list was routinely empty while the message had survived: the pane showed an "interrupted" card with no accounting, and the agent's reply to that very message went to a stream nobody was reading. Once the server has taken the stop, the ending is now the server's, and the run ends on the server's own `run.end` with the turn's real reason and usage. A stop the server refused, or a server too old for the run routes, still ends the stream locally — and a card the desktop has to draw for itself now carries the last usage reading, for served and local-model runs alike.
+
+**An idle served pane no longer draws "ended · no reply" every few seconds.** With the server still working, every live-work tick joined its run — and the run's own `session.started` reached the window before the start call answered, was adopted onto the very pane doing the joining, and made it look live, so the join concluded the column had moved on and disposed the run it had just asked for. One stopped card per tick, with nothing typed. The join now holds the run's events from the moment its id is minted until the conversation is rebuilt.
+
+**A memory bank is installed without holding the keyboard.** At every run start the banks were written into every project of every profile on the main thread — tens of thousands of files on a machine with many projects, a third of a second and more — and keystrokes queued behind it, then arrived in a burst. The run's own project is still written before the run starts; every other project follows behind it, one per turn of the event loop, and a file that has not changed is no longer rewritten.
+
 ## What's new in 2.17.1
 
 A conversation on an Artemis Server takes a screenshot or a file, and anything that cannot carry one says so rather than dropping it.
