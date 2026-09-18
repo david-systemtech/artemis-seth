@@ -46,6 +46,7 @@ import type {
   ProviderEffortOption,
   ProviderModelOption,
   RemoteGapPayload,
+  RemoteHelloPayload,
   RunsListResponse,
   ServerConnectionInfo,
   ServerErrorBody,
@@ -74,6 +75,7 @@ import {
   REMOTE_EVENTS_PATH,
   REMOTE_LIVE_WORK_PATH,
   REMOTE_RUNS_PATH,
+  REMOTE_STREAM_EPOCH_PARAM,
   REMOTE_STREAM_GAP,
   REMOTE_STREAM_HELLO,
   REMOTE_TERMINALS_PATH,
@@ -111,6 +113,28 @@ const DIALOG_REASON =
 /* The bridge                                                                 */
 /* -------------------------------------------------------------------------- */
 
+
+/**
+ * How many of the server's heartbeats a stream may miss before it is dead.
+ *
+ * One missed heartbeat is a busy network; three in a row is a socket nobody is
+ * on the other end of. Generous on purpose — the cost of waiting is a window a
+ * few seconds late, the cost of being hasty is a reconnect storm on a slow link.
+ */
+const SILENCE_HEARTBEATS = 3;
+
+/**
+ * The silence limit until a hello names the server's heartbeat: three of its
+ * default fifteen seconds. Also what a server older than `heartbeatMs` gets.
+ */
+const DEFAULT_SILENCE_LIMIT_MS = 45_000;
+
+/**
+ * A floor under the derived limit, so a server configured with a very short
+ * heartbeat cannot turn every quiet moment into a reconnect.
+ */
+const MIN_SILENCE_LIMIT_MS = 10_000;
+
 /**
  * Build the bridge for one configured connection.
  *
@@ -129,6 +153,12 @@ export function createRemoteBridge(
      * to stop consuming its scripted responses.
      */
     readonly signal?: AbortSignal;
+    /**
+     * How long the event stream may be silent before it is taken for dead.
+     * Normally derived from the heartbeat the server's hello names; pinned by
+     * tests, and by a deployment that knows something about its network.
+     */
+    readonly silenceLimitMs?: number;
   } = {},
 ): ArtemisBridge {
   const origin = config.origin.replace(/\/+$/, '');
@@ -266,14 +296,50 @@ export function createRemoteBridge(
    * window closes.
    */
   let lastSeq: number | null = null;
+  /**
+   * Which feed {@link lastSeq} was counted by, once a hello has said.
+   *
+   * A feed's seqs start over with the process that serves it, so a cursor is
+   * only meaningful together with this. Sent back on reconnect, and compared
+   * against every hello — see `dispatch`.
+   */
+  let feedEpoch: string | null = null;
+  /** How much silence means a dead socket rather than a quiet stream. See `pump`. */
+  let silenceLimitMs = options.silenceLimitMs ?? DEFAULT_SILENCE_LIMIT_MS;
 
   function dispatch(message: { id?: string; event?: string; data: string }): void {
     if (message.event === REMOTE_STREAM_HELLO) {
       try {
-        const hello = JSON.parse(message.data) as { seq?: number };
-        // Only when this window has no cursor yet: a reconnect keeps its own,
-        // which is behind the head by exactly the replay now arriving.
-        if (lastSeq === null && typeof hello.seq === 'number') lastSeq = hello.seq;
+        const hello = JSON.parse(message.data) as Partial<RemoteHelloPayload>;
+        /*
+         * A reconnect keeps its own cursor, which is behind the head by exactly
+         * the replay now arriving — *when both were counted by the same feed*.
+         * Seqs start over with the serving process, so across a restart the
+         * cursor names a count that no longer exists, and keeping it is what
+         * left a window deaf: the server skipped everything at or below the
+         * stale number, which on a fresh feed is everything.
+         *
+         * Two tells, either sufficient. The epoch is exact. The head standing
+         * *behind* the cursor is the same fact read off a server too old to
+         * name one: no feed's head is ever behind a number it handed out.
+         * Either way this hello's head is the only honest starting point, and
+         * what the old cursor promised is gone — which the renderer's stall
+         * sweep heals per run, exactly as it does for a reported gap.
+         */
+        const restarted =
+          lastSeq !== null &&
+          typeof hello.seq === 'number' &&
+          ((typeof hello.epoch === 'string' && feedEpoch !== null && hello.epoch !== feedEpoch) ||
+            hello.seq < lastSeq);
+        if (typeof hello.epoch === 'string') feedEpoch = hello.epoch;
+        if (typeof hello.seq === 'number' && (lastSeq === null || restarted)) lastSeq = hello.seq;
+        if (
+          options.silenceLimitMs === undefined &&
+          typeof hello.heartbeatMs === 'number' &&
+          hello.heartbeatMs > 0
+        ) {
+          silenceLimitMs = Math.max(MIN_SILENCE_LIMIT_MS, hello.heartbeatMs * SILENCE_HEARTBEATS);
+        }
       } catch {
         // A malformed hello costs the cursor's starting point, nothing more.
       }
@@ -331,14 +397,42 @@ export function createRemoteBridge(
   async function pump(): Promise<void> {
     let failures = 0;
     while (!ended()) {
+      /*
+       * A socket that died without saying so reads as a quiet stream for ever:
+       * `reader.read()` neither resolves nor throws, the loop below never
+       * reaches its retry, and the window shows the last thing it heard until
+       * something else opens a connection. The server sends a heartbeat
+       * comment on a quiet stream precisely so that silence can mean
+       * something; this is the other half — several heartbeats of nothing
+       * aborts the connection, and the ordinary reconnect takes it from there.
+       * The clock covers the connect as well: a request that never answers is
+       * the same failure one step earlier.
+       */
+      const connection = new AbortController();
+      let silence: ReturnType<typeof setTimeout> | undefined;
+      const abortConnection = (): void => {
+        if (silence !== undefined) clearTimeout(silence);
+        connection.abort();
+      };
+      options.signal?.addEventListener('abort', abortConnection, { once: true });
+      const heard = (): void => {
+        if (silence !== undefined) clearTimeout(silence);
+        silence = setTimeout(abortConnection, silenceLimitMs);
+      };
       try {
-        const response = await fetch(`${origin}${REMOTE_EVENTS_PATH}`, {
+        heard();
+        // Only alongside a cursor: the epoch says whose count that number is.
+        const resume =
+          lastSeq !== null && feedEpoch !== null
+            ? `?${REMOTE_STREAM_EPOCH_PARAM}=${encodeURIComponent(feedEpoch)}`
+            : '';
+        const response = await fetch(`${origin}${REMOTE_EVENTS_PATH}${resume}`, {
           headers: {
             authorization,
             accept: 'text/event-stream',
             ...(lastSeq === null ? {} : { 'last-event-id': String(lastSeq) }),
           },
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
+          signal: connection.signal,
         });
         if (!response.ok || response.body === null) {
           throw new Error(`the event stream answered ${String(response.status)}`);
@@ -350,12 +444,17 @@ export function createRemoteBridge(
         for (;;) {
           const { done, value } = await reader.read();
           if (done || ended()) break;
+          // Any bytes count, a heartbeat comment included — that is its job.
+          heard();
           for (const message of decoder.feed(text.decode(value, { stream: true }))) {
             dispatch(message);
           }
         }
       } catch {
         // Fall through to the retry below; the cursor survives.
+      } finally {
+        if (silence !== undefined) clearTimeout(silence);
+        options.signal?.removeEventListener('abort', abortConnection);
       }
       if (ended()) break;
       failures += 1;
