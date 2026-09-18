@@ -10910,8 +10910,24 @@ async function attachServedRun(pane: Pane, sessionId: SessionId): Promise<boolea
   if (!bridge) return false;
 
   servedAttaching.add(sessionId);
+  const runId = newId('run');
+  /*
+   * Held from before the start call, not from `attachRun`.
+   *
+   * A served run's first event is the `session.started` that names the
+   * conversation being joined, and it can reach this window before
+   * `runs.start` has answered. Routed on arrival, with no pane holding the id
+   * yet, `claimContinuation` adopted it onto this very pane — which then read
+   * as live, so the guard below concluded the column had moved on and let the
+   * run go. Disposing it drew a stopped card with nothing under it, the pane
+   * fell idle again, and the next live-work tick did the same: one "no reply"
+   * every few seconds, for as long as the server kept working (seen
+   * 2026-09-18). Holding the id first means nothing of this run's is drawn,
+   * or adopted, until `attachRun` rebuilds the conversation and releases it;
+   * the paths that give the run up release the hold themselves.
+   */
+  replayBuffers.set(runId, []);
   try {
-    const runId = newId('run');
     const input: RunInput = {
       providerId: state.activeProviderId,
       profileId: state.activeProfileId,
@@ -10924,6 +10940,7 @@ async function attachServedRun(pane: Pane, sessionId: SessionId): Promise<boolea
     };
     const result = await call(() => bridge.runs.start({ input }));
     if (!result.ok) {
+      replayBuffers.delete(runId);
       servedAttachDeclined.set(sessionId, Date.now());
       return false;
     }
@@ -10931,6 +10948,7 @@ async function attachServedRun(pane: Pane, sessionId: SessionId): Promise<boolea
     // will draw is let go rather than left streaming into a buffer.
     const current = paneState(pane);
     if (isLive(current) || !sessionIdsOf(current).includes(sessionId)) {
+      replayBuffers.delete(runId);
       void call(() => bridge.runs.dispose({ runId }));
       return false;
     }

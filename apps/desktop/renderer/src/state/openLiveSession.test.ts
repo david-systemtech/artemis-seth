@@ -80,6 +80,14 @@ let startedRuns: string[] = [];
 let workingSessions: string[] = [];
 /** Runs the composer asked the engine to attach to a served conversation with. */
 let attachedInputs: { runId: string; resumeSessionId?: string; attachToLive?: boolean }[] = [];
+/** Runs the window gave up on. */
+let disposedRuns: string[] = [];
+/**
+ * Whether a served attach announces its session before `runs.start` answers,
+ * as the engine really does: the run's first event is the `session.started`
+ * for the conversation it is joining, pushed the moment the run exists.
+ */
+let announceOnStart = false;
 
 function liveRun(runId: string, sessionId: string, status = 'running') {
   return {
@@ -134,6 +142,18 @@ function session(id: string) {
       // carrying the seam the server measured. See `attachServedRun`.
       if (input?.attachToLive === true && input.resumeSessionId !== undefined) {
         attachedInputs.push(input);
+        if (announceOnStart) {
+          handleAgentEvent({
+            type: 'session.started',
+            runId: input.runId,
+            seq: 0,
+            ts: 1,
+            sessionId: input.resumeSessionId,
+            providerId: 'artemis',
+            cwd: '/a',
+            resumedFrom: input.resumeSessionId,
+          } as never);
+        }
         return {
           ok: true,
           value: { run: { ...liveRun(input.runId, input.resumeSessionId), providerId: 'artemis' } },
@@ -145,6 +165,10 @@ function session(id: string) {
       ok: true,
       value: { sessionIds: workingSessions, working: workingSessions, delegated: [] },
     }),
+    dispose: async ({ runId }: { runId: string }) => {
+      disposedRuns.push(runId);
+      return { ok: true, value: {} };
+    },
     onEvent: () => () => undefined,
   },
   sessions: {
@@ -213,6 +237,8 @@ beforeEach(() => {
   startedRuns = [];
   workingSessions = [];
   attachedInputs = [];
+  disposedRuns = [];
+  announceOnStart = false;
 });
 
 afterEach(() => {
@@ -387,6 +413,55 @@ describe('opening a conversation from the sidebar', () => {
     });
 
     // Still attached on the next poll: nothing asks the engine twice.
+    await refreshLiveWork();
+    expect(attachedInputs).toHaveLength(1);
+    setPaneState(focusedPane(), { activeProviderId: 'claude', activeProfileId: 'p1' } as never);
+  });
+
+  it('keeps the served run it joined when its own announcement lands first', async () => {
+    /*
+     * Seen 2026-09-18: the pane fell idle while the server went on working,
+     * and from then on drew a stopped card with nothing under it every few
+     * seconds, with no message sent. Each live-work tick attached; the run's
+     * own `session.started` reached the window before `runs.start` answered;
+     * with no pane holding the id yet, `claimContinuation` adopted it onto
+     * this pane — which then read as live, so the attach concluded the
+     * column had moved on and disposed the run it had just asked for. The
+     * dispose ended it, the card was drawn, the pane fell idle, and the next
+     * tick did it all again.
+     */
+    setPaneState(focusedPane(), {
+      resumeSessionId: 'sv2',
+      run: null,
+      activeProviderId: 'artemis',
+      activeProfileId: 'p-served',
+    } as never);
+    mainProcessRuns = [];
+    workingSessions = ['sv2'];
+    announceOnStart = true;
+
+    await refreshLiveWork();
+
+    expect(attachedInputs).toHaveLength(1);
+    const attached = attachedInputs[0]?.runId;
+    // The run it asked for is the run it kept: rebuilt, not let go.
+    expect(disposedRuns).toEqual([]);
+    expect(eventsAsked).toEqual([attached]);
+    expect(paneState(focusedPane()).run).toMatchObject({
+      runId: attached,
+      sessionId: 'sv2',
+      status: 'running',
+    });
+    // And nothing of its own was drawn as a turn that came and went.
+    const transcript = focusedPane().transcript;
+    transcript.flush();
+    const ends = transcript
+      .getListSnapshot()
+      .map((id) => transcript.getItem(id))
+      .filter((item) => item?.kind === 'run-end');
+    expect(ends).toHaveLength(0);
+
+    // Live, so the next tick has nothing to do.
     await refreshLiveWork();
     expect(attachedInputs).toHaveLength(1);
     setPaneState(focusedPane(), { activeProviderId: 'claude', activeProfileId: 'p1' } as never);

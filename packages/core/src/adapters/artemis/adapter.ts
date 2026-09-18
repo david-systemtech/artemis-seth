@@ -915,11 +915,15 @@ class ArtemisRun implements Run {
     } catch (error) {
       const aborted = this.#abort.signal.aborted;
       this.#status = 'ended';
+      // The tokens were spent whether or not the turn was let finish, so the
+      // last reading rides the card exactly as it does on a clean ending;
+      // without it a stopped turn showed no accounting at all.
       this.#emit({
         type: 'run.end',
         reason: aborted ? 'interrupted' : 'error',
         ...(aborted ? {} : { error: toError(error) }),
         ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+        ...(this.#usage === undefined ? {} : { usage: this.#usage }),
       } as never);
     } finally {
       this.#queue.close();
@@ -1415,33 +1419,47 @@ class ArtemisRun implements Run {
   async interrupt(): Promise<InterruptResult> {
     // With `detach` set, a vanished socket no longer means "stop" — it means
     // "keep going". So the interrupt has to say so out loud, on the route the
-    // server keeps for exactly this. The abort that follows is what ends the
-    // *local* stream; a server too old for the run routes never announced an id,
-    // so it is stopped by that abort alone, as it always was.
+    // server keeps for exactly this. A server too old for the run routes never
+    // announced an id, so it is stopped by the local abort alone, as it always
+    // was; so is one that refused or never answered the route, because then
+    // nothing over there has been told to stop.
     if (this.#remoteRunId !== undefined) {
-      const queued = await this.#post(this.#runRoute('interrupt'), {})
+      const accepted = await this.#post(this.#runRoute('interrupt'), {})
         .then(async (response) => {
-          if (!response.ok) return 0;
+          if (!response.ok) return undefined;
           const reply = (await response.json()) as Partial<ServerRunInterruptBody>;
           return Array.isArray(reply.stillQueued) ? reply.stillQueued.length : 0;
         })
-        .catch(() => 0);
+        .catch(() => undefined);
       /*
-       * Messages were queued behind the turn that was just stopped, and the
-       * server keeps them: the provider over there holds a queued message
-       * across an interrupt by design and opens the next turn on it, and that
-       * turn arrives on this same stream. So the stream stays open. Aborting
-       * it here — which is what "read it now" used to do — ended the local
-       * run a second after the click and left the conversation looking
-       * stopped, while the server went on answering a message nobody was
-       * listening for.
+       * Once the server has taken the stop, the ending is its to send and this
+       * stream is where it arrives. Aborting here instead — which is what a
+       * stop used to do whenever the server named nothing as still queued —
+       * ended the local run a second after the click, with an `interrupted`
+       * card and no accounting, while the server went on: a message queued
+       * behind the turn is kept across an interrupt by design, the provider
+       * opens the next turn on it, and that turn came down a stream nobody was
+       * reading any more. The desktop showed "ended · no reply" over a
+       * conversation the server was still answering.
+       *
+       * The count of queued messages says nothing about that either way. A
+       * Claude server names only the queued ids it can match to a steer of
+       * this client's, so an empty list is "none it could name", not "none
+       * survived" — the very case seen live, where the list was empty and the
+       * queued message was answered all the same. So the stream stays open
+       * whatever the count; the server's own `run.end`, with the turn's real
+       * reason and usage, is what ends it. A link that has died in the
+       * meantime is the reconnect loop's business, as for any other stretch of
+       * the run.
        *
        * The server names the queued messages by its own filing; this side
        * knows only what it sent and has not yet seen delivered, in order. The
        * ones still queued are the most recent of those, which is the count
        * the server gave.
        */
-      if (queued > 0) return { stillQueued: this.#steered.slice(-queued) };
+      if (accepted !== undefined) {
+        return { stillQueued: accepted > 0 ? this.#steered.slice(-accepted) : [] };
+      }
     }
     this.#abort.abort();
     return { stillQueued: [] };
