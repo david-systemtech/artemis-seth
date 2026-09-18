@@ -1,7 +1,9 @@
 """Ask a cheap model to read the pull request, and leave one comment about it.
 
-The comment is rewritten in place on every push, so a pull request carries one
-review that tracks its head rather than a column of stale ones. It ends with a
+The comment is rewritten in place each time a review runs - when the pull
+request opens, and again whenever someone adds the `ai-review` label - so a pull
+request carries one review rather than a column of stale ones. It names the
+commit it read, because it no longer tracks the head by itself. It ends with a
 machine-readable block, because the second reader of this comment is Claude,
 and a fenced JSON array is a contract where prose is a guess.
 
@@ -617,7 +619,8 @@ def render(result: dict, model: str, sha: str, skipped: int, truncated: bool, ef
         f"<sub>Reviewed `{sha[:7]}`"
         + (f" · {skipped} file(s) skipped as noise" if skipped else "")
         + (" · **diff truncated — the tail was not reviewed**" if truncated else "")
-        + ". Re-runs on every push and replaces this comment. "
+        + ". Pushes do not re-run it: add the `ai-review` label for another pass, "
+        + "which replaces this comment. "
         + "A finding is a lead, not a verdict.</sub>",
     ]
     return "\n".join(lines)
@@ -747,7 +750,7 @@ def say_no_review(why: str) -> None:
             "",
             f"**No review for {head}.** {why} This is not an approval.",
             "",
-            "<sub>Re-runs on every push and replaces this comment.</sub>",
+            "<sub>Pushes do not re-run it: add the `ai-review` label to try again.</sub>",
         ]
     )
     upsert_comment(CONTEXT["repo"], CONTEXT["number"], CONTEXT["token"], body)
