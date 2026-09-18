@@ -141,6 +141,7 @@ import {
   applyPlanLimit,
   composeAgentPrompts,
   composeAlwaysOnSkills,
+  composesAlwaysOnSkillsHere,
   enabledToolServers,
   lowestTierModel,
 } from '@rx-artemis/protocol';
@@ -247,25 +248,6 @@ export function inlineBankIndex(providerId: string): boolean {
  */
 export function bankToolsAvailable(providerId: string): boolean {
   return takesHostToolServers(providerId);
-}
-
-/**
- * Are always-on skills composed into this run *on this machine*?
- *
- * Two conditions, and the second is the one worth a named function. The first
- * is the one standing instructions have: a provider that cannot take an append
- * is not sent one, because the pane would then be claiming something the model
- * never read.
- *
- * The second is where the run executes. A run on an Artemis server happens on
- * that machine, and an always-on skill names the folder its files are in —
- * composed here it would hand an agent working on one disk the paths of
- * another. Such a run carries the skills' *names* and the server composes them
- * from its own copy, which is the memory banks' arrangement for the same
- * reason.
- */
-export function composesAlwaysOnSkillsHere(providerId: string, systemPromptAppend: boolean): boolean {
-  return systemPromptAppend && providerId !== 'artemis';
 }
 
 export function withSystemPromptAppended(input: RunInput, text: string | undefined): RunInput {

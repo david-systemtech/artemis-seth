@@ -45,7 +45,7 @@
 
 import type { ReactElement } from 'react';
 import { SparklesIcon } from 'lucide-react';
-import { isAlwaysOn, skillSlashCommand, type SkillInfo } from '@rx-artemis/protocol';
+import { composesAlwaysOnSkillsHere, isAlwaysOn, skillSlashCommand, type SkillInfo } from '@rx-artemis/protocol';
 
 import { useSkills } from '../../hooks/useSkills';
 import { useApp } from '../../state/store';
@@ -85,11 +85,14 @@ function reach(skill: SkillInfo): string {
 function SkillRow({
   skill,
   on,
+  told,
   profileLabel,
   onToggle,
 }: {
   readonly skill: SkillInfo;
   readonly on: boolean;
+  /** Whether any account the skill reaches is given its always-on skills. */
+  readonly told: boolean;
   readonly profileLabel: (id: string) => string;
   readonly onToggle: (on: boolean) => void;
 }): ReactElement {
@@ -111,9 +114,11 @@ function SkillRow({
         </ItemDescription>
         <ItemDescription className="line-clamp-none text-2xs leading-relaxed text-ink-faint">
           {reach(skill)} {where}.
-          {skill.bodyChars > 0
-            ? ` Always on adds about ${approximateTokens(skill.bodyChars)} tokens to every run.`
-            : ' Its file has no instructions in it, so always on would add nothing.'}
+          {skill.bodyChars === 0
+            ? ' Its file has no instructions in it, so always on would add nothing.'
+            : told
+              ? ` Always on adds about ${approximateTokens(skill.bodyChars)} tokens to every run.`
+              : ' None of the accounts it reaches is told its always-on skills, so the switch adds nothing to a run.'}
         </ItemDescription>
       </ItemContent>
       <ItemActions>
@@ -133,6 +138,20 @@ export function SkillsSection(): ReactElement {
   const profiles = useApp((s) => s.profiles);
   const profileLabel = (id: string): string =>
     profiles.find((profile) => profile.id === id)?.label ?? 'an account that is no longer here';
+  const providers = useApp((s) => s.providers);
+  /*
+   * The engine's own rule, fed what each provider reports about itself, so a
+   * row prices always-on only where a run is given it. A provider not yet
+   * listed is priced anyway: "adds nothing" said too early would be the lie.
+   */
+  const toldOn = (profileId: string): boolean => {
+    const profile = profiles.find((candidate) => candidate.id === profileId);
+    if (profile === undefined) return false;
+    const provider = providers.find((candidate) => candidate.id === profile.providerId);
+    return provider === undefined || composesAlwaysOnSkillsHere(provider.id, provider.capabilities.systemPromptAppend);
+  };
+  const told = (skill: SkillInfo): boolean =>
+    (skill.origin.kind === 'profile' ? skill.origin.profileIds : profiles.map((profile) => profile.id)).some(toldOn);
 
   // Choices whose skill is not on this machine right now. Kept in view: see the
   // file header.
@@ -180,6 +199,7 @@ export function SkillsSection(): ReactElement {
                 key={skill.name}
                 skill={skill}
                 on={isAlwaysOn(pane.document, skill.name)}
+                told={told(skill)}
                 profileLabel={profileLabel}
                 onToggle={(on) => pane.setAlwaysOn(skill.name, on)}
               />

@@ -13,11 +13,11 @@
 import { describe, expect, it } from 'vitest';
 
 import type { RunInput } from '@rx-artemis/protocol';
+import { composesAlwaysOnSkillsHere } from '@rx-artemis/protocol';
 
 import {
   bankToolsAvailable,
   builtInsFor,
-  composesAlwaysOnSkillsHere,
   inlineBankIndex,
   mergeAdditionalDirectories,
   rememberModels,

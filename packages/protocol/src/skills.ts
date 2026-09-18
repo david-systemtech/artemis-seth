@@ -30,9 +30,10 @@
  * points at files beside it — a checklist, a script — so the text has to be
  * composed with the directory *that* machine keeps it in. For a local run that
  * is here; for a run on an Artemis server it is the server, which is why a
- * served request carries names rather than prose. The memory banks' prompt
- * already works this way, for the same reason: text naming one machine's paths
- * is wrong on every other machine.
+ * served request is to carry names rather than prose — and until the server
+ * composes them, a served run is given none. The memory banks' prompt already
+ * works this way, for the same reason: text naming one machine's paths is
+ * wrong on every other machine.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS IS NOT A ROW IN THE PROMPT LIBRARY
@@ -248,6 +249,28 @@ export function alwaysOnSkillNames(
   return document.alwaysOn
     .filter((entry) => scopeCovers(entry.scope, profileId))
     .map((entry) => entry.name);
+}
+
+/**
+ * Are always-on skills composed into a run of this provider *on this machine*?
+ *
+ * Two conditions, and the second is the one worth a named function. The first
+ * is the one standing instructions have: a provider that cannot take an append
+ * is not sent one, because the pane would then be claiming something the model
+ * never read.
+ *
+ * The second is where the run executes. A run on an Artemis server happens on
+ * that machine, and an always-on skill names the folder its files are in —
+ * composed here it would hand an agent working on one disk the paths of
+ * another. Such a run is to carry the skills' *names* for the server to compose
+ * from its own copy, the memory banks' arrangement for the same reason; until
+ * that is built, it is given none.
+ *
+ * Here rather than in the engine because the pane asks it too: a skill that
+ * only accounts this answers `false` for can reach is priced at nothing.
+ */
+export function composesAlwaysOnSkillsHere(providerId: string, systemPromptAppend: boolean): boolean {
+  return systemPromptAppend && providerId !== 'artemis';
 }
 
 /* -------------------------------------------------------------------------- */

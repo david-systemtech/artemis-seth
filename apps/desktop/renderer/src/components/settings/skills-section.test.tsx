@@ -18,6 +18,7 @@ import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import type { SkillInfo, SkillLibraryDocument, SkillsSaveRequest } from '@rx-artemis/protocol';
+import { NO_CAPABILITIES } from '@rx-artemis/protocol';
 
 import { SkillsSection } from '@/components/settings/SkillsSection';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -90,6 +91,7 @@ beforeEach(() => {
   saveScript = [];
   seedApp({
     profiles: [{ id: 'p-work', label: 'Work', providerId: 'claude', configDir: '/home/u/.claude-work' }],
+    providers: [],
   });
 });
 
@@ -265,6 +267,29 @@ describe('always on', () => {
     // with whatever this pane guessed they were.
     expect(screen.getByRole('alert').textContent).toContain('Could not read the skills folder.');
     expect(screen.queryByRole('switch')).toBeNull();
+  });
+
+  it('prices nothing for a skill that only accounts never told can reach', async () => {
+    const codex = (append: boolean) =>
+      ({
+        id: 'codex',
+        label: 'Codex',
+        capabilities: { ...NO_CAPABILITIES, systemPromptAppend: append },
+        models: [],
+        effortLevels: [],
+        available: true,
+      }) as never;
+    seedApp({
+      profiles: [{ id: 'p-codex', label: 'Codex account', providerId: 'codex', configDir: '/home/u/.codex' }],
+      providers: [codex(false)],
+    });
+    skills = [skill({ name: 'tdd', origin: { kind: 'profile', profileIds: ['p-codex'] } })];
+    await renderPane();
+
+    // The switch reaches no run, so no run pays for it - and the row says so
+    // rather than quoting a price nobody is charged.
+    expect(screen.queryByText(/Always on adds about/)).toBeNull();
+    expect(screen.getByText(/None of the accounts it reaches is told/)).toBeTruthy();
   });
 
   it('says plainly which conversations the switch does not reach', async () => {
