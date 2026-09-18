@@ -65,6 +65,21 @@ export function useSkills(): SkillsPaneState {
   const latest = useRef<SkillLibraryDocument>(document);
   latest.current = document;
 
+  /**
+   * What main last said it holds — the document every run is composed from —
+   * and how many switches have been sent to it.
+   *
+   * While switches are in flight the pane shows its own guess; when the last
+   * of them is answered it shows main's word instead. Undoing one failed switch
+   * on top of the guess cannot do that: a later save carried the failed switch
+   * with it, so it may well have landed after all, and a switch-off put back
+   * by hand comes back with a scope of everyone, not the one it had.
+   */
+  const stored = useRef<SkillLibraryDocument>(document);
+  const sent = useRef(0);
+  /** The newest save whose answer {@link stored} reflects. */
+  const answered = useRef(0);
+
   useEffect(() => {
     const bridge = channel();
     if (bridge === null) {
@@ -86,6 +101,7 @@ export function useSkills(): SkillsPaneState {
       }
       setError(null);
       setSkills(result.value.skills);
+      stored.current = result.value.document;
       setDocument(result.value.document);
     })();
 
@@ -110,18 +126,26 @@ export function useSkills(): SkillsPaneState {
       return;
     }
 
+    const save = ++sent.current;
     void (async () => {
       const result = await call(() => bridge.save({ document: next }));
       if (result.ok) {
+        // Main answers with what it stored, which may differ from what was
+        // sent: it rebuilds the document on the way in.
+        if (save > answered.current) {
+          stored.current = result.value.document;
+          answered.current = save;
+        }
         setSaveError(null);
-        return;
+      } else {
+        setSaveError(result.error.message);
       }
-      setSaveError(result.error.message);
-      // Put back only what this switch changed. A later switch that has since
-      // landed is not this one's to undo.
-      const undone = withSkillAlwaysOn(latest.current, name, !on);
-      latest.current = undone;
-      setDocument(undone);
+      // A switch still in flight keeps the pane on its guess; the last answer
+      // settles it on what main holds.
+      if (save === sent.current) {
+        latest.current = stored.current;
+        setDocument(stored.current);
+      }
     })();
   }, []);
 

@@ -48,6 +48,12 @@ let skills: readonly SkillInfo[] = [];
 let stored: SkillLibraryDocument = { version: 1, alwaysOn: [] };
 let listFails: string | null = null;
 let saveFails: string | null = null;
+/**
+ * Per-save outcomes, taken in order: a message fails that save, `null` lets it
+ * land. Once it runs out, `saveFails` decides. For the interleavings a single
+ * outcome cannot script.
+ */
+let saveScript: (string | null)[] = [];
 const saves: SkillsSaveRequest[] = [];
 
 /** Installed before the first render: `resolveBridge` memoises on first use. */
@@ -56,7 +62,8 @@ const saves: SkillsSaveRequest[] = [];
     list: async () => (listFails === null ? ok({ skills, document: stored }) : failed(listFails)),
     save: async (request: SkillsSaveRequest) => {
       saves.push(request);
-      if (saveFails !== null) return failed(saveFails);
+      const outcome = saveScript.length > 0 ? saveScript.shift() : saveFails;
+      if (outcome !== null && outcome !== undefined) return failed(outcome);
       stored = request.document;
       return ok({ document: stored });
     },
@@ -80,6 +87,7 @@ beforeEach(() => {
   stored = { version: 1, alwaysOn: [] };
   listFails = null;
   saveFails = null;
+  saveScript = [];
   seedApp({
     profiles: [{ id: 'p-work', label: 'Work', providerId: 'claude', configDir: '/home/u/.claude-work' }],
   });
@@ -194,6 +202,45 @@ describe('always on', () => {
     // conversation.
     expect(isOn('unslop')).toBe(false);
     expect(screen.getByRole('alert').textContent).toContain('The disk is full.');
+  });
+
+  it('ends on what was stored when a failed switch is followed by one that lands', async () => {
+    await renderPane();
+    saveScript = ['The disk is full.', null];
+
+    // Two switches in one tick, so the second save carries the first switch
+    // as well. The first save fails; the second stores both.
+    fireEvent.click(toggle('tdd'));
+    fireEvent.click(toggle('unslop'));
+    await act(async () => {});
+
+    // Every run is now given tdd. A pane showing it off would be the same lie
+    // the failed-save rule exists to prevent, turned around, and the next
+    // switch thrown would save that lie over the real choice.
+    expect(stored.alwaysOn.map((entry) => entry.name)).toEqual(['tdd', 'unslop']);
+    expect(isOn('tdd')).toBe(true);
+    expect(isOn('unslop')).toBe(true);
+  });
+
+  it('puts a failed switch-off back exactly as it was stored, narrowed scope and all', async () => {
+    const narrowed = { kind: 'profiles', profileIds: ['p-work'] } as const;
+    stored = { version: 1, alwaysOn: [{ name: 'tdd', scope: narrowed }] };
+    await renderPane();
+    saveScript = ['The disk is full.'];
+
+    fireEvent.click(toggle('tdd'));
+    await act(async () => {});
+    expect(isOn('tdd')).toBe(true);
+
+    // The next switch saves the whole document, so what the failed one put
+    // back is what gets written: the entry as it was, not one widened to
+    // every account.
+    fireEvent.click(toggle('unslop'));
+    await act(async () => {});
+    expect(saves.at(-1)?.document.alwaysOn).toEqual([
+      { name: 'tdd', scope: narrowed },
+      { name: 'unslop', scope: { kind: 'all' } },
+    ]);
   });
 
   it('keeps a choice in view when its skill is not on this machine, so it can be switched off', async () => {
