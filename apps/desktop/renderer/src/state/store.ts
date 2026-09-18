@@ -7888,12 +7888,44 @@ async function attachRun(pane: Pane, handle: RunHandle): Promise<void> {
     (previous.resumeSessionId === handle.sessionId ||
       previous.run?.sessionId === handle.sessionId);
 
+  /*
+   * Keep the conversation on screen when nothing could put it back.
+   *
+   * The rebuild below is exact only with a seam: history read up to
+   * `historyOffset`, the run's own events under it. Without one there is no
+   * history read at all, so the reset left the pane holding the run alone —
+   * every earlier turn gone. Reported 2026-09-18 on a served conversation:
+   * "read now" on a queued message interrupts the turn, the provider opens the
+   * queued message as a turn of its own, the server adopts that turn with no
+   * seam, and the live-work poll re-attached this pane to it over the very rows
+   * it had been showing a moment before. A *local* continuation never lost
+   * them, because `claimContinuation` repoints an idle pane without touching a
+   * row; this is the same rule for the served one.
+   *
+   * Only for a pane that was live on this conversation and whose run has ended.
+   * Its rows were drawn from the stream, and the run being attached is a later
+   * turn of the same conversation, so nothing in the replay overlaps them. A
+   * pane with no run on the session holds a stored snapshot, or nothing — and a
+   * snapshot taken while the turn was already running has part of the turn in
+   * it, so keeping it under the run's replay would draw that turn twice. The
+   * reset stays the honest choice there, and the seam the honest cure.
+   */
+  const keepRows =
+    handle.historyOffset === undefined &&
+    handle.sessionId !== undefined &&
+    previous.run !== null &&
+    previous.run.status === 'ended' &&
+    previous.run.sessionId === handle.sessionId &&
+    !pane.transcript.isEmpty;
+
   replayBuffers.set(handle.runId, []);
-  // The transcript is about to be rebuilt from the first retained event, so
-  // the gate's memory of this run belongs to a drawing that no longer exists.
-  // Left in place it would silently drop the whole replay.
-  appliedSeqs.delete(handle.runId);
-  pane.transcript.reset();
+  if (!keepRows) {
+    // The transcript is about to be rebuilt from the first retained event, so
+    // the gate's memory of this run belongs to a drawing that no longer exists.
+    // Left in place it would silently drop the whole replay.
+    appliedSeqs.delete(handle.runId);
+    pane.transcript.reset();
+  }
   setPaneState(pane, {
     run: fromHandle(handle),
     activeProviderId: handle.providerId,
@@ -7901,8 +7933,9 @@ async function attachRun(pane: Pane, handle: RunHandle): Promise<void> {
     cwd: handle.cwd,
     // The reset above took every row; the two reads below put them back. Until
     // they do — or give up — this pane is a conversation being read in, not a
-    // new one. See `blankTranscript`, and the clear in the `finally`.
-    historyLoading: true,
+    // new one. See `blankTranscript`, and the clear in the `finally`. A pane
+    // that kept its rows has nothing to wait for.
+    historyLoading: !keepRows,
     permissionQueue: [],
     ...(sameSession
       ? {}
@@ -10953,7 +10986,16 @@ async function attachServedRun(pane: Pane, sessionId: SessionId): Promise<boolea
       return false;
     }
     servedAttachDeclined.delete(sessionId);
-    await attachRun(pane, result.value.run);
+    /*
+     * The handle `runs.start` answers with is the registry's first snapshot,
+     * taken before the run's own `session.started` has been pumped, so it
+     * names no session. Handed over as it is, `attachRun` could neither read
+     * the history above the seam (`replayEarlierTurns` reads nothing for a
+     * run whose session is unknown) nor tell that this pane already holds the
+     * conversation. The session is the one this attach was asked for.
+     */
+    const joined = result.value.run;
+    await attachRun(pane, joined.sessionId === undefined ? { ...joined, sessionId } : joined);
     return true;
   } finally {
     servedAttaching.delete(sessionId);

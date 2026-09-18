@@ -790,6 +790,10 @@ export function createHeadlessHost(
         runId: query.runId as never,
         env: await envFor(query.profileId as ProfileId, profile.providerId),
         ...(query.cwd === undefined ? {} : { cwd: query.cwd }),
+        // The page the route was asked for, in the adapter's own unit — the
+        // same stored messages `countSessionMessages` answers in.
+        ...(query.limit === undefined ? {} : { limit: query.limit }),
+        ...(query.offset === undefined ? {} : { offset: query.offset }),
       });
     },
     /*

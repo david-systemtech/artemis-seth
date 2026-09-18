@@ -389,6 +389,10 @@ export interface SessionSource {
     readonly sessionId: string;
     readonly runId: string;
     readonly cwd?: string;
+    /** Page size in stored messages; the whole conversation when absent. */
+    readonly limit?: number;
+    /** Page offset in stored messages. Defaults to 0. */
+    readonly offset?: number;
   }): Promise<{ readonly events: readonly AgentEvent[]; readonly hasMore: boolean }>;
   /**
    * Store a title against a session, exactly as a local rename would.
@@ -1072,6 +1076,24 @@ export async function handleServerRequest(
     }
     const entry = context.ledger.get(sessionId);
     if (entry === undefined) return unknownSession();
+    /*
+     * The page the client asked for. A window attaching to a run in progress
+     * reads the turns *before* it as `limit: historyOffset` — see `RunHandle`
+     * — and until these were read the route answered the whole file under
+     * that ask, so the turn in progress was drawn once from the file and
+     * again from the run. Anything but a whole number is refused outright
+     * rather than read as "everything": a client that sent a limit meant one.
+     */
+    const limit = pageNumber(url.searchParams.get('limit'));
+    const offset = pageNumber(url.searchParams.get('offset'));
+    if (limit === 'invalid' || offset === 'invalid') {
+      return fail(
+        400,
+        'invalid_request_error',
+        'invalid_page',
+        '`limit` and `offset` must be whole numbers.',
+      );
+    }
     const replay = await context.sessions.messages({
       profileId: entry.profileId,
       sessionId,
@@ -1079,6 +1101,8 @@ export async function handleServerRequest(
       // and the consumer re-stamps them into its own transcript anyway.
       runId: `server-replay:${sessionId}`,
       cwd: entry.cwd,
+      ...(limit === undefined ? {} : { limit }),
+      ...(offset === undefined ? {} : { offset }),
     });
     const body: ServerSessionMessagesBody = {
       object: 'artemis.session.messages',
@@ -1098,6 +1122,21 @@ export async function handleServerRequest(
 
   return fail(404, 'invalid_request_error', 'unknown_endpoint', `No route for ${path}.`);
 }
+
+/**
+ * A page number off the query string: absent, a whole number, or junk.
+ *
+ * Three answers rather than two because the route has to tell "no page asked
+ * for" from "a page asked for badly". The first is the whole conversation, as
+ * the route has always answered; the second is refused, because a client that
+ * sent a limit meant one, and reading it as "everything" would hand back the
+ * exact over-read the parameter exists to prevent.
+ */
+function pageNumber(raw: string | null): number | undefined | 'invalid' {
+  if (raw === null) return undefined;
+  return /^\d+$/.test(raw) ? Number(raw) : 'invalid';
+}
+
 
 /**
  * The index: what this server is and where the rest of it is.
@@ -3717,7 +3756,16 @@ function chunkFor(
     // it does.
     case 'run':
       hooks.claim?.(event.runId);
-      return chatChunk({ ...frame, delta: {}, ...stamped({ runId: event.runId }) });
+      return chatChunk({
+        ...frame,
+        delta: {},
+        ...stamped({
+          runId: event.runId,
+          // The seam beside the address, when the registry measured one: the
+          // client that started this run is the one that cannot count it.
+          ...(event.historyOffset === undefined ? {} : { historyOffset: event.historyOffset }),
+        }),
+      });
 
     // A prompt the run is parked on, or the news that it is settled. Only for
     // a caller that asked for these; see `ArtemisRemoteOptions`. Its answer

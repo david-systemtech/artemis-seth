@@ -394,6 +394,13 @@ export interface ArtemisResponseExtensions {
    * moment it needs it is usually the moment the stream has already broken.
    */
   readonly runId?: string;
+  /**
+   * How many stored messages the conversation held when the run began — the
+   * seam between what `/api/v0/sessions/{id}/messages` should be read up to
+   * and what this stream carries. Beside `runId` on the announcement chunk,
+   * when the server measured it. See `RunHandle.historyOffset`.
+   */
+  readonly historyOffset?: number;
   /** The concrete model that ran, when the route named an alias. */
   readonly resolvedModel?: string;
   /**

@@ -577,6 +577,11 @@ class ArtemisRun implements Run {
    * for a run that did not.
    */
   readonly #attach: { readonly runId: RunId; readonly historyOffset: number | undefined } | undefined;
+  /**
+   * The seam the server measured for a run this side started, learned off the
+   * stream's run announcement. See {@link historyOffset}.
+   */
+  #wireHistoryOffset: number | undefined;
 
   constructor(
     input: ResolvedRunInput,
@@ -658,8 +663,19 @@ class ArtemisRun implements Run {
     });
   }
 
+  /**
+   * How much of the conversation predates this run, once known.
+   *
+   * Two sources, never both. A run joining a turn in progress was told by the
+   * server's run list before it opened ({@link attach}). A run this side
+   * started is told on the stream, beside the run id, because the server took
+   * the count before it spawned the provider and this side never could — the
+   * conversation lives over there. The registry reads this at every snapshot
+   * (see `Run.historyOffset`), so a window that reloads mid-turn rebuilds the
+   * conversation above the seam instead of showing the turn alone.
+   */
   get historyOffset(): number | undefined {
-    return this.#attach?.historyOffset;
+    return this.#attach?.historyOffset ?? this.#wireHistoryOffset;
   }
 
   get status(): RunStatus {
@@ -1152,6 +1168,12 @@ class ArtemisRun implements Run {
     // Learned like the session id: the server announces it once and early,
     // and every native run route addresses it from here on.
     if (extensions?.runId !== undefined) this.#remoteRunId = extensions.runId as RunId;
+    // The seam, announced beside the run id. The first reading stands: a
+    // reconnect replays the announcement, and the count is a fact about how
+    // the run began, not about the stream that is carrying it now.
+    if (extensions?.historyOffset !== undefined && this.#wireHistoryOffset === undefined) {
+      this.#wireHistoryOffset = extensions.historyOffset;
+    }
     /*
      * A park stands in the thread where it was raised, so the block in
      * progress closes before the card is drawn.
@@ -1817,11 +1839,21 @@ export function createArtemisAdapter(
      * The server already speaks `AgentEvent` — its replay is the engine's own
      * — so the only translation is the run id: events are re-stamped with the
      * caller's, which is what lands them in the transcript that asked.
+     *
+     * The page asked for is the page sent. `limit` is how a window attaching
+     * to a run in progress reads only the turns *before* it — `limit:
+     * historyOffset`, see `RunHandle` — and until it crossed the wire the
+     * server answered the whole file under that ask, the turn in progress
+     * included, under the very replay that was about to draw that turn again.
      */
     async getSessionMessages(query: SessionMessagesQuery): Promise<SessionTranscript> {
       const root = baseUrl(query.env);
+      const page = new URLSearchParams();
+      if (query.limit !== undefined) page.set('limit', String(query.limit));
+      if (query.offset !== undefined) page.set('offset', String(query.offset));
+      const search = page.toString();
       const response = await fetch(
-        `${root}${API_PREFIX}/sessions/${encodeURIComponent(String(query.sessionId))}/messages`,
+        `${root}${API_PREFIX}/sessions/${encodeURIComponent(String(query.sessionId))}/messages${search.length === 0 ? '' : `?${search}`}`,
         { headers: authHeaders(query.env), signal: AbortSignal.timeout(15_000) },
       );
       if (!response.ok) {

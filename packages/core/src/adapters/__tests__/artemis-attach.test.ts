@@ -269,3 +269,62 @@ describe('a stream that heartbeats while the run moves on without it', () => {
     await run.dispose();
   });
 });
+
+describe('a run this side started learns the seam its server measured', () => {
+  const STARTED_INPUT = {
+    runId: 'run-local-2',
+    providerId: 'artemis',
+    profileId: 'prof-a',
+    cwd: '/w',
+    prompt: 'keep going',
+    model: 'work-max/opus',
+    resumeSessionId: 'sess-9',
+    env: ENV,
+  } as unknown as ResolvedRunInput;
+
+  it('reads it off the run announcement, and the first reading stands', async () => {
+    /*
+     * The conversation lives on the server, so the registry on this side
+     * cannot count it before the run starts — the one moment the count is
+     * exact. The server took it then, and says so beside the run id. Without
+     * it a window that reloaded mid-turn drew the turn alone.
+     */
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) => {
+        const address = String(url);
+        if (address.endsWith('/v1/chat/completions')) {
+          return sseResponse([
+            chunk({}, { runId: 'srv-run', historyOffset: 12 }),
+            chunk({ content: 'hi' }, { seq: 0 }),
+            // A replayed announcement cannot move it: the count is a fact
+            // about how the run began.
+            chunk({}, { runId: 'srv-run', historyOffset: 99 }),
+            DONE,
+          ]);
+        }
+        throw new Error(`unexpected request: ${address}`);
+      }),
+    );
+
+    const run = await createArtemisAdapter().createRun(STARTED_INPUT);
+    const events = await drain(run.events);
+
+    expect(run.historyOffset).toBe(12);
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+  });
+
+  it('stays unknown on a server that does not say', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => sseResponse([chunk({}, { runId: 'srv-run' }), DONE])),
+    );
+
+    const run = await createArtemisAdapter().createRun(STARTED_INPUT);
+    await drain(run.events);
+
+    // Not zero: a reader must not take an old server's silence for "the
+    // whole file belongs to this run".
+    expect(run.historyOffset).toBeUndefined();
+  });
+});

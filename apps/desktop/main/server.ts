@@ -257,12 +257,17 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       readonly sessionId: string;
       readonly runId: string;
       readonly cwd?: string;
+      readonly limit?: number;
+      readonly offset?: number;
     }) =>
       options.engine.require().getSessionMessages({
         profileId: query.profileId as never,
         sessionId: query.sessionId as never,
         runId: query.runId as never,
         ...(query.cwd === undefined ? {} : { cwd: query.cwd }),
+        // The page the route was asked for; see `SessionSource.messages`.
+        ...(query.limit === undefined ? {} : { limit: query.limit }),
+        ...(query.offset === undefined ? {} : { offset: query.offset }),
       }),
     // The three writes, delegated to the same engine handlers the sidebar
     // uses, so a rename over the wire and a rename from the window are one

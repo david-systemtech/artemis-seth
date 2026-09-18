@@ -289,11 +289,18 @@ export interface Run {
   readonly sessionId: SessionId | undefined;
 
   /**
-   * How many stored messages predate the turn this run follows, for a run
-   * attached to one already going (`RunInput.attachToLive`). The registry
-   * measures that seam for a run it starts; one that joins a turn in progress
-   * can only be told by the side serving it. Absent when the run is its own
-   * turn.
+   * How many stored messages predate the turn this run follows, when the
+   * adapter is the side that knows.
+   *
+   * The registry measures that seam for a run it starts, before the provider
+   * is spawned. Three kinds of run can only be told later, and report it here:
+   * one that joins a turn already going (`RunInput.attachToLive`), whose seam
+   * the serving side measured when the turn began; a turn the provider opened
+   * on its own, which counts the conversation the moment it announces itself;
+   * and a served run, which learns the seam its server measured off the
+   * stream. It may therefore become defined after the run has started — the
+   * registry reads it whenever a handle is snapshotted, never only once.
+   * Absent while unknown, which a reader must not take for zero.
    */
   readonly historyOffset?: number;
 

@@ -29,6 +29,7 @@ import {
   focusedPane,
   handleAgentEvent,
   refreshLiveWork,
+  resetRunStreamState,
   resumeSession,
   splitPane,
   submitPrompt,
@@ -88,6 +89,10 @@ let disposedRuns: string[] = [];
  * for the conversation it is joining, pushed the moment the run exists.
  */
 let announceOnStart = false;
+/** The seam the server reports for a served attach; `undefined` is a turn the provider opened on its own. */
+let attachSeam: number | undefined = 0;
+/** Whether the engine's first handle for a served attach names its session. */
+let nameless = false;
 
 function liveRun(runId: string, sessionId: string, status = 'running') {
   return {
@@ -154,9 +159,24 @@ function session(id: string) {
             resumedFrom: input.resumeSessionId,
           } as never);
         }
+        const { historyOffset: _seam, sessionId: _named, ...bare } = liveRun(
+          input.runId,
+          input.resumeSessionId,
+        );
         return {
           ok: true,
-          value: { run: { ...liveRun(input.runId, input.resumeSessionId), providerId: 'artemis' } },
+          value: {
+            run: {
+              ...bare,
+              providerId: 'artemis',
+              // A turn the provider opened on its own is adopted by the server
+              // with no seam; see `attachRun` on what the pane does then.
+              ...(attachSeam === undefined ? {} : { historyOffset: attachSeam }),
+              // The engine's first handle is a snapshot taken before the run's
+              // own `session.started` has been pumped, so it names no session.
+              ...(nameless ? {} : { sessionId: input.resumeSessionId }),
+            },
+          },
         };
       }
       return { ok: false, error: { code: 'unknown', message: 'unexpected rival run' } };
@@ -239,6 +259,8 @@ beforeEach(() => {
   attachedInputs = [];
   disposedRuns = [];
   announceOnStart = false;
+  attachSeam = 0;
+  nameless = false;
 });
 
 afterEach(() => {
@@ -502,5 +524,129 @@ describe('opening a conversation from the sidebar', () => {
     expect(sent).toBe(true);
     expect(steeredRuns).toEqual(['r-live']);
     expect(startedRuns).toHaveLength(0);
+  });
+});
+
+describe('a served pane whose turn ended, re-attached to the turn that followed', () => {
+  /** What the focused pane shows, row by row. */
+  function rows(): string {
+    const transcript = focusedPane().transcript;
+    transcript.flush();
+    return transcript
+      .getListSnapshot()
+      .map((id) => (transcript.getItem(id) as { text?: string } | undefined)?.text ?? '')
+      .join('|');
+  }
+
+  /** A pane that was live on `sv3`, drew a row from its stream, and whose turn then ended. */
+  function paneThatWasLive() {
+    setPaneState(focusedPane(), {
+      resumeSessionId: 'sv3',
+      activeProviderId: 'artemis',
+      activeProfileId: 'p-served',
+      run: { ...liveRun('old-run', 'sv3'), providerId: 'artemis' },
+    } as never);
+    handleAgentEvent(say('old-run', 'earlier words'));
+    setPaneState(focusedPane(), {
+      run: { ...liveRun('old-run', 'sv3', 'ended'), providerId: 'artemis', endReason: 'interrupted' },
+    } as never);
+    mainProcessRuns = [];
+    workingSessions = ['sv3'];
+  }
+
+  beforeEach(() => {
+    // Run ids repeat across these cases; the gate must not remember the last one's.
+    resetRunStreamState();
+    focusedPane().transcript.reset();
+  });
+
+  afterEach(() => {
+    setPaneState(focusedPane(), {
+      resumeSessionId: null,
+      run: null,
+      activeProviderId: 'claude',
+      activeProfileId: 'p1',
+    } as never);
+  });
+
+  it('keeps its rows when the server has no seam for the next turn', async () => {
+    /*
+     * Reported 2026-09-18: "read now" on a queued message interrupts the turn,
+     * the provider opens the message as a turn of its own, the server adopts
+     * it with no seam, and the live-work poll re-attached the pane to it —
+     * over the very conversation it had just been showing. With no seam there
+     * is no history read, so the reset left the pane holding the new turn
+     * alone.
+     */
+    paneThatWasLive();
+    attachSeam = undefined;
+
+    await refreshLiveWork();
+
+    expect(attachedInputs).toHaveLength(1);
+    const attached = attachedInputs[0]?.runId;
+    expect(paneState(focusedPane()).run).toMatchObject({ runId: attached, status: 'running' });
+    expect(rows()).toBe('earlier words');
+    expect(historyRead).toEqual([]);
+    expect(paneState(focusedPane()).historyLoading).toBe(false);
+
+    // The next turn's words land under the ones kept.
+    handleAgentEvent(say(attached as string, 'newer words'));
+    expect(rows()).toBe('earlier words|newer words');
+  });
+
+  it('rebuilds from the seam when the server measured one', async () => {
+    // The exact rebuild — history up to the seam, the run under it — is the
+    // right answer whenever there is a seam; rows kept blind are the fallback.
+    paneThatWasLive();
+    attachSeam = 4;
+
+    await refreshLiveWork();
+
+    expect(attachedInputs).toHaveLength(1);
+    expect(historyRead).toEqual(['sv3']);
+    expect(rows()).not.toContain('earlier words');
+  });
+
+  it('reads the history above the seam even when the engine has not yet named the session', async () => {
+    /*
+     * `runs.start` answers with the registry's first snapshot, taken before
+     * the run's own `session.started` has been pumped, so it names no session
+     * — and a history read needs one. The attach knows which conversation it
+     * asked for.
+     */
+    paneThatWasLive();
+    attachSeam = 4;
+    nameless = true;
+
+    await refreshLiveWork();
+
+    expect(historyRead).toEqual(['sv3']);
+    expect(paneState(focusedPane()).run).toMatchObject({ sessionId: 'sv3' });
+  });
+
+  it('still resets a pane that holds only a stored snapshot', async () => {
+    /*
+     * A snapshot read while the turn was already running has part of the turn
+     * in it; kept under the run's replay, that part would be drawn twice.
+     * Without a seam the reset is the honest choice: the turn alone, rather
+     * than a conversation with a turn in it twice.
+     */
+    setPaneState(focusedPane(), {
+      resumeSessionId: 'sv3',
+      activeProviderId: 'artemis',
+      activeProfileId: 'p-served',
+      run: null,
+    } as never);
+    focusedPane().transcript.apply(say('history:sv3', 'a stored row'));
+    expect(rows()).toBe('a stored row');
+    mainProcessRuns = [];
+    workingSessions = ['sv3'];
+    attachSeam = undefined;
+
+    await refreshLiveWork();
+
+    expect(attachedInputs).toHaveLength(1);
+    expect(rows()).not.toContain('a stored row');
   });
 });

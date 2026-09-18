@@ -533,6 +533,14 @@ type TurnEventBody =
        */
       readonly kind: 'run';
       readonly runId: RunId;
+      /**
+       * How many stored messages the conversation held when the run began,
+       * when the registry measured it. Rides the announcement so the client
+       * that started the run — which could not take the count itself, the
+       * conversation being on this side — can rebuild the conversation above
+       * the turn after a reload. See `RunHandle.historyOffset`.
+       */
+      readonly historyOffset?: number;
     }
   | {
       /**
@@ -1123,7 +1131,11 @@ export async function* runTurn(
     }
 
     runId = handle.runId;
-    yield { kind: 'run', runId };
+    yield {
+      kind: 'run',
+      runId,
+      ...(handle.historyOffset === undefined ? {} : { historyOffset: handle.historyOffset }),
+    };
     yield* translator.announce(handle.sessionId === undefined ? undefined : String(handle.sessionId));
 
     // Events that arrived while `startRun` was in flight were queued with no
@@ -1351,8 +1363,15 @@ export async function* resumeTurn(
         : await source.runEvents({ runId });
 
     // The run id first, as on the original stream: a client rebuilding from
-    // nothing learns the address before anything addressed to it.
-    yield { kind: 'run', runId };
+    // nothing learns the address before anything addressed to it. The seam
+    // rides with it while the registry still knows the run, so a client that
+    // joins a turn in progress is told where the history it reads should end.
+    const handle = source.getRun === undefined ? undefined : await source.getRun(runId);
+    yield {
+      kind: 'run',
+      runId,
+      ...(handle?.historyOffset === undefined ? {} : { historyOffset: handle.historyOffset }),
+    };
     const first = replay.events[0]?.seq;
     if (first !== undefined && first > after + 1) {
       yield { kind: 'gap', afterSeq: after, firstSeq: first };

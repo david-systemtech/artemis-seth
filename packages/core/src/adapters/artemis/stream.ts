@@ -55,6 +55,15 @@ export interface ServerExtensionsDelta {
    */
   readonly runId?: string;
   /**
+   * How many stored messages the conversation held when the server's run
+   * began — the seam between the history a client reads off
+   * `/api/v0/sessions/{id}/messages` and the turn this stream carries. Beside
+   * `runId` on the announcement chunk, when the server measured it. A server
+   * older than this field sends none, and the seam stays unknown, which every
+   * client already handled. See `RunHandle.historyOffset`.
+   */
+  readonly historyOffset?: number;
+  /**
    * The resume cursor: the sequence number of the run event this chunk came
    * from. Remembered by the adapter, and handed back on
    * `GET /api/v0/runs/{id}/stream?after=N` when the stream has to be picked
@@ -217,6 +226,10 @@ function readExtensions(value: unknown): ServerExtensionsDelta | undefined {
   }
   const runId = asString(record['runId']);
   if (runId !== undefined) out.runId = runId;
+  const historyOffset = record['historyOffset'];
+  if (typeof historyOffset === 'number' && Number.isInteger(historyOffset) && historyOffset >= 0) {
+    out.historyOffset = historyOffset;
+  }
   const error = asString(record['error']);
   if (error !== undefined) out.error = error;
   if (typeof record['seq'] === 'number' && Number.isInteger(record['seq'])) out.seq = record['seq'];

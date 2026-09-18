@@ -1,0 +1,245 @@
+/**
+ * A turn the CLI opens on its own measures where the conversation ends and it
+ * begins.
+ *
+ * The registry takes a started run's seam before the CLI is spawned. A turn
+ * the CLI opens by itself — the queued message it answers after an interrupt,
+ * the task notification it replies to — is adopted with none, and a window
+ * that joined such a turn on the server had nothing to read history up to: it
+ * drew the turn alone, over a conversation it had been showing a moment before
+ * (2026-09-18, a served session, after "read now" on a queued message). The
+ * process knows what the registry cannot: the `init` that announces the turn
+ * comes after the CLI has filed the message that opened it and before a word
+ * of its answer, so a count taken then *is* the seam.
+ *
+ * These pin that the count is taken when the turn announces itself, that it
+ * lands on the adopted run, and that a read that fails leaves the seam unknown
+ * rather than the turn broken.
+ */
+
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import type { AgentEvent, RunId } from '@rx-artemis/protocol';
+import type { SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+
+const sdkMock = vi.hoisted(() => ({
+  onQuery: undefined as ((params: { prompt: unknown; options?: unknown }) => unknown) | undefined,
+  /** What the session file holds when it is read. */
+  stored: [] as unknown[],
+  /** Every read of a stored session, as the SDK was asked. */
+  reads: [] as { sessionId: string; options: unknown }[],
+  failReads: false,
+}));
+
+vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
+  query: (params: { prompt: unknown; options?: unknown }) => {
+    if (sdkMock.onQuery === undefined) throw new Error('test did not install a query hook');
+    return sdkMock.onQuery(params);
+  },
+  listSessions: () => Promise.resolve([]),
+  getSessionMessages: (sessionId: string, options: unknown) => {
+    sdkMock.reads.push({ sessionId, options });
+    if (sdkMock.failReads) return Promise.reject(new Error('transcript unreadable'));
+    return Promise.resolve(sdkMock.stored);
+  },
+}));
+
+const { createClaudeAdapter } = await import('../claude.js');
+const { AsyncQueue } = await import('../stream.js');
+type ResolvedRunInput = import('../types.js').ResolvedRunInput;
+type Run = import('../types.js').Run;
+
+class FakeQuery {
+  readonly messages = new AsyncQueue<SDKMessage>();
+  closed = false;
+  [Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+    return this.messages[Symbol.asyncIterator]();
+  }
+  interrupt(): Promise<{ still_queued: string[] }> {
+    return Promise.resolve({ still_queued: [] });
+  }
+  async setModel(): Promise<void> {}
+  async setPermissionMode(): Promise<void> {}
+  async applyFlagSettings(): Promise<void> {}
+  close(): void {
+    this.closed = true;
+    this.messages.close();
+  }
+}
+
+function installQuery(): { fake: () => FakeQuery; prompts: () => AsyncIterable<SDKUserMessage> } {
+  let captured: { fake: FakeQuery; prompt: AsyncIterable<SDKUserMessage> } | undefined;
+  sdkMock.onQuery = (params) => {
+    const fake = new FakeQuery();
+    captured = { fake, prompt: params.prompt as AsyncIterable<SDKUserMessage> };
+    return fake;
+  };
+  return {
+    fake: () => {
+      if (captured === undefined) throw new Error('query() was never called');
+      return captured.fake;
+    },
+    prompts: () => {
+      if (captured === undefined) throw new Error('query() was never called');
+      return captured.prompt;
+    },
+  };
+}
+
+const BASE_INPUT: ResolvedRunInput = {
+  runId: 'run-1',
+  providerId: 'claude',
+  profileId: 'prof-1',
+  cwd: process.cwd(),
+  prompt: 'launch a subagent',
+  env: {},
+} as ResolvedRunInput;
+
+const INIT: SDKMessage = {
+  type: 'system',
+  subtype: 'init',
+  session_id: 'sess-abc',
+  cwd: process.cwd(),
+  model: 'claude-opus-4',
+  tools: [],
+  slash_commands: [],
+  permissionMode: 'default',
+  claude_code_version: '2.1.226',
+  mcp_servers: [],
+  apiKeySource: 'user',
+  output_style: 'default',
+  skills: [],
+  plugins: [],
+  uuid: 'init-1',
+} as unknown as SDKMessage;
+
+const RESULT: SDKMessage = {
+  type: 'result',
+  subtype: 'success',
+  is_error: false,
+  duration_ms: 100,
+  duration_api_ms: 90,
+  num_turns: 1,
+  result: 'done',
+  stop_reason: 'end_turn',
+  total_cost_usd: 0.01,
+  usage: { input_tokens: 1, output_tokens: 2 },
+  modelUsage: {},
+  permission_denials: [],
+  session_id: 'sess-abc',
+  uuid: 'result-1',
+} as unknown as SDKMessage;
+
+function tasksChanged(tasks: readonly { task_id: string; description: string }[]): SDKMessage {
+  return {
+    type: 'system',
+    subtype: 'background_tasks_changed',
+    tasks: tasks.map((task) => ({ ...task, task_type: 'local_subagent', status: 'running' })),
+    session_id: 'sess-abc',
+    uuid: `tasks-${String(tasks.length)}`,
+  } as unknown as SDKMessage;
+}
+
+function assistantText(text: string, id = 'msg-a'): SDKMessage {
+  return {
+    type: 'assistant',
+    message: { id, role: 'assistant', content: [{ type: 'text', text }] },
+    session_id: 'sess-abc',
+    uuid: `u-${id}`,
+    parent_tool_use_id: null,
+  } as unknown as SDKMessage;
+}
+
+async function drain(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
+  const out: AgentEvent[] = [];
+  for await (const event of events) out.push(event);
+  return out;
+}
+
+/** Wait for the next prompt the adapter pushed at the CLI. */
+async function nextPrompt(prompts: AsyncIterator<SDKUserMessage>): Promise<SDKUserMessage> {
+  const next = await prompts.next();
+  if (next.done === true) throw new Error('the prompt queue closed');
+  return next.value;
+}
+
+/**
+ * A process left alive by a subagent: the first turn launched one and ended.
+ * Whatever the CLI says next opens a turn of its own.
+ */
+async function processHoldingWork() {
+  const adopted: Run[] = [];
+  let n = 0;
+  const adapter = createClaudeAdapter({
+    onContinuation: (run) => adopted.push(run),
+    newRunId: () => `run-c${String(++n)}` as RunId,
+  });
+  const query = installQuery();
+  const first = await adapter.createRun(BASE_INPUT);
+  const prompts = query.prompts()[Symbol.asyncIterator]();
+  await nextPrompt(prompts);
+
+  const fake = query.fake();
+  fake.messages.push(INIT);
+  fake.messages.push(tasksChanged([{ task_id: 't1', description: 'sleep then report' }]));
+  fake.messages.push(RESULT);
+  await drain(first.events);
+  expect(fake.closed).toBe(false);
+  // Nothing was read to get here: the seam is a continuation's concern.
+  expect(sdkMock.reads).toEqual([]);
+
+  return { fake, adopted };
+}
+
+afterEach(() => {
+  sdkMock.onQuery = undefined;
+  sdkMock.stored = [];
+  sdkMock.reads = [];
+  sdkMock.failReads = false;
+});
+
+describe('a turn the CLI opens on its own', () => {
+  it('counts the conversation the moment the turn announces itself, and reports it on the run', async () => {
+    const { fake, adopted } = await processHoldingWork();
+    // What the session file holds when the CLI opens its next turn: the
+    // conversation so far and the message that opened the turn, and not one
+    // word of the answer.
+    sdkMock.stored = new Array<unknown>(6).fill({ type: 'user' });
+
+    fake.messages.push(INIT);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    const turn = adopted[0] as Run;
+    await vi.waitFor(() => expect(turn.historyOffset).toBe(6));
+
+    // Read from the conversation's own store and directory, as every read is.
+    expect(sdkMock.reads).toEqual([{ sessionId: 'sess-abc', options: { dir: process.cwd() } }]);
+
+    fake.messages.push(assistantText('The subagent returned early.', 'msg-notif'));
+    fake.messages.push(RESULT);
+    const events = await drain(turn.events);
+    expect(events.find((e) => e.type === 'text.complete')).toMatchObject({
+      text: 'The subagent returned early.',
+    });
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+  });
+
+  it('leaves the seam unknown when the store cannot be read, and the turn untouched', async () => {
+    const { fake, adopted } = await processHoldingWork();
+    sdkMock.failReads = true;
+
+    fake.messages.push(INIT);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    await vi.waitFor(() => expect(sdkMock.reads).toHaveLength(1));
+    const turn = adopted[0] as Run;
+
+    fake.messages.push(assistantText('still here', 'msg-2'));
+    fake.messages.push(RESULT);
+    const events = await drain(turn.events);
+
+    // Unknown, not zero: a zero would tell a window the whole file is this
+    // turn's, and it would draw the conversation twice.
+    expect(turn.historyOffset).toBeUndefined();
+    expect(events.find((e) => e.type === 'text.complete')).toMatchObject({ text: 'still here' });
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+  });
+});
