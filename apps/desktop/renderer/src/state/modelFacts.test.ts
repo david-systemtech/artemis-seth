@@ -310,3 +310,44 @@ describe('recommendModel', () => {
     expect(recommendModel(PINNED, undefined, fableOut, NOW)).toBeNull();
   });
 });
+
+/**
+ * A window whose reset has passed since it was read says nothing about now.
+ * The protocol's own helpers drop it (`currentWindow`); these scan for
+ * themselves, so they have to as well — or a model stays struck through as
+ * "limit reached" for a poll cycle after its limit came back.
+ */
+describe('a bucket that has rolled over since it was read', () => {
+  const READ_AT = NOW - 10 * 60_000;
+  const RESET_AT = NOW - 60_000;
+
+  it('no longer refuses the model, and no longer counts as its pressure', () => {
+    const stale = usage(
+      [
+        { id: 'five_hour', utilization: 12, resetsAt: NOW + 3_600_000 },
+        { id: 'model_scoped:Fable', utilization: 100, status: 'rejected', resetsAt: RESET_AT },
+      ],
+      READ_AT,
+    );
+
+    expect(modelScopedWindow(FABLE_LIVE, stale, NOW)).toBeNull();
+    expect(modelExhaustion(FABLE_LIVE, stale, NOW)).toBeNull();
+    // What is left is the window that is still running.
+    expect(modelPressure(FABLE_LIVE, stale, NOW)?.window.id).toBe('five_hour');
+    // Before the reset it was exactly what it said.
+    expect(modelExhaustion(FABLE_LIVE, stale, RESET_AT - 1)).not.toBeNull();
+  });
+
+  it('drops a lapsed shared window from the pressure too', () => {
+    const stale = usage(
+      [
+        { id: 'five_hour', utilization: 100, resetsAt: RESET_AT },
+        { id: 'seven_day', utilization: 40, resetsAt: NOW + 86_400_000 },
+      ],
+      READ_AT,
+    );
+
+    expect(modelPressure(SONNET, stale, NOW)?.window.id).toBe('seven_day');
+    expect(modelPressure(SONNET, stale, RESET_AT - 1)?.window.id).toBe('five_hour');
+  });
+});

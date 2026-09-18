@@ -34,6 +34,7 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type {
+  AgentEvent,
   PlanUsage,
   ProfileId,
   ProviderId,
@@ -43,6 +44,7 @@ import type {
   ServerMemoryBankScope,
   SessionDelegatedWork,
 } from '@rx-artemis/protocol';
+import { applyPlanLimit, mergePlanUsage } from '@rx-artemis/protocol';
 import {
   composeAlwaysOnSkills,
   skillSourceIdFor,
@@ -510,35 +512,124 @@ export function createHeadlessHost(
   };
 
   /**
-   * The gauges, read where the accounts are and cached where they are read.
+   * The gauges, read where the accounts are and held once per account.
    *
    * A reading is a CLI control call per account, so one is allowed to be a
    * minute old — the same tolerance the desktop's own poller extends to an
-   * idle profile. Failures cache too, briefly, so an account whose CLI is
+   * idle profile. Failures are held too, briefly, so an account whose CLI is
    * wedged does not get probed on every request.
+   *
+   * Three things this is careful about, and it used to be careful about none
+   * of them. All three produce the same symptom at the far end — two clients
+   * on one account reading two different numbers — which is why they are one
+   * cache rather than three fixes.
+   *
+   * **In-flight reads are shared.** The entry holds the *promise*, exactly as
+   * `commandCache` below does. Two clients polling `/usage` a moment apart
+   * otherwise each spawned a CLI for every account they asked about, and then
+   * the one that answered last won regardless of which had the later truth.
+   *
+   * **Readings merge.** `mergePlanUsage` settles two accounts of one gauge per
+   * window rather than per snapshot, so a slow read cannot undo a fast one and
+   * a live `plan.limit` verdict cannot undo a poll that has since re-read the
+   * window it was about.
+   *
+   * **A served run's verdicts land here.** The provider states a limit on every
+   * API response, and those responses are this machine's runs — so the gauge a
+   * remote client is shown is corrected within seconds of the provider deciding
+   * something, rather than at the next cache expiry. See the subscription below.
    */
   const USAGE_CACHE_MS = 60_000;
-  const usageCache = new Map<string, { at: number; row: { profileId: string; label: string; usage: PlanUsage } }>();
+  /** One account's reading, and the label the row carries it under. */
+  type UsageRow = { readonly label: string; readonly usage: PlanUsage };
+  /** Per account: when the read behind it started, and what it resolves to. */
+  const usageCache = new Map<string, { readonly at: number; readonly value: Promise<UsageRow> }>();
+
+  /**
+   * Publish an account's reading, and drop it again if it turns out to fail.
+   *
+   * A rejection is not cached: an account whose CLI was away for one request
+   * must not be answered "no" for the rest of the minute by the memory of it.
+   * The identity check is what makes that safe when several of these overlap —
+   * only the entry this call put there is removed.
+   */
+  const remember = (profileId: string, at: number, value: Promise<UsageRow>): Promise<UsageRow> => {
+    usageCache.set(profileId, { at, value });
+    value.catch(() => {
+      if (usageCache.get(profileId)?.value === value) usageCache.delete(profileId);
+    });
+    return value;
+  };
+
+  /** Start one read, publish its promise, and merge what it learns on the way out. */
+  const readUsage = (profileId: string): Promise<UsageRow> => {
+    const held = usageCache.get(profileId);
+    return remember(
+      profileId,
+      Date.now(),
+      (async () => {
+        const profile = await profiles.require(profileId as ProfileId);
+        const adapter = providers.get(profile.providerId);
+        if (adapter?.fetchPlanUsage === undefined) {
+          throw new Error(`${String(profile.providerId)} does not report plan usage.`);
+        }
+        const usage = await adapter.fetchPlanUsage({
+          profileId: profile.id,
+          env: await envFor(profile.id, profile.providerId),
+        } as never);
+        /*
+          Against whatever was held when this started rather than replacing it:
+          a `plan.limit` folded in while this CLI was running is newer about its
+          own window and older about every other, which is exactly the judgement
+          `mergePlanUsage` makes window by window. A failed previous read is not
+          evidence of anything and is merged against as an absence.
+        */
+        const previous = await held?.value.catch(() => undefined);
+        return { label: profile.label, usage: mergePlanUsage(previous?.usage ?? null, usage) };
+      })(),
+    );
+  };
+
+  /**
+   * How many times a read will follow the cache forward before answering.
+   *
+   * Each hop is a merge that landed while the caller was waiting — in practice
+   * one, from a verdict folded in mid-read. The cap is there because the loop
+   * reads a map that other requests are writing, and a bound is cheaper to
+   * reason about than an argument that it cannot go round for ever.
+   */
+  const USAGE_CHAIN_HOPS = 8;
+
   const usageSource: UsageSource = {
     read: async (query) => {
       const rows: { profileId: string; label: string; usage: PlanUsage }[] = [];
       for (const profileId of query.profileIds) {
         const cached = usageCache.get(profileId);
-        if (cached !== undefined && Date.now() - cached.at < USAGE_CACHE_MS) {
-          rows.push(cached.row);
-          continue;
-        }
+        const fresh = cached !== undefined && Date.now() - cached.at < USAGE_CACHE_MS;
         try {
-          const profile = await profiles.require(profileId as ProfileId);
-          const adapter = providers.get(profile.providerId);
-          if (adapter?.fetchPlanUsage === undefined) continue;
-          const usage = await adapter.fetchPlanUsage({
-            profileId: profile.id,
-            env: await envFor(profile.id, profile.providerId),
-          } as never);
-          const row = { profileId, label: profile.label, usage };
-          usageCache.set(profileId, { at: Date.now(), row });
-          rows.push(row);
+          let awaited = fresh && cached !== undefined ? cached.value : readUsage(profileId);
+          let row = await awaited;
+          /*
+            The cache, not the read — the same rule the desktop's refresh handler
+            answers by, and for the same reason.
+
+            A verdict folded in while this read was out replaces the entry with a
+            promise chained off the one being awaited here, so what the caller
+            was waiting on is a reading the cache has already superseded. Without
+            this the client whose request *caused* the read would be the one
+            client shown the un-corrected gauge — a served account refusing
+            requests, reported at its polled percentage, to exactly the client
+            that asked. Every entry this follows is either chained off the
+            promise just resolved or belongs to a later read, so neither can be
+            waiting on this caller.
+          */
+          for (let hop = 0; hop < USAGE_CHAIN_HOPS; hop += 1) {
+            const current = usageCache.get(profileId);
+            if (current === undefined || current.value === awaited) break;
+            awaited = current.value;
+            row = await awaited;
+          }
+          rows.push({ profileId, label: row.label, usage: row.usage });
         } catch {
           // An unreadable gauge is a row that does not appear; the account
           // itself is untouched, and the next request past the cache retries.
@@ -547,6 +638,49 @@ export function createHeadlessHost(
       return rows;
     },
   };
+
+  /**
+   * Fold a served run's live limit verdict into that account's cached gauge.
+   *
+   * The provider states what it is doing with requests on every API response,
+   * and on this machine those responses belong to runs this process is driving.
+   * Without this the served gauge was polled-only: a remote client could be told
+   * "97%" by a cache a few seconds old while this server was being refused
+   * outright on that account — the same "97% but out" the desktop's own fold
+   * exists to correct, one process further away.
+   *
+   * Only an account something has already been read for. A verdict names one
+   * window and rarely carries a percentage, so a gauge built from one alone
+   * would be a nearly-empty reading occupying the cache for a minute and
+   * suppressing the real read behind it.
+   *
+   * The cache's stamp is deliberately *not* moved: a verdict is a correction to
+   * a reading, not a reading, and pushing the expiry out on every API response
+   * would mean the numbers were never re-read at all.
+   */
+  const foldPlanLimit = (event: AgentEvent): void => {
+    if (event.type !== 'plan.limit') return;
+    const profileId = runs.get(event.runId)?.profileId;
+    if (profileId === undefined) return;
+    const held = usageCache.get(String(profileId));
+    if (held === undefined) return;
+    remember(
+      String(profileId),
+      held.at,
+      held.value.then((previous) => {
+        const folded = applyPlanLimit(previous.usage, event.limit, Date.now());
+        if (folded === null) return previous;
+        return { label: previous.label, usage: mergePlanUsage(previous.usage, folded) };
+      }),
+    );
+  };
+
+  /*
+   * Its own subscription rather than a second job for the feed's, which has to
+   * stay exactly one publisher — see the note on `feed` above, where a second
+   * subscription would number every event twice. This one publishes nothing.
+   */
+  runs.subscribe(foldPlanLimit);
 
   /**
    * The slash commands a session on one account would offer, for the route.

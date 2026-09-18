@@ -58,12 +58,13 @@ import {
   type PlanLimitStatus,
   type PlanUsage,
   type PlanUsageWindow,
+  type ProfileId,
 } from '@rx-artemis/protocol';
 
 import { call, resolveBridge } from '../lib/bridge';
 import { formatTokens } from '@rx-artemis/transcript';
 import { useServedAccount } from '../hooks/useServedAccount';
-import { activeCapabilities, useApp } from '../state/store';
+import { acceptPlanUsage, activeCapabilities, useApp } from '../state/store';
 import { useContextReading, type ContextReading } from '../hooks/useContextReading';
 import { usePane, usePaneRef } from '../state/paneContext';
 import { paneState } from '../state/pane';
@@ -396,20 +397,7 @@ function ageHint(fetchedAt: number, now: number): string {
 }
 
 /**
- * The newer of two readings of the same account, or whichever one exists.
- *
- * `fetchedAt` rather than a preference for either source, because neither
- * subsumes the other and which is fresher genuinely alternates — see
- * {@link usePlanUsage}.
- */
-function newerReading(a: PlanUsage | null, b: PlanUsage | null): PlanUsage | null {
-  if (a === null) return b;
-  if (b === null) return a;
-  return b.fetchedAt > a.fetchedAt ? b : a;
-}
-
-/**
- * One profile's plan usage, cached-then-fresh, and never behind the poll.
+ * One profile's plan usage, cached-then-fresh, and the same for everyone.
  *
  * A hook rather than a prop drilled down from one owner, because two unrelated
  * places ask this question about two different profiles: the status bar asks
@@ -422,27 +410,22 @@ function newerReading(a: PlanUsage | null, b: PlanUsage | null): PlanUsage | nul
  * and attributing one account's limits to another is a worse answer than none.
  * A card's profile cannot change, so it passes nothing.
  *
- * ## Two sources, and the rings used to see only one
+ * ## One reading, held once
  *
- * Artemis holds this fact in two places, and for a while they were not
- * connected:
+ * What this returns is **`planUsageByProfile`, and only that**. It used to also
+ * keep the result of its own {@link load} in component state and show whichever
+ * of the two was newer, which put a copy of the account's gauge inside every
+ * mounted meter — one per pane, one per profile card. Each copy was written by
+ * its own refresh and by nothing else, so pressing refresh in one pane moved
+ * that pane and left the pane beside it, the run navigator's footer, the
+ * profile menu and the handoff picker on the older number until the next poll
+ * cycle up to two minutes later. The same account, two numbers, on one screen.
  *
- *  - **This hook's own state**, filled by {@link load} — on mount, on a profile
- *    change, and when the popover opens.
- *  - **`planUsageByProfile`** in the app store, which the main process's poll
- *    pushes into every few minutes for *every* account.
- *
- * The rings rendered the first and never read the second. So the three numbers
- * on the status bar were frozen at whatever the last `load` returned: sit on one
- * account while an agent works through a long job and the 5-hour ring would not
- * move, though the true figure was in the store the whole time, one selector
- * away. Reloading the window fixed it, because that remounts the meter — which
- * is exactly the "I have to refresh to see changes" this was reported as.
- *
- * Neither source subsumes the other, which is why this takes the newer of the
- * two rather than preferring one. The poll is the only thing that keeps an idle
- * account current; the local read is the only thing current in the instant after
- * a profile switch or a manual refresh, before the next cycle comes round.
+ * So `load` now writes what it learns into the store, where every reader is
+ * already looking, and main broadcasts a refresh to every window besides. The
+ * store's own merge decides what is newer — per window, see `mergePlanUsage` —
+ * which is the guard this hook used to keep for itself and could never apply to
+ * anyone else's copy.
  */
 function usePlanUsage(
   profileId: string | null,
@@ -452,24 +435,16 @@ function usePlanUsage(
   readonly refreshing: boolean;
   readonly load: (mode: 'cached' | 'refresh') => Promise<boolean>;
 } {
-  /*
-    The reading is stored *with* the profile it describes, and read back only
-    on a match, rather than being cleared by an effect when `profileId`
-    changes. An effect clears one render too late, and that render is the one
-    that paints the previous account's percentage under the new account's
-    name — the exact mislabelling the in-flight guard below exists to prevent.
-  */
-  const [held, setHeld] = useState<{ readonly of: string; readonly usage: PlanUsage } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const local = held !== null && held.of === profileId ? held.usage : null;
   /*
-    The poll's copy of the same account. Selected by id rather than taking the
-    whole map, so a cycle that re-reads seven *other* profiles does not re-render
-    this meter seven times — the entries are replaced individually, so the one
-    this subscribes to keeps its identity until it is the one that moved.
+    Selected by id rather than taking the whole map, so a cycle that re-reads
+    seven *other* profiles does not re-render this meter seven times — the
+    entries are replaced individually, so the one this subscribes to keeps its
+    identity until it is the one that moved. Reading by id is also what makes a
+    profile switch correct without an effect to clear anything: the selector
+    simply answers about the new account on the very render that changes it.
   */
-  const polled = useApp((s) => (profileId === null ? null : (s.planUsageByProfile[profileId] ?? null)));
-  const usage = newerReading(local, polled);
+  const usage = useApp((s) => (profileId === null ? null : (s.planUsageByProfile[profileId] ?? null)));
 
   /** Resolves true when a reading actually landed, so a caller can escalate. */
   const load = useCallback(
@@ -484,21 +459,19 @@ function usePlanUsage(
 
       if (follow && follow() !== profileId) return false;
       if (res.ok && res.value.usage !== null) {
-        const fresh = res.value.usage;
         /*
-          Never backwards, for the same reason `newerReading` exists a few lines
-          up. The two modes race: opening the popover fires `cached` and then
-          `refresh`, and a card that misses the cache escalates to a refresh
-          while the cached reply may still be in flight. A `refresh` spawns a
-          CLI and takes a second or two, so the *older* cached reading can be
-          the one that lands last — and unguarded it would overwrite the fresh
-          figure it was only ever meant to precede.
+          Into the shared map, which orders it against everything else known
+          about this account. The two modes race — opening the popover fires
+          `cached` and then `refresh`, and a card that misses the cache
+          escalates to a refresh while the cached reply may still be in flight,
+          so the *older* cached reading can be the one that lands last — and
+          that ordering is the map's business rather than this component's.
+
+          `true` regardless of whether the map moved: the caller is asking "did
+          anything answer", which decides whether to escalate to a real fetch.
+          A reading identical to the one already held answered perfectly well.
         */
-        setHeld((prev) =>
-          prev !== null && prev.of === profileId && fresh.fetchedAt < prev.usage.fetchedAt
-            ? prev
-            : { of: profileId, usage: fresh },
-        );
+        acceptPlanUsage(profileId as ProfileId, res.value.usage);
         return true;
       }
       return false;

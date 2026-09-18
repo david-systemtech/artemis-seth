@@ -119,6 +119,13 @@ export async function broadcastPlanUsageReading(
     }
     return;
   }
+  /*
+   * What goes out is the engine's *cache* value, because that is what
+   * `refreshPlanUsage` answers with — the read merged into whatever else has
+   * been learned about this account since it started. Pushing this read's own
+   * result instead would broadcast a reading the cache had already superseded,
+   * so the windows would hold a number the process that serves them does not.
+   */
   const usage = await engine.require().refreshPlanUsage({ profileId });
   if (cancelled()) return;
   push(profileId, { profileId, usage });

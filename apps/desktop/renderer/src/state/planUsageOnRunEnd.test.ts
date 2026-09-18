@@ -337,6 +337,46 @@ describe('when two readings race', () => {
 
     expect(useApp.getState().planUsageByProfile).toBe(before);
   });
+
+  it('takes a newer window out of a snapshot that looks older overall', () => {
+    /*
+      The reported bug, at the store. A `plan.limit` verdict about the *weekly*
+      window is folded in and stamps the snapshot a second after the poll of the
+      five-hour window was answered — so the poll's reading, which is the only
+      one that saw the reset, looks like the older of the two.
+
+      Ordered by snapshot it is discarded and the pre-reset 100 stands until the
+      next cycle: "it reported 100% until a few seconds ago when it flipped".
+      Ordered per window the fresh 2 lands and the verdict stays.
+    */
+    if (pushToFeed === null) throw new Error('the plan usage feed is not installed');
+    pushToFeed({
+      profileId: 'p1',
+      usage: {
+        available: true,
+        fetchedAt: 2_000,
+        windows: [
+          { id: 'five_hour', label: '5 hours', utilization: 100, resetsAt: null, at: 1_000 },
+          { id: 'seven_day', label: '7 days', utilization: 40, resetsAt: null, at: 2_000, status: 'warning' },
+        ],
+      },
+    });
+
+    pushToFeed({
+      profileId: 'p1',
+      usage: {
+        available: true,
+        fetchedAt: 1_500,
+        windows: [
+          { id: 'five_hour', label: '5 hours', utilization: 2, resetsAt: null, at: 1_500 },
+        ],
+      },
+    });
+
+    const held = useApp.getState().planUsageByProfile['p1'];
+    expect(held?.windows.find((w) => w.id === 'five_hour')?.utilization).toBe(2);
+    expect(held?.windows.find((w) => w.id === 'seven_day')?.status).toBe('warning');
+  });
 });
 
 describe('when nothing finished', () => {

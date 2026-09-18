@@ -87,7 +87,7 @@ interface RawUsageResponse {
  * Each bucket becomes its own window, keyed `model_scoped:<name>` so the id
  * stays stable across reads and a caller can recognise the family by prefix.
  */
-function expandModelScoped(value: unknown): PlanUsageWindow[] {
+function expandModelScoped(value: unknown, fetchedAt: number): PlanUsageWindow[] {
   if (!Array.isArray(value)) return [];
   const out: PlanUsageWindow[] = [];
   for (const entry of value as readonly RawModelScoped[]) {
@@ -104,6 +104,7 @@ function expandModelScoped(value: unknown): PlanUsageWindow[] {
       label: `7 days · ${name}`,
       utilization: clampUtilization(entry.utilization),
       resetsAt: parseResetsAt(entry.resets_at),
+      at: fetchedAt,
     });
   }
   return out;
@@ -128,13 +129,14 @@ interface RawSpend {
  * copy calls the feature — the payload's disclaimer opens "Usage credits cover
  * you when you hit your plan limits".
  */
-function spendWindow(value: unknown): PlanUsageWindow | null {
+function spendWindow(value: unknown, fetchedAt: number): PlanUsageWindow | null {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
   return {
     id: 'spend',
     label: 'Usage Credits',
     utilization: clampUtilization((value as RawSpend).percent),
     resetsAt: null,
+    at: fetchedAt,
   };
 }
 
@@ -190,7 +192,15 @@ export function clampUtilization(value: number | null | undefined): number | nul
   return Math.max(0, Math.min(100, value));
 }
 
-/** Translate the provider's payload into the provider-neutral protocol shape. */
+/**
+ * Translate the provider's payload into the provider-neutral protocol shape.
+ *
+ * Every window is stamped `at: fetchedAt` as well as the snapshot carrying it.
+ * A poll reads all of them at one instant, so the two say the same thing here —
+ * but they stop saying the same thing the moment a live verdict is folded in
+ * beside them, and a window with no stamp of its own would then be re-dated by
+ * the fold. See `PlanUsageWindow.at` in the protocol.
+ */
 export function mapPlanUsage(raw: unknown, fetchedAt: number): PlanUsage {
   const response = (raw ?? {}) as RawUsageResponse;
 
@@ -230,14 +240,15 @@ export function mapPlanUsage(raw: unknown, fetchedAt: number): PlanUsage {
       label,
       utilization: clampUtilization(entry.utilization),
       resetsAt: parseResetsAt(entry.resets_at),
+      at: fetchedAt,
     });
   }
 
   // Then the per-model buckets, which are a list rather than a window.
-  windows.push(...expandModelScoped(limits['model_scoped']));
+  windows.push(...expandModelScoped(limits['model_scoped'], fetchedAt));
 
   // Then usage credits, which carry their own shape — see `spendWindow`.
-  const spend = spendWindow(limits['spend']);
+  const spend = spendWindow(limits['spend'], fetchedAt);
   if (spend !== null) windows.push(spend);
 
   // Then anything the provider has added since this file was written. Passing
@@ -255,6 +266,7 @@ export function mapPlanUsage(raw: unknown, fetchedAt: number): PlanUsage {
       label: id.replace(/_/g, ' '),
       utilization: clampUtilization(entry.utilization),
       resetsAt: parseResetsAt(entry.resets_at),
+      at: fetchedAt,
     });
   }
 
@@ -273,8 +285,16 @@ export function mapPlanUsage(raw: unknown, fetchedAt: number): PlanUsage {
  *
  * Separated from the query's construction so it can be tested against a plain
  * object, and so the caller owns the subprocess lifecycle.
+ *
+ * `now` is a clock rather than an instant, and that is the whole point: this
+ * call spans a CLI spawn and a control round-trip, which is a second or two of
+ * wall time. Stamping before it would date the reading to when it was *asked
+ * for*, so two reads of one account would order by who started first rather
+ * than by who learned the later truth — and a poll that started before a plan
+ * window reset would be filed as describing the moment after it. The clock is
+ * read once the provider has answered, which is when the numbers became true.
  */
-export async function readPlanUsage(query: unknown, now: number): Promise<PlanUsage> {
+export async function readPlanUsage(query: unknown, now: () => number): Promise<PlanUsage> {
   const method = resolveUsageMethod(query);
   if (!method) {
     return {
@@ -282,19 +302,20 @@ export async function readPlanUsage(query: unknown, now: number): Promise<PlanUs
       unavailableReason:
         'This version of the provider CLI does not report plan usage. Updating it may enable this.',
       windows: [],
-      fetchedAt: now,
+      fetchedAt: now(),
     };
   }
 
   try {
-    return mapPlanUsage(await method(), now);
+    const raw = await method();
+    return mapPlanUsage(raw, now());
   } catch (cause) {
     // An experimental endpoint that errors is not a reason to break the caller.
     return {
       available: false,
       unavailableReason: `Could not read plan usage: ${cause instanceof Error ? cause.message : String(cause)}`,
       windows: [],
-      fetchedAt: now,
+      fetchedAt: now(),
     };
   }
 }

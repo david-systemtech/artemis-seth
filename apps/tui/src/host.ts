@@ -65,6 +65,7 @@ import {
 } from '@rx-artemis/core';
 
 import { createReadOnlyProfileKeys } from './profileKeys.js';
+import { createPlanUsageStore, type PlanUsageStore } from './planUsageStore.js';
 
 export interface TuiHost {
   readonly dataDir: string;
@@ -161,8 +162,18 @@ export interface TuiHost {
    * something. Costs one CLI call, so it is asked for off the launch path.
    */
   listCommands(profileId: ProfileId, providerId: ProviderId, cwd: string): Promise<readonly string[]>;
-  /** The account's plan windows, or `null` when the provider reports none. One CLI call. */
+  /**
+   * The account's plan windows, or `null` when the provider reports none. One
+   * CLI call.
+   *
+   * What comes back is {@link planUsage}'s merged value rather than this read's
+   * own, so a caller cannot end up holding a number the rest of the process
+   * disagrees with — including when a slower read of the same account answers
+   * after a faster one.
+   */
   fetchPlanUsage(profileId: ProfileId, providerId: ProviderId): Promise<PlanUsage | null>;
+  /** The one reading per account this process holds. See {@link PlanUsageStore}. */
+  readonly planUsage: PlanUsageStore;
   dispose(): Promise<void>;
 }
 
@@ -303,6 +314,9 @@ export function createTuiHost(dataDir: string, options: TuiHostOptions = {}): Tu
     },
     ...(options.onError === undefined ? {} : { onError: options.onError }),
   });
+
+  /** One per process. See {@link PlanUsageStore} for why it is not per conversation. */
+  const planUsage = createPlanUsageStore();
 
   const catalogue = createCatalogue({
     source: {
@@ -462,10 +476,18 @@ export function createTuiHost(dataDir: string, options: TuiHostOptions = {}): Tu
       if (adapter?.deleteSession === undefined) return false;
       return adapter.deleteSession({ sessionId, cwd, env: await historyEnvFor(profileId, providerId) });
     },
+    planUsage,
     fetchPlanUsage: async (profileId, providerId) => {
       const adapter = providers.get(providerId);
       if (adapter?.fetchPlanUsage === undefined) return null;
-      return adapter.fetchPlanUsage({ profileId, env: await envFor(profileId, providerId), cwd: options.cwd ?? dataDir });
+      const read = await adapter.fetchPlanUsage({
+        profileId,
+        env: await envFor(profileId, providerId),
+        cwd: options.cwd ?? dataDir,
+      });
+      // Through the one store on the way out, so every conversation on this
+      // account sees it and nobody sees anything else.
+      return planUsage.merge(profileId, read);
     },
     dispose: async () => {
       await runs.disposeAll();
