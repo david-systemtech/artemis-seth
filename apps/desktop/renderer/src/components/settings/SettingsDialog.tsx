@@ -182,12 +182,12 @@ export const SETTINGS_NAV: readonly NavBand[] = [
         hint: 'Procedures agents can load',
         icon: <SparklesIcon aria-hidden="true" />,
       },
-      // Directly under Instructions, because it is the same question answered
-      // by a repository instead of by a paragraph: the prompts are what the
-      // user states, a bank is what the agents maintain. They shared a pane
-      // for a while and the banks outgrew it — a bank now carries a name, a
-      // format, a set of profiles and a validation report, none of which fits
-      // under someone else's heading.
+      // Close under Instructions, with only Skills between them, because it is
+      // the same question answered by a repository instead of by a paragraph:
+      // the prompts are what the user states, a bank is what the agents
+      // maintain. They shared a pane for a while and the banks outgrew it — a
+      // bank now carries a name, a format, a set of profiles and a validation
+      // report, none of which fits under someone else's heading.
       {
         id: 'memory-banks',
         label: 'Memory banks',
