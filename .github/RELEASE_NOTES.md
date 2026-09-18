@@ -1,6 +1,14 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.18.0
+
+A served conversation reaches the skills installed on the server, and a remote pane's `/` menu lists them.
+
+**A served run gets the server's skills, slash commands and marketplace plugins.** The headless server started every run with no plugins, so a skill installed on the serving machine never reached a served conversation, however it was asked for. The server now builds the same content bridge the desktop and the terminal build — an account's `skills/`, the machine's `~/.agents/skills`, and the marketplace plugins the account has enabled — and hands it to every run: the ones a desktop starts, the ones an OpenAI client starts, and routine firings. A Codex account gets `~/.codex/skills` linked into its own directory, as it does on the desktop. Drop a skill into `~/.agents/skills/<name>/SKILL.md` on the server and the next turn has it.
+
+**The desktop learns a server's commands from the server.** A pane on an Artemis Server had nothing in its `/` menu: the list arrives on `session.started`, which a served run does not carry, and there was no way to ask beforehand. `GET /api/v0/commands` now answers the slash commands a session on the server would offer — the union across the accounts the connection can see, with a row per account, read in the connection's own directory with the same plugins a run there is given, and answered from a one-minute cache — and the desktop and the terminal fill a remote pane's menu from it. A skill on the server is typed as `/artemis-skills:<name>`, and `/<name>` finds it, exactly as it does locally. Nothing has to be kept in two places. **Update the server with the app:** against an older server the menu stays shut for remote panes, as it did before.
+
 ## What's new in 2.17.3
 
 A served conversation keeps everything above the turn it is on.
