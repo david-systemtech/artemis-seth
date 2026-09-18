@@ -163,6 +163,67 @@ describe('assertNoSecrets — event policy', () => {
     expect(() => assertNoSecrets(event, 'push', EVENT_SCAN_POLICY)).not.toThrow();
   });
 
+  it('delivers a question that quotes a key shape, rather than parking the run on a prompt nobody saw', () => {
+    // The agent's own words. A dropped `permission.request` is not a gap in a
+    // transcript: the run waits on a prompt that was never drawn, and the wait
+    // ends as a refusal the user never gave.
+    const event = {
+      type: 'permission.request',
+      runId: 'r1',
+      seq: 1,
+      ts: 0,
+      requestId: 'req-1',
+      request: {
+        id: 'req-1',
+        runId: 'r1',
+        toolName: 'AskUserQuestion',
+        input: {},
+        requestedAt: 0,
+        question: {
+          questions: [
+            {
+              question: `Send it as \`Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345\`, or as ${FAKE_KEY}?`,
+              header: 'Auth header',
+              multiSelect: false,
+              options: [
+                { label: 'Bearer', description: 'The header form.', preview: `curl -H "x-api-key: ${FAKE_KEY}"` },
+                { label: 'Query', description: 'In the URL.' },
+              ],
+            },
+          ],
+        },
+      },
+    };
+
+    expect(() => assertNoSecrets(event, 'agent-event', EVENT_SCAN_POLICY)).not.toThrow();
+  });
+
+  it('delivers a plan to approve, and what the person said back', () => {
+    const plan = {
+      type: 'permission.request',
+      request: { id: 'req-2', toolName: 'ExitPlanMode', input: {}, plan: { plan: `1. Rotate ${FAKE_KEY}\n2. Redeploy` } },
+    };
+    const resolved = {
+      type: 'permission.resolved',
+      requestId: 'req-1',
+      outcome: 'denied',
+      note: `not with ${FAKE_KEY} in the URL`,
+      answers: [{ question: 'Which header?', options: ['Bearer'], notes: `use ${FAKE_KEY} from the vault` }],
+    };
+
+    expect(() => assertNoSecrets(plan, 'agent-event', EVENT_SCAN_POLICY)).not.toThrow();
+    expect(() => assertNoSecrets(resolved, 'agent-event', EVENT_SCAN_POLICY)).not.toThrow();
+  });
+
+  it('still refuses a profile field inside a question, at any depth', () => {
+    const event = {
+      type: 'permission.request',
+      request: { question: { questions: [{ question: 'Which?', options: [{ label: 'A', publicEnv: {} }] }] } },
+    };
+
+    expect(() => assertNoSecrets(event, 'agent-event', EVENT_SCAN_POLICY)).toThrow(SecretLeakError);
+  });
+
   it('still refuses a profile field on an event', () => {
     const event = { type: 'session.started', runId: 'r1', seq: 0, ts: 0, secretRef: 'profile-abc' };
     expect(() => assertNoSecrets(event, 'push', EVENT_SCAN_POLICY)).toThrow(SecretLeakError);

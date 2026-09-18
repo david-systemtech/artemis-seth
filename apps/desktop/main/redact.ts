@@ -327,6 +327,26 @@ export const RESPONSE_SCAN_POLICY: ScanPolicy = {
  */
 export const EVENT_SCAN_POLICY: ScanPolicy = {
   forbiddenKeys: new Set(PROFILE_LEAK_KEYS),
+  /*
+   * The last four are what a permission prompt is made of, and they were
+   * missing: `question` is the interview the agent wants answered (its text,
+   * its headers, its options), `plan` is the plan it wants approved, and
+   * `answers` and `note` are what the person said back. All model prose or the
+   * user's own, exactly like `text`.
+   *
+   * They matter more than any other key here, because of what a drop costs. A
+   * dropped delta is a gap in a transcript. A dropped `permission.request` is a
+   * run parked on a prompt that was never drawn: the agent asked, nothing
+   * appeared, and the wait ended as a refusal the user never gave. That is how
+   * this was found — a question that *quoted* the false positive described on
+   * `SECRET_VALUE_RULES` was itself refused, twice, and the person it was
+   * addressed to saw only that an event had been dropped.
+   *
+   * Marking the container rather than each leaf is deliberate: `question` and
+   * `answers` exempt everything under them from the value patterns, including
+   * option labels and previews added later, while the forbidden-key check
+   * still runs at every depth beneath.
+   */
   contentKeys: new Set([
     'text',
     'resulttext',
@@ -338,6 +358,10 @@ export const EVENT_SCAN_POLICY: ScanPolicy = {
     'firstprompt',
     'summary',
     'blockedpath',
+    'question',
+    'plan',
+    'answers',
+    'note',
   ]),
   // Tool inputs and tool results are provider data, unbounded in size and
   // shape. Walking them would cost real time on every delta for no benefit.
