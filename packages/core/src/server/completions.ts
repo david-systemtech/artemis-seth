@@ -154,6 +154,13 @@ export interface RunSource {
     /** Standing instructions to append to the provider's preset. Append-only. */
     readonly systemPrompt?: string;
     /**
+     * The caller's always-on skills, by name. The host reads each one it
+     * carries off its own disk and appends the bodies after
+     * {@link systemPrompt}; a name it does not carry is skipped. Names only
+     * ever reach a lookup among the folders the host found, never a path.
+     */
+    readonly alwaysOnSkills?: readonly string[];
+    /**
      * Files and images the prompt is about.
      *
      * The third field to join this shape, and on firmer ground than the other
@@ -1110,6 +1117,9 @@ export async function* runTurn(
         ...(turn.extensions.systemPrompt === undefined
           ? {}
           : { systemPrompt: turn.extensions.systemPrompt }),
+        ...(turn.extensions.alwaysOnSkills === undefined
+          ? {}
+          : { alwaysOnSkills: turn.extensions.alwaysOnSkills }),
         // Read off `artemis.attachments` and off the trailing message's
         // `image_url` parts, merged and bounded together by the route.
         ...(turn.extensions.attachments === undefined

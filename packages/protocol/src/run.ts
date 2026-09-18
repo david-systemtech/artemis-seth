@@ -254,6 +254,19 @@ export interface RunInput {
 
   readonly systemPrompt?: SystemPromptSpec;
 
+  /**
+   * The skills the user keeps always on, by name, for a run that executes on
+   * another machine.
+   *
+   * A local run never carries this: the engine reads each skill's body off
+   * this machine's disk and folds it into {@link systemPrompt}. A served run
+   * executes where *its* skills are, so the names cross instead and the server
+   * resolves them — see `ArtemisChatExtensions.alwaysOnSkills`. Set by the
+   * host after validation and by nothing else; a front end does not supply it,
+   * and the run-start validators do not read it.
+   */
+  readonly alwaysOnSkills?: readonly string[];
+
   /** Human-readable title for the session, shown in the history pane. */
   readonly title?: string;
 

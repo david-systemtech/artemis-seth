@@ -111,6 +111,7 @@ export {
   type ArtemisServerOptions,
   type CommandSource,
   type MemoryBankAdmin,
+  type SkillsAdmin,
   type ServerContext,
   type ServerReply,
   type ServerRequestInfo,

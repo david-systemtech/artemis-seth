@@ -1916,6 +1916,53 @@ describe('POST /v1/chat/completions', () => {
     }
   });
 
+  it('hands the always-on skill names to the run, for the host to read off its own disk', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed', result: 'ok' }]);
+    const { server, url } = await serveWith(true, source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        artemis: { alwaysOnSkills: ['unslop', 'house-rules'] },
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { artemis: { ignored?: readonly string[] } };
+      expect(body.artemis).not.toHaveProperty('ignored');
+      // Names, exactly as sent: this layer reads no skill and composes no text.
+      expect(source.started[0]?.input).toMatchObject({ alwaysOnSkills: ['unslop', 'house-rules'] });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('sets the names aside with the instructions where the provider cannot append, naming each', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed', result: 'ok' }]);
+    const { server, url } = await serveWith(false, source);
+    try {
+      const both = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        artemis: { systemPrompt: 'Follow the house style.', alwaysOnSkills: ['unslop'] },
+      });
+      const body = (await both.json()) as { artemis: { ignored?: readonly string[] } };
+      expect(body.artemis.ignored).toEqual(['artemis.systemPrompt', 'artemis.alwaysOnSkills']);
+      expect(source.started[0]?.input).not.toHaveProperty('alwaysOnSkills');
+
+      // Alone, it is the only thing named: a client told only that its
+      // instructions were dropped would still believe its skills were read.
+      const alone = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        artemis: { alwaysOnSkills: ['unslop'] },
+      });
+      expect(((await alone.json()) as { artemis: { ignored?: readonly string[] } }).artemis.ignored).toEqual([
+        'artemis.alwaysOnSkills',
+      ]);
+    } finally {
+      await server.close();
+    }
+  });
+
   it('refuses a route this connection may not use, as though it did not exist', async () => {
     const source = fakeRuns([{ type: 'run.end', reason: 'completed' }]);
     const { createArtemisServer } = await import('../http.js');

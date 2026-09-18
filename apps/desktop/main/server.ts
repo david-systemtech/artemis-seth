@@ -366,6 +366,9 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         ...(input.systemPrompt === undefined
           ? {}
           : { systemPrompt: { kind: 'append', text: input.systemPrompt } as const }),
+        // The client's always-on skills, by name. The engine reads the bodies
+        // off this machine's disk, beside this machine's own always-on choice.
+        ...(input.alwaysOnSkills === undefined ? {} : { alwaysOnSkills: input.alwaysOnSkills }),
         // Read and bounded by the route before it got here; the registry checks
         // them again against this profile's provider.
         ...(input.attachments === undefined ? {} : { attachments: input.attachments }),

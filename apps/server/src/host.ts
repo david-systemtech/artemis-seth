@@ -44,6 +44,13 @@ import type {
   SessionDelegatedWork,
 } from '@rx-artemis/protocol';
 import {
+  composeAlwaysOnSkills,
+  skillSourceIdFor,
+  skillSourceLimitProblem,
+  withSkillSource,
+  withoutSkillSource,
+} from '@rx-artemis/protocol';
+import {
   RunError,
   checkAuthStatus,
   createCatalogue,
@@ -52,14 +59,19 @@ import {
   createRemoteRunGuard,
   createServerRoutineStore,
   createSessionLedger,
+  createSkillSourceRegistry,
+  createSkillSources,
   createWorkspaceResolver,
   joinSystemPromptAppends,
   linkSkillsIntoCodexHome,
+  listSkills,
   machineBankPrompt,
   managedEnvKeys,
   memoryToolServer,
   registryPath,
   resolveContentPlugins,
+  resolveSkills,
+  skillRootsFor,
   MEMORY_TOOL_SERVER,
   DuplicateProfileLabelError,
   ProfileStore,
@@ -71,6 +83,7 @@ import {
   type CommandSource,
   type MemoryBankAdmin,
   type ProfileAdmin,
+  type SkillsAdmin,
   type ProviderRegistry,
   type PushFeed,
   type RemoteAccessEvent,
@@ -145,6 +158,11 @@ export interface HeadlessHost {
    * read and rescoped over the wire. See `memoryBanks.ts`.
    */
   readonly memoryBankAdmin: MemoryBankAdmin;
+  /**
+   * What the skills routes act through: the skills this machine carries, and
+   * the repositories it keeps cloned to get them. See `skillsAdmin` below.
+   */
+  readonly skillsAdmin: SkillsAdmin;
   /** Every push the server can stream to a remote client. See `server/feed.ts`. */
   readonly feed: PushFeed;
   /** Interrupt-on-disconnect for bridge-started runs. See `server/guard.ts`. */
@@ -253,18 +271,36 @@ export function createHeadlessHost(
   const onContentWarning = (message: string, error: unknown): void => {
     process.stderr.write(`${message}: ${error instanceof Error ? error.message : String(error)}\n`);
   };
+  /**
+   * The repositories of skills this machine keeps cloned.
+   *
+   * The same arrangement the desktop has — a list in `<data dir>/skills.json`,
+   * a clone of each under `<data dir>/skill-sources` — because the point of a
+   * source is to have the same skills on every machine, and a server is the
+   * one machine nobody sits at to install them by hand. The list is changed
+   * over the wire, by a connection holding the administrative grant; see
+   * `skillsAdmin`.
+   */
+  const skillRegistry = createSkillSourceRegistry(join(dataDir, 'skills.json'));
+  const skillSources = createSkillSources({
+    dataDir,
+    onWarning: (message) => process.stderr.write(`${message}\n`),
+  });
+  const skillSourceRoots = async () => skillSources.roots(await skillRegistry.sources());
+
   const contentPluginsFor = async (profileId: ProfileId, providerId: ProviderId) => {
     if (providerId !== 'claude' && providerId !== 'codex') return [];
     const configDir = profiles.configDirFor(await profiles.require(profileId));
+    const extraSkillDirs = (await skillSourceRoots()).map((root) => root.dir);
     if (providerId === 'codex') {
-      await linkSkillsIntoCodexHome({ configDir, onWarning: onContentWarning });
+      await linkSkillsIntoCodexHome({ configDir, extraSkillDirs, onWarning: onContentWarning });
       return [];
     }
     // One call, because the two sources overlap: a skill an enabled
     // marketplace plugin offers must not also be bridged under Artemis's name.
     // `GET /api/v0/commands` reads through here too, so the menu a client
     // draws and the run it starts agree. See `resolveContentPlugins`.
-    return resolveContentPlugins({ configDir, dataDir, onWarning: onContentWarning });
+    return resolveContentPlugins({ configDir, dataDir, extraSkillDirs, onWarning: onContentWarning });
   };
 
   const runs = new RunRegistry({
@@ -677,8 +713,39 @@ export function createHeadlessHost(
       : { ...withPrompt, additionalDirectories: directories };
   };
 
+  /**
+   * The caller's always-on skills, as the text a run is given.
+   *
+   * The names arrive on the request; the bodies are read here, off this
+   * machine's disk, from the folders a run on that account is offered skills
+   * from — so what a name resolves to is the skill the session could also be
+   * asked to run by command. A name this machine does not carry contributes
+   * nothing, which is how a client's choice survives a server that has not
+   * pulled the repository yet.
+   *
+   * Never throws: a skill that cannot be read is a run that starts without it.
+   */
+  const alwaysOnSkillsPrompt = async (run: {
+    readonly profileId: string;
+    readonly alwaysOnSkills?: readonly string[];
+  }): Promise<string | undefined> => {
+    const names = run.alwaysOnSkills ?? [];
+    if (names.length === 0) return undefined;
+    try {
+      const profileId = run.profileId as ProfileId;
+      const configDir = profiles.configDirFor(await profiles.require(profileId));
+      const roots = skillRootsFor({ profileId, configDir }, undefined, await skillSourceRoots());
+      return composeAlwaysOnSkills(await resolveSkills(names, roots));
+    } catch (error) {
+      process.stderr.write(
+        `skills: could not compose the always-on skills: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return undefined;
+    }
+  };
+
   const runSource: RunSource = {
-    startRun: (input) => {
+    startRun: async (input) => {
       const permissionMode = clampMode(input.providerId as ProviderId, input.permissionMode);
       /*
        * The banks this account carries, installed for this project before the
@@ -692,16 +759,21 @@ export function createHeadlessHost(
 
       /*
        * What the run is told, on top of the serving provider's preset: the
-       * client's own standing instructions (the route has already set the
-       * field aside for a provider that cannot append), then this machine's
-       * memory-bank prompt, scoped to the account the turn bills.
+       * client's own standing instructions, then the skills it keeps always
+       * on (the route has already set both aside for a provider that cannot
+       * append), then this machine's memory-bank prompt, scoped to the account
+       * the turn bills. The desktop's order for a local run, for the same
+       * reason: what the person wrote comes first.
        *
        * The wire and the adapter both refuse a replacement, so an append is
        * the only shape that reaches here.
        */
       const instructions = canAppend(input.providerId)
-        ? joinSystemPromptAppends(input.systemPrompt, bankPrompt(input))
+        ? joinSystemPromptAppends(input.systemPrompt, await alwaysOnSkillsPrompt(input), bankPrompt(input))
         : undefined;
+      // Pulled in the background and at most every so often: the run starts on
+      // the copies already here, and the next one gets whatever this fetched.
+      void skillRegistry.sources().then((sources) => skillSources.syncInBackground(sources));
       return runs.start({
         providerId: input.providerId as ProviderId,
         profileId: input.profileId as ProfileId,
@@ -962,6 +1034,56 @@ export function createHeadlessHost(
     commandSource,
     routines,
     profileAdmin,
+    skillsAdmin: {
+      list: async ({ profileIds }) => {
+        const sources = await skillRegistry.sources();
+        const accounts = [];
+        for (const profileId of profileIds) {
+          const profile = await profiles.get(profileId as ProfileId);
+          if (profile === undefined) continue;
+          // Skills are a Claude and Codex affair; no other account has a folder.
+          if (profile.providerId !== 'claude' && profile.providerId !== 'codex') continue;
+          accounts.push({ profileId: profile.id, configDir: profiles.configDirFor(profile) });
+        }
+        return {
+          skills: await listSkills({ accounts, sources: skillSources.roots(sources) }),
+          sources: await skillSources.status(sources),
+        };
+      },
+      addSource: async ({ url, subdir }) => {
+        // Decided inside the update, against what is stored at this call's
+        // turn: the parser would otherwise keep the first twenty and drop the
+        // one just added, and the reply would call that a success.
+        let full: string | null = null;
+        const document = await skillRegistry.update((current) => {
+          full = skillSourceLimitProblem(current, url);
+          return full === null ? withSkillSource(current, url, subdir) : current;
+        });
+        if (full !== null) return full;
+        const added = (document.sources ?? []).find((source) => source.id === skillSourceIdFor(url));
+        // Cloned before answering, so the reply lists what it brought — and a
+        // clone that fails is reported against the row, not as a failed request.
+        if (added !== undefined) await skillSources.sync(added, { force: true });
+        commandCache.clear();
+        return null;
+      },
+      removeSource: async (id) => {
+        const source = (await skillRegistry.sources()).find((entry) => entry.id === id);
+        if (source === undefined) return false;
+        await skillRegistry.update((current) => withoutSkillSource(current, id));
+        await skillSources.remove(source);
+        commandCache.clear();
+        return true;
+      },
+      syncSources: async (id) => {
+        const sources = await skillRegistry.sources();
+        const wanted = id === undefined ? sources : sources.filter((source) => source.id === id);
+        if (id !== undefined && wanted.length === 0) return false;
+        await Promise.all(wanted.map((source) => skillSources.sync(source, { force: true })));
+        commandCache.clear();
+        return true;
+      },
+    },
     memoryBankAdmin: {
       // Synchronous underneath — the registry is one small file — and promised
       // here because the seam is shaped for a host whose store is not.
