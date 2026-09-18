@@ -456,6 +456,9 @@ export const DEFAULT_SKILL_SOURCE_SUBDIR = 'skills';
  *    in every log line that names the source. The machine's own git credentials
  *    are what a private repository is reached with.
  */
+const CREDENTIAL_IN_URL =
+  'Leave the username and token out of the URL. A private repository is reached with this machine’s own git credentials.';
+
 export function skillSourceUrlProblem(url: string): string | null {
   const trimmed = url.trim();
   if (trimmed.length === 0) return 'Enter the repository’s URL.';
@@ -465,12 +468,15 @@ export function skillSourceUrlProblem(url: string): string | null {
   if (trimmed.startsWith('-')) return 'A URL cannot start with a hyphen.';
 
   if (/^https:\/\//i.test(trimmed)) {
-    if (/^https:\/\/[^/]*@/i.test(trimmed)) {
-      return 'Leave the username and token out of the URL. A private repository is reached with this machine’s own git credentials.';
-    }
+    if (/^https:\/\/[^/]*@/i.test(trimmed)) return CREDENTIAL_IN_URL;
     return /^https:\/\/[^/]+\/.+/i.test(trimmed) ? null : 'That URL names a host but no repository.';
   }
-  if (/^ssh:\/\/[^/]+\/.+/i.test(trimmed)) return null;
+  if (/^ssh:\/\/[^/]+\/.+/i.test(trimmed)) {
+    // A bare user is how ssh is addressed (`ssh://git@host/…`) and stays
+    // legal; a `user:password@` is a credential, and this is the one transport
+    // besides https that has somewhere to put one.
+    return /^ssh:\/\/[^/@]*:[^/@]*@/i.test(trimmed) ? CREDENTIAL_IN_URL : null;
+  }
   if (/^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^:].*$/.test(trimmed)) return null;
   return 'Use an https://, ssh:// or git@host:owner/repo URL.';
 }
@@ -480,6 +486,8 @@ export function skillSourceSubdirProblem(subdir: string): string | null {
   const trimmed = subdir.trim();
   if (trimmed.length === 0) return 'Name the folder that holds the skills.';
   if (trimmed.length > SKILL_LIMITS.subdir) return 'That folder name is too long.';
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f]/.test(trimmed)) return 'A folder name cannot contain control characters.';
   if (trimmed.startsWith('/') || trimmed.startsWith('\\') || /^[A-Za-z]:/.test(trimmed)) {
     return 'The folder is relative to the repository, not to the disk.';
   }
@@ -519,7 +527,11 @@ export function skillSourceIdFor(url: string): string {
     hash ^= canonical.charCodeAt(index);
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
-  const words = canonical.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
+  // Cut, *then* trimmed: a cut that lands on a hyphen would otherwise leave
+  // one on the end, the id would read `…--1a2b3c4d`, and the validators that
+  // guard removing and pulling a source — which hold an id to exactly the
+  // alphabet written here — would refuse it for as long as it existed.
+  const words = canonical.replace(/[^a-z0-9]+/g, '-').slice(0, 80).replace(/^-+|-+$/g, '');
   return `${words.length === 0 ? 'source' : words}-${hash.toString(16).padStart(8, '0')}`;
 }
 
@@ -543,6 +555,22 @@ export function skillSourceLabel(url: string): string {
 }
 
 /** The library with a source added. The same repository twice is one source. */
+/**
+ * Why one more source cannot be added, or `null` when it can.
+ *
+ * {@link SKILL_LIMITS.sources} is a bound on a file, and the parser applies it
+ * by keeping the first twenty — right for a corrupt document, and exactly
+ * wrong for the one moment a person can run into it: the source they just
+ * added would be the one dropped, without a word. So the hosts ask first.
+ * Re-adding a URL already held replaces it, which is never over the limit.
+ */
+export function skillSourceLimitProblem(document: SkillLibraryDocument, url: string): string | null {
+  const sources = document.sources ?? [];
+  if (sources.length < SKILL_LIMITS.sources) return null;
+  if (sources.some((source) => source.id === skillSourceIdFor(url))) return null;
+  return `Artemis keeps at most ${String(SKILL_LIMITS.sources)} skill repositories. Remove one before adding another.`;
+}
+
 export function withSkillSource(
   document: SkillLibraryDocument,
   url: string,
