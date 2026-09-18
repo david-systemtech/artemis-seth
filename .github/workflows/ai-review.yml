@@ -1,9 +1,10 @@
 # A cheap model reads the pull request before we do.
 # ============================================================================
 #
-# It leaves one comment, rewritten on every push, ending in a JSON block: the
-# prose is for whichever of us reviews the pull request, the JSON for an agent
-# that re-checks the findings before anyone acts on them. A finding is a lead,
+# It leaves one comment, ending in a JSON block: the prose is for whichever of
+# us reviews the pull request, the JSON for an agent that re-checks the findings
+# before anyone acts on them. The comment is written when the pull request opens
+# and rewritten when someone asks - see "When it runs" below. A finding is a lead,
 # never a verdict - the model costs about a cent a review and is wrong often
 # enough that acting on it unchecked would be worse than not running it. It
 # approves nothing and is not a required check.
@@ -33,6 +34,24 @@
 # reviewed by the version already merged - and the one that adds them, not at
 # all.
 #
+# ## When it runs: once, and then when asked
+#
+# When a pull request opens, reopens or leaves draft - and after that only when
+# somebody adds the `ai-review` label, which the job takes off again when it is
+# done so the label can be added a second time.
+#
+# It used to run on every push. A review of a large diff takes the model most
+# of half an hour, and a pull request that is being worked on is pushed to many
+# times: the 2.18.0 skills pull requests each sat behind a fresh review after
+# every follow-up commit, including the commits that answered the review
+# before. Most pushes do not want a second opinion; the one that does can ask.
+#
+# The label, rather than a comment command or a manual dispatch, because it
+# keeps the run inside the `pull_request_target` event this file is built
+# around - the base commit to check out, the author's association, the draft
+# flag are all on it - and because only someone who can triage the repository
+# can add one, which is the rule the next section is about.
+#
 # ## Why only maintainers' pull requests
 #
 # Every review is paid for, through an OpenRouter key one of us funds, and on a
@@ -49,7 +68,11 @@ on:
     # `ready_for_review` is what makes skipping drafts safe: a draft gets no
     # review (see the job's `if`), and the moment it is marked ready this fires
     # and it gets one - without waiting for another push.
-    types: [opened, synchronize, reopened, ready_for_review]
+    #
+    # No `synchronize`: a push does not re-run the review. `labeled` is how one
+    # is asked for - see "When it runs" above, and the job's `if` for which
+    # label counts.
+    types: [opened, reopened, ready_for_review, labeled]
 
 # Read the code, write one comment.
 permissions:
@@ -64,11 +87,13 @@ concurrency:
 jobs:
   review:
     # Drafts are unfinished by declaration; `no-ai-review` is the escape hatch
-    # for the pull request where the review would only be noise.
+    # for the pull request where the review would only be noise. Of all the
+    # labels a pull request can be given, only `ai-review` is a request for one.
     if: >-
       !github.event.pull_request.draft &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
-      !contains(github.event.pull_request.labels.*.name, 'no-ai-review')
+      !contains(github.event.pull_request.labels.*.name, 'no-ai-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ai-review')
     # GitHub-hosted, and it must stay that way: this job holds a secret while it
     # reads pull requests from forks, and a machine of our own is no place for
     # that. Hosted minutes are free on a public repository. Ubuntu ships the
@@ -130,3 +155,16 @@ jobs:
           # not code, and the release notes restate a change in prose.
           REVIEW_SKIP: docs/design/* .github/RELEASE_NOTES.md
         run: python3 .github/scripts/ai_review.py
+
+      # The label is a button, not a state: taken off once the review it asked
+      # for has been written (or abandoned), so the next request is adding it
+      # again. `always()` because the step above is allowed to fail and this
+      # still has to run; its own failure costs nothing but a label left on.
+      - name: Take the request label back off
+        if: always() && github.event.action == 'labeled'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api -X DELETE
+          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/ai-review"
