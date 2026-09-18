@@ -164,6 +164,17 @@ describe('listSkills', () => {
     });
   });
 
+  it('lists a skill whose frontmatter is not valid YAML, rather than failing the list', async () => {
+    await skill(join(home, '.agents', 'skills'), 'broken', '---\ndescription: [never closed\n---\nStill a body.\n');
+
+    const skills = await listSkills({ accounts: accounts(), home });
+
+    // The frontmatter parser reports bad YAML instead of throwing, so one bad
+    // file is one skill with nothing to say for itself - not a pane that
+    // cannot open.
+    expect(skills).toMatchObject([{ name: 'broken', description: '', bodyChars: 'Still a body.'.length }]);
+  });
+
   it('prices a body past the injection limit at the limit, which is all a run is given', async () => {
     const body = 'x'.repeat(SKILL_LIMITS.body * 4);
     await skill(join(home, '.agents', 'skills'), 'huge', `---\ndescription: Long.\n---\n${body}\n`);
