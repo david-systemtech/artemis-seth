@@ -108,6 +108,16 @@
  * Empty groups keep their heading, unlike every other section here, because the
  * drop target *is* how the first session gets in. See `sessionGroups.ts`.
  *
+ * The order of the stack is the user's as well. A group heading can be picked
+ * up and dropped between two others, and it is the *list* that takes that drop
+ * rather than the headings: where a group lands is a question about the whole
+ * stack — the upper half of a group's block means before it, the lower half
+ * after it, anywhere above or below the stack means its nearest end — so it is
+ * answered once, from the row offsets the virtualiser already has
+ * (`groupDropAt`), and drawn as one insertion line on the boundary the group
+ * would really land on. The heading's menu has "Move up" and "Move down" for
+ * the same move without a drag.
+ *
  * ## 0c. The row's menu answers to four letters
  *
  * `R`ename, `P`in, `A`rchive, `D`elete, each drawn as a key cap on the right of
@@ -176,6 +186,8 @@ import {
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
+  ArrowDownIcon,
+  ArrowUpIcon,
   ChevronDownIcon,
   CornerUpLeftIcon,
   FolderIcon,
@@ -194,13 +206,16 @@ import type { ProfileId, SessionSummary } from '@rx-artemis/protocol';
 import { useCapability, useProviderCapability } from '../hooks/useCapability';
 import { condenseTitle, formatRelative } from '@rx-artemis/transcript';
 import { lastSegment } from '../lib/paths';
+import { isGroupDrag, readGroupDrag, writeGroupDrag } from '../lib/groupDrag';
 import {
   flattenGroups,
+  groupDropAt,
   groupSessionsByProject,
   liftSessionGroups,
   orderSessions,
   partitionSessions,
   sessionKey,
+  type GroupDrop,
   type ListRow,
 } from '../lib/sessionGroups';
 import {
@@ -217,6 +232,7 @@ import {
   refreshSessions,
   renameSession,
   renameSessionGroup,
+  reorderSessionGroup,
   resumeSession,
   sessionOrderKey,
   toggleArchivedExpanded,
@@ -858,6 +874,19 @@ const PinnedHeading = memo(function PinnedHeading({
  * Exactly what a session row does, for the same reason: an input floating over
  * a live button leaves the fold handler armed underneath the thing the user is
  * trying to type in. See {@link RenameField}.
+ *
+ * ## Its place in the stack is the user's, and there are two ways to change it
+ *
+ * The heading can be picked up and dropped between two others, and its menu
+ * has "Move up" and "Move down" for the same move a step at a time — the drag
+ * is not available from a keyboard and is a real effort on a trackpad, which is
+ * the argument "Move to group" already makes for rows. This component is only
+ * the *source* of that drag: it says what is being carried and that it has been
+ * picked up. The list takes the drop (see `VirtualRows`), because where a group
+ * lands is a question about the whole stack and no single heading can answer
+ * it. The two menu items name the neighbours the flattening handed down, so
+ * they move past the group drawn above or below even while a filter is hiding
+ * others, and are disabled at the ends of the stack.
  */
 const SessionGroupHeading = memo(function SessionGroupHeading({
   groupId,
@@ -867,6 +896,11 @@ const SessionGroupHeading = memo(function SessionGroupHeading({
   top,
   renaming,
   onRename,
+  previousGroupId,
+  nextGroupId,
+  dragging,
+  onDragStart,
+  onDragEnd,
 }: {
   readonly groupId: string;
   readonly name: string;
@@ -877,6 +911,16 @@ const SessionGroupHeading = memo(function SessionGroupHeading({
   readonly renaming: boolean;
   /** Open the rename field on a group, or close whichever one is open. */
   readonly onRename: (groupId: string | null) => void;
+  /** The group drawn above this one, or `null` at the top of the stack. */
+  readonly previousGroupId: string | null;
+  /** The group drawn below this one, or `null` at the bottom of the stack. */
+  readonly nextGroupId: string | null;
+  /** True while this heading is the one being carried. */
+  readonly dragging: boolean;
+  /** This heading was picked up. The list remembers which, for the drop. */
+  readonly onDragStart: (groupId: string) => void;
+  /** The drag is over — landed, refused or abandoned. */
+  readonly onDragEnd: () => void;
 }): ReactElement {
   const drop = useSessionDropTarget(groupId);
 
@@ -889,7 +933,27 @@ const SessionGroupHeading = memo(function SessionGroupHeading({
   }
 
   return (
-    <div style={{ top, height: HEADER_HEIGHT }} className="absolute inset-x-0 px-1.5">
+    <div
+      style={{ top, height: HEADER_HEIGHT }}
+      className={cn('absolute inset-x-0 px-1.5', dragging && 'opacity-50')}
+      /*
+       * The drag source for putting the groups in a different order, hung on
+       * the positioning wrapper for the reason a session row gives: a `<button
+       * draggable>` is a fight over who owns the pointer, and the wrapper costs
+       * nothing and leaves the fold, the double-click and the menu exactly as
+       * they were.
+       *
+       * `dragend` arrives here whether the drop landed, was refused or was
+       * abandoned with Escape, which makes it the one place the picked-up state
+       * can reliably be put down again.
+       */
+      draggable
+      onDragStart={(event) => {
+        writeGroupDrag(event.dataTransfer, { id: groupId, name });
+        onDragStart(groupId);
+      }}
+      onDragEnd={onDragEnd}
+    >
       <ContextMenu>
         <ContextMenuTrigger asChild>
           <button
@@ -897,7 +961,7 @@ const SessionGroupHeading = memo(function SessionGroupHeading({
             onClick={() => toggleSessionGroupCollapsed(groupId)}
             onDoubleClick={() => onRename(groupId)}
             aria-expanded={!collapsed}
-            title="A group you made. Drag a session onto it to file it here."
+            title="A group you made. Drag a session onto it to file it here, or drag the heading to move the group."
             {...drop.handlers}
             className={cn(
               'flex h-full w-full min-w-0 items-center gap-1 rounded-md px-1.5 text-left transition-colors hover:bg-wash',
@@ -929,6 +993,33 @@ const SessionGroupHeading = memo(function SessionGroupHeading({
           <MenuAction hotkey="r" onSelect={() => onRename(groupId)}>
             <PencilIcon aria-hidden="true" />
             Rename
+          </MenuAction>
+
+          {/*
+           * The drag, a step at a time. Past the neighbour that is *drawn*, so
+           * the move is one the reader can see even with a filter hiding other
+           * groups; disabled rather than hidden at the ends, so the menu keeps
+           * its shape and the letters keep their places.
+           */}
+          <MenuAction
+            hotkey="u"
+            disabled={previousGroupId === null}
+            onSelect={() => {
+              if (previousGroupId !== null) reorderSessionGroup(groupId, previousGroupId, 'before');
+            }}
+          >
+            <ArrowUpIcon aria-hidden="true" />
+            Move up
+          </MenuAction>
+          <MenuAction
+            hotkey="n"
+            disabled={nextGroupId === null}
+            onSelect={() => {
+              if (nextGroupId !== null) reorderSessionGroup(groupId, nextGroupId, 'after');
+            }}
+          >
+            <ArrowDownIcon aria-hidden="true" />
+            Move down
           </MenuAction>
 
           <ContextMenuSeparator />
@@ -1079,6 +1170,27 @@ function VirtualRows({
   const [scrollTop, setScrollTop] = useState(0);
   const [viewport, setViewport] = useState(0);
 
+  /*
+   * A group heading being carried, and where it would land.
+   *
+   * Component state rather than store state for the reason `renamingGroup` is:
+   * it changes many times a second while a pointer moves, it means nothing once
+   * the gesture is over, and nothing outside this list has any use for it.
+   *
+   * `draggedGroup` exists because a drop target cannot read a drag's payload
+   * until the drop — only its types (see `groupDrag.ts`) — and "would this
+   * change anything?" needs to know which heading is in the air. It is only
+   * ever a refinement: a drag from another window leaves it `null`, the line is
+   * then drawn everywhere, and the drop still reads the real id off the
+   * payload.
+   */
+  const [draggedGroup, setDraggedGroup] = useState<string | null>(null);
+  const [groupDrop, setGroupDrop] = useState<GroupDrop | null>(null);
+  const endGroupDrag = useCallback((): void => {
+    setDraggedGroup(null);
+    setGroupDrop(null);
+  }, []);
+
   useEffect(() => {
     const element = scrollRef.current;
     if (!element || typeof ResizeObserver === 'undefined') return;
@@ -1127,6 +1239,85 @@ function VirtualRows({
   const first = Math.max(0, indexAt(offsets, scrollTop) - OVERSCAN);
   const last = Math.min(rows.length - 1, indexAt(offsets, scrollTop + height) + OVERSCAN);
 
+  /*
+   * The list is the drop target for a carried group, not the headings.
+   *
+   * Where a group lands is a question about the whole stack, so it is asked
+   * here, once, of the geometry this component already owns: the pointer is
+   * turned into a position in list pixels and `groupDropAt` reads the answer
+   * off the same `offsets` the rows were drawn from. That is what lets the
+   * lower half of an open group mean "after this group" and draw its line under
+   * the group's last row, where the heading would actually go — a heading that
+   * took its own drops could only ever draw a line against itself.
+   *
+   * A session drag never gets here as far as these are concerned: both handlers
+   * decline anything that is not carrying a group, exactly as the headings'
+   * own handlers decline anything that is not carrying a session, so the two
+   * gestures share elements without either answering for the other.
+   */
+  const groupDropFor = (event: DragEvent<HTMLDivElement>): GroupDrop | null => {
+    const element = scrollRef.current;
+    if (!element) return null;
+    const y = event.clientY - element.getBoundingClientRect().top + element.scrollTop;
+    return groupDropAt(rows, offsets, y, draggedGroup);
+  };
+
+  const overGroupDrag = (event: DragEvent<HTMLDivElement>): void => {
+    if (!isGroupDrag(event.dataTransfer)) return;
+    const drop = groupDropFor(event);
+    // Fewer than two groups: nothing to arrange, so nothing to accept.
+    if (drop === null) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    // `dragover` fires for as long as the pointer is held over the list, and
+    // almost every one of them resolves to the place the last one did.
+    setGroupDrop((current) =>
+      current !== null &&
+      current.anchorId === drop.anchorId &&
+      current.edge === drop.edge &&
+      current.lineY === drop.lineY &&
+      current.changes === drop.changes
+        ? current
+        : drop,
+    );
+  };
+
+  const leaveGroupDrag = (event: DragEvent<HTMLDivElement>): void => {
+    /*
+     * `dragleave` bubbles up from every row the pointer crosses; only the one
+     * that really leaves the list takes the line away.
+     *
+     * Asked two ways because the first is not dependable: `relatedTarget` is
+     * where the pointer went, but engines have shipped drag events with it left
+     * `null`, and a line that blinked out at every row boundary until the next
+     * `dragover` would be the result. The pointer still being inside the list's
+     * own rectangle is the answer that needs nothing from the event but its
+     * coordinates.
+     */
+    const into = event.relatedTarget;
+    if (into instanceof Node && event.currentTarget.contains(into)) return;
+    const box = event.currentTarget.getBoundingClientRect();
+    const inside =
+      event.clientX >= box.left &&
+      event.clientX < box.right &&
+      event.clientY >= box.top &&
+      event.clientY < box.bottom;
+    if (inside) return;
+    setGroupDrop(null);
+  };
+
+  const dropGroupDrag = (event: DragEvent<HTMLDivElement>): void => {
+    if (!isGroupDrag(event.dataTransfer)) return;
+    const id = readGroupDrag(event.dataTransfer);
+    const drop = groupDropFor(event);
+    // No `dragend` arrives on a *target*, and the source may have been scrolled
+    // out of the window and unmounted by now, so the drop tidies up as well.
+    endGroupDrag();
+    if (id === null || drop === null) return;
+    event.preventDefault();
+    reorderSessionGroup(id, drop.anchorId, drop.edge);
+  };
+
   const visible: ReactElement[] = [];
   for (let i = first; i <= last; i += 1) {
     const row = rows[i];
@@ -1167,6 +1358,13 @@ function VirtualRows({
           top={top}
           renaming={renamingGroup === row.groupId}
           onRename={onRenameGroup}
+          // `null`, not `undefined`, so the props keep one identity at the ends
+          // of the stack — the same bargain `groupId` strikes on a row.
+          previousGroupId={row.previousGroupId ?? null}
+          nextGroupId={row.nextGroupId ?? null}
+          dragging={draggedGroup === row.groupId}
+          onDragStart={setDraggedGroup}
+          onDragEnd={endGroupDrag}
         />,
       );
       continue;
@@ -1193,10 +1391,34 @@ function VirtualRows({
     <div
       ref={scrollRef}
       onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+      onDragEnter={overGroupDrag}
+      onDragOver={overGroupDrag}
+      onDragLeave={leaveGroupDrag}
+      onDrop={dropGroupDrag}
       className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain"
     >
       <div className="relative" style={{ height: total }}>
         {visible}
+        {/*
+          Where the carried group would land: one line, on the boundary between
+          two groups' blocks. A line rather than the ground-and-ring a session
+          drag lights a heading with, and the difference is the point — that
+          drop files a row *under* a heading and has no position to show, this
+          one is nothing but a position. Not drawn where the drop would change
+          nothing, so a heading held over its own place promises no move.
+
+          Kept a pixel inside the top so a line above the very first row is not
+          half clipped by the scroller, and out of the pointer's way so it can
+          never become the element the drag is over.
+        */}
+        {groupDrop !== null && groupDrop.changes ? (
+          <div
+            aria-hidden="true"
+            data-slot="group-drop-line"
+            style={{ top: Math.max(1, groupDrop.lineY) }}
+            className="pointer-events-none absolute inset-x-1.5 z-10 h-0.5 -translate-y-1/2 rounded-full bg-beam"
+          />
+        ) : null}
       </div>
     </div>
   );
@@ -1755,8 +1977,8 @@ const Row = memo(function Row({
  * into an attribute selector below, and `"` or `]` arriving from a keyboard
  * layout nobody tested would be a syntax error thrown at a right-click.
  */
-type Hotkey = 'r' | 'p' | 'a' | 'd';
-const HOTKEYS: ReadonlySet<string> = new Set<Hotkey>(['r', 'p', 'a', 'd']);
+type Hotkey = 'r' | 'p' | 'a' | 'd' | 'u' | 'n';
+const HOTKEYS: ReadonlySet<string> = new Set<Hotkey>(['r', 'p', 'a', 'd', 'u', 'n']);
 
 /**
  * Turn a letter into the click it stands for.

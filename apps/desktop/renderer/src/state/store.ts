@@ -128,8 +128,10 @@ import { isAbsolutePath, lastSegment } from '../lib/paths';
 import { newId } from '../lib/id';
 import {
   entriesFiling,
+  moveGroup,
   sessionKey,
   type CustomGroup,
+  type GroupEdge,
   type GroupMembership,
 } from '../lib/sessionGroups';
 import {
@@ -1173,7 +1175,7 @@ export interface AppState {
    */
   readonly pinnedCollapsed: boolean;
   /**
-   * The groups the user has made in the sidebar, in the order they were made.
+   * The groups the user has made in the sidebar, in the order they are drawn.
    *
    * The third way a session can leave its project heading, after the pin and
    * the archive, and the only one whose sections a person names themselves. See
@@ -1187,9 +1189,15 @@ export interface AppState {
    * about the transcripts. It rides in `prefs.json` beside
    * {@link pinnedSessions} for exactly that reason.
    *
-   * Creation order rather than name order, and no reordering control: the list
-   * is meant to be a handful of shelves, and the one thing worse than a shelf
-   * in the wrong place is a shelf that moves when you rename it. `collapsed`
+   * The order is the user's own. A new group starts at the bottom of the stack
+   * and is moved from there by dragging its heading, or a step at a time from
+   * the heading's menu — see {@link reorderSessionGroup}. It is never *derived*,
+   * from names least of all: the one thing worse than a shelf in the wrong
+   * place is a shelf that moves when you rename it. (The first version had no
+   * reordering at all, on the argument that a handful of shelves does not need
+   * it. A handful is exactly when the order gets noticed: the group made last
+   * week for the work that matters most sat under three older ones for good.)
+   * `collapsed`
    * lives on the record instead of in a parallel set like
    * {@link collapsedProjects}, because a group has an id to hang it on and
    * deleting the group then takes its fold state with it rather than leaving an
@@ -8979,9 +8987,9 @@ const NEW_GROUP_NAME = 'New group';
  * just created. Returning the id is what makes that one call instead of
  * creating a group and then guessing which of them is new.
  *
- * Appended rather than prepended: the list is in creation order and stays that
- * way (see {@link AppState.sessionGroups}), so a new group appears at the
- * bottom of the group stack rather than displacing the ones above it.
+ * Appended rather than prepended: a new group appears at the bottom of the
+ * group stack rather than displacing the ones above it, and is the user's to
+ * move from there — see {@link reorderSessionGroup}.
  */
 export function createSessionGroup(name: string = NEW_GROUP_NAME): string {
   const id = newId('grp');
@@ -9063,6 +9071,26 @@ export function toggleSessionGroupCollapsed(id: string): void {
       return { ...group, collapsed: true };
     }),
   }));
+  savePrefs();
+}
+
+/**
+ * Move a group to sit directly before or after another.
+ *
+ * The order of {@link AppState.sessionGroups} is the order the headings are
+ * drawn in, and it is the user's to arrange: by dragging a heading, or a step
+ * at a time from the heading's menu. Both name an anchor and a side rather than
+ * a position, and `moveGroup` in `sessionGroups.ts` says why.
+ *
+ * Nothing is written when nothing moved — an unknown id, a group dropped on
+ * itself, one dropped where it already sits — so a drag that ends where it
+ * began does not touch the preferences file.
+ */
+export function reorderSessionGroup(id: string, anchorId: string, edge: GroupEdge): void {
+  const current = useApp.getState().sessionGroups;
+  const next = moveGroup(current, id, anchorId, edge);
+  if (next === current) return;
+  useApp.setState({ sessionGroups: next });
   savePrefs();
 }
 

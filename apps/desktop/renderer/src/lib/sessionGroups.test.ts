@@ -12,13 +12,17 @@ import type { ProfileId, SessionSummary } from '@rx-artemis/protocol';
 import {
   entriesFiling,
   flattenGroups,
+  groupDropAt,
   groupIdOf,
   groupSessionsByProject,
   liftSessionGroups,
   matchesQuery,
+  moveGroup,
   orderSessions,
   partitionSessions,
   sessionKey,
+  type CustomGroup,
+  type ListRow,
 } from './sessionGroups';
 
 /** `partitionSessions` with the set the case under test is not about. */
@@ -1104,5 +1108,189 @@ describe('flattenGroups with the user’s groups', () => {
     expect(rows[1]).toMatchObject({ group: 1, pinned: true });
     expect(rows[3]).toMatchObject({ group: 3, groupId: 'g1' });
     expect(rows[5]).toMatchObject({ group: 0 });
+  });
+
+  it('tells each heading which groups are drawn above and below it', () => {
+    // What "Move up" and "Move down" anchor on. The ends of the stack name
+    // nothing, which is what disables the item.
+    const rows = flattenGroups(projects(), new Set(), {
+      groups: [
+        { group: { id: 'g1', name: 'Billing' }, sessions: grouped },
+        { group: { id: 'g2', name: 'Docs' }, sessions: [] },
+        { group: { id: 'g3', name: 'Ops' }, sessions: [] },
+      ],
+    });
+
+    const headings = rows.filter((r) => r.kind === 'group-header');
+    expect(headings.map((r) => [r.previousGroupId, r.nextGroupId])).toEqual([
+      [undefined, 'g2'],
+      ['g1', 'g3'],
+      ['g2', undefined],
+    ]);
+  });
+
+  it('names the neighbours that are drawn, not the ones a filter dropped', () => {
+    // `liftSessionGroups` drops a group that matches nothing while a query is
+    // typed, so the sections arriving here are already the visible ones — and a
+    // move has to land somewhere the reader can see it land.
+    const rows = flattenGroups(projects(), new Set(), {
+      groups: [
+        { group: { id: 'g1', name: 'Billing' }, sessions: grouped },
+        { group: { id: 'g3', name: 'Ops' }, sessions: grouped },
+      ],
+    });
+
+    const headings = rows.filter((r) => r.kind === 'group-header');
+    expect(headings[0]).toMatchObject({ nextGroupId: 'g3' });
+    expect(headings[1]).toMatchObject({ previousGroupId: 'g1' });
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Arranging the groups                                                       */
+/* -------------------------------------------------------------------------- */
+
+describe('moveGroup', () => {
+  const GROUPS: readonly CustomGroup[] = [
+    { id: 'a', name: 'Billing' },
+    { id: 'b', name: 'Docs', collapsed: true },
+    { id: 'c', name: 'Ops' },
+  ];
+  const order = (groups: readonly CustomGroup[]): string => groups.map((g) => g.id).join('');
+
+  it('puts a group directly before its anchor', () => {
+    expect(order(moveGroup(GROUPS, 'c', 'a', 'before'))).toBe('cab');
+    expect(order(moveGroup(GROUPS, 'c', 'b', 'before'))).toBe('acb');
+  });
+
+  it('puts a group directly after its anchor', () => {
+    expect(order(moveGroup(GROUPS, 'a', 'c', 'after'))).toBe('bca');
+    expect(order(moveGroup(GROUPS, 'a', 'b', 'after'))).toBe('bac');
+  });
+
+  it('carries the whole record, fold state included, and leaves the input alone', () => {
+    const moved = moveGroup(GROUPS, 'b', 'a', 'before');
+
+    expect(moved[0]).toEqual({ id: 'b', name: 'Docs', collapsed: true });
+    expect(order(GROUPS)).toBe('abc');
+  });
+
+  it('hands back the same list when nothing moved, so nothing is written', () => {
+    // Identity, not equality: the store compares references to decide whether a
+    // drag that ended where it began touches the preferences file.
+    expect(moveGroup(GROUPS, 'b', 'b', 'before')).toBe(GROUPS);
+    expect(moveGroup(GROUPS, 'b', 'a', 'after')).toBe(GROUPS);
+    expect(moveGroup(GROUPS, 'b', 'c', 'before')).toBe(GROUPS);
+  });
+
+  it('moves nothing for a group or an anchor the list no longer holds', () => {
+    // A heading dragged from a window whose group was deleted in this one.
+    expect(moveGroup(GROUPS, 'gone', 'a', 'before')).toBe(GROUPS);
+    expect(moveGroup(GROUPS, 'a', 'gone', 'after')).toBe(GROUPS);
+  });
+});
+
+describe('groupDropAt', () => {
+  /** The list's two row heights. See `ROW_HEIGHT` and `HEADER_HEIGHT` in `SessionList`. */
+  const offsetsOf = (rows: readonly ListRow[]): readonly number[] => {
+    const starts = [0];
+    for (const row of rows) starts.push((starts.at(-1) ?? 0) + (row.kind === 'session' ? 54 : 24));
+    return starts;
+  };
+
+  /*
+   * A pin shelf, three groups — one open with two rows, one folded, one empty —
+   * and a project underneath:
+   *
+   *     0   Pinned                 78  Billing   ┐ block [78, 210), middle 144
+   *    24     kept                102    filed-1 │
+   *                               156    filed-2 ┘
+   *                               210  Docs (folded)   block [210, 234)
+   *                               234  Ops (empty)     block [234, 258)
+   *                               258  api
+   *                               282    loose
+   */
+  const rows = flattenGroups(
+    groupSessionsByProject([session({ id: 'loose', cwd: '/code/api', updatedAt: 5 })]),
+    new Set(),
+    {
+      pinned: { sessions: [session({ id: 'kept', cwd: '/code/web', updatedAt: 9 })], collapsed: false },
+      groups: [
+        {
+          group: { id: 'a', name: 'Billing' },
+          sessions: [
+            session({ id: 'filed-1', cwd: '/code/web', updatedAt: 8 }),
+            session({ id: 'filed-2', cwd: '/code/web', updatedAt: 7 }),
+          ],
+        },
+        {
+          group: { id: 'b', name: 'Docs', collapsed: true },
+          sessions: [session({ id: 'filed-3', cwd: '/code/web', updatedAt: 6 })],
+        },
+        { group: { id: 'c', name: 'Ops' }, sessions: [] },
+      ],
+    },
+  );
+  const offsets = offsetsOf(rows);
+  const at = (y: number, dragged?: string | null) => groupDropAt(rows, offsets, y, dragged);
+
+  it('reads the upper half of a group’s block as before it', () => {
+    expect(at(80)).toMatchObject({ anchorId: 'a', edge: 'before', lineY: 78 });
+    expect(at(215)).toMatchObject({ anchorId: 'b', edge: 'before', lineY: 210 });
+  });
+
+  it('reads the lower half as after it, and draws the line under its last row', () => {
+    // Over Billing's first row, past the middle of the block. The line goes to
+    // the end of the group — 210 — not under its heading at 102: between a
+    // heading and its own rows is not a place a group can land.
+    expect(at(150)).toMatchObject({ anchorId: 'a', edge: 'after', lineY: 210 });
+    expect(at(230)).toMatchObject({ anchorId: 'b', edge: 'after', lineY: 234 });
+  });
+
+  it('treats an open group’s rows as part of the group', () => {
+    expect(at(120)).toMatchObject({ anchorId: 'a', edge: 'before' });
+    expect(at(200)).toMatchObject({ anchorId: 'a', edge: 'after' });
+  });
+
+  it('sends anything above the stack to its top and anything below to its bottom', () => {
+    // Pinned and the projects are not places a group can go, but they are an
+    // unambiguous direction — a heading dragged there lands at the nearest end.
+    expect(at(10)).toMatchObject({ anchorId: 'a', edge: 'before', lineY: 78 });
+    expect(at(300)).toMatchObject({ anchorId: 'c', edge: 'after', lineY: 258 });
+    expect(at(-40)).toMatchObject({ anchorId: 'a', edge: 'before' });
+    expect(at(9_999)).toMatchObject({ anchorId: 'c', edge: 'after' });
+  });
+
+  it('draws one line for one boundary, from whichever side it is approached', () => {
+    expect(at(230)?.lineY).toBe(at(240)?.lineY);
+  });
+
+  it('says when a drop would change nothing, once it knows what is being carried', () => {
+    // Billing held over itself, either half, and over the top of its neighbour.
+    expect(at(80, 'a')?.changes).toBe(false);
+    expect(at(150, 'a')?.changes).toBe(false);
+    expect(at(215, 'a')?.changes).toBe(false);
+    // Past the neighbour is a real move.
+    expect(at(230, 'a')?.changes).toBe(true);
+    // Ops, from the bottom: under Docs is where it already is, over it is not.
+    expect(at(230, 'c')?.changes).toBe(false);
+    expect(at(215, 'c')?.changes).toBe(true);
+  });
+
+  it('assumes every position is a move until told which group is in the air', () => {
+    // A drag from another window: the types say "a group" and nothing else.
+    expect(at(80)?.changes).toBe(true);
+    expect(at(80, null)?.changes).toBe(true);
+    // Carried, but filtered out of this window's list.
+    expect(at(80, 'not-drawn')?.changes).toBe(true);
+  });
+
+  it('has nowhere to put a group when there are fewer than two', () => {
+    const one = flattenGroups([], new Set(), {
+      groups: [{ group: { id: 'a', name: 'Billing' }, sessions: [] }],
+    });
+
+    expect(groupDropAt(one, offsetsOf(one), 10)).toBeNull();
+    expect(groupDropAt([], [0], 10)).toBeNull();
   });
 });
