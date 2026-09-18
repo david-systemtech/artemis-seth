@@ -1473,11 +1473,37 @@ describe('RunRegistry — adopting', () => {
     expect(registry.list().map((h) => h.runId)).toContain('run-c1');
   });
 
-  it('carries no history offset, because the seam cannot be known after the fact', () => {
+  it('carries no history offset at adoption, because the registry cannot count it here', () => {
     const { registry } = harness();
-    // By the time a turn announces itself the provider has already written part
-    // of it, so any count taken here is wrong by an amount nothing can subtract.
+    // By the time a turn announces itself the provider has already filed the
+    // message that opened it, so a count the registry took now would be wrong
+    // by an amount it cannot identify. The adapter is the side that can.
     expect(adopt(registry, continuation()).historyOffset).toBeUndefined();
+  });
+
+  it('reports the seam the run measures after adoption, on every later read', async () => {
+    /*
+     * The served-continuation loss of 2026-09-18: a turn the provider opened
+     * on its own was adopted without a seam, a window attached to it, and
+     * with no seam to read history up to, the whole conversation above the
+     * turn was dropped. The adapter now counts the seam once the turn is open
+     * and reports it on the run; nothing rebuilds the stored handle for that,
+     * so it has to be read at snapshot time.
+     */
+    const { registry } = harness();
+    const run = continuation();
+    adopt(registry, run);
+    expect(registry.get('run-c1')?.historyOffset).toBeUndefined();
+
+    (run as unknown as { historyOffset?: number }).historyOffset = 42;
+
+    expect(registry.get('run-c1')?.historyOffset).toBe(42);
+    expect(registry.list().find((h) => h.runId === 'run-c1')?.historyOffset).toBe(42);
+
+    // And it survives the handle being rebuilt on a transition.
+    run.emit(sessionStarted('run-c1'));
+    await flush();
+    expect(registry.get('run-c1')?.historyOffset).toBe(42);
   });
 
   it('pumps the adopted run to subscribers and retains it for replay', async () => {
@@ -1629,6 +1655,29 @@ describe('history offset', () => {
 
     // `session.started` replaces the handle. The offset is a fact about how the
     // run began and must not be dropped on the way through.
+    expect(h.registry.get(handle.runId)?.historyOffset).toBe(7);
+  });
+
+  it('takes a seam the run learns after starting, when it measured none itself', async () => {
+    // The served adapter's case: the conversation lives on the server, so this
+    // registry cannot count it, and the server tells the run on the stream.
+    const h = harness();
+    const handle = await h.registry.start(input({ resumeSessionId: 'session-abc' }));
+    expect(handle.historyOffset).toBeUndefined();
+
+    (h.runs[0] as { historyOffset?: number }).historyOffset = 5;
+
+    expect(h.registry.get(handle.runId)?.historyOffset).toBe(5);
+  });
+
+  it('keeps the seam it measured over one the run reports later', async () => {
+    // The registry's count was taken at the one instant it was exact; a number
+    // the run offers afterwards cannot be more right than that.
+    const h = harness({ countSessionMessages: () => Promise.resolve(7) });
+    const handle = await h.registry.start(input({ resumeSessionId: 'session-abc' }));
+
+    (h.runs[0] as { historyOffset?: number }).historyOffset = 99;
+
     expect(h.registry.get(handle.runId)?.historyOffset).toBe(7);
   });
 });

@@ -285,3 +285,22 @@ describe('the token counts a served run reports', () => {
     expect(end.usage?.tokens.cacheReadInputTokens).toBe(100);
   });
 });
+
+describe('readServerChunk — the seam beside the run id', () => {
+  it('reads the history offset off the announcement', () => {
+    const delta = readServerChunk({
+      choices: [{ delta: {} }],
+      artemis: { runId: 'srv-run', historyOffset: 911 },
+    });
+    expect(delta?.artemis?.runId).toBe('srv-run');
+    expect(delta?.artemis?.historyOffset).toBe(911);
+  });
+
+  it('keeps zero, which is a fresh conversation, and drops what is not a count', () => {
+    const read = (historyOffset: unknown) =>
+      readServerChunk({ choices: [{ delta: {} }], artemis: { historyOffset } })?.artemis
+        ?.historyOffset;
+    expect(read(0)).toBe(0);
+    for (const junk of [-1, 1.5, '12', null, true]) expect(read(junk)).toBeUndefined();
+  });
+});

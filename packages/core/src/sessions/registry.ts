@@ -178,7 +178,22 @@ function snapshot(entry: RunEntry): RunHandle {
   // Same read-time stamping as `lastSeq`, for the same reason: the count moves
   // per send while the stored handle is replaced only on transitions. See
   // `RunHandle.promptCount` on what an adopting window does with it.
-  return entry.prompts > 0 ? { ...stamped, promptCount: entry.prompts } : stamped;
+  const counted = entry.prompts > 0 ? { ...stamped, promptCount: entry.prompts } : stamped;
+  /*
+   * The seam, when the run learned it after it started.
+   *
+   * `start` records the one it measured. A run that could only be told later —
+   * a turn the provider opened by itself and counted once it announced itself,
+   * a served run told by its server — carries the number on the `Run`, and no
+   * transition rebuilds the stored handle for it. Read here so everyone who
+   * asks after the fact gets it: the window re-attaching after a reload, the
+   * client joining a served continuation. Never over one the registry took
+   * itself, which was measured at the one instant it was exact.
+   */
+  const seam = entry.run.historyOffset;
+  return counted.historyOffset === undefined && seam !== undefined
+    ? { ...counted, historyOffset: seam }
+    : counted;
 }
 
 /** Receives every event of the runs it is subscribed to. */
@@ -713,12 +728,15 @@ export class RunRegistry {
    * — capabilities, the conversation, whose account and which directory — is
    * already fixed on the run or the process that opened it.
    *
-   * No `historyOffset`. The seam it measures is "how much of the session file
-   * predates this run", and there is no honest answer here: by the time a turn
-   * announces itself the provider has already written part of it. Absent means
-   * "this cannot be counted", which is a case the renderer already handles by
-   * showing no earlier history rather than a duplicated turn — and the pane this
-   * lands in is normally the one that has the conversation on screen already.
+   * No `historyOffset` at adoption. The seam it measures is "how much of the
+   * session file predates this run", and the registry cannot take it here: by
+   * the time a turn announces itself the provider has already filed the message
+   * that opened it. An adapter that can tell where its own output begins counts
+   * the seam itself once the turn is open and reports it on the run, and
+   * {@link snapshot} carries it from there. Until it does, absent means "this
+   * cannot be counted": a renderer that already has the conversation on screen
+   * keeps it, and one rebuilding from nothing shows the turn alone rather than
+   * a conversation twice.
    *
    * @throws {RunError} `cancelled` when the registry is shutting down.
    * @throws {RunError} `invalid_request` when the run id is already known.

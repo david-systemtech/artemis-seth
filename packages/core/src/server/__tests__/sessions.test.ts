@@ -271,6 +271,64 @@ describe('GET /api/v0/sessions/{id}/messages', () => {
     expect(foreign.status).toBe(404);
     expect(JSON.stringify(absent.body)).toBe(JSON.stringify(foreign.body));
   });
+
+  it('reads the page it is asked for, and hands it to the store', async () => {
+    /*
+     * A window attaching to a run in progress reads the turns *before* it as
+     * `limit: historyOffset`. The route used to drop both numbers and answer
+     * the whole file, so the turn in progress was drawn from the file and
+     * then again from the run's own replay.
+     */
+    const { ledger } = await freshLedger();
+    seedOwnership(ledger);
+    const asked: Record<string, unknown>[] = [];
+    const source: SessionSource = {
+      ...sessionSource,
+      messages: async (query) => {
+        asked.push(query as Record<string, unknown>);
+        return { events: [], hasMore: true };
+      },
+    };
+
+    const reply = await handleServerRequest(
+      get('/api/v0/sessions/sess-1/messages?limit=911&offset=2', TOKEN_A),
+      context(ledger, { sessions: source }),
+    );
+
+    expect(reply.status).toBe(200);
+    expect(asked).toEqual([expect.objectContaining({ sessionId: 'sess-1', limit: 911, offset: 2 })]);
+    expect((reply.body as { hasMore: boolean }).hasMore).toBe(true);
+  });
+
+  it('asks for nothing in particular when no page is named, and refuses one that is not a number', async () => {
+    const { ledger } = await freshLedger();
+    seedOwnership(ledger);
+    const asked: Record<string, unknown>[] = [];
+    const source: SessionSource = {
+      ...sessionSource,
+      messages: async (query) => {
+        asked.push(query as Record<string, unknown>);
+        return { events: [], hasMore: false };
+      },
+    };
+
+    const whole = await handleServerRequest(
+      get('/api/v0/sessions/sess-1/messages', TOKEN_A),
+      context(ledger, { sessions: source }),
+    );
+    expect(whole.status).toBe(200);
+    expect(asked[0]).not.toHaveProperty('limit');
+    expect(asked[0]).not.toHaveProperty('offset');
+
+    // A client that sent a limit meant one; "everything" is the over-read the
+    // parameter exists to prevent.
+    const junk = await handleServerRequest(
+      get('/api/v0/sessions/sess-1/messages?limit=lots', TOKEN_A),
+      context(ledger, { sessions: source }),
+    );
+    expect(junk.status).toBe(400);
+    expect(asked).toHaveLength(1);
+  });
 });
 
 describe('the resume gate on chat completions', () => {

@@ -1631,23 +1631,8 @@ export function createClaudeAdapter(options?: ClaudeAdapterOptions): ProviderAda
      * A zero it invented would make a reloading window replay the whole
      * conversation twice.
      */
-    async countSessionMessages(input: SessionMessageCountQuery): Promise<number> {
-      const configDir = readEnv(input.env, CLAUDE_CONFIG_DIR_ENV);
-      try {
-        const stored = await withClaudeConfigDir(
-          configDir,
-          () =>
-            sdkGetSessionMessages(input.sessionId, {
-              ...(input.cwd === undefined ? {} : { dir: input.cwd }),
-            }),
-          'countSessionMessages',
-        );
-        return stored.length;
-      } catch (error) {
-        throw adapterError('unknown', `Could not read that session: ${describe(error)}`, {
-          cause: error,
-        });
-      }
+    countSessionMessages(input: SessionMessageCountQuery): Promise<number> {
+      return countStoredMessages(input.env, input.sessionId, input.cwd);
     },
 
     async getSessionMessages(input: SessionMessagesQuery): Promise<SessionTranscript> {
@@ -3108,6 +3093,8 @@ class ClaudeProcess {
       forkSession: false,
       attachments: undefined,
     });
+    // Before the CLI has written a word of the turn — see the method.
+    void this.#measureSeam(turn);
 
     this.#deps.diagnostic?.(
       `Run ${runId}: the provider started a turn of its own on session ${this.#sessionId ?? '—'}.`,
@@ -3119,6 +3106,42 @@ class ClaudeProcess {
       sessionId: this.#sessionId,
     });
     return true;
+  }
+
+  /**
+   * Count the conversation a turn of the CLI's own is being added to.
+   *
+   * The registry takes a started run's seam before the CLI is spawned, which
+   * is the one instant that count is exact; a turn the CLI opens by itself has
+   * no such instant for the registry, which adopts it without one. What this
+   * side knows that the registry does not is *when* the turn opened. The
+   * `init` that announces it comes after the CLI has filed the message that
+   * opened the turn — the queued prompt, the task notification — and before it
+   * has written a word of its answer (measured 3 ms apart on 2026-09-18, with
+   * the first assistant record seventeen seconds later). A count taken now
+   * therefore ends exactly where this turn's output begins, with the message
+   * that opened it on the history side — which is where a replay wants it,
+   * because the turn's own stream never carries that message.
+   *
+   * Reported on the turn once known, and read from there by every handle the
+   * registry snapshots after — see `Run.historyOffset`. A failed read leaves
+   * the seam unknown, which the renderer already handles; nothing here may
+   * disturb the turn.
+   */
+  async #measureSeam(turn: ClaudeTurn): Promise<void> {
+    // A turn the CLI runs ahead of a fresh spawn's prompt arrives before the
+    // first `init` has been mapped, so the process may not have the id yet;
+    // the resume the spawn was asked for names the same conversation.
+    const sessionId = this.#sessionId ?? this.#input.resumeSessionId;
+    if (sessionId === undefined) return;
+    try {
+      turn.noteHistoryOffset(await countStoredMessages(this.#input.env, sessionId, this.#input.cwd));
+    } catch (error) {
+      this.#deps.diagnostic?.(
+        `Run ${turn.runId}: could not measure where the conversation ends and this turn begins.`,
+        error,
+      );
+    }
   }
 
   /* -------------------------------- attaching ------------------------------ */
@@ -5243,6 +5266,8 @@ class ClaudeTurn implements Run {
   readonly #process: ClaudeProcess;
   readonly #state: ClaudeMapperState;
   readonly #events: AsyncQueue<AgentEvent>;
+  /** The seam, once the process has counted it. See {@link noteHistoryOffset}. */
+  #historyOffset: number | undefined;
 
   constructor(process: ClaudeProcess, state: ClaudeMapperState, events: AsyncQueue<AgentEvent>) {
     this.#process = process;
@@ -5260,6 +5285,24 @@ class ClaudeTurn implements Run {
 
   get sessionId(): SessionId | undefined {
     return this.#state.sessionId;
+  }
+
+  get historyOffset(): number | undefined {
+    return this.#historyOffset;
+  }
+
+  /**
+   * Record where the conversation ends and this turn begins — how many stored
+   * messages predate it.
+   *
+   * Set once, by the process, for a turn the CLI opened on its own; a turn the
+   * registry started had its seam taken before the spawn and never comes
+   * through here. The registry reads it off the run at every snapshot, so a
+   * window attaching to this turn after the fact draws the conversation above
+   * it rather than the turn alone. See `Run.historyOffset`.
+   */
+  noteHistoryOffset(count: number): void {
+    if (this.#historyOffset === undefined) this.#historyOffset = count;
   }
 
   /**
@@ -5488,6 +5531,42 @@ export function setClaudeConfigDirQueueReporter(
   reporter: ((report: ClaudeConfigDirQueueReport) => void) | undefined,
 ): void {
   configDirQueueReporter = reporter;
+}
+
+/**
+ * How many messages a stored session holds right now, in the unit
+ * `getSessionMessages` pages in.
+ *
+ * The same read `getSessionMessages` does — the SDK gives no cheaper way to
+ * ask "how many?" — but it stops at `.length` instead of turning every stored
+ * record into events, which is where the cost of the read actually is. Two
+ * callers, both on paths where what it skips matters: the adapter's
+ * `countSessionMessages`, taken before a resumed run is spawned, and a process
+ * measuring the seam of a turn the CLI opened on its own.
+ *
+ * Throws on a failed read rather than answering `0`, because the caller has
+ * to be able to tell "this session is empty" from "I could not look". A zero
+ * it invented would make a reloading window replay the whole conversation
+ * twice.
+ */
+async function countStoredMessages(
+  env: EnvBundle,
+  sessionId: SessionId,
+  cwd: string | undefined,
+): Promise<number> {
+  const configDir = readEnv(env, CLAUDE_CONFIG_DIR_ENV);
+  try {
+    const stored = await withClaudeConfigDir(
+      configDir,
+      () => sdkGetSessionMessages(sessionId, { ...(cwd === undefined ? {} : { dir: cwd }) }),
+      'countSessionMessages',
+    );
+    return stored.length;
+  } catch (error) {
+    throw adapterError('unknown', `Could not read that session: ${describe(error)}`, {
+      cause: error,
+    });
+  }
 }
 
 /**

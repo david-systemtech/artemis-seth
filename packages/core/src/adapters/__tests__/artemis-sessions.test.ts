@@ -109,6 +109,38 @@ describe('getSessionMessages', () => {
     expect(transcript.events[0]).toMatchObject({ runId: 'history:sess-9', text: 'hi' });
   });
 
+  it('asks for the page it was given, in the query string', async () => {
+    /*
+     * `limit: historyOffset` is how a window attaching to a run in progress
+     * reads only the turns before it. Left off the request, the server
+     * answered the whole file, and the turn in progress was drawn once from
+     * the file and again from the run.
+     */
+    const urls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) => {
+        urls.push(String(url));
+        return jsonResponse({ object: 'artemis.session.messages', events: [], hasMore: true });
+      }),
+    );
+
+    const adapter = createArtemisAdapter();
+    const page = await adapter.getSessionMessages!({
+      profileId: 'p' as never,
+      sessionId: 'sess-9' as never,
+      runId: 'history:sess-9' as never,
+      env: ENV,
+      limit: 911,
+      offset: 2,
+    });
+
+    expect(urls).toEqual([
+      'http://server.tail:6472/api/v0/sessions/sess-9/messages?limit=911&offset=2',
+    ]);
+    expect(page.hasMore).toBe(true);
+  });
+
   it('surfaces the server\'s 404 as its own sentence', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ error: {} }, 404)));
     const adapter = createArtemisAdapter();

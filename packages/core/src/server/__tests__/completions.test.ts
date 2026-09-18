@@ -2073,3 +2073,57 @@ describe('every block of the answer reaches the wire, not only the first', () =>
     expect(done.result.text).toBe('Hello');
   });
 });
+
+describe('the run announcement carries the seam', () => {
+  it('names how much of the conversation predates the run, when the registry measured it', async () => {
+    /*
+     * The client that started this run is the one that cannot count it: the
+     * conversation lives on this side. Without the number a window that
+     * reloaded mid-turn had nothing to read history up to, and drew the turn
+     * alone.
+     */
+    const base = fakeRuns([{ type: 'run.end', reason: 'completed', seq: 0 }]);
+    const source: RunSource = {
+      ...base,
+      startRun: async (input) => ({ ...(await base.startRun(input)), historyOffset: 911 }),
+    };
+
+    const events = await drain(source);
+
+    expect(events[0]).toMatchObject({ kind: 'run', runId: 'run-1', historyOffset: 911 });
+  });
+
+  it('says nothing about it when the registry could not count', async () => {
+    const events = await drain(fakeRuns([{ type: 'run.end', reason: 'completed', seq: 0 }]));
+    expect(events[0]).toMatchObject({ kind: 'run', runId: 'run-1' });
+    expect(events[0]).not.toHaveProperty('historyOffset');
+  });
+
+  it('repeats it on a stream picked back up, while the registry still knows the run', async () => {
+    // A client joining a turn in progress rebuilds from this stream alone, so
+    // it is told where the history it reads should end.
+    const base = retainingRuns([
+      { type: 'text.delta', text: 'so far', seq: 0 },
+      { type: 'run.end', reason: 'completed', seq: 1 },
+    ]);
+    const source: RunSource = {
+      ...base,
+      getRun: async (runId) =>
+        ({
+          runId,
+          providerId: 'claude',
+          profileId: 'prof-a',
+          cwd: '/w',
+          status: 'running',
+          capabilities: NO_CAPABILITIES,
+          startedAt: 0,
+          historyOffset: 911,
+        }) as unknown as RunHandle,
+    };
+
+    const events = [];
+    for await (const event of resumeTurn(source, { runId: 'run-1' as never })) events.push(event);
+
+    expect(events[0]).toMatchObject({ kind: 'run', runId: 'run-1', historyOffset: 911 });
+  });
+});
