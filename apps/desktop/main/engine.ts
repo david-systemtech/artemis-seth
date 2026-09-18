@@ -146,6 +146,8 @@ import {
   composesAlwaysOnSkillsHere,
   enabledToolServers,
   lowestTierModel,
+  skillSourceIdFor,
+  skillSourceLimitProblem,
   withoutSkillSource,
   withSkillSource,
 } from '@rx-artemis/protocol';
@@ -153,7 +155,7 @@ import {
 import { AgentPromptStore } from './agentPrompts.js';
 import { SkillLibraryStore } from './skillLibrary.js';
 import { anyBankAvailable, banksForRun, configureMemoryBanks, isMasterEnabled, promptBanks, syncMemoryBanksInBackground } from './memoryBanks.js';
-import { EngineUnavailableError, ValidationError } from './errors.js';
+import { EngineUnavailableError, ValidationError, WorkspaceError } from './errors.js';
 import { createLogger } from './log.js';
 import { ensureSignInForwarder, stopSignInForwarder } from './signInLoopback.js';
 import { createMemoryBankSecrets } from './memoryBankSecrets.js';
@@ -1684,8 +1686,15 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       skillLibrary.update((current) => ({ ...current, alwaysOn: document.alwaysOn })),
     listSkillSources: async () => skillSources.status((await skillLibrary.load()).sources ?? []),
     addSkillSource: async (url, subdir) => {
-      const next = await skillLibrary.update((current) => withSkillSource(current, url, subdir));
-      const added = next.sources?.at(-1);
+      const next = await skillLibrary.update((current) => {
+        // Inside the update, so it is decided against what is stored at this
+        // call's turn and not against a copy read before another add landed.
+        const full = skillSourceLimitProblem(current, url);
+        // A sentence written to be shown, which is what this error is for.
+        if (full !== null) throw new WorkspaceError(full);
+        return withSkillSource(current, url, subdir);
+      });
+      const added = next.sources?.find((source) => source.id === skillSourceIdFor(url));
       // Tried now rather than left to the next run, so the pane that asked
       // shows either the skills or git's own reason for their absence.
       if (added !== undefined) await skillSources.sync(added, { force: true });
