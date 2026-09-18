@@ -145,6 +145,11 @@ export interface ListSkillsOptions {
  * still reaches every *other* account — a nuance one row cannot carry, and the
  * uncommon case: the point of the machine folder is to not keep per-account
  * copies.
+ *
+ * Two accounts with *separate* copies of one name are one row as well, and it
+ * names both: each is offered a skill by that name, and the switch on the row
+ * reaches both. What the row says the skill is for, and what it costs, are the
+ * first account's copy's — the other nuance one row cannot carry.
  */
 export async function listSkills(options: ListSkillsOptions): Promise<readonly SkillInfo[]> {
   const home = options.home ?? homedir();
@@ -171,7 +176,16 @@ export async function listSkills(options: ListSkillsOptions): Promise<readonly S
   const byName = new Map<string, SkillInfo>();
   for (const root of roots) {
     for (const folder of await skillFoldersIn(root.dir)) {
-      if (byName.has(folder.name)) continue;
+      const listed = byName.get(folder.name);
+      if (listed !== undefined) {
+        if (listed.origin.kind === 'profile' && root.origin.kind === 'profile') {
+          byName.set(folder.name, {
+            ...listed,
+            origin: { kind: 'profile', profileIds: [...listed.origin.profileIds, ...root.origin.profileIds] },
+          });
+        }
+        continue;
+      }
       const document = await readSkillDocument(folder.dir);
       byName.set(folder.name, {
         name: folder.name,

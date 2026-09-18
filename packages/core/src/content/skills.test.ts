@@ -148,6 +148,22 @@ describe('listSkills', () => {
     expect(skills[0]).toMatchObject({ description: 'Mine.', origin: { kind: 'profile', profileIds: [WORK] } });
   });
 
+  it('names both accounts when each has its own copy of one name', async () => {
+    await skill(join(work, 'skills'), 'review', '---\ndescription: Work review.\n---\nWork body.\n');
+    await skill(join(personal, 'skills'), 'review', '---\ndescription: Home review.\n---\nA longer home body.\n');
+
+    const skills = await listSkills({ accounts: accounts(), home });
+
+    // Each account is offered a skill by this name, and a switch thrown on
+    // the row reaches both. What the row says and costs is the first copy's.
+    expect(skills).toHaveLength(1);
+    expect(skills[0]).toMatchObject({
+      name: 'review',
+      description: 'Work review.',
+      origin: { kind: 'profile', profileIds: [WORK, HOME] },
+    });
+  });
+
   it('prices a body past the injection limit at the limit, which is all a run is given', async () => {
     const body = 'x'.repeat(SKILL_LIMITS.body * 4);
     await skill(join(home, '.agents', 'skills'), 'huge', `---\ndescription: Long.\n---\n${body}\n`);
