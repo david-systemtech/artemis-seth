@@ -345,6 +345,261 @@ describe('the event stream', () => {
     expect(streams[1]?.headers['last-event-id']).toBe('2');
     expect(seen).toHaveLength(2);
   });
+
+  const eventStreams = (): RecordedRequest[] =>
+    requests.filter((request) => new URL(request.url).pathname === '/api/v0/events');
+
+  /*
+   * The restart. A feed's seqs start over with the process that serves it, so
+   * the cursor a window carries across a server restart names a count that no
+   * longer exists. Kept, it made the server skip everything at or below it —
+   * which on a fresh feed is everything — and the window went deaf.
+   */
+  it('names its feed on reconnect, and starts over when the server names another', async () => {
+    replies.set('/api/v0/events', [
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([
+          sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":0,"version":"t","epoch":"before"}' }),
+          frame(1, textDelta(0)) + frame(2, textDelta(1)),
+        ]),
+      },
+      // The server came back as a new process: a new epoch, counting from 1.
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([
+          sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":0,"version":"t","epoch":"after"}' }),
+          frame(1, textDelta(2)),
+        ]),
+      },
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody(
+          [sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":1,"version":"t","epoch":"after"}' })],
+          true,
+        ),
+      },
+    ]);
+    const bridge = bridgeUnderTest();
+    const seen: AgentEvent[] = [];
+    bridge.runs.onEvent((event) => seen.push(event));
+
+    await until(() => eventStreams().length >= 3);
+    const [first, second, third] = eventStreams();
+    // Nothing to resume, so nothing to qualify.
+    expect(first?.url.endsWith('/api/v0/events')).toBe(true);
+    // The reconnect says whose count its cursor is.
+    expect(second?.headers['last-event-id']).toBe('2');
+    expect(new URL(second?.url ?? '').searchParams.get('epoch')).toBe('before');
+    // And after the restart it resumes from the *new* feed's numbering: the
+    // cursor is the 1 it was just handed, not the 2 it arrived with.
+    expect(third?.headers['last-event-id']).toBe('1');
+    expect(new URL(third?.url ?? '').searchParams.get('epoch')).toBe('after');
+    // The event the new process published was heard, not discarded as old.
+    expect(seen).toHaveLength(3);
+  });
+
+  it('reads a head behind its cursor as a restart, from a server too old to name its feed', async () => {
+    replies.set('/api/v0/events', [
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([
+          sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":0,"version":"t"}' }),
+          frame(1, textDelta(0)) + frame(2, textDelta(1)) + frame(3, textDelta(2)),
+        ]),
+      },
+      // No epoch — but no feed's head is ever behind a number it handed out.
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":1,"version":"t"}' })]),
+      },
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody(
+          [sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":1,"version":"t"}' })],
+          true,
+        ),
+      },
+    ]);
+    bridgeUnderTest();
+
+    await until(() => eventStreams().length >= 3);
+    const [, second, third] = eventStreams();
+    expect(second?.headers['last-event-id']).toBe('3');
+    expect(third?.headers['last-event-id']).toBe('1');
+  });
+
+  /*
+   * A socket that died without saying so reads as a quiet stream for ever. The
+   * server's heartbeat is what lets silence mean something; this is the client
+   * holding it to that.
+   */
+  it('gives up on a stream that has gone silent, and reconnects', async () => {
+    const opened: string[] = [];
+    install((async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = String(input);
+      opened.push(url);
+      const signal = init?.signal ?? undefined;
+      let sent = false;
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          getReader: () => ({
+            read: (): Promise<{ done: boolean; value?: Uint8Array }> => {
+              if (!sent) {
+                sent = true;
+                const hello = sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":0,"version":"t"}' });
+                return Promise.resolve({ done: false, value: new TextEncoder().encode(hello) });
+              }
+              // Then nothing, the way a half-open socket says nothing — until
+              // the request is aborted, which is what a real fetch rejects on.
+              return new Promise((_resolve, reject) => {
+                signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+              });
+            },
+          }),
+        },
+      } as unknown as Response;
+    }) as typeof fetch);
+
+    createRemoteBridge(CONFIG, null, { signal: lifetime.signal, silenceLimitMs: 25 });
+
+    await until(() => opened.length >= 2);
+    expect(opened.length).toBeGreaterThanOrEqual(2);
+  });
+
+  /*
+   * The restart again, against a server too old to name its feed — the one
+   * case the epoch cannot help with. That server took the stale cursor as its
+   * own and skips everything at or below it for as long as the connection
+   * lives, while its heartbeats keep the watchdog satisfied. Adopting the head
+   * on this side is not enough: only a new connection carries it back.
+   */
+  it('reconnects at once when a server too old to name its feed has restarted', async () => {
+    replies.set('/api/v0/events', [
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([
+          sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":0,"version":"t"}' }),
+          frame(1, textDelta(0)) + frame(2, textDelta(1)) + frame(3, textDelta(2)),
+        ]),
+      },
+      // The restarted server answers the stale cursor, then stays open.
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":1,"version":"t"}' })], true),
+      },
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":1,"version":"t"}' })], true),
+      },
+    ]);
+    bridgeUnderTest();
+
+    await until(() => eventStreams().length >= 3);
+    const [, second, third] = eventStreams();
+    expect(second?.headers['last-event-id']).toBe('3');
+    // Without waiting for that stream to end or fall silent, which it never would.
+    expect(third?.headers['last-event-id']).toBe('1');
+  });
+
+  it('leaves a server that names its feed to heal the stream itself', async () => {
+    replies.set('/api/v0/events', [
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([
+          sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":0,"version":"t","epoch":"before"}' }),
+          frame(1, textDelta(0)) + frame(2, textDelta(1)) + frame(3, textDelta(2)),
+        ]),
+      },
+      // A server new enough to name its feed refuses the foreign cursor itself
+      // and streams from its own head, so this connection is already right.
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody(
+          [
+            sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":1,"version":"t","epoch":"after"}' }),
+            frame(2, textDelta(3)),
+          ],
+          true,
+        ),
+      },
+    ]);
+    const bridge = bridgeUnderTest();
+    const seen: AgentEvent[] = [];
+    bridge.runs.onEvent((event) => seen.push(event));
+
+    await until(() => seen.length >= 4);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    // One reconnect for the restart, not a second one on top of it.
+    expect(eventStreams()).toHaveLength(2);
+  });
+
+  /*
+   * The hello that names the heartbeat arrives in the same read that proves
+   * the stream alive, so the clock that read starts must already be the one
+   * the hello asks for — or a server with a slower heartbeat than the default
+   * gets one spurious reconnect before its first heartbeat can land.
+   */
+  it('holds the stream to the heartbeat its hello names from the first quiet moment', async () => {
+    vi.useFakeTimers();
+    try {
+      const opened: string[] = [];
+      install((async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        opened.push(String(input));
+        const signal = init?.signal ?? undefined;
+        let sent = false;
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            getReader: () => ({
+              read: (): Promise<{ done: boolean; value?: Uint8Array }> => {
+                if (!sent) {
+                  sent = true;
+                  const hello = sseMessage({
+                    event: REMOTE_STREAM_HELLO,
+                    data: '{"seq":0,"version":"t","heartbeatMs":60000}',
+                  });
+                  return Promise.resolve({ done: false, value: new TextEncoder().encode(hello) });
+                }
+                return new Promise((_resolve, reject) => {
+                  signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+                });
+              },
+            }),
+          },
+        } as unknown as Response;
+      }) as typeof fetch);
+
+      // No pinned limit: the default until the hello says otherwise.
+      createRemoteBridge(CONFIG, null, { signal: lifetime.signal });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(opened).toHaveLength(1);
+
+      // Three of its sixty-second heartbeats is three minutes. Silence past the
+      // forty-five-second default is not death on this server...
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(opened).toHaveLength(1);
+      // ...silence past what it asked for is.
+      await vi.advanceTimersByTimeAsync(125_000);
+      expect(opened.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('control verbs on the wire', () => {

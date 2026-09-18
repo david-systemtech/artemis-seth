@@ -301,6 +301,17 @@ export type RemoteStreamChannel = (typeof REMOTE_STREAM_CHANNELS)[number];
 /** `event:` name of the greeting message every stream opens with. */
 export const REMOTE_STREAM_HELLO = 'artemis:stream:hello';
 
+/**
+ * The query parameter a reconnecting client names its feed's epoch in. See
+ * {@link RemoteHelloPayload.epoch}.
+ *
+ * A query parameter rather than a header on purpose: a custom header has to be
+ * allowed by the server's CORS preflight, and one that was not would turn every
+ * reconnect into a refused request — against exactly the older servers a newer
+ * client has to keep working with.
+ */
+export const REMOTE_STREAM_EPOCH_PARAM = 'epoch';
+
 /** `event:` name of the honest-gap message. See {@link RemoteGapPayload}. */
 export const REMOTE_STREAM_GAP = 'artemis:stream:gap';
 
@@ -339,6 +350,28 @@ export interface RemoteHelloPayload {
   readonly seq: number;
   /** The serving Artemis's version, for a client that wants to say so. */
   readonly version: string;
+  /**
+   * Which feed {@link seq} — and every `id:` on this stream — is counted by.
+   *
+   * A feed's numbering starts over with the process that owns it, so a client
+   * that reconnects across a server restart is holding a cursor from a count
+   * that no longer exists, and nothing about the number says so. A client that
+   * remembers the epoch it was reading can tell: a different one means "that
+   * cursor is not mine", and the honest response is to adopt this hello's
+   * `seq` and re-sync the way a gap is re-synced. Sent back on reconnect as the
+   * {@link REMOTE_STREAM_EPOCH_PARAM} query parameter, so the server can refuse
+   * the stale cursor from its side too. Absent from a server older than the
+   * field.
+   */
+  readonly epoch?: string;
+  /**
+   * How often a quiet stream sends a heartbeat comment, in milliseconds.
+   *
+   * What makes silence mean something: a client that has heard nothing for
+   * several of these is not watching a quiet stream, it is holding a dead
+   * socket. Absent from a server older than the field.
+   */
+  readonly heartbeatMs?: number;
 }
 
 /**
