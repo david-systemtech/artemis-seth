@@ -285,6 +285,20 @@ describe('a name a marketplace plugin offers', () => {
     expect(row?.name).toBe('my-tdd');
     expect(row?.pluginOffers?.[0]?.command).toBe('/mattpocock-skills:tdd');
   });
+
+  it('says what a session calls a skill whose file names it differently from its folder', async () => {
+    await skill(join(home, '.agents', 'skills'), 'my-tdd', '---\nname: tdd\ndescription: Mine.\n---\nBody.\n');
+    await skill(join(home, '.agents', 'skills'), 'unslop', '---\nname: unslop\ndescription: De-slop.\n---\nEdit.\n');
+    await skill(join(home, '.agents', 'skills'), 'bare', '---\ndescription: No name at all.\n---\nBody.\n');
+
+    const listed = await listSkills({ accounts: accounts(), home });
+
+    // Identity stays the folder's; the command is drawn from what the CLI offers.
+    expect(listed.find((entry) => entry.name === 'my-tdd')?.offeredAs).toBe('tdd');
+    // Agreeing, or naming nothing, is the usual case and carries no field at all.
+    expect(listed.find((entry) => entry.name === 'unslop')).not.toHaveProperty('offeredAs');
+    expect(listed.find((entry) => entry.name === 'bare')).not.toHaveProperty('offeredAs');
+  });
 });
 
 describe('synced sources', () => {

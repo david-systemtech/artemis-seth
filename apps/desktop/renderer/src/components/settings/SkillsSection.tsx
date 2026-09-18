@@ -153,7 +153,7 @@ function SkillRow({
     <Item size="sm" className="items-start">
       <ItemContent>
         <ItemTitle className="text-xs text-ink">
-          <code className="font-mono text-2xs text-beam-text">{skillSlashCommand(skill.name)}</code>
+          <code className="font-mono text-2xs text-beam-text">{skillSlashCommand(skill.offeredAs ?? skill.name)}</code>
         </ItemTitle>
         <ItemDescription className="line-clamp-none text-2xs leading-relaxed text-ink-muted">
           {skill.description.length > 0

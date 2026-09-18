@@ -144,6 +144,12 @@ describe('readChatExtensions', () => {
     expect(readChatExtensions({ artemis: { alwaysOnSkills: [] } })).toEqual({});
   });
 
+  it('drops a name that reads as a path, as the desktop’s own validator does', () => {
+    expect(
+      readChatExtensions({ artemis: { alwaysOnSkills: ['../etc', 'a/b', 'a\\b', '.', '..', 'unslop'] } }),
+    ).toEqual({ alwaysOnSkills: ['unslop'] });
+  });
+
   it('bounds the always-on names by what a skill library can hold', () => {
     const many = Array.from({ length: 500 }, (_, index) => `skill-${String(index)}`);
     const read = readChatExtensions({ artemis: { alwaysOnSkills: [...many, 'x'.repeat(201)] } });

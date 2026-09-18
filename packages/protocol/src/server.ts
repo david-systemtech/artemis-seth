@@ -1907,12 +1907,18 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
  * ones, than a skill library can hold. Names are kept exactly as sent — a
  * skill is known by its folder's name, and trimming one would look up a
  * different folder.
+ *
+ * A name that reads as a path is dropped, the rule the desktop's own save
+ * validator holds a choice to. The host never joins a name into a path — it
+ * looks one up among the folders it found — so this guards nothing today; it
+ * is here so that stays true of the wire even if a host one day forgets.
  */
 function alwaysOnSkillsOrNothing(value: unknown): { alwaysOnSkills?: readonly string[] } {
   if (!Array.isArray(value)) return {};
   const names: string[] = [];
   for (const entry of value) {
     if (typeof entry !== 'string' || entry.length === 0 || entry.length > SKILL_LIMITS.name) continue;
+    if (entry.includes('/') || entry.includes('\\') || entry === '.' || entry === '..') continue;
     if (names.includes(entry)) continue;
     names.push(entry);
     if (names.length === SKILL_LIMITS.count) break;

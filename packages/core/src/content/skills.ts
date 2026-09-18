@@ -268,7 +268,13 @@ export async function listSkills(options: ListSkillsOptions): Promise<readonly S
   // reaches: a second account's folder can still widen a row above.
   const rows = [...byName.values()].map(({ offeredName, ...row }): SkillInfo => {
     const pluginOffers = pluginOffersFor(offeredName, row.origin);
-    return pluginOffers.length === 0 ? row : { ...row, pluginOffers };
+    return {
+      ...row,
+      // Said only when it differs: the command is drawn from it, and a pane
+      // that drew the folder's name would show a command no session offers.
+      ...(offeredName === row.name ? {} : { offeredAs: offeredName }),
+      ...(pluginOffers.length === 0 ? {} : { pluginOffers }),
+    };
   });
 
   // By name, so the list holds still between reads: `readdir` order is the
