@@ -555,29 +555,35 @@ SEVERITY_ICON = {"blocker": "🛑", "major": "🔸", "minor": "🔹", "nit": "·
 
 
 def render(result: dict, model: str, sha: str, skipped: int, truncated: bool, effort: str, note: str) -> str:
+    # The schema is a request, not a guarantee (see run_effort), and by now the
+    # review has been paid for. A finding that bends it - a severity outside the
+    # enum, a field left out - is shown as it came rather than costing the rest.
     findings = sorted(
-        result.get("findings", []),
-        key=lambda f: (SEVERITY_ORDER.get(f.get("severity", "nit"), 9), f.get("file", "")),
+        (f for f in result.get("findings") or [] if isinstance(f, dict)),
+        key=lambda f: (SEVERITY_ORDER.get(f.get("severity"), 9), str(f.get("file", ""))),
     )
     lines = [
         MARKER,
         f"### 🤖 Automated review — `{model}` · effort `{effort}`",
         "",
         *([f"> {note}", ""] if note else []),
-        result.get("summary", "").strip(),
+        str(result.get("summary") or "").strip(),
         "",
     ]
     if findings:
-        counts = {}
+        counts: dict = {}
         for f in findings:
-            counts[f["severity"]] = counts.get(f["severity"], 0) + 1
-        tally = ", ".join(f"{n} {sev}" for sev, n in sorted(counts.items(), key=lambda kv: SEVERITY_ORDER[kv[0]]))
+            counts[f.get("severity", "?")] = counts.get(f.get("severity", "?"), 0) + 1
+        tally = ", ".join(
+            f"{n} {sev}" for sev, n in sorted(counts.items(), key=lambda kv: SEVERITY_ORDER.get(kv[0], 9))
+        )
         lines += [f"**{len(findings)} finding(s):** {tally}", ""]
         for f in findings:
-            icon = SEVERITY_ICON.get(f["severity"], "·")
-            where = f"`{f['file']}`" + (f":{f['line']}" if f.get("line") else "")
-            conf = "" if f.get("confidence") == "high" else f" _({f.get('confidence')} confidence)_"
-            lines += [f"{icon} **{f['title']}** — {where} · {f['category']}{conf}", "", f"  {f['detail']}", ""]
+            icon = SEVERITY_ICON.get(f.get("severity"), "·")
+            where = f"`{f.get('file', '?')}`" + (f":{f['line']}" if f.get("line") else "")
+            conf = "" if f.get("confidence") == "high" else f" _({f.get('confidence', '?')} confidence)_"
+            title, category = f.get("title", "(untitled)"), f.get("category", "?")
+            lines += [f"{icon} **{title}** — {where} · {category}{conf}", "", f"  {f.get('detail', '')}", ""]
     else:
         lines += ["No findings. ✅", ""]
     # The findings are the model's words, and the model quotes code. A finding
