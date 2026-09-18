@@ -228,6 +228,35 @@ describe('a host’s sources', { timeout: 60_000 }, () => {
     expect(warnings[0]).toContain(gone.url);
   });
 
+  it('reports a failure once per attempt, not once per run that starts meanwhile', async () => {
+    const warnings: string[] = [];
+    const sources = createSkillSources({ dataDir, onWarning: (message) => warnings.push(message) });
+    const gone: SkillSource = { ...source, url: pathToFileURL(join(root, 'no-such-repo')).href };
+
+    await sources.sync(gone);
+    // Three runs start inside the throttle window. Nothing is tried again, so
+    // there is nothing new to say: the pane still carries the reason.
+    for (let run = 0; run < 3; run += 1) sources.syncInBackground([gone]);
+    const asked = await sources.sync(gone);
+
+    expect(asked).toMatchObject({ ok: false, throttled: true });
+    expect(warnings).toEqual([]);
+    expect((await sources.status([gone]))[0]?.error).toBeDefined();
+  });
+
+  it('removes a source whose first clone is still running, and the clone does not come back', async () => {
+    const sources = createSkillSources({ dataDir });
+
+    // Not awaited: the clone is in its scratch folder when the removal is asked for.
+    const cloning = sources.sync(source);
+    await sources.remove(source);
+
+    expect((await cloning).ok).toBe(true);
+    // The removal waited for the clone to land and deleted what it brought.
+    expect(existsSync(skillSourceCloneDir(dataDir, source))).toBe(false);
+    expect(await sources.status([source])).toEqual([{ source, cloned: false, skillCount: 0 }]);
+  });
+
   it('deletes a removed source’s copy, and forgets how its last sync went', async () => {
     const sources = createSkillSources({ dataDir });
     await sources.sync(source);

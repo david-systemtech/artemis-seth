@@ -364,6 +364,15 @@ describe('what the review of the first cut found', () => {
     ).toBeUndefined();
   });
 
+  it('refuses a query string or a fragment, the other place a credential rides in a URL', () => {
+    expect(skillSourceUrlProblem('https://git.example.com/team/skills.git?private_token=glpat-abc')).toMatch(
+      /no "\?" or "#" part/,
+    );
+    expect(skillSourceUrlProblem('https://github.com/a/b#main')).toMatch(/no "\?" or "#" part/);
+    expect(skillSourceUrlProblem('ssh://git@github.com/a/b?x=1')).toMatch(/no "\?" or "#" part/);
+    expect(skillSourceUrlProblem('https://github.com/a/b.git')).toBeNull();
+  });
+
   it('never derives an id the validators would refuse, wherever the cut lands', () => {
     // Main holds an id to this alphabet before it removes or pulls a source,
     // so an id outside it would name a row that can be neither.
