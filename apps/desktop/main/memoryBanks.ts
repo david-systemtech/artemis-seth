@@ -848,8 +848,8 @@ function installBankNow(
   registry: BankRegistryV2,
   record: BankRecord,
   cwd?: string,
-): InstallEverywhereReport | null {
-  if (artemisRoot === null) return null;
+): Promise<InstallEverywhereReport | null> {
+  if (artemisRoot === null) return Promise.resolve(null);
   // The registry rather than a number: each profile's share is the banks that
   // profile carries, and one number cannot be right for all of them.
   return reconcileBankInstalls(record, artemisRoot, cwd, registry);
@@ -1970,7 +1970,7 @@ export async function addMemoryBank(request: MemoryBankAddRequest): Promise<Memo
   const next = withBank(registry, record);
   saveBanks(next);
   steps.push('Registered for every profile.');
-  steps.push(installSaid(installBankNow(next, record)));
+  steps.push(installSaid(await installBankNow(next, record)));
 
   if (!hadBanks && !isMasterEnabled()) {
     writeSwitch(true);
@@ -2117,9 +2117,9 @@ export async function setMemoryBankEnabled(
   saveBanks(updated);
 
   if (request.enabled) {
-    return { message: `'${request.slug}' is on. ${installSaid(installBankNow(updated, next))}` };
+    return { message: `'${request.slug}' is on. ${installSaid(await installBankNow(updated, next))}` };
   }
-  if (artemisRoot !== null) uninstallBankEverywhere(request.slug, artemisRoot);
+  if (artemisRoot !== null) await uninstallBankEverywhere(request.slug, artemisRoot);
   return {
     message: `'${request.slug}' is off — its memories are out of project memory and runs are no longer told about it. The repository stays on disk.`,
   };
@@ -2149,7 +2149,7 @@ export async function setMemoryBankProfiles(
         ? 'no profile'
         : count(request.profiles.profileIds.length, 'profile');
   return {
-    message: `'${request.slug}' now reaches ${reach}. ${installSaid(installBankNow(updated, next))}`,
+    message: `'${request.slug}' now reaches ${reach}. ${installSaid(await installBankNow(updated, next))}`,
   };
 }
 
@@ -2237,7 +2237,7 @@ export async function syncMemoryBank(request: MemoryBankSyncRequest): Promise<Me
     } finally {
       credentials.dispose();
     }
-    steps.push(installSaid(installBankNow(registry, record)));
+    steps.push(installSaid(await installBankNow(registry, record)));
   }
   return { message: steps.join(' ') };
 }
@@ -2338,7 +2338,7 @@ export async function forgetMemoryBank(request: MemoryBankForgetRequest): Promis
   const steps: string[] = [];
 
   if (artemisRoot !== null) {
-    uninstallBankEverywhere(request.slug, artemisRoot);
+    await uninstallBankEverywhere(request.slug, artemisRoot);
     steps.push(`Removed '${request.slug}' from every project's memory.`);
   }
   saveBanks(withoutBank(registry, request.slug));
@@ -2452,12 +2452,17 @@ export function pullDue(lastAt: number | undefined, now: number): boolean {
  * the banks and shows the pane; keeping them turning is its own housekeeping,
  * not an instruction for the model to carry.
  *
- * ## Why the install is synchronous and the pull is not
+ * ## What is done before this returns, and what is not
  *
- * The two halves have nothing in common but a name. Installing is a handful of
- * file writes from the checkout as it already stands, and it is what makes a
- * project opened for the first time carry the bank *for the run that is
- * starting right now* — so it happens before this function returns. Pulling is
+ * The two halves have nothing in common but a name. Installing is file writes
+ * from the checkout as it already stands, and it is what makes a project
+ * opened for the first time carry the bank *for the run that is starting
+ * right now* — so that project's install happens before this function
+ * returns. Every other project of every profile gets the same install behind
+ * the run, a project per turn of the event loop (see `installBankEverywhere`):
+ * this is the main process, the keyboard goes through it, and writing the
+ * whole machine's projects in one synchronous pass at every run start was the
+ * typed line that froze and then arrived in a burst (2026-09-18). Pulling is
  * the network: it belongs to the next run, not this one, so it is fired and
  * forgotten, throttled per bank, and re-installs only the banks whose checkout
  * actually moved.
@@ -2492,21 +2497,24 @@ export function syncMemoryBanksInBackground(cwd?: string): void {
   // First, from the checkout as it is. Each bank's own profile scope decides
   // which profiles are written to, and the run's directory is included even
   // when no profile has a memory directory for it yet — that is the project
-  // about to be opened.
-  for (const record of banks) {
-    try {
-      installBankNow(registry, record, cwd);
-    } catch (error) {
+  // about to be opened. Every bank is started here, so each one's install of
+  // that project is done before this returns; the rest of each bank's
+  // projects follow behind, and the pull waits for all of them.
+  const installs = banks.map((record) =>
+    installBankNow(registry, record, cwd).catch((error: unknown) => {
       log.warn(`Could not install '${record.slug}' into project memory`, error);
-    }
-  }
+      return null;
+    }),
+  );
 
-  void pullBanks(registry, banks, cwd).finally(() => {
-    syncInFlight = false;
-    const next = pendingCwd;
-    pendingCwd = undefined;
-    if (next !== undefined && next !== lastSyncCwd) syncMemoryBanksInBackground(next);
-  });
+  void Promise.all(installs)
+    .then(() => pullBanks(registry, banks, cwd))
+    .finally(() => {
+      syncInFlight = false;
+      const next = pendingCwd;
+      pendingCwd = undefined;
+      if (next !== undefined && next !== lastSyncCwd) syncMemoryBanksInBackground(next);
+    });
 }
 
 /**
@@ -2537,7 +2545,7 @@ async function pullBanks(
         const pulled = await pullBank(record.path, credentials.env, 180_000);
         if (!pulled.pulled) continue;
         log.info(`memory-banks: '${record.slug}' ${pulled.detail}`);
-        installBankNow(registry, record, cwd);
+        await installBankNow(registry, record, cwd);
       }
     } finally {
       credentials.dispose();

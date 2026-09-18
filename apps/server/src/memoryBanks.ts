@@ -274,23 +274,32 @@ export function createServerMemoryBanks(options: ServerMemoryBanksOptions): Serv
    * written: they share one project memory file, so a re-install of a single
    * bank must keep to the share it had when all of them were written.
    */
-  function install(
+  /*
+   * Every bank is started before any is awaited: each install writes the
+   * run's own project before its first await, and the rest of that bank's
+   * projects follow a turn of the event loop at a time, so a served turn can
+   * begin the moment `prepare` returns with its project written. The memo is
+   * stamped before the work rather than after, as `refresh` does, so a second
+   * run arriving while the installs are still going does not start rivals;
+   * a bank whose install failed is forgotten again so the next run retries.
+   */
+  async function install(
     records: readonly BankRecord[],
     cwd: string | undefined,
     budget: IndexBudget,
-  ): void {
-    for (const record of records) {
-      try {
-        reconcileBankInstalls(record, options.dataDir, cwd, budget);
-        const memo = installedFrom.get(record.slug) ?? { stamp: '', at: 0, cwds: new Set<string>() };
-        memo.stamp = sourceStamp(record.path);
-        memo.at = now();
-        if (cwd !== undefined) memo.cwds.add(cwd);
-        installedFrom.set(record.slug, memo);
-      } catch (error) {
+  ): Promise<void> {
+    const pending = records.map((record) => {
+      const memo = installedFrom.get(record.slug) ?? { stamp: '', at: 0, cwds: new Set<string>() };
+      memo.stamp = sourceStamp(record.path);
+      memo.at = now();
+      if (cwd !== undefined) memo.cwds.add(cwd);
+      installedFrom.set(record.slug, memo);
+      return reconcileBankInstalls(record, options.dataDir, cwd, budget).catch((error: unknown) => {
+        installedFrom.delete(record.slug);
         warn(`could not install '${record.slug}'`, error);
-      }
-    }
+      });
+    });
+    await Promise.all(pending);
   }
 
   /** The banks whose installs may be stale for this run: never written, moved, unseen project, or old. */
@@ -330,7 +339,7 @@ export function createServerMemoryBanks(options: ServerMemoryBanksOptions): Serv
           // own words: `pullBank` runs `--quiet`, which prints nothing on
           // either outcome, so the message cannot tell the two apart.
           log(`memory banks: '${record.slug}' moved to ${after} (${result.detail}); reinstalling`);
-          install([record], cwd, budget);
+          await install([record], cwd, budget);
         } catch (error) {
           warn(`could not pull '${record.slug}'`, error);
         }
@@ -347,7 +356,9 @@ export function createServerMemoryBanks(options: ServerMemoryBanksOptions): Serv
         // memory file is loaded up to a fixed size, so two banks each taking a
         // full index is one index whose tail nobody reads.
         const budget = sharedIndexBudget(records.length);
-        install(dueForInstall(records, run.cwd), run.cwd, budget);
+        // The run's own project is written before this call returns its
+        // promise; the rest is behind the run, which does not wait for it.
+        void install(dueForInstall(records, run.cwd), run.cwd, budget);
         refresh(records, run.cwd, budget);
       } catch (error) {
         // Belt and braces: every step above already catches its own, and a run
