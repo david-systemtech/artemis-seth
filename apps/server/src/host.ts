@@ -45,6 +45,7 @@ import type {
 } from '@rx-artemis/protocol';
 import {
   RunError,
+  buildContentBridge,
   checkAuthStatus,
   createCatalogue,
   createDefaultProviderRegistry,
@@ -53,7 +54,9 @@ import {
   createServerRoutineStore,
   createSessionLedger,
   createWorkspaceResolver,
+  discoverMarketplacePlugins,
   joinSystemPromptAppends,
+  linkSkillsIntoCodexHome,
   machineBankPrompt,
   managedEnvKeys,
   memoryToolServer,
@@ -66,6 +69,7 @@ import {
   SessionLifecycleLog,
   SESSION_LIFECYCLE_LOG_FILE,
   type Catalogue,
+  type CommandSource,
   type MemoryBankAdmin,
   type ProfileAdmin,
   type ProviderRegistry,
@@ -96,6 +100,17 @@ import { createFileProfileSecrets } from './secrets.js';
  */
 const MAX_SESSION_TITLE = 200;
 
+/**
+ * How long a slash-command reading is answered from memory.
+ *
+ * The reading opens the provider's CLI and asks it — a control call, never a
+ * turn — which is a second or two this process should not spend on every
+ * settle of every client's composer. A minute is long enough that a busy
+ * connection is answered from memory and short enough that a skill dropped
+ * into the container shows up in the next menu rather than the next release.
+ */
+const COMMAND_CACHE_MS = 60_000;
+
 /** The providers this host hands its tool servers to — core's list, shared with the desktop. */
 const takesHostTools = takesHostToolServers;
 
@@ -109,6 +124,12 @@ export interface HeadlessHost {
   readonly runSource: RunSource;
   readonly sessionSource: SessionSource;
   readonly usageSource: UsageSource;
+  /**
+   * What `GET /api/v0/commands` answers through: the slash commands a session
+   * on one served account would offer, this machine's skills among them.
+   * Read with the same plugins a run here is given, so the two agree.
+   */
+  readonly commandSource: CommandSource;
   /**
    * Routines that fire *in this server*, on schedule, with every client closed.
    *
@@ -217,9 +238,45 @@ export function createHeadlessHost(
     });
   };
 
+  /**
+   * This machine's own skills, slash commands and marketplace plugins,
+   * delivered to the run — the desktop's `contentPluginsFor` and the
+   * terminal's, through the same core seam. Resolved per run, so a skill
+   * dropped into the container while it is up works on the next message. A
+   * bridge that cannot be built is a line on stderr and a run without it,
+   * never a run that does not start.
+   *
+   * Whose content this is deserves stating: the *server's*. A run reaches the
+   * `skills/` of the account it runs as and the `~/.agents/skills` of the user
+   * this process runs as — nothing from the client's disk, which is why
+   * `GET /api/v0/commands` exists for the client to learn what is here.
+   */
+  const onContentWarning = (message: string, error: unknown): void => {
+    process.stderr.write(`${message}: ${error instanceof Error ? error.message : String(error)}\n`);
+  };
+  const contentPluginsFor = async (profileId: ProfileId, providerId: ProviderId) => {
+    if (providerId !== 'claude' && providerId !== 'codex') return [];
+    const configDir = profiles.configDirFor(await profiles.require(profileId));
+    if (providerId === 'codex') {
+      await linkSkillsIntoCodexHome({ configDir, onWarning: onContentWarning });
+      return [];
+    }
+    const [bridged, marketplace] = await Promise.all([
+      buildContentBridge({ configDir, dataDir, onWarning: onContentWarning }),
+      discoverMarketplacePlugins({ configDir, onWarning: onContentWarning }),
+    ]);
+    return [...bridged, ...marketplace];
+  };
+
   const runs = new RunRegistry({
     resolveAdapter: (id) => providers.get(id),
-    resolveRun: async ({ profileId, providerId }) => ({ env: await envFor(profileId, providerId) }),
+    resolveRun: async ({ profileId, providerId }) => {
+      const [env, plugins] = await Promise.all([
+        envFor(profileId, providerId),
+        contentPluginsFor(profileId, providerId),
+      ]);
+      return { env, plugins };
+    },
     /*
      * Far above the registry's default of a thousand, because here the tail
      * is not a courtesy to a window that reloaded: it is what a client that
@@ -453,6 +510,52 @@ export function createHeadlessHost(
         }
       }
       return rows;
+    },
+  };
+
+  /**
+   * The slash commands a session on one account would offer, for the route.
+   *
+   * Cached per account and directory for {@link COMMAND_CACHE_MS}, and
+   * in-flight reads are shared, so two clients settling at once cost one CLI.
+   * Asked with the same plugins a run here is given — the whole point: this
+   * machine's skills arrive on that channel, and a list without them would be
+   * missing exactly the rows the client is asking for.
+   */
+  const commandCache = new Map<string, { readonly at: number; readonly value: Promise<readonly string[]> }>();
+  const commandSource: CommandSource = {
+    list: (query) => {
+      const providerId = query.providerId as ProviderId;
+      const profileId = query.profileId as ProfileId;
+      const adapter = providers.get(providerId);
+      const listCommands = adapter?.listCommands?.bind(adapter);
+      if (listCommands === undefined) return Promise.resolve([]);
+
+      // The query has to start somewhere that exists — the same substitution
+      // the desktop's engine makes for a column with no directory yet.
+      const cwd = query.cwd ?? dataDir;
+      const key = `${providerId} ${profileId} ${cwd}`;
+      const cached = commandCache.get(key);
+      if (cached !== undefined && Date.now() - cached.at < COMMAND_CACHE_MS) return cached.value;
+
+      const value = (async (): Promise<readonly string[]> => {
+        const [env, plugins] = await Promise.all([
+          envFor(profileId, providerId),
+          contentPluginsFor(profileId, providerId),
+        ]);
+        return listCommands({ env, cwd, plugins });
+      })().catch((error: unknown) => {
+        // The contract says the adapter resolves; if one rejects, that is a
+        // bug in the adapter and not a reason to answer nothing for a minute
+        // — the failure is dropped from the cache and the next ask retries.
+        commandCache.delete(key);
+        process.stderr.write(
+          `Could not list slash commands for ${providerId}: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+        return [];
+      });
+      commandCache.set(key, { at: Date.now(), value });
+      return value;
     },
   };
 
@@ -857,6 +960,7 @@ export function createHeadlessHost(
     runSource,
     sessionSource,
     usageSource,
+    commandSource,
     routines,
     profileAdmin,
     memoryBankAdmin: {

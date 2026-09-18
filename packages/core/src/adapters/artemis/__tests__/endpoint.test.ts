@@ -1201,6 +1201,46 @@ describe('the probe and the catalogue', () => {
     });
     expect(catalogue).toEqual({ models: [], live: false });
   });
+
+  it('fills the slash-command menu from the server, with the token', async () => {
+    const { origin, seen } = await serve((request, response) => {
+      expect(request.url).toBe('/api/v0/commands');
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(
+        JSON.stringify({
+          object: 'artemis.commands',
+          commands: ['compact', 'artemis-skills:unslop', 'compact', 7],
+          accounts: [],
+        }),
+      );
+    });
+
+    const adapter = createArtemisAdapter();
+    const commands = await adapter.listCommands?.({
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok_123' },
+      cwd: process.cwd(),
+    });
+
+    // The serving machine's names as it spells them, folded and read leniently
+    // — and nothing about this machine's directory on the wire.
+    expect(commands).toEqual(['compact', 'artemis-skills:unslop']);
+    expect(seen[0]?.url).toBe('/api/v0/commands');
+    expect(seen[0]?.authorization).toBe('Bearer tok_123');
+  });
+
+  it('offers no commands against a server too old for the route, or one that is away', async () => {
+    const older = await serve((_request, response) => {
+      response.writeHead(404, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: { message: 'no such route', type: 'invalid_request_error' } }));
+    });
+    const adapter = createArtemisAdapter();
+    expect(
+      await adapter.listCommands?.({ env: { [LOCAL_BASE_URL_ENV]: older.origin }, cwd: process.cwd() }),
+    ).toEqual([]);
+    expect(
+      await adapter.listCommands?.({ env: { [LOCAL_BASE_URL_ENV]: 'http://127.0.0.1:9' }, cwd: process.cwd() }),
+    ).toEqual([]);
+  });
 });
 
 /**

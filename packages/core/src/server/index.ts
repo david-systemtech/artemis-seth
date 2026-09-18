@@ -109,6 +109,7 @@ export {
   isStreamReply,
   type ArtemisServer,
   type ArtemisServerOptions,
+  type CommandSource,
   type MemoryBankAdmin,
   type ServerContext,
   type ServerReply,

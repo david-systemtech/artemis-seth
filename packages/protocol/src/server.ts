@@ -383,6 +383,42 @@ export interface ServerModelsBody {
   readonly models: readonly ServerModel[];
 }
 
+/**
+ * One account's slash commands, as `GET /api/v0/commands` reports them.
+ *
+ * Kept per account beside the union because the union is what a menu wants
+ * and the account is what a person debugging a missing skill wants: a skill
+ * installed under one profile's config directory reaches that account alone,
+ * and a flat list cannot say which.
+ */
+export interface ServerCommandsAccount {
+  readonly profileId: ProfileId;
+  readonly profileSlug: string;
+  readonly profileLabel: string;
+  readonly providerId: ProviderId;
+  /** The names a session on this account would offer, as its provider spells them. */
+  readonly commands: readonly string[];
+}
+
+/**
+ * The body of `GET /api/v0/commands` — what a session on the server would
+ * offer when `/` is typed, asked before there is one.
+ *
+ * `commands` is the union across every account the connection can see, in
+ * first-seen order and without duplicates: what a client asks before it has
+ * picked a route, which is the moment a composer's menu opens. The names are
+ * the *serving machine's*. Its skills and commands reach a served run through
+ * that machine's own content bridge, so a skill installed there arrives as
+ * `artemis-skills:<name>` exactly as it does in a local session — and a client
+ * holding the token learns the names here rather than keeping a copy of every
+ * skill on its own disk.
+ */
+export interface ServerCommandsBody {
+  readonly object: 'artemis.commands';
+  readonly commands: readonly string[];
+  readonly accounts: readonly ServerCommandsAccount[];
+}
+
 /* -------------------------------------------------------------------------- */
 /* Adding an account to a server, from somewhere else                         */
 /* -------------------------------------------------------------------------- */
