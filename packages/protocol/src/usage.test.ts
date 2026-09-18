@@ -6,6 +6,13 @@
  * of its own. What is tested here is mostly what the recommendation *refuses*
  * to say: the exclusions are the part that keeps it from sending someone to a
  * metered account, or advising on numbers from twenty minutes ago.
+ *
+ * The last three blocks are about a different obligation: that a reading is one
+ * fact about an account rather than one per holder of it. `mergePlanUsage` is
+ * how every cache in the product settles two partial accounts of one gauge, and
+ * `at` on a window is what lets it do so per window instead of per snapshot —
+ * without which a verdict about the weekly limit re-dates, and thereby
+ * protects, a five-hour percentage that has since been superseded.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -14,6 +21,7 @@ import { resolvePlanWeight } from './planCapacity.js';
 import {
   applyPlanLimit,
   bindingWindow,
+  mergePlanUsage,
   PLAN_USAGE_MAX_AGE_MS,
   planHeadroom,
   recommendProfile,
@@ -722,7 +730,9 @@ describe('applyPlanLimit', () => {
     const merged = applyPlanLimit(null, { status: 'rejected', windowId: 'five_hour', label: '5 hours' }, NOW);
     expect(merged?.available).toBe(true);
     expect(merged?.windows).toEqual([
-      { id: 'five_hour', label: '5 hours', utilization: null, resetsAt: null, status: 'rejected' },
+      // `at` is the verdict's own clock: this window was observed now, and the
+      // stamp is what stops a later fold on some *other* window re-dating it.
+      { id: 'five_hour', label: '5 hours', utilization: null, resetsAt: null, status: 'rejected', at: NOW },
     ]);
   });
 
@@ -795,5 +805,276 @@ describe('planMeterSlots', () => {
   it('draws nothing when the plan is unknown or does not apply', () => {
     expect(planMeterSlots(null)).toEqual([]);
     expect(planMeterSlots({ available: false, unavailableReason: 'API key billing', windows: [], fetchedAt: 0 })).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* One reading per account                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A window with its own observation time. `at` is the whole subject below, so
+ * it is stated rather than defaulted.
+ */
+function window_(
+  id: string,
+  utilization: number | null,
+  at: number,
+  extra: Partial<PlanUsageWindow> = {},
+): PlanUsageWindow {
+  return { id, label: id, utilization, resetsAt: null, at, ...extra };
+}
+
+/** A snapshot whose stamp is the newest of its windows, as a real one's is. */
+function snapshot(windows: readonly PlanUsageWindow[], overrides: Partial<PlanUsage> = {}): PlanUsage {
+  const newest = windows.reduce((max, w) => Math.max(max, w.at ?? 0), 0);
+  return { available: true, windows, fetchedAt: newest, ...overrides };
+}
+
+describe('a window keeps the clock it was read on', () => {
+  it('is not re-dated by a verdict about a different window', () => {
+    /*
+      The mechanism behind the report. A verdict on the weekly window used to
+      stamp the *whole* snapshot, so the five-hour percentage beside it — read
+      minutes earlier, and about to be superseded — was filed as the newest
+      thing known about the account.
+    */
+    const polled = snapshot([window_('five_hour', 100, 1_000), window_('seven_day', 40, 1_000)]);
+
+    const merged = applyPlanLimit(polled, { status: 'warning', windowId: 'seven_day' }, 2_000);
+
+    expect(merged?.windows.find((w) => w.id === 'seven_day')?.at).toBe(2_000);
+    expect(merged?.windows.find((w) => w.id === 'five_hour')?.at).toBe(1_000);
+    // The snapshot as a whole is as new as its newest window, which is the
+    // verdict — that part is unchanged, and is why the per-window stamp matters.
+    expect(merged?.fetchedAt).toBe(2_000);
+  });
+
+  it('gives an unstamped window the snapshot it came in on', () => {
+    // A reading from a peer, a disk seed, or a version older than `at`. It is
+    // pinned on the way through rather than left to inherit the new stamp.
+    const old: PlanUsage = {
+      available: true,
+      fetchedAt: 1_000,
+      windows: [{ id: 'five_hour', label: '5 hours', utilization: 100, resetsAt: null }],
+    };
+
+    const merged = applyPlanLimit(old, { status: 'rejected', windowId: 'seven_day' }, 5_000);
+
+    expect(merged?.windows.find((w) => w.id === 'five_hour')?.at).toBe(1_000);
+  });
+});
+
+describe('mergePlanUsage', () => {
+  it('keeps the newer of each window independently', () => {
+    // Neither side is newer *throughout*, which is the ordinary case once live
+    // verdicts are folded in beside polled numbers.
+    const held = snapshot([window_('five_hour', 100, 1_000), window_('seven_day', 40, 3_000)]);
+    const incoming = snapshot([window_('five_hour', 2, 2_000), window_('seven_day', 10, 1_500)]);
+
+    const merged = mergePlanUsage(held, incoming);
+
+    expect(merged.windows.find((w) => w.id === 'five_hour')?.utilization).toBe(2);
+    expect(merged.windows.find((w) => w.id === 'seven_day')?.utilization).toBe(40);
+    expect(merged.fetchedAt).toBe(3_000);
+  });
+
+  it('takes a window either side has and the other has never heard of', () => {
+    // A snapshot that omits a window is not evidence the window is gone — a
+    // verdict-built one names exactly one, and a poll may add a new bucket.
+    const held = snapshot([window_('five_hour', 30, 1_000)]);
+    const incoming = snapshot([window_('model_scoped:Fable', 8, 2_000)]);
+
+    expect(mergePlanUsage(held, incoming).windows.map((w) => w.id)).toEqual([
+      'model_scoped:Fable',
+      'five_hour',
+    ]);
+  });
+
+  it('gives a tie to the incoming reading', () => {
+    // Two readings of one instant are one fact; preferring either is arbitrary.
+    const held = snapshot([window_('five_hour', 30, 1_000)]);
+    const incoming = snapshot([window_('five_hour', 31, 1_000)]);
+
+    expect(mergePlanUsage(held, incoming).windows[0]?.utilization).toBe(31);
+  });
+
+  it('is idempotent, and answers with the same object when nothing moved', () => {
+    /*
+      Reference identity is the "was this news?" test every caller uses: a store
+      that rebuilt its map on an unchanged reading would re-render every meter
+      in the app, and a handoff would be reconsidered on a cycle that learned
+      nothing.
+    */
+    const held = snapshot([window_('five_hour', 30, 1_000), window_('seven_day', 9, 1_000)]);
+    const older = snapshot([window_('five_hour', 88, 500)]);
+
+    // Nothing in it is newer than anything held, so nothing moved.
+    expect(mergePlanUsage(held, older)).toBe(held);
+    // And a reading merged twice — a push re-delivered, a cache re-seeded from
+    // the value it already holds — settles on the first result.
+    const news = snapshot([window_('five_hour', 44, 2_000)]);
+    const once = mergePlanUsage(held, news);
+    expect(once).not.toBe(held);
+    expect(mergePlanUsage(once, news)).toBe(once);
+    expect(mergePlanUsage(once, once)).toBe(once);
+    /*
+      And the same reading arriving as a *different object* is still not news.
+      This is the ordinary case rather than a corner: a refresh reaches a window
+      both as the reply it asked for and as the broadcast it caused, and every
+      IPC hop clones. Judged by identity alone, each of those would rebuild the
+      map and redraw every meter to show the number it was already showing.
+    */
+    expect(mergePlanUsage(once, structuredClone(news) as PlanUsage)).toBe(once);
+  });
+
+  it('takes anything at all when nothing is held', () => {
+    const incoming = snapshot([window_('five_hour', 30, 1_000)]);
+    expect(mergePlanUsage(null, incoming)).toBe(incoming);
+    expect(mergePlanUsage(undefined, incoming)).toBe(incoming);
+  });
+
+  it('does not let an unavailable answer blank a newer good reading', () => {
+    /*
+      "No plan limits" is what a wedged CLI, a scope-limited token and a genuine
+      API-key profile all report, and they are indistinguishable here. Only a
+      strictly newer one is allowed to replace a reading that was right.
+    */
+    const good = snapshot([window_('five_hour', 30, 5_000)]);
+    const blank: PlanUsage = { available: false, windows: [], fetchedAt: 4_000 };
+
+    expect(mergePlanUsage(good, blank)).toBe(good);
+    expect(mergePlanUsage(good, { ...blank, fetchedAt: 5_000 })).toBe(good);
+    expect(mergePlanUsage(good, { ...blank, fetchedAt: 6_000 }).available).toBe(false);
+  });
+
+  it('lets a plan reappear on an account that had reported none', () => {
+    const blank: PlanUsage = { available: false, windows: [], fetchedAt: 4_000 };
+    const good = snapshot([window_('five_hour', 30, 5_000)]);
+
+    expect(mergePlanUsage(blank, good)).toBe(good);
+    // And not on an older reading of it.
+    expect(mergePlanUsage(blank, snapshot([window_('five_hour', 30, 3_000)]))).toBe(blank);
+  });
+
+  it('carries the plan tier from whichever side names it', () => {
+    const held = snapshot([window_('five_hour', 30, 1_000)], { subscriptionType: 'max' });
+    const incoming = snapshot([window_('five_hour', 31, 2_000)]);
+
+    expect(mergePlanUsage(held, incoming).subscriptionType).toBe('max');
+  });
+
+  it('ends the reported sequence on the post-reset number', () => {
+    /*
+      The whole report, end to end. A 5-hour window sitting at 100 before its
+      reset; a verdict about the *weekly* window folding in a second later; and
+      then the poll that actually saw the reset answering with 2.
+
+      Before this, the fold re-dated the held 100 to the verdict's clock, the
+      poll's snapshot looked older than the cache, and it was discarded — "one
+      session reports it near zero while this session reported it as 100%".
+    */
+    const held = snapshot([window_('five_hour', 100, 1_000), window_('seven_day', 40, 1_000)]);
+
+    const folded = applyPlanLimit(held, { status: 'warning', windowId: 'seven_day' }, 2_000);
+    expect(folded).not.toBeNull();
+    const afterFold = mergePlanUsage(held, folded as PlanUsage);
+    expect(afterFold.windows.find((w) => w.id === 'five_hour')?.utilization).toBe(100);
+
+    // The poll answered at 1,500 — before the fold landed, after the reset.
+    const poll = snapshot([window_('five_hour', 2, 1_500), window_('seven_day', 41, 1_500)]);
+    const settled = mergePlanUsage(afterFold, poll);
+
+    expect(settled.windows.find((w) => w.id === 'five_hour')?.utilization).toBe(2);
+    // And the verdict about the weekly window, which nothing has superseded.
+    expect(settled.windows.find((w) => w.id === 'seven_day')?.status).toBe('warning');
+  });
+});
+
+describe('a window whose reset has passed', () => {
+  const RESET = 10_000;
+  /** Read before the rollover: the number describes a period that is over. */
+  const stale = snapshot([
+    { id: 'five_hour', label: '5 hours', utilization: 100, resetsAt: RESET, at: 9_000 },
+    { id: 'seven_day', label: '7 days', utilization: 40, resetsAt: null, at: 9_000 },
+  ]);
+
+  it('is not what binds the account, and is not its headroom', () => {
+    expect(bindingWindow(stale, RESET - 1)?.id).toBe('five_hour');
+    expect(bindingWindow(stale, RESET + 1)?.id).toBe('seven_day');
+    // 0% of room before the rollover; 60% after it, from the window that is
+    // still a fact. Not 0, and not a claim that the 5-hour window is empty.
+    expect(planHeadroom(stale, RESET - 1)).toBe(0);
+    expect(planHeadroom(stale, RESET + 1)).toBe(60);
+  });
+
+  it('keeps its slot and loses its number', () => {
+    /*
+      Not skipped: the two rings beside it would slide sideways at the one
+      moment the user is watching for the rollover. Not its old value either —
+      that is the "still 100% after it reset" being reported. A slot with no
+      number is the existing "—".
+    */
+    const slots = planMeterSlots(stale, RESET + 1);
+
+    expect(slots.map((slot) => [slot.label, slot.window.utilization])).toEqual([
+      ['5hr', null],
+      ['Week', 40],
+    ]);
+  });
+
+  it('is kept when the reading is from after the rollover', () => {
+    // The provider says 3% of the new window is gone. The clock does not get to
+    // overrule that just because the reset time it also reported has passed.
+    const fresh = snapshot([
+      { id: 'five_hour', label: '5 hours', utilization: 3, resetsAt: RESET, at: RESET + 500 },
+    ]);
+
+    expect(bindingWindow(fresh, RESET + 600)?.utilization).toBe(3);
+    expect(planMeterSlots(fresh, RESET + 600)[0]?.window.utilization).toBe(3);
+  });
+
+  it('is nobody the recommendation can rank', () => {
+    /*
+      A lapsed window reading 100% would otherwise exclude an account that is
+      in fact empty — and a lapsed one reading 3% would win on a number about a
+      period that has ended.
+    */
+    const spent = snapshot([
+      { id: 'five_hour', label: '5 hours', utilization: 3, resetsAt: RESET, at: 9_000 },
+    ]);
+    const other = snapshot([window_('five_hour', 50, 9_000)]);
+
+    const before = recommendProfile(
+      [
+        { profileId: 'spent', usage: spent },
+        { profileId: 'other', usage: other },
+      ],
+      { now: RESET - 1 },
+    );
+    expect(before?.profileId).toBe('spent');
+
+    // After the rollover there is one rankable account left, and one candidate
+    // is no recommendation at all.
+    const after = recommendProfile(
+      [
+        { profileId: 'spent', usage: spent },
+        { profileId: 'other', usage: other },
+      ],
+      { now: RESET + 1 },
+    );
+    expect(after).toBeNull();
+  });
+
+  it('drops a verdict it was carrying', () => {
+    // An `ok` clearing a `rejected` is the rollover arriving as an event. When
+    // no event comes — the run ended — the clock has to do it instead.
+    const refused = snapshot([
+      { id: 'five_hour', label: '5 hours', utilization: 97, resetsAt: RESET, at: 9_000, status: 'rejected' },
+    ]);
+
+    expect(planHeadroom(refused, RESET - 1)).toBe(0);
+    expect(bindingWindow(refused, RESET + 1)).toBeNull();
+    expect(planHeadroom(refused, RESET + 1)).toBeNull();
   });
 });

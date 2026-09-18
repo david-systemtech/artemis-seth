@@ -144,6 +144,7 @@ import {
   composesAlwaysOnSkillsHere,
   enabledToolServers,
   lowestTierModel,
+  mergePlanUsage,
 } from '@rx-artemis/protocol';
 
 import { AgentPromptStore } from './agentPrompts.js';
@@ -1415,6 +1416,12 @@ function createEngine(options: EngineOptions): ArtemisEngine {
    * dropped. `applyPlanLimit` decides what counts as news; anything that is
    * none returns `null` and nothing is pushed, which is what keeps a chatty
    * event stream from becoming a chatty push channel.
+   *
+   * The fold goes back through `mergePlanUsage` before it is stored, so a
+   * verdict that arrives while a poll of the same account is in flight loses
+   * to that poll on every window the poll actually re-read. What is broadcast
+   * is the cache's value rather than this fold's — one reading per account,
+   * and every window sees the same one.
    */
   const foldPlanLimit = (event: AgentEvent): void => {
     if (event.type !== 'plan.limit') return;
@@ -1423,8 +1430,12 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     const run = runs.get(event.runId);
     if (run === undefined) return;
 
-    const merged = applyPlanLimit(planUsageCache.get(run.profileId) ?? null, event.limit, Date.now());
-    if (merged === null) return;
+    const held = planUsageCache.get(run.profileId) ?? null;
+    const folded = applyPlanLimit(held, event.limit, Date.now());
+    if (folded === null) return;
+
+    const merged = mergePlanUsage(held, folded);
+    if (merged === held) return;
 
     planUsageCache.set(run.profileId, merged);
     const push: PlanUsagePush = { profileId: run.profileId, usage: merged };
@@ -1809,23 +1820,25 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       });
 
       /*
-        Never let the cache go backwards.
+        Never let the cache go backwards — and never answer from anything but
+        the cache either.
 
-        Two reads of one account overlap routinely — the poll's sweep and the
-        targeted read a run's end asks for — and each takes as long as a CLI
-        spawn, so the one that started first can finish last. Storing whichever
-        answered most recently would leave `cachedPlanUsage` describing an
-        earlier moment than the reading it replaced, which is then what every
-        newly-opened window seeds itself from.
+        Two reads of one account overlap routinely: the poll's sweep, the
+        targeted read a run's end asks for, a popover being opened in each of
+        two windows. Each takes as long as a CLI spawn, so the one that started
+        first can finish last, and each learns a slightly different slice of the
+        truth once live verdicts are folded in beside them.
 
-        The caller still gets what *this* read learned; it is only the shared
-        cache that insists on moving forward.
+        `mergePlanUsage` settles both at once. Every window is decided on its
+        own observation time, so a fresh percentage is never thrown away because
+        something *else* about the held reading was newer; and what is returned
+        is the merged cache value rather than this read's own, so the caller
+        that asked cannot end up holding a different number from the window next
+        to it. There is one reading per account in this process, and this is it.
       */
-      const previous = planUsageCache.get(query.profileId);
-      if (previous === undefined || usage.fetchedAt >= previous.fetchedAt) {
-        planUsageCache.set(query.profileId, usage);
-      }
-      return usage;
+      const merged = mergePlanUsage(planUsageCache.get(query.profileId) ?? null, usage);
+      planUsageCache.set(query.profileId, merged);
+      return merged;
     },
 
     suggestConfigDir: (label) => profiles.suggestConfigDir(label),

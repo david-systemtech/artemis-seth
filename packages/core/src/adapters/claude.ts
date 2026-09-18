@@ -1994,7 +1994,10 @@ export function createClaudeAdapter(options?: ClaudeAdapterOptions): ProviderAda
             settingSources: [],
           },
         });
-        return await readPlanUsage(sdkQuery, now());
+        // The clock itself, not a reading of it: `readPlanUsage` spans the CLI
+        // spawn and the control call, and the reading is true as of when the
+        // provider answered rather than when it was asked. See its header.
+        return await readPlanUsage(sdkQuery, now);
       } catch (cause) {
         // Spawning the CLI can fail for all the ordinary reasons — a bad cwd, a
         // missing runtime. None of them justify breaking the caller, which is a

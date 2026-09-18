@@ -1234,6 +1234,16 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
      * The expensive half: spawns a provider subprocess. Costs no model tokens
      * — see the adapter's `fetchPlanUsage` — but takes a second or two, which
      * is exactly why it is a separate channel from the cached read.
+     *
+     * **Whoever asked, everyone hears.** A reading is a fact about an account,
+     * not about the window that happened to press refresh, so both branches
+     * below broadcast through `broadcastPlanUsageReading` — the same push every
+     * poll cycle makes, to every window. This used to be true only of the
+     * server branch: a local refresh answered the caller and told nobody, so a
+     * second pane, the navigator's footer, the profile menu and the handoff
+     * picker all kept the older number until the poll came round up to two
+     * minutes later. That is the same account reading two different numbers on
+     * one screen, which is the whole complaint.
      */
     [IPC.usagePlanRefresh]: {
       validate: validateUsagePlan,
@@ -1262,9 +1272,17 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
           }
           return { usage: null };
         }
-        return {
-          usage: await engine.require().refreshPlanUsage({ profileId: request.profileId }),
-        };
+        /*
+         * Failures propagate, unlike the server branch's: a local provider
+         * that cannot be read is a real error for the window that asked, and
+         * the meter has a place to say so. An unknown profile falls through to
+         * the engine, which is where "no such profile" is worded properly.
+         */
+        await broadcastPlanUsageReading(engine, request.profileId, profile?.providerId ?? 'claude');
+        // The cache, not the read: the push carried the merged value, and an
+        // invoke reply that disagreed with the push it just caused would put
+        // this window one reading out of step with every other one.
+        return { usage: engine.require().cachedPlanUsage(request.profileId) };
       },
     },
 

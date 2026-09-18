@@ -282,7 +282,7 @@ function CandidateRow({
   const blocked = block !== null && block.kind !== 'unchecked';
 
   const tier = signedOut ? undefined : usage?.subscriptionType;
-  const binding = bindingWindow(usage);
+  const binding = bindingWindow(usage, now);
   const capacity = binding?.utilization ?? null;
   const rejected = binding?.status === 'rejected';
 

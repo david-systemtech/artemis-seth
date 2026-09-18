@@ -252,12 +252,12 @@ interface Reading {
  * way — this just keeps it from being `7 days · opus` on the one plan that has
  * nothing else to meter.
  */
-function shortName(usage: PlanUsage, window: PlanUsageWindow): string {
+function shortName(usage: PlanUsage, window: PlanUsageWindow, now: number): string {
   const named = window.id.startsWith(MODEL_SCOPED_PREFIX)
     ? window.id.slice(MODEL_SCOPED_PREFIX.length).trim()
     : '';
   if (named.length > 0) return named.toLowerCase();
-  const slot = planMeterSlots(usage).find((s) => s.window.id === window.id);
+  const slot = planMeterSlots(usage, now).find((s) => s.window.id === window.id);
   // A slot standing under the provider's own label is the meter's fallback for
   // a plan with none of the three named windows on it, not a short name of
   // ours to lowercase. Without this the same window would be `Extra usage` on
@@ -307,7 +307,7 @@ function read(model: ModelRef, usage: PlanUsage | null | undefined, now: number)
   if (!usage?.available) return empty;
 
   const own = modelWindow(model, usage);
-  const binding = bindingWindow(windowsBinding(usage, own));
+  const binding = bindingWindow(windowsBinding(usage, own), now);
   if (binding === null) return empty;
 
   // The model's own bucket answers for the model; the account's binding window
@@ -321,7 +321,7 @@ function read(model: ModelRef, usage: PlanUsage | null | undefined, now: number)
         ? binding
         : null;
 
-  const bindingLabel = shortName(usage, binding);
+  const bindingLabel = shortName(usage, binding, now);
   const percent = binding.utilization === null ? null : Math.round(binding.utilization);
 
   // A forecast from a reading three polls old is not a forecast, and a number

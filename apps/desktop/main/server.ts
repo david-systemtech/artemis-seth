@@ -99,6 +99,17 @@ const log = createLogger('server');
 /** Beside `profiles.json` and `prefs.json`, and named the way they are. */
 export const SERVER_CONFIG_FILE = 'server.json';
 
+/**
+ * How old the engine's cached gauge may be before a served request re-reads it.
+ *
+ * A minute, which is the tolerance the headless server extends to its own
+ * accounts and shorter than the poller's own sweep — so on a desktop with a
+ * window open this almost never spawns anything, and on one whose poller is
+ * idling (no window, macOS) it still refuses to serve a figure from ten minutes
+ * ago as if it were current.
+ */
+const SERVED_USAGE_MAX_AGE_MS = 60_000;
+
 /** What persists across launches. Everything else about the server is live state. */
 interface StoredConfig {
   readonly port: number;
@@ -316,6 +327,13 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
    * The gauges for a desktop that serves. The engine's own cache answers —
    * the same numbers this machine's windows read — with a refresh for a
    * profile nobody local has looked at lately.
+   *
+   * It did not, until now: every request re-read every asked-for account,
+   * which is one CLI spawn per profile per client poll, and left a remote
+   * client watching a gauge the local windows had never seen. The cache is
+   * kept current by the poller, the run-end settle read and the live
+   * `plan.limit` fold, so answering from it is both cheaper and the only way
+   * the two ends of the same account agree.
    */
   const usageSource = {
     read: async (query: { readonly profileIds: readonly string[] }) => {
@@ -331,7 +349,11 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       );
       for (const profileId of query.profileIds) {
         try {
-          const usage = await options.engine.require().refreshPlanUsage({ profileId: profileId as never });
+          const cached = options.engine.require().cachedPlanUsage(profileId as never);
+          const usage =
+            cached !== null && Date.now() - cached.fetchedAt < SERVED_USAGE_MAX_AGE_MS
+              ? cached
+              : await options.engine.require().refreshPlanUsage({ profileId: profileId as never });
           rows.push({ profileId, label: labels.get(profileId) ?? profileId, usage });
         } catch {
           // Unreadable gauge: no row, account untouched.

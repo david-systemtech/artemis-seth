@@ -125,6 +125,8 @@ describe('mapPlanUsage', () => {
       label: '7 days · Fable',
       utilization: 81,
       resetsAt: Date.parse(RESET_ISO),
+      // Every window carries when it was observed — see `PlanUsageWindow.at`.
+      at: NOW,
     });
     expect(buckets[1]!.id).toBe('model_scoped:Opus');
     expect(buckets[1]!.resetsAt).toBeNull();
@@ -175,7 +177,7 @@ describe('mapPlanUsage', () => {
 
     const spend = usage.windows.filter((w) => w.id === 'spend');
     expect(spend).toEqual([
-      { id: 'spend', label: 'Usage Credits', utilization: 12, resetsAt: null },
+      { id: 'spend', label: 'Usage Credits', utilization: 12, resetsAt: null, at: NOW },
     ]);
   });
 
@@ -191,7 +193,7 @@ describe('mapPlanUsage', () => {
     );
 
     expect(usage.windows).toEqual([
-      { id: 'spend', label: 'Usage Credits', utilization: null, resetsAt: null },
+      { id: 'spend', label: 'Usage Credits', utilization: null, resetsAt: null, at: NOW },
     ]);
   });
 
@@ -213,6 +215,38 @@ describe('mapPlanUsage', () => {
 });
 
 describe('readPlanUsage', () => {
+  /** A clock rather than an instant — see the function's own header for why. */
+  const clock = (): number => NOW;
+
+  it('stamps the reading when the provider answered, not when it was asked', async () => {
+    /*
+      The read spans a CLI spawn and a control call. Stamped on the way in, two
+      overlapping reads of one account order by which *started* first — so the
+      slow read that saw a window reset was filed as older than the fast read
+      of it from before, and then discarded for going backwards.
+    */
+    let ticks = 0;
+    const ticking = (): number => {
+      ticks += 1;
+      return NOW + ticks;
+    };
+    const query = {
+      usage: async () => {
+        // Time passes while the provider is being asked.
+        ticking();
+        ticking();
+        return { rate_limits_available: true, rate_limits: { five_hour: { utilization: 40 } } };
+      },
+    };
+
+    const usage = await readPlanUsage(query, ticking);
+
+    expect(usage.fetchedAt).toBe(NOW + 3);
+    // And each window carries the same instant, so a live verdict folded in
+    // later cannot re-date the ones it did not touch.
+    expect(usage.windows[0]!.at).toBe(NOW + 3);
+  });
+
   it('finds the method under its current experimental name', async () => {
     const query = {
       usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
@@ -221,7 +255,7 @@ describe('readPlanUsage', () => {
       }),
     };
 
-    const usage = await readPlanUsage(query, NOW);
+    const usage = await readPlanUsage(query, clock);
     expect(usage.available).toBe(true);
     expect(usage.windows[0]!.utilization).toBe(40);
   });
@@ -236,14 +270,14 @@ describe('readPlanUsage', () => {
       }),
     };
 
-    const usage = await readPlanUsage(query, NOW);
+    const usage = await readPlanUsage(query, clock);
     expect(usage.windows[0]!.utilization).toBe(1);
   });
 
   it('degrades to unavailable when the SDK exposes no usage method at all', async () => {
     // The scenario this file exists for: the experimental API is withdrawn or
     // renamed to something unrecognised. The status line must not break.
-    const usage = await readPlanUsage({ someOtherMethod: async () => ({}) }, NOW);
+    const usage = await readPlanUsage({ someOtherMethod: async () => ({}) }, clock);
 
     expect(usage.available).toBe(false);
     expect(usage.unavailableReason).toMatch(/does not report plan usage/i);
@@ -256,14 +290,14 @@ describe('readPlanUsage', () => {
       },
     };
 
-    const usage = await readPlanUsage(query, NOW);
+    const usage = await readPlanUsage(query, clock);
     expect(usage.available).toBe(false);
     expect(usage.unavailableReason).toContain('control channel closed');
   });
 
   it('never throws, whatever it is handed', async () => {
-    await expect(readPlanUsage(null, NOW)).resolves.toMatchObject({ available: false });
-    await expect(readPlanUsage(undefined, NOW)).resolves.toMatchObject({ available: false });
-    await expect(readPlanUsage('nonsense', NOW)).resolves.toMatchObject({ available: false });
+    await expect(readPlanUsage(null, clock)).resolves.toMatchObject({ available: false });
+    await expect(readPlanUsage(undefined, clock)).resolves.toMatchObject({ available: false });
+    await expect(readPlanUsage('nonsense', clock)).resolves.toMatchObject({ available: false });
   });
 });

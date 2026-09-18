@@ -105,6 +105,23 @@ export interface PlanUsageWindow {
    * polled snapshot alone carries only its number.
    */
   readonly status?: PlanLimitStatus;
+  /**
+   * When *this window's* number was observed, ms since epoch.
+   *
+   * A snapshot's {@link PlanUsage.fetchedAt} describes the newest thing in it,
+   * and a merged snapshot is not all one age: a live verdict folded in by
+   * {@link applyPlanLimit} is seconds old while the percentages beside it are
+   * as old as the poll that read them. Stamping the snapshot alone therefore
+   * re-dated windows nobody had re-read, and a genuinely newer poll answering
+   * a second later was rejected for looking older than a figure it superseded
+   * — the "it said 100% until it suddenly flipped" this field exists to fix.
+   *
+   * Optional because a reading may come from a peer, a disk seed or a version
+   * that predates this field; every reader falls back to the snapshot's own
+   * `fetchedAt`, which is exactly the old behaviour. {@link mergePlanUsage} and
+   * {@link currentWindow} are the two that care.
+   */
+  readonly at?: number;
 }
 
 /**
@@ -165,15 +182,24 @@ export interface PlanLimitReading {
  * The merge keeps what it is not contradicted on: a report with no percentage
  * leaves the polled percentage standing rather than blanking it.
  *
- * `fetchedAt` is stamped on the merged snapshot because the *verdict* is
- * fresh, even though any untouched percentages are as old as the poll that
- * read them. While reports are arriving the active-profile poll re-reads the
- * numbers every thirty seconds, which bounds how far the two can drift.
+ * `fetchedAt` is stamped on the merged snapshot because the *verdict* is fresh
+ * — but **only the window this touched carries that clock**. Every other window
+ * keeps the `at` it already had, or has the old snapshot's `fetchedAt`
+ * materialised onto it if it had none, so a verdict about the weekly limit
+ * cannot re-date a five-hour percentage nobody re-read. That re-dating is what
+ * made a genuinely newer poll look stale: the fold stamped the whole snapshot a
+ * second after the poll was answered, the poll's reading was refused for going
+ * backwards, and the pre-reset number stood until the cycle after.
  *
- * Note the complement: a later poll replaces the snapshot wholesale and drops
- * any held verdict. That is self-healing, not loss — a verdict with no run
- * feeding it fresh evidence goes stale the moment the window rolls, and the
- * poll's numbers are the better fact within minutes either way.
+ * The snapshot's own stamp is therefore the newest of its windows rather than
+ * the caller's clock outright — the same number in the ordinary case, and an
+ * honest one when the caller's clock is behind a window already held.
+ *
+ * Note the complement: a later poll supersedes each window it re-read through
+ * {@link mergePlanUsage} and drops the verdict on it. That is self-healing, not
+ * loss — a verdict with no run feeding it fresh evidence goes stale the moment
+ * the window rolls, and the poll's numbers are the better fact within minutes
+ * either way.
  */
 export function applyPlanLimit(
   usage: PlanUsage | null | undefined,
@@ -204,21 +230,219 @@ export function applyPlanLimit(
     utilization: reading.utilization ?? current?.utilization ?? null,
     resetsAt: reading.resetsAt ?? current?.resetsAt ?? null,
     status: reading.status,
+    at: fetchedAt,
   };
+
+  /*
+    Every other window is pinned to the moment it was actually read. Where it
+    carries no stamp of its own — a snapshot from a peer, a disk seed, a
+    version older than `at` — the held snapshot's `fetchedAt` is the truth
+    about it, so it is written on rather than left to be inherited from a
+    stamp this merge is about to move.
+  */
+  const held = existing?.fetchedAt ?? fetchedAt;
+  const untouched = (w: PlanUsageWindow): PlanUsageWindow =>
+    w.at === undefined ? { ...w, at: held } : w;
 
   const windows =
     current === null
-      ? [...(existing?.windows ?? []), window]
-      : existing?.windows.map((w) => (w.id === windowId ? window : w)) ?? [window];
+      ? [...(existing?.windows ?? []).map(untouched), window]
+      : existing?.windows.map((w) => (w.id === windowId ? window : untouched(w))) ?? [window];
+
+  return {
+    available: true,
+    windows,
+    fetchedAt: snapshotFetchedAt(windows, fetchedAt),
+    ...(existing?.subscriptionType === undefined
+      ? {}
+      : { subscriptionType: existing.subscriptionType }),
+  };
+}
+
+/**
+ * When a snapshot as a whole was last observed: the newest of its windows.
+ *
+ * `fallback` is the old rule — the caller's clock — and answers for a snapshot
+ * whose windows carry no stamps at all, which is every snapshot written before
+ * {@link PlanUsageWindow.at} existed.
+ */
+function snapshotFetchedAt(windows: readonly PlanUsageWindow[], fallback: number): number {
+  let newest: number | null = null;
+  for (const window of windows) {
+    if (window.at === undefined) continue;
+    if (newest === null || window.at > newest) newest = window.at;
+  }
+  return newest === null ? fallback : Math.max(newest, fallback);
+}
+
+/** When this window's number was observed, falling back to its snapshot's stamp. */
+function observedAt(window: PlanUsageWindow, snapshot: PlanUsage): number {
+  return window.at ?? snapshot.fetchedAt;
+}
+
+/**
+ * Do these two describe the same window in the same state?
+ *
+ * Field by field rather than by identity, because the same reading commonly
+ * arrives as two objects — an IPC reply and the broadcast it caused, a push
+ * re-delivered, a cache re-seeded from itself — and every hop clones. Every
+ * field of {@link PlanUsageWindow} is a primitive, so this is the whole of it.
+ */
+function sameWindow(a: PlanUsageWindow, b: PlanUsageWindow): boolean {
+  return (
+    a.id === b.id &&
+    a.label === b.label &&
+    a.utilization === b.utilization &&
+    a.resetsAt === b.resetsAt &&
+    a.status === b.status &&
+    a.at === b.at
+  );
+}
+
+/**
+ * The one reading of an account, from two partial accounts of it.
+ *
+ * This is the rule that makes a gauge a fact about an account rather than a
+ * fact about whoever last asked. Every holder of a reading — the desktop main
+ * process's cache, each renderer's store, the server's cache, the terminal's
+ * per-process map — merges through here, so two panes on one account cannot
+ * hold two different numbers, and a reply that overtakes an older one in flight
+ * cannot undo it.
+ *
+ * ## Per window, not per snapshot
+ *
+ * The two sides are rarely the same age *throughout*. A poll re-reads every
+ * window at once; a live verdict folded by {@link applyPlanLimit} refreshes
+ * exactly one. Ordering whole snapshots by {@link PlanUsage.fetchedAt} therefore
+ * throws away a newer percentage whenever anything else about the other side is
+ * newer — which is precisely the reported bug: a five-hour window that had just
+ * reset to 2% was refused because a verdict on the *weekly* window had re-dated
+ * a held 100%. So each window is decided on its own {@link PlanUsageWindow.at},
+ * and the snapshot's stamp is the newest of what survives.
+ *
+ * Ties go to `incoming`: two readings describing the same instant are the same
+ * fact, and preferring either is arbitrary.
+ *
+ * ## Absence is not news
+ *
+ * An `available: false` answer — "no plan limits apply", but also "the CLI could
+ * not be spawned" and "this token cannot read the usage endpoint" — replaces a
+ * good reading only when it is *strictly* newer. A transient failure must not
+ * blank a gauge that was right a moment ago, and the two are indistinguishable
+ * on the wire.
+ *
+ * ## The same object when nothing moved
+ *
+ * Returns `held` itself when the merge changed nothing, so a caller can use
+ * reference identity to answer "was this news?" — which is what keeps a store
+ * from re-rendering every meter, and a handoff from being reconsidered, on a
+ * cycle that restated what was already known. "Nothing" is judged by value
+ * rather than by object identity, because the same reading routinely arrives
+ * twice as two objects: the reply to a refresh and the broadcast that refresh
+ * caused are one reading and two clones of it.
+ */
+export function mergePlanUsage(
+  held: PlanUsage | null | undefined,
+  incoming: PlanUsage,
+): PlanUsage {
+  if (held === null || held === undefined) return incoming;
+  if (held === incoming) return held;
+
+  if (!incoming.available) {
+    // Strictly newer, and only then. See "Absence is not news" above.
+    return incoming.fetchedAt > held.fetchedAt ? incoming : held;
+  }
+  if (!held.available) return incoming.fetchedAt >= held.fetchedAt ? incoming : held;
+
+  /*
+    Display order comes from the newer side, which is the one whose account of
+    what windows this plan has is current. Windows only the older side knows
+    about follow in its own order rather than being dropped — a snapshot that
+    omits a window is not evidence that the window is gone.
+  */
+  const newer = incoming.fetchedAt >= held.fetchedAt ? incoming : held;
+  const older = newer === incoming ? held : incoming;
+
+  const windows: PlanUsageWindow[] = [];
+  const seen = new Set<string>();
+  for (const source of [newer, older]) {
+    for (const window of source.windows) {
+      if (seen.has(window.id)) continue;
+      seen.add(window.id);
+      const mine = held.windows.find((w) => w.id === window.id);
+      const theirs = incoming.windows.find((w) => w.id === window.id);
+      if (mine === undefined) windows.push(window);
+      else if (theirs === undefined) windows.push(mine);
+      else if (sameWindow(mine, theirs)) {
+        /*
+          Identical readings, so which object is kept is arbitrary — and `held`
+          is the one that makes the answer below come out as "no news". These
+          two arrive as separate objects routinely: one reading reaches a window
+          both as the reply to the refresh it asked for and as the broadcast
+          that refresh caused, and every IPC hop clones. Taking `incoming` would
+          rebuild the snapshot and redraw every meter to show what they already
+          showed.
+        */
+        windows.push(mine);
+      } else {
+        windows.push(
+          observedAt(theirs, incoming) >= observedAt(mine, held) ? theirs : mine,
+        );
+      }
+    }
+  }
+
+  const fetchedAt = Math.max(held.fetchedAt, incoming.fetchedAt);
+  const subscriptionType = newer.subscriptionType ?? older.subscriptionType;
+
+  /*
+    Nothing moved: every window that survived is the one `held` already had, by
+    identity, and the snapshot around them says the same. Windows are only ever
+    chosen between here — never rebuilt — so identity is a sound test and a
+    cheap one.
+  */
+  if (
+    fetchedAt === held.fetchedAt &&
+    subscriptionType === held.subscriptionType &&
+    windows.length === held.windows.length &&
+    windows.every((window, index) => window === held.windows[index])
+  ) {
+    return held;
+  }
 
   return {
     available: true,
     windows,
     fetchedAt,
-    ...(existing?.subscriptionType === undefined
-      ? {}
-      : { subscriptionType: existing.subscriptionType }),
+    ...(subscriptionType === undefined ? {} : { subscriptionType }),
   };
+}
+
+/**
+ * This window, or `null` when the reading of it is from before it rolled over.
+ *
+ * A window's percentage is a statement about a period that ends. Once
+ * `resetsAt` has passed, a figure read *before* that instant describes a period
+ * that no longer exists — and it is worse than no figure at all, because it
+ * reads as current. That is the other half of the reported complaint: a 5-hour
+ * window sat at 100% after it had reset, and every surface drew it, ranked
+ * accounts by it and refused handoffs on it.
+ *
+ * A reading taken at or after the rollover is kept, whatever the clock says: it
+ * *is* the new period's number, and the provider is the one who says so.
+ *
+ * `null` rather than a zero: nothing here knows what the new period holds. Zero
+ * is a measurement, and the honest output is the same "—" a window that has
+ * never been read shows.
+ */
+export function currentWindow(
+  window: PlanUsageWindow,
+  now: number,
+  fetchedAt: number,
+): PlanUsageWindow | null {
+  const resetsAt = window.resetsAt;
+  if (resetsAt === null || resetsAt > now) return window;
+  return (window.at ?? fetchedAt) < resetsAt ? null : window;
 }
 
 /**
@@ -300,24 +524,35 @@ export function isModelScoped(id: string): boolean {
  * Note this answers *only* the chosen window. A plan can be comfortable on the
  * focused one and nearly out on another, so the number here is not a promise
  * that nothing is about to run out — that is what the full list is for.
+ *
+ * `now` is the clock a lapsed window is measured against — see
+ * {@link currentWindow}. It defaults so the dozen call sites that only ever
+ * mean "now" stay one argument long; tests pass it explicitly.
  */
 export function focusedWindow(
   usage: PlanUsage | null | undefined,
   focus: PlanMeterFocus,
+  now: number = Date.now(),
 ): PlanUsageWindow | null {
   if (!usage?.available) return null;
   if (focus === 'model') {
     let worst: PlanUsageWindow | null = null;
-    for (const window of usage.windows) {
+    for (const raw of usage.windows) {
+      const window = currentWindow(raw, now, usage.fetchedAt);
+      if (window === null) continue;
       if (!isModelScoped(window.id) || window.utilization === null) continue;
       if (worst === null || window.utilization > (worst.utilization ?? -1)) worst = window;
     }
     return worst;
   }
-  return usage.windows.find((w) => w.id === focus) ?? null;
+  const found = usage.windows.find((w) => w.id === focus);
+  return found === undefined ? null : currentWindow(found, now, usage.fetchedAt);
 }
 
-export function bindingWindow(usage: PlanUsage | null | undefined): PlanUsageWindow | null {
+export function bindingWindow(
+  usage: PlanUsage | null | undefined,
+  now: number = Date.now(),
+): PlanUsageWindow | null {
   if (!usage?.available) return null;
   // A window the provider has said it is rejecting on outranks any percentage:
   // it is the limit that is stopping you as a fact, not a forecast. It binds
@@ -325,7 +560,12 @@ export function bindingWindow(usage: PlanUsage | null | undefined): PlanUsageWin
   // evidence that some 40% window is the tighter constraint.
   let rejected: PlanUsageWindow | null = null;
   let worst: PlanUsageWindow | null = null;
-  for (const window of usage.windows) {
+  for (const raw of usage.windows) {
+    // A window whose period ended before this number was read binds nothing:
+    // it is a statement about a period that is over, and a `rejected` verdict
+    // on it is the one most likely to have been cleared by the rollover.
+    const window = currentWindow(raw, now, usage.fetchedAt);
+    if (window === null) continue;
     if (window.status === 'rejected') {
       if (rejected === null || (window.utilization ?? -1) > (rejected.utilization ?? -1)) {
         rejected = window;
@@ -366,26 +606,51 @@ export interface PlanMeterSlot {
  * it" — so this is up to three slots. Where none of the three exist, the
  * window closest to full stands alone under the provider's own name, so a
  * provider with its own vocabulary still shows a real number.
+ *
+ * A window that *has* lapsed — its reset time passed after the reading was
+ * taken — keeps its slot and loses its number. Skipping it would move the two
+ * rings beside it sideways at the one moment the user is watching for the
+ * rollover, and leaving the old percentage standing is the "still 100% an hour
+ * after it reset" this whole file is about. A blank slot says what is true:
+ * this plan has this limit, and nobody has read it since it came back.
  */
-export function planMeterSlots(usage: PlanUsage | null | undefined): readonly PlanMeterSlot[] {
+export function planMeterSlots(
+  usage: PlanUsage | null | undefined,
+  now: number = Date.now(),
+): readonly PlanMeterSlot[] {
   if (!usage?.available) return [];
   const slots: PlanMeterSlot[] = [];
 
-  const fiveHour = focusedWindow(usage, 'five_hour');
-  if (fiveHour !== null) slots.push({ id: fiveHour.id, label: '5hr', window: fiveHour });
+  /** The window as it should be drawn: itself, or itself with the number gone. */
+  const drawn = (window: PlanUsageWindow): PlanUsageWindow =>
+    currentWindow(window, now, usage.fetchedAt) ?? lapsed(window);
 
-  const week = focusedWindow(usage, 'seven_day');
-  if (week !== null) slots.push({ id: week.id, label: 'Week', window: week });
+  const fiveHour = usage.windows.find((w) => w.id === 'five_hour');
+  if (fiveHour !== undefined) slots.push({ id: fiveHour.id, label: '5hr', window: drawn(fiveHour) });
+
+  const week = usage.windows.find((w) => w.id === 'seven_day');
+  if (week !== undefined) slots.push({ id: week.id, label: 'Week', window: drawn(week) });
 
   const fable = usage.windows.find(
     (w) => isModelScoped(w.id) && w.id.slice('model_scoped:'.length).toLowerCase() === 'fable',
   );
-  if (fable !== undefined) slots.push({ id: fable.id, label: 'Fable', window: fable });
+  if (fable !== undefined) slots.push({ id: fable.id, label: 'Fable', window: drawn(fable) });
 
   if (slots.length > 0) return slots;
 
-  const binding = bindingWindow(usage);
+  const binding = bindingWindow(usage, now);
   return binding === null ? [] : [{ id: binding.id, label: binding.label, window: binding }];
+}
+
+/**
+ * The same window with nothing claimed about how full it is.
+ *
+ * Its identity, name and reset time are still facts; the percentage and the
+ * provider's verdict are not, because both were about the period that just
+ * ended. `null` utilization is the value every surface already draws as "—".
+ */
+function lapsed(window: PlanUsageWindow): PlanUsageWindow {
+  return { id: window.id, label: window.label, utilization: null, resetsAt: window.resetsAt };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -452,12 +717,16 @@ export const PLAN_USAGE_MAX_AGE_MS = 3 * PLAN_USAGE_POLL_INTERVAL_MS;
  * an average for the same reason: a plan is as free as its most-consumed limit,
  * so an account at 5% weekly and 98% five-hourly has 2% of room, not 48%.
  *
- * `null` when there is nothing to answer from — no reading, no plan limits, or
- * a plan whose windows all report `null` utilization. That is distinct from
- * `0`, which is a plan that is genuinely full.
+ * `null` when there is nothing to answer from — no reading, no plan limits, a
+ * plan whose windows all report `null` utilization, or one whose every window
+ * has rolled over since it was read. That is distinct from `0`, which is a plan
+ * that is genuinely full.
  */
-export function planHeadroom(usage: PlanUsage | null | undefined): number | null {
-  const binding = bindingWindow(usage);
+export function planHeadroom(
+  usage: PlanUsage | null | undefined,
+  now: number = Date.now(),
+): number | null {
+  const binding = bindingWindow(usage, now);
   if (binding === null) return null;
   // A rejected window is zero headroom whatever its percentage reads — the
   // provider is refusing requests, and "3% left" on a window that is already
@@ -568,7 +837,9 @@ export interface PlanRecommendation {
  * not been re-read in three poll cycles is not evidence about now.
  *
  * **A reading with no usable number.** A plan whose every window reports `null`
- * utilization cannot be ranked against one that reports figures.
+ * utilization cannot be ranked against one that reports figures — and a window
+ * that has rolled over since it was read has no usable number either, whatever
+ * percentage it still carries. See {@link currentWindow}.
  *
  * **An account the user has taken out of the pool.** Not excluded here, and
  * deliberately: `autoSelect` and `disabled` are facts about a *profile*, and
@@ -624,7 +895,9 @@ export function recommendProfile(
     // such a reading is treated as current instead of infinitely stale.
     if (Math.max(0, options.now - usage.fetchedAt) > maxAge) continue;
 
-    const binding = bindingWindow(usage);
+    // On the caller's clock, so a window that has rolled over since the reading
+    // was taken ranks nobody — including the account it would have excluded.
+    const binding = bindingWindow(usage, options.now);
     if (binding === null) continue;
     // The same rule as {@link planHeadroom}: a rejected window is zero room
     // whatever it reads. It stays *in* the ranking rather than being excluded —

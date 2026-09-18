@@ -927,12 +927,20 @@ export function createCodexAdapter(options?: CodexAdapterOptions): ProviderAdapt
      * first-class method with a stable name.
      */
     async fetchPlanUsage(input: PlanUsageQuery): Promise<PlanUsage> {
-      const fetchedAt = now();
       try {
         const response = await withAppServer(
           { deps, env: input.env, cwd: input.cwd },
           async (session) => session.request(CODEX_METHOD.accountRateLimitsRead, {}),
         );
+        /*
+          Stamped here rather than on the way in, and the difference is a whole
+          app-server spawn. A reading dated from when it was *asked for* orders
+          two overlapping reads by which started first, so a slow read of an
+          account that had just reset was filed as older than a fast read of it
+          from before — and then refused for going backwards. These numbers
+          became true when Codex answered.
+        */
+        const fetchedAt = now();
 
         const limits = asRecord(asRecord(response)['rateLimits']);
         if (Object.keys(limits).length === 0) {
@@ -944,7 +952,7 @@ export function createCodexAdapter(options?: CodexAdapterOptions): ProviderAdapt
           };
         }
 
-        const windows = parseRateLimitWindows(limits);
+        const windows = parseRateLimitWindows(limits, fetchedAt);
         const planType = readString(limits, 'planType');
 
         if (windows.length === 0) {
@@ -972,7 +980,7 @@ export function createCodexAdapter(options?: CodexAdapterOptions): ProviderAdapt
           available: false,
           unavailableReason: 'Codex did not report plan limits for this profile.',
           windows: [],
-          fetchedAt,
+          fetchedAt: now(),
         };
       }
     },
@@ -2034,8 +2042,15 @@ export function parseThreadList(
  * (`five_hour`, `seven_day`) and every readout draws them under the same names
  * it draws Claude's. Any other duration keeps Artemis's own `primary` /
  * `secondary`; `PlanUsageWindowId` is deliberately open-ended for that.
+ *
+ * `fetchedAt` stamps each window with when it was observed, so a live verdict
+ * folded in later cannot re-date the ones it did not touch. See
+ * `PlanUsageWindow.at` in the protocol.
  */
-export function parseRateLimitWindows(limits: Record<string, unknown>): PlanUsageWindow[] {
+export function parseRateLimitWindows(
+  limits: Record<string, unknown>,
+  fetchedAt: number,
+): PlanUsageWindow[] {
   const windows: PlanUsageWindow[] = [];
 
   for (const [key, id] of [
@@ -2055,6 +2070,7 @@ export function parseRateLimitWindows(limits: Record<string, unknown>): PlanUsag
       utilization: usedPercent ?? null,
       // Unix seconds here, unlike the `*AtMs` fields elsewhere in the protocol.
       resetsAt: resetsAt === undefined ? null : resetsAt * 1000,
+      at: fetchedAt,
     });
   }
 

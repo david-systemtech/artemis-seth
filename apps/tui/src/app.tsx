@@ -242,6 +242,7 @@ import type { HistoryScope } from './history.js';
 import type { Launched } from './launch.js';
 import { modelRowFacts } from './modelFacts.js';
 import type { ModelListing } from './host.js';
+import { seedablePlanUsage } from './planUsageStore.js';
 import { renderDiff } from './render/diff.js';
 import { imageProtocol } from './render/images.js';
 import { EXAMPLE_SNIPPETS, toSnippetName } from './snippets.js';
@@ -467,8 +468,6 @@ const QUIT_WINDOW_MS = 2_000;
 const ESC_ESC_WINDOW_MS = 600;
 /** A plan-usage read is a CLI call; one a minute is the desktop's own tolerance. */
 const PLAN_USAGE_MIN_INTERVAL_MS = 60_000;
-/** A cached plan reading older than this is not shown while the fresh one is read: the windows will have moved. */
-const USAGE_SEED_MAX_AGE_MS = 24 * 60 * 60_000;
 /** A model list older than this is re-read at launch, in the background, so `/model` has a fresh one. */
 const MODELS_WARM_MAX_AGE_MS = 24 * 60 * 60_000;
 /** The key legend, for a picker whose hint has something else to say first. */
@@ -614,9 +613,11 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         driver: host.runs,
         settings,
         capabilitiesFor: (id) => host.capabilitiesFor(id),
+        // The process's one gauge per account, so a second conversation on this
+        // profile opens on the number the first is already showing.
+        planUsage: host.planUsage,
       });
-      const remembered = cache.get<PlanUsage>(usageKey(settings.profileId));
-      if (remembered !== undefined && Date.now() - remembered.at < USAGE_SEED_MAX_AGE_MS) created.setPlanUsage(remembered.value);
+      created.setPlanUsage(seedablePlanUsage(cache.get<PlanUsage>(usageKey(settings.profileId))));
       const commands = cache.get<readonly string[]>(commandsKey(settings.profileId, settings.cwd));
       if (commands !== undefined) created.seedSlashCommands(commands.value);
       return created;
@@ -1250,13 +1251,19 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     [host, cache, state.settings.profileId, state.settings.providerId, conversation],
   );
 
-  /** What the line under the composer shows for an account before its fresh reading lands. */
+  /**
+   * What the line under the composer shows for an account before its fresh
+   * reading lands.
+   *
+   * Nothing is written for an account with no usable seed, rather than a `null`
+   * being written over whatever is held: the gauge is keyed by account now, so
+   * the new account's line is already blank if nothing is known about it — and
+   * blanking would throw away a reading another conversation on that same
+   * account is looking at.
+   */
   const seedPlanUsage = useCallback(
     (profileId: string) => {
-      const remembered = cache.get<PlanUsage>(usageKey(profileId));
-      conversation.setPlanUsage(
-        remembered !== undefined && Date.now() - remembered.at < USAGE_SEED_MAX_AGE_MS ? remembered.value : null,
-      );
+      conversation.setPlanUsage(seedablePlanUsage(cache.get<PlanUsage>(usageKey(profileId))));
     },
     [cache, conversation],
   );

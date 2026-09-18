@@ -110,6 +110,7 @@ import {
 } from '@rx-artemis/transcript';
 
 import { ChangeLedger } from './changes.js';
+import { createPlanUsageStore, type PlanUsageStore } from './planUsageStore.js';
 
 /** The slice of `RunRegistry` a conversation needs. Satisfied structurally. */
 export interface RunDriver {
@@ -367,6 +368,16 @@ export interface ConversationOptions {
    * one over a `Map`.
    */
   readonly ledger?: (cwd: string) => ChangeLedger;
+  /**
+   * Where this conversation's account's plan reading is held.
+   *
+   * The process's one store — see {@link PlanUsageStore} — rather than a field
+   * on this object, because two conversations on one account are two views of
+   * one gauge and used to be two gauges. A conversation built without one gets
+   * a private store, which is the old behaviour and is what every test that
+   * does not care about this gets.
+   */
+  readonly planUsage?: PlanUsageStore;
 }
 
 const describe = (error: unknown): string =>
@@ -533,7 +544,12 @@ export class Conversation {
   #pending: PermissionRequest[] = [];
   #queued: readonly QueuedMessage[] = [];
   #tasks: readonly BackgroundTask[] = [];
-  #planUsage: PlanUsage | null = null;
+  /**
+   * Where this account's plan reading is held — the process's one store, not a
+   * copy of its own. See {@link PlanUsageStore}.
+   */
+  readonly #gauges: PlanUsageStore;
+  readonly #gaugesOff: () => void;
   /**
    * Each meter's reading when the turn now running began, so the end can be
    * subtracted from it. Absent between turns, and empty for an account that
@@ -619,8 +635,23 @@ export class Conversation {
     this.#now = options.now ?? Date.now;
     this.transcript = new TranscriptModel(options.scheduler ?? frameScheduler);
     this.changes = options.ledger?.(options.settings.cwd) ?? new ChangeLedger(options.settings.cwd);
+    this.#gauges = options.planUsage ?? createPlanUsageStore();
     this.#snapshot = this.#buildSnapshot();
     this.#unsubscribe = this.#driver.subscribe((event) => this.#onEvent(event));
+    /*
+      Another conversation reading this account is this conversation's news
+      too: one refresh anywhere moves every line under every composer that is
+      spending the same plan. Filtered to this account so a sweep over six
+      others does not redraw a screen whose numbers did not move.
+    */
+    this.#gaugesOff = this.#gauges.subscribe((profileId) => {
+      if (profileId === this.#settings.profileId) this.#notify();
+    });
+  }
+
+  /** This account's plan reading, held once for the whole process. */
+  get #planUsage(): PlanUsage | null {
+    return this.#gauges.get(this.#settings.profileId);
   }
 
   /* ---------------------------------------------------------------------- */
@@ -956,9 +987,17 @@ export class Conversation {
     this.#notify();
   }
 
-  /** A fetched snapshot replaces whatever `plan.limit` events had folded. */
+  /**
+   * Take a reading of this conversation's account.
+   *
+   * Folded into the process's one gauge rather than stored here, so it reaches
+   * every other conversation on the same account at the same instant — and so
+   * it cannot undo something newer that one of them already knew. `null` is
+   * "nothing was learned" and clears nothing: a failed read and an absent seed
+   * both arrive that way, and neither is evidence about the plan.
+   */
   setPlanUsage(usage: PlanUsage | null): void {
-    this.#planUsage = usage;
+    this.#gauges.merge(this.#settings.profileId, usage);
     this.#notify();
   }
 
@@ -1052,6 +1091,7 @@ export class Conversation {
 
   dispose(): void {
     this.#unsubscribe();
+    this.#gaugesOff();
     this.#listeners.clear();
     this.#eventListeners.clear();
   }
@@ -1619,9 +1659,11 @@ export class Conversation {
         break;
       case 'plan.limit': {
         // `null` means "nothing to fold onto" — a reading with no window — and
-        // is not a reason to forget what was known.
+        // is not a reason to forget what was known. What is folded goes back
+        // through the store, which decides per window whether this verdict is
+        // newer than what a poll on another conversation has since read.
         const folded = applyPlanLimit(this.#planUsage, event.limit, event.ts);
-        if (folded !== null) this.#planUsage = folded;
+        if (folded !== null) this.#gauges.merge(this.#settings.profileId, folded);
         break;
       }
       case 'run.end': {
