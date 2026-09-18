@@ -108,9 +108,11 @@ MAX_ATTEMPTS = 4
 # A refusal is a fact about that moment, not about the provider: BaseTen
 # served one request and refused the next two minutes later. A fast provider
 # that refuses is therefore asked again - after the other fast ones have had
-# their turn, and no sooner than REFUSAL_WAITS_S after it refused, a wait that
-# grows with each refusal, because a saturated pool is waited out, not
-# hammered. This many refusals before the slower tier is settled for.
+# their turn, and no sooner than REFUSAL_WAITS_S after it refused. The waits
+# grow with each refusal, because a saturated pool is waited out, not
+# hammered; at two asks only the first is ever used, and the rest stay for
+# whoever raises the count again. This many refusals before the slower tier is
+# settled for.
 #
 # Two, not more. It was eight, to ride out a pool saturated for minutes; on
 # 2026-09-18 CoreWeave, ranked first by its published speed, refused all 24
