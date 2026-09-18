@@ -1,6 +1,14 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.17.3
+
+A served conversation keeps everything above the turn it is on.
+
+**Reading a queued message early no longer wipes the conversation.** Pressed on a served conversation, "read it now" interrupts the turn, and the provider opens the queued message as a turn of its own. The desktop joined that turn and rebuilt the pane from it alone, so every earlier message disappeared and only the agent's newest reply was left, even though the server still held the whole transcript. The same happened on switching back to a conversation whose live turn the provider had started by itself. A pane that was already showing the conversation now keeps what it was showing when it joins the next turn.
+
+**Reopening or reloading mid-turn rebuilds the whole conversation.** A turn the provider opens on its own now records how much of the conversation came before it, and a served run learns that same count from its server. So a window that joins a turn in progress draws the earlier turns above it rather than the turn alone. The history read is also paged the way it was asked for, so the turn in progress is no longer drawn twice, once from the stored file and once from the run. **Update the server with the app:** the desktop keeps a pane's messages against any server, but reopening and reloading only rebuild the history against a server built on this release.
+
 ## What's new in 2.17.2
 
 A served conversation survives its own Stop button, and typing no longer freezes while a memory bank is written.
