@@ -1118,11 +1118,14 @@ class LocalRun implements Run {
       // what makes "stop" different from "undo".
       await this.#writes;
       this.#status = 'ended';
+      // The same accounting a clean ending carries: the tokens counted so far
+      // were spent whether or not the turn was let finish.
       this.#emit({
         type: 'run.end',
         reason: aborted ? 'interrupted' : 'error',
         sessionId: this.#sessionId,
         ...(aborted ? {} : { error: toError(error, this.#flavour) }),
+        ...(this.#usage === undefined ? {} : { usage: this.#usage }),
       } as never);
     } finally {
       // Every parked approval is released, or a disposed run leaves the loop

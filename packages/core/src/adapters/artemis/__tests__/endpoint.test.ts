@@ -667,18 +667,36 @@ describe('a live run: steering, interrupting and answering', () => {
     expect(steer?.authorization).toBe('Bearer tok');
   });
 
-  it('interrupts on the run route and still ends interrupted', async () => {
+  it('interrupts on the run route and ends on the ending the server sends', async () => {
+    let held: ServerResponse | undefined;
     const { origin, seen } = await serve((request, response) => {
       if (request.url === '/v1/chat/completions') {
+        held = response;
         response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
         response.write(sse(chunk({ role: 'assistant' })));
         response.write(sse(chunk({}, { artemis: { runId: 'srv-2' } })));
         response.write(sse(chunk({ content: 'thinking…' })));
-        return; // holds forever; the interrupt is the only exit
+        return; // holds; the server ends it once it has taken the interrupt
       }
       if (request.url === '/api/v0/runs/srv-2/interrupt') {
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ runId: 'srv-2' }));
+        // The provider over there winds the turn down and the server says so,
+        // with the turn's accounting, on the stream it already has.
+        held?.write(
+          sse(
+            chunk(
+              {},
+              {
+                finish_reason: 'stop',
+                usage: { prompt_tokens: 40, completion_tokens: 3, total_tokens: 43 },
+                artemis: { endReason: 'interrupted' },
+              },
+            ),
+          ),
+        );
+        held?.write(sse('[DONE]'));
+        held?.end();
         return;
       }
       response.writeHead(404);
@@ -701,7 +719,55 @@ describe('a live run: steering, interrupting and answering', () => {
     // The explicit interrupt reached the server — a detached run needs it, since
     // the abort that ends the local stream now reads as "detach", not "stop".
     expect(seen.some((row) => row.url === '/api/v0/runs/srv-2/interrupt')).toBe(true);
-    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'interrupted' });
+    // And the ending is the server's, accounting and all — not a card this side
+    // drew for itself the moment the route answered.
+    expect(events.at(-1)).toMatchObject({
+      type: 'run.end',
+      reason: 'interrupted',
+      usage: { tokens: { inputTokens: 40, outputTokens: 3 } },
+    });
+  });
+
+  it('still carries the last usage reading when it has to end the run itself', async () => {
+    // A server too old for the run routes never announces a run id, so the
+    // stop is the local abort alone — and the tokens counted by then were
+    // spent all the same.
+    const { origin } = await serve((request, response) => {
+      if (request.url === '/v1/chat/completions') {
+        response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        response.write(sse(chunk({ role: 'assistant' })));
+        response.write(
+          sse(
+            chunk(
+              { content: 'thinking…' },
+              { usage: { prompt_tokens: 21, completion_tokens: 2, total_tokens: 23 } },
+            ),
+          ),
+        );
+        return; // holds forever; the local abort is the only exit
+      }
+      response.writeHead(404);
+      response.end();
+    });
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      runId: 'run-old' as RunId,
+      env: { [LOCAL_BASE_URL_ENV]: origin },
+    } as ResolvedRunInput);
+
+    const events: AgentEvent[] = [];
+    for await (const event of run.events) {
+      events.push(event);
+      if (event.type === 'text.delta') void run.interrupt();
+    }
+
+    expect(events.at(-1)).toMatchObject({
+      type: 'run.end',
+      reason: 'interrupted',
+      usage: { tokens: { inputTokens: 21, outputTokens: 2 } },
+    });
   });
 
   it('draws a card from a permission chunk and answers it on the run route', async () => {
@@ -1578,18 +1644,32 @@ describe('forking, rewinding and reading a queued message now', () => {
     expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
   });
 
-  it('still stops outright when nothing is queued', async () => {
+  it('keeps the stream open even when the server names nothing as queued', async () => {
+    /*
+     * The case seen live on 2026-09-18: a message queued behind the turn, the
+     * stop pressed to have it read now, and the server's receipt naming no
+     * queued message — a Claude server lists only the ids it can match to a
+     * steer of this client's. The message survived and was answered all the
+     * same, so an empty list is no reason to end the conversation on this
+     * side; the server's own ending is.
+     */
+    let held: ServerResponse | undefined;
     const { origin, seen } = await serve((request, response) => {
       if (request.url === '/v1/chat/completions') {
+        held = response;
         response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
         response.write(sse(chunk({ role: 'assistant' })));
         response.write(sse(chunk({}, { artemis: { runId: 'srv-s' } })));
         response.write(sse(chunk({ content: 'working…' })));
-        return; // holds forever; the stop is the only exit
+        return; // holds: the stop is acknowledged, then the next turn arrives
       }
       if (request.url === '/api/v0/runs/srv-s/interrupt') {
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ runId: 'srv-s', stillQueued: [] }));
+        held?.write(sse(chunk({ content: ' read it, carrying on' })));
+        held?.write(sse(chunk({}, { finish_reason: 'stop', artemis: { endReason: 'completed' } })));
+        held?.write(sse('[DONE]'));
+        held?.end();
         return;
       }
       response.writeHead(404);
@@ -1604,12 +1684,54 @@ describe('forking, rewinding and reading a queued message now', () => {
     } as ResolvedRunInput);
 
     const events: AgentEvent[] = [];
+    let outcome: { readonly stillQueued: readonly string[] } | undefined;
+    for await (const event of run.events) {
+      events.push(event);
+      if (event.type === 'text.delta' && outcome === undefined) outcome = await run.interrupt();
+    }
+
+    expect(seen.some((row) => row.url === '/api/v0/runs/srv-s/interrupt')).toBe(true);
+    expect(outcome).toEqual({ stillQueued: [] });
+    expect(
+      events.some((event) => event.type === 'text.delta' && event.text === ' read it, carrying on'),
+    ).toBe(true);
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+  });
+
+  it('stops outright when the server will not take the interrupt', async () => {
+    // Nothing over there has been told to stop, so the local abort is the only
+    // stop there is — a dead Stop button would be worse than a torn stream.
+    const { origin, seen } = await serve((request, response) => {
+      if (request.url === '/v1/chat/completions') {
+        response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        response.write(sse(chunk({ role: 'assistant' })));
+        response.write(sse(chunk({}, { artemis: { runId: 'srv-r' } })));
+        response.write(sse(chunk({ content: 'working…' })));
+        return; // holds forever; the local abort is the only exit
+      }
+      if (request.url === '/api/v0/runs/srv-r/interrupt') {
+        response.writeHead(503, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: { message: 'not now' } }));
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+
+    const adapter = createArtemisAdapter();
+    const run = await adapter.createRun({
+      ...base,
+      runId: 'run-r' as RunId,
+      env: { [LOCAL_BASE_URL_ENV]: origin, [LOCAL_API_KEY_ENV]: 'tok' },
+    } as ResolvedRunInput);
+
+    const events: AgentEvent[] = [];
     for await (const event of run.events) {
       events.push(event);
       if (event.type === 'text.delta') void run.interrupt();
     }
 
-    expect(seen.some((row) => row.url === '/api/v0/runs/srv-s/interrupt')).toBe(true);
+    expect(seen.some((row) => row.url === '/api/v0/runs/srv-r/interrupt')).toBe(true);
     expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'interrupted' });
   });
 });
