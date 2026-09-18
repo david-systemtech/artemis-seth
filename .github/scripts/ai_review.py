@@ -554,6 +554,11 @@ SEVERITY_ORDER = {"blocker": 0, "major": 1, "minor": 2, "nit": 3}
 SEVERITY_ICON = {"blocker": "🛑", "major": "🔸", "minor": "🔹", "nit": "·"}
 
 
+def fence_for(text: str) -> str:
+    """A code fence longer than any run of backticks in the text, so nothing inside can end it."""
+    return "`" * max(3, len(max(re.findall(r"`+", text) or [""], key=len)) + 1)
+
+
 def render(result: dict, model: str, sha: str, skipped: int, truncated: bool, effort: str, note: str) -> str:
     # The schema is a request, not a guarantee (see run_effort), and by now the
     # review has been paid for. A finding that bends it - a severity outside the
@@ -590,7 +595,7 @@ def render(result: dict, model: str, sha: str, skipped: int, truncated: bool, ef
     # that contains a fence would end this one early and hand the next reader a
     # truncated array - so the fence is always longer than anything inside it.
     payload = json.dumps(findings, indent=2)
-    fence = "`" * max(3, len(max(re.findall(r"`+", payload) or [""], key=len)) + 1)
+    fence = fence_for(payload)
     lines += [
         "<details><summary>Findings as JSON (for the next reviewer)</summary>",
         "",
@@ -697,11 +702,15 @@ def main() -> int:
             log(f"no {name} on the base branch - reviewing without it")
     rulebook = "\n\n".join(rules) or "(none found)"
 
+    # A diff of a markdown file carries that file's own fences, and one of them
+    # on a context line would close a plain ``` early, leaving the rest of the
+    # diff - and the instruction after it - as loose text.
+    fence = fence_for(diff)
     prompt = (
         f"# The repository's rules (from the base branch)\n\n{rulebook}\n\n"
         f"# Pull request #{number}: {pr.get('title', '')}\n\n"
         f"{(pr.get('body') or '(no description)')[:4000]}\n\n"
-        f"# The diff\n\n```diff\n{diff}\n```\n\n"
+        f"# The diff\n\n{fence}diff\n{diff}\n{fence}\n\n"
         "Review it. Report only defects you can point at in this diff."
     )
 
