@@ -30,6 +30,8 @@ import type {
   ProviderDescriptor,
   ProviderModelOption,
   RunEndReason,
+  SkillInfo,
+  SkillLibraryDocument,
   RunHandle,
   RunSuggestion,
   Routine,
@@ -65,6 +67,7 @@ import {
   SHARED_ENTRIES,
   normalizeProfileColor,
   parseAgentPromptsDocument,
+  parseSkillLibraryDocument,
   type BrowserEvent,
   type BrowserInfo,
   type BrowserState,
@@ -753,6 +756,56 @@ let mockBankMemories: MemoryBankMemory[] = [
     file: 'memory/sessions/artemis-agent-harness.md',
   },
 ];
+
+/**
+ * The dev mock's skills: one of each shape the Skills pane has to draw — chosen
+ * by the model or typed, typed only, an account's own, and one nobody
+ * described — with one already always-on so the populated state is what a
+ * developer meets first.
+ */
+const MOCK_SKILLS: readonly SkillInfo[] = [
+  {
+    name: 'code-review',
+    description: 'Review a diff for correctness bugs before it is proposed.',
+    origin: { kind: 'machine' },
+    dir: '/Users/demo/.agents/skills/code-review',
+    modelInvocable: true,
+    userInvocable: true,
+    bodyChars: 5_200,
+  },
+  {
+    name: 'release',
+    description: 'Cut a release: gates, tag, and the notes that go with it.',
+    origin: { kind: 'profile', profileIds: ['demo-personal' as ProfileId] },
+    dir: '/Users/demo/.claude/skills/release',
+    modelInvocable: false,
+    userInvocable: true,
+    bodyChars: 2_100,
+  },
+  {
+    name: 'scratch',
+    description: '',
+    origin: { kind: 'machine' },
+    dir: '/Users/demo/.agents/skills/scratch',
+    modelInvocable: true,
+    userInvocable: true,
+    bodyChars: 340,
+  },
+  {
+    name: 'unslop',
+    description: 'Remove AI writing patterns from prose. Use for docs, READMEs and anything that should sound human.',
+    origin: { kind: 'machine' },
+    dir: '/Users/demo/.agents/skills/unslop',
+    modelInvocable: true,
+    userInvocable: true,
+    bodyChars: 3_900,
+  },
+];
+
+let mockSkillLibrary: SkillLibraryDocument = parseSkillLibraryDocument({
+  version: 1,
+  alwaysOn: [{ name: 'unslop', scope: { kind: 'all' } }],
+});
 
 /**
  * The prompt library, in memory.
@@ -2136,6 +2189,14 @@ export function createMockBridge(): ArtemisBridge {
       save: async (request) => {
         mockAgentPrompts = parseAgentPromptsDocument(request.document);
         return ok({ document: mockAgentPrompts });
+      },
+    },
+
+    skills: {
+      list: async () => ok({ skills: MOCK_SKILLS, document: mockSkillLibrary }),
+      save: async (request) => {
+        mockSkillLibrary = parseSkillLibraryDocument(request.document);
+        return ok({ document: mockSkillLibrary });
       },
     },
 

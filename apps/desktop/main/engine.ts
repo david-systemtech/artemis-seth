@@ -76,6 +76,8 @@ import type {
   RoutineDraft,
   RoutinePatch,
   RoutineSnapshot,
+  SkillInfo,
+  SkillLibraryDocument,
   ToolServerConfig,
 } from '@rx-artemis/protocol';
 
@@ -129,16 +131,23 @@ import {
   buildContentBridge,
   discoverMarketplacePlugins,
   linkSkillsIntoCodexHome,
+  listSkills,
+  resolveSkills,
+  skillRootsFor,
   takesHostToolServers,
 } from '@rx-artemis/core';
 import {
+  alwaysOnSkillNames,
   applyPlanLimit,
   composeAgentPrompts,
+  composeAlwaysOnSkills,
+  composesAlwaysOnSkillsHere,
   enabledToolServers,
   lowestTierModel,
 } from '@rx-artemis/protocol';
 
 import { AgentPromptStore } from './agentPrompts.js';
+import { SkillLibraryStore } from './skillLibrary.js';
 import { anyBankAvailable, banksForRun, configureMemoryBanks, isMasterEnabled, promptBanks, syncMemoryBanksInBackground } from './memoryBanks.js';
 import { EngineUnavailableError, ValidationError } from './errors.js';
 import { createLogger } from './log.js';
@@ -414,6 +423,22 @@ export interface ArtemisEngine {
   readAgentPrompts(): Promise<AgentPromptsDocument>;
   /** Replace the library. Answers with what was actually stored. */
   writeAgentPrompts(document: AgentPromptsDocument): Promise<AgentPromptsDocument>;
+
+  /**
+   * Every skill a session on this machine would be offered.
+   *
+   * On the host for the reason the prompt library is: the same folders are read
+   * again on the path of a run, to compose the always-on ones, and the list a
+   * person is shown has to come from the same reading of the disk.
+   */
+  listSkills(): Promise<readonly SkillInfo[]>;
+  /**
+   * Which skills are always on, as stored. For the pane: rejects when the
+   * file cannot be read, rather than handing it a guess it would save over.
+   */
+  readSkillLibrary(): Promise<SkillLibraryDocument>;
+  /** Replace those choices. Answers with what was actually stored. */
+  writeSkillLibrary(document: SkillLibraryDocument): Promise<SkillLibraryDocument>;
 
   startRun(input: RunInput): Promise<RunHandle>;
   sendToRun(
@@ -898,6 +923,7 @@ function createEngine(options: EngineOptions): ArtemisEngine {
   const profiles = new ProfileStore({ userDataDir, managedEnvKeys: managed, secrets });
 
   const agentPrompts = new AgentPromptStore({ userDataDir });
+  const skillLibrary = new SkillLibraryStore({ userDataDir });
 
   /*
    * The key managers, before the memory banks — because a bank may hold a
@@ -993,6 +1019,49 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       return withSystemPromptAppended(input, text);
     } catch (error) {
       log.warn('Could not compose the agent prompt library; starting without it', error);
+      return input;
+    }
+  };
+
+  /**
+   * Append the skills the user switched always-on, after the standing prompts.
+   *
+   * The same two refusals {@link withAgentPrompts} makes, for the same reasons:
+   * nothing is sent to a provider that cannot take an append, and nothing here
+   * can fail a run. After the prompts rather than before, because the prompts
+   * are the user's own words about how to work and a skill is a procedure to
+   * follow while doing it.
+   *
+   * ## Composed from the run's own account, at the moment it starts
+   *
+   * The names are resolved against the folders *this* account is offered skills
+   * from — its own `skills/`, then the machine's — which is the precedence the
+   * content bridge uses, so the always-on text is the text of the very skill
+   * the session could also be asked to run. And it is read now, not cached: a
+   * skill a synced source updated overnight is the updated skill this morning.
+   *
+   * A local model gets these too. It has no skill mechanism of its own, which
+   * makes this the *only* way it is ever told what a skill says.
+   *
+   * Which runs this applies to is {@link composesAlwaysOnSkillsHere}.
+   */
+  const withAlwaysOnSkills = async (input: RunInput): Promise<RunInput> => {
+    let capabilities;
+    try {
+      capabilities = providers.require(input.providerId).capabilities;
+    } catch {
+      return input;
+    }
+    if (!composesAlwaysOnSkillsHere(input.providerId, capabilities.systemPromptAppend)) return input;
+
+    try {
+      const names = alwaysOnSkillNames(await skillLibrary.read(), input.profileId);
+      if (names.length === 0) return input;
+      const configDir = profileConfigDir(await profiles.require(input.profileId));
+      const skills = await resolveSkills(names, skillRootsFor({ profileId: input.profileId, configDir }));
+      return withSystemPromptAppended(input, composeAlwaysOnSkills(skills));
+    } catch (error) {
+      log.warn('Could not compose the always-on skills; starting without them', error);
       return input;
     }
   };
@@ -1556,6 +1625,18 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     readAgentPrompts: () => agentPrompts.read(),
     writeAgentPrompts: (document) => agentPrompts.write(document),
 
+    listSkills: async () => {
+      // The accounts that have a skills folder of their own. Every other kind
+      // of account is still offered the machine-wide ones, which are listed
+      // whoever is asking.
+      const accounts = (await profiles.list())
+        .filter((profile) => profile.providerId === 'claude' || profile.providerId === 'codex')
+        .map((profile) => ({ profileId: profile.id, configDir: profileConfigDir(profile) }));
+      return listSkills({ accounts });
+    },
+    readSkillLibrary: () => skillLibrary.load(),
+    writeSkillLibrary: (document) => skillLibrary.write(document),
+
     startRun: async (input) => {
       // The banks' own `SessionStart` hook cannot run under `settingSources:
       // []`, so Artemis keeps the banks turning itself. The install half is
@@ -1585,7 +1666,7 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       // they record what the user asked for — the prompt to name the session
       // by, the account to attribute it to — and neither is a fact about the
       // system prompt or the bank directories the run happened to carry.
-      const handle = await runs.start(await withAgentPrompts(withBanks));
+      const handle = await runs.start(await withAlwaysOnSkills(await withAgentPrompts(withBanks)));
       namer.noteRun(input, handle.runId);
       owners.noteRun(input, handle.runId);
       return handle;

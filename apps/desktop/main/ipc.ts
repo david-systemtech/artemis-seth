@@ -185,6 +185,8 @@ import {
   validateServerRoutinesRunNow,
   validateAgentPromptsList,
   validateAgentPromptsSave,
+  validateSkillsList,
+  validateSkillsSave,
   validateMemoryBankAdd,
   validateMemoryBankForget,
   validateMemoryBankMemories,
@@ -775,6 +777,29 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       validate: validateAgentPromptsSave,
       handle: async (request) => ({
         document: await engine.require().writeAgentPrompts(request.document),
+      }),
+    },
+
+    /*
+     * Through the engine for the prompt library's reason: the always-on choices
+     * are read on the path of every run, so the one store `startRun` composes
+     * from has to be the one the pane writes to. The skills themselves are read
+     * off the disk on every list rather than cached, so a skill installed — or
+     * pulled — while the pane is open is there the next time it is opened.
+     */
+    [IPC.skillsList]: {
+      validate: validateSkillsList,
+      handle: async () => {
+        const host = engine.require();
+        const [skills, document] = await Promise.all([host.listSkills(), host.readSkillLibrary()]);
+        return { skills, document };
+      },
+    },
+
+    [IPC.skillsSave]: {
+      validate: validateSkillsSave,
+      handle: async (request) => ({
+        document: await engine.require().writeSkillLibrary(request.document),
       }),
     },
 

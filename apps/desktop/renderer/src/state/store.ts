@@ -228,6 +228,7 @@ export type SettingsSection =
   | 'browser'
   | 'permissions'
   | 'agents'
+  | 'skills'
   | 'cerebro'
   | 'memory-banks'
   | 'secrets'
@@ -263,6 +264,7 @@ const SETTINGS_SECTION_HOMES: Readonly<Record<SettingsSection, SettingsSection>>
   browser: 'permissions',
   permissions: 'permissions',
   agents: 'agents',
+  skills: 'skills',
   cerebro: 'memory-banks',
   'memory-banks': 'memory-banks',
   secrets: 'secrets',
@@ -1563,6 +1565,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   'browser',
   'permissions',
   'agents',
+  'skills',
   'cerebro',
   'secrets',
   'server',

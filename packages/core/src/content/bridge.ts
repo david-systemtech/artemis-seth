@@ -156,6 +156,8 @@ import {
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 
+import { BRIDGED_SKILL_PLUGIN } from '@rx-artemis/protocol';
+
 import type { LocalPlugin } from '../adapters/types.js';
 
 /**
@@ -183,8 +185,11 @@ export type ContentWarning = (message: string, error: unknown) => void;
  *
  * Codex needs no equivalent — its links land in a directory it already reads, so
  * those skills keep their bare names.
+ *
+ * The value lives in the protocol, beside the command the settings pane draws
+ * with it, so what a person is told to type cannot drift from what is served.
  */
-const PLUGIN_NAME = 'artemis-skills';
+const PLUGIN_NAME = BRIDGED_SKILL_PLUGIN;
 
 /** Where all Claude bridges live, under Artemis's own data directory. */
 const BRIDGES_DIR = 'content-bridges';
@@ -259,6 +264,21 @@ async function readSource(sourceDir: string): Promise<readonly DiscoveredSkill[]
     if (isSkill) found.push({ name, dir });
   }
   return found;
+}
+
+/**
+ * {@link readSource}, for `skills.ts`.
+ *
+ * Exported so that the list a person is shown and the set a run is offered are
+ * decided by one test of "is this folder a skill" rather than by two that agree
+ * today. Under a name that says what it is, because `export *` puts it on
+ * core's surface.
+ */
+export const skillFoldersIn = readSource;
+
+/** `~/.agents/skills` for a given home — the folder both providers read. */
+export function neutralSkillsDir(home: string = homedir()): string {
+  return join(home, ...NEUTRAL_SKILLS);
 }
 
 /**
