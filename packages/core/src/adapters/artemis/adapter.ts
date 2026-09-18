@@ -823,6 +823,13 @@ class ArtemisRun implements Run {
         ...(this.#input.systemPrompt?.kind === 'append'
           ? { systemPrompt: this.#input.systemPrompt.text }
           : {}),
+        // The always-on skills, as names: the server reads the bodies off its
+        // own disk, because a skill's text may point at files beside it and a
+        // served run can only open the server's. An older server drops the
+        // field and the run starts without them, which is what it did before.
+        ...(this.#input.alwaysOnSkills === undefined || this.#input.alwaysOnSkills.length === 0
+          ? {}
+          : { alwaysOnSkills: this.#input.alwaysOnSkills }),
         /*
          * The files and images this prompt is about, carried whole. The server
          * stages them into a directory of its own and names them to the agent
@@ -1152,10 +1159,20 @@ class ArtemisRun implements Run {
      * it is the failure the capability flag exists to prevent. The user's cure
      * is on the picker: an account whose provider can take instructions.
      */
-    if (extensions?.ignored?.includes('artemis.systemPrompt') === true && !this.#instructionsDropped) {
+    // The always-on skills ride the same capability and are dropped with them,
+    // so one notice names whichever of the two this run actually went without.
+    const droppedPrompts = extensions?.ignored?.includes('artemis.systemPrompt') === true;
+    const droppedSkills = extensions?.ignored?.includes('artemis.alwaysOnSkills') === true;
+    if ((droppedPrompts || droppedSkills) && !this.#instructionsDropped) {
       this.#instructionsDropped = true;
+      const without =
+        droppedPrompts && droppedSkills
+          ? 'your prompt library or your always-on skills'
+          : droppedPrompts
+            ? 'your prompt library'
+            : 'your always-on skills';
       this.#notice(
-        "The serving account's provider cannot take standing instructions, so this run started without your prompt library. Pick an account on a provider that can (Claude, or a local model) to have them apply.",
+        `The serving account's provider cannot take standing instructions, so this run started without ${without}. Pick an account on a provider that can (Claude, or a local model) to have them apply.`,
       );
     }
     /*

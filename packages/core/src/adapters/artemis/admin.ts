@@ -38,6 +38,10 @@ import type {
   ServerMemoryBankBody,
   ServerMemoryBankScope,
   ServerMemoryBanksBody,
+  ServerSkillSourceAddRequest,
+  ServerSkillsBody,
+  SkillInfo,
+  SkillSourceStatus,
   ServerRoutineBody,
   ServerRoutineDeletedBody,
   ServerRoutinesBody,
@@ -213,6 +217,106 @@ export async function setRemoteMemoryBankScope(
     `${API_PREFIX}/memory-banks/${encodeURIComponent(slug)}`,
     options,
     { method: 'PATCH', body: { profiles } },
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Skills: what the server carries, and the repositories it clones them from  */
+/* -------------------------------------------------------------------------- */
+
+/** A server's skills as a client has to meet them. */
+export interface RemoteSkills {
+  /**
+   * The server answers this surface at all. False for one too old to have it
+   * and for a host that carries no skills, which a pane treats alike: there is
+   * nothing to list, and the always-on names it sends are simply not read.
+   */
+  readonly available: boolean;
+  /** This profile's token may add, pull and remove repositories. */
+  readonly manage: boolean;
+  readonly skills: readonly SkillInfo[];
+  readonly sources: readonly SkillSourceStatus[];
+  /** The server's accounts, for labelling a skill that reaches only some. */
+  readonly profiles: readonly ServerMemoryBankAccount[];
+}
+
+const NO_REMOTE_SKILLS: RemoteSkills = {
+  available: false,
+  manage: false,
+  skills: [],
+  sources: [],
+  profiles: [],
+};
+
+function remoteSkillsOf(body: ServerSkillsBody | null): RemoteSkills {
+  if (body === null) return NO_REMOTE_SKILLS;
+  return {
+    available: true,
+    manage: body.manage === true,
+    skills: Array.isArray(body.skills) ? body.skills : [],
+    sources: Array.isArray(body.sources) ? body.sources : [],
+    profiles: Array.isArray(body.profiles) ? body.profiles : [],
+  };
+}
+
+/**
+ * Long enough for a clone. The server answers a write only once git has
+ * finished, so the reply can list what the repository brought, and git's own
+ * ceiling there is two minutes.
+ */
+const SKILL_SOURCE_WRITE_TIMEOUT_MS = 150_000;
+
+/** What the server carries. An absent surface is an answer, not an error. */
+export async function readRemoteSkills(
+  env: ArtemisProfileEnv,
+  options?: { readonly signal?: AbortSignal },
+): Promise<RemoteSkills> {
+  return remoteSkillsOf(
+    await absentOnUnavailable(call<ServerSkillsBody>(env, `${API_PREFIX}/skills`, options)),
+  );
+}
+
+/** Have the server clone a repository of skills and keep it pulled. */
+export async function addRemoteSkillSource(
+  env: ArtemisProfileEnv,
+  source: ServerSkillSourceAddRequest,
+): Promise<RemoteSkills> {
+  return remoteSkillsOf(
+    await call<ServerSkillsBody>(
+      env,
+      `${API_PREFIX}/skills/sources`,
+      { signal: AbortSignal.timeout(SKILL_SOURCE_WRITE_TIMEOUT_MS) },
+      { method: 'POST', body: source },
+    ),
+  );
+}
+
+/** Have the server stop carrying a repository, and delete its clone. */
+export async function removeRemoteSkillSource(
+  env: ArtemisProfileEnv,
+  id: string,
+): Promise<RemoteSkills> {
+  return remoteSkillsOf(
+    await call<ServerSkillsBody>(env, `${API_PREFIX}/skills/sources/${encodeURIComponent(id)}`, undefined, {
+      method: 'DELETE',
+    }),
+  );
+}
+
+/** Have the server pull one repository now, or all of them. */
+export async function syncRemoteSkillSources(
+  env: ArtemisProfileEnv,
+  id?: string,
+): Promise<RemoteSkills> {
+  const path =
+    id === undefined ? `${API_PREFIX}/skills/sync` : `${API_PREFIX}/skills/sources/${encodeURIComponent(id)}/sync`;
+  return remoteSkillsOf(
+    await call<ServerSkillsBody>(
+      env,
+      path,
+      { signal: AbortSignal.timeout(SKILL_SOURCE_WRITE_TIMEOUT_MS) },
+      { method: 'POST' },
+    ),
   );
 }
 

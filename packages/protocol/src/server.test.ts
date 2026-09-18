@@ -133,6 +133,30 @@ describe('readChatExtensions', () => {
     expect(readChatExtensions({ artemis: { systemPrompt: 42 } })).toEqual({});
   });
 
+  it('reads the always-on skills as names, kept exactly, and drops what is not one', () => {
+    expect(readChatExtensions({ artemis: { alwaysOnSkills: ['unslop', ' padded ', 'unslop', 7, ''] } })).toEqual({
+      // Once each, in the order given, and never trimmed: a skill is known by
+      // its folder's name, and a trimmed one would look up a different folder.
+      alwaysOnSkills: ['unslop', ' padded '],
+    });
+    // A setting of the wrong shape is a caller that sent nothing.
+    expect(readChatExtensions({ artemis: { alwaysOnSkills: 'unslop' } })).toEqual({});
+    expect(readChatExtensions({ artemis: { alwaysOnSkills: [] } })).toEqual({});
+  });
+
+  it('drops a name that reads as a path, as the desktop’s own validator does', () => {
+    expect(
+      readChatExtensions({ artemis: { alwaysOnSkills: ['../etc', 'a/b', 'a\\b', '.', '..', 'unslop'] } }),
+    ).toEqual({ alwaysOnSkills: ['unslop'] });
+  });
+
+  it('bounds the always-on names by what a skill library can hold', () => {
+    const many = Array.from({ length: 500 }, (_, index) => `skill-${String(index)}`);
+    const read = readChatExtensions({ artemis: { alwaysOnSkills: [...many, 'x'.repeat(201)] } });
+    expect(read.alwaysOnSkills).toHaveLength(200);
+    expect(read.alwaysOnSkills?.[0]).toBe('skill-0');
+  });
+
   it('drops a remote block that says nothing it can act on', () => {
     // Same rule as every other field: unknown keys drop, wrong types drop, and
     // a client that meant it sends a boolean. Half-honouring `detach: 1` would

@@ -42,6 +42,7 @@ import {
 } from 'electron';
 
 import {
+  DEFAULT_SKILL_SOURCE_SUBDIR,
   IPC,
   IPC_CHANNELS,
   IPC_PUSH,
@@ -55,11 +56,12 @@ import {
   type IpcRequest,
   type IpcResponse,
   type RunSuggestion,
+  type ServerSkillsResponse,
   type Unsubscribe,
   type WorkspacePickDirectoryRequest,
 } from '@rx-artemis/protocol';
 
-import { checkWorkingDirectory, createWorktree, describeWorkspace } from '@rx-artemis/core';
+import { checkWorkingDirectory, createWorktree, describeWorkspace, type RemoteSkills } from '@rx-artemis/core';
 
 import {
   addMemoryBank,
@@ -178,6 +180,9 @@ import {
   validateServerAccountSignIn,
   validateServerAccountSubmitCode,
   validateServerMemoryBanksSetProfiles,
+  validateServerSkillsSourceAdd,
+  validateServerSkillsSourceRemove,
+  validateServerSkillsSourceSync,
   validateServerRoutines,
   validateServerRoutinesCreate,
   validateServerRoutinesUpdate,
@@ -310,6 +315,18 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
     ]);
     return { skills, document, sources };
   };
+
+  /**
+   * A server's skills, in the pane's words. `profiles` on the wire, `accounts`
+   * here, for the reason the server memory-bank list renames them.
+   */
+  const serverSkillsReply = (remote: RemoteSkills): ServerSkillsResponse => ({
+    available: remote.available,
+    manage: remote.manage,
+    skills: remote.skills,
+    sources: remote.sources,
+    accounts: remote.profiles,
+  });
 
   const handlers: ChannelHandlers = {
     /* ---------------------------------------------------------------- */
@@ -1394,6 +1411,33 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
           accounts: remote.profiles,
         };
       },
+    },
+
+    [IPC.serverSkillsList]: {
+      validate: validateServerAccounts,
+      handle: async (request) => serverSkillsReply(await engine.require().remoteSkills(request.profileId)),
+    },
+
+    [IPC.serverSkillsSourceAdd]: {
+      validate: validateServerSkillsSourceAdd,
+      handle: async (request) =>
+        serverSkillsReply(
+          await engine
+            .require()
+            .addRemoteSkillSource(request.profileId, request.url, request.subdir ?? DEFAULT_SKILL_SOURCE_SUBDIR),
+        ),
+    },
+
+    [IPC.serverSkillsSourceRemove]: {
+      validate: validateServerSkillsSourceRemove,
+      handle: async (request) =>
+        serverSkillsReply(await engine.require().removeRemoteSkillSource(request.profileId, request.id)),
+    },
+
+    [IPC.serverSkillsSourceSync]: {
+      validate: validateServerSkillsSourceSync,
+      handle: async (request) =>
+        serverSkillsReply(await engine.require().syncRemoteSkillSources(request.profileId, request.id)),
     },
 
     [IPC.serverMemoryBanksSetProfiles]: {

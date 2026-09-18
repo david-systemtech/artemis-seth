@@ -106,6 +106,11 @@ import {
   readRemoteAccounts,
   readRemoteMemoryBanks,
   setRemoteMemoryBankScope,
+  readRemoteSkills,
+  addRemoteSkillSource,
+  removeRemoteSkillSource,
+  syncRemoteSkillSources,
+  type RemoteSkills,
   readRemoteUsage,
   readRemoteSignIn,
   resolveEnv,
@@ -142,10 +147,10 @@ import {
   applyPlanLimit,
   composeAgentPrompts,
   composeAlwaysOnSkills,
-  composesAlwaysOnSkillsHere,
   enabledToolServers,
   lowestTierModel,
   mergePlanUsage,
+  planAlwaysOnSkills,
   skillSourceIdFor,
   skillSourceLimitProblem,
   withoutSkillSource,
@@ -586,6 +591,15 @@ export interface ArtemisEngine {
    * rescope one. The client half of `/api/v0/memory-banks`.
    */
   remoteMemoryBanks(profileId: ProfileId): Promise<RemoteMemoryBanks>;
+  /**
+   * The skills an Artemis server carries, and the repositories it keeps
+   * cloned, asked through one of its profiles. The writes need that profile's
+   * token to hold the administrative grant; the server says so when it does not.
+   */
+  remoteSkills(profileId: ProfileId): Promise<RemoteSkills>;
+  addRemoteSkillSource(profileId: ProfileId, url: string, subdir: string): Promise<RemoteSkills>;
+  removeRemoteSkillSource(profileId: ProfileId, id: string): Promise<RemoteSkills>;
+  syncRemoteSkillSources(profileId: ProfileId, id?: string): Promise<RemoteSkills>;
   /** Attach one of the server's banks to every account there, or to exactly these. */
   setRemoteMemoryBankScope(
     profileId: ProfileId,
@@ -1078,7 +1092,7 @@ function createEngine(options: EngineOptions): ArtemisEngine {
    * A local model gets these too. It has no skill mechanism of its own, which
    * makes this the *only* way it is ever told what a skill says.
    *
-   * Which runs this applies to is {@link composesAlwaysOnSkillsHere}.
+   * Which runs this applies to, and how, is {@link planAlwaysOnSkills}.
    */
   const withAlwaysOnSkills = async (input: RunInput): Promise<RunInput> => {
     let capabilities;
@@ -1087,20 +1101,39 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     } catch {
       return input;
     }
-    if (!composesAlwaysOnSkillsHere(input.providerId, capabilities.systemPromptAppend)) return input;
+    // Names a served caller sent are for this function alone: whatever it
+    // decides, no adapter below is handed a list it has no use for — except
+    // the one that carries it on to the machine the run executes on.
+    const { alwaysOnSkills: asked, ...rest } = input;
+    const bare: RunInput = asked === undefined ? input : rest;
+    if (!capabilities.systemPromptAppend) return bare;
 
     try {
-      const names = alwaysOnSkillNames(await skillLibrary.read(), input.profileId);
-      if (names.length === 0) return input;
+      const plan = planAlwaysOnSkills({
+        providerId: input.providerId,
+        systemPromptAppend: capabilities.systemPromptAppend,
+        own: alwaysOnSkillNames(await skillLibrary.read(), input.profileId),
+        ...(asked === undefined ? {} : { asked }),
+      });
+      if (plan.kind === 'none') return bare;
+      /*
+       * A run on an Artemis server executes there, with the server's skills,
+       * and a skill's text may point at files beside it — so the choice
+       * crosses as names and the server reads the bodies off its own disk.
+       * The memory banks' arrangement, for the same reason.
+       */
+      if (plan.kind === 'send') return { ...bare, alwaysOnSkills: plan.names };
+
+      const names = plan.names;
       const configDir = profileConfigDir(await profiles.require(input.profileId));
       const skills = await resolveSkills(
         names,
         skillRootsFor({ profileId: input.profileId, configDir }, undefined, await skillSourceRoots()),
       );
-      return withSystemPromptAppended(input, composeAlwaysOnSkills(skills));
+      return withSystemPromptAppended(bare, composeAlwaysOnSkills(skills));
     } catch (error) {
       log.warn('Could not compose the always-on skills; starting without them', error);
-      return input;
+      return bare;
     }
   };
 
@@ -1949,6 +1982,13 @@ function createEngine(options: EngineOptions): ArtemisEngine {
      */
     remoteAccounts: async (profileId) => readRemoteAccounts(await remoteEnvFor(profileId)),
     remoteMemoryBanks: async (profileId) => readRemoteMemoryBanks(await remoteEnvFor(profileId)),
+    remoteSkills: async (profileId) => readRemoteSkills(await remoteEnvFor(profileId)),
+    addRemoteSkillSource: async (profileId, url, subdir) =>
+      addRemoteSkillSource(await remoteEnvFor(profileId), { url, subdir }),
+    removeRemoteSkillSource: async (profileId, id) =>
+      removeRemoteSkillSource(await remoteEnvFor(profileId), id),
+    syncRemoteSkillSources: async (profileId, id) =>
+      syncRemoteSkillSources(await remoteEnvFor(profileId), id),
     setRemoteMemoryBankScope: async (profileId, slug, scope) =>
       (await setRemoteMemoryBankScope(await remoteEnvFor(profileId), slug, scope)).bank,
 

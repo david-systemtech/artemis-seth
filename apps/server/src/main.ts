@@ -187,6 +187,7 @@ async function serve(): Promise<void> {
     // answers an administrator with an empty list rather than a 501, which is
     // the truthful answer — the registry is there, and it is empty.
     memoryBanks: host.memoryBankAdmin,
+    skills: host.skillsAdmin,
     ...(signInTimeoutMs() === undefined ? {} : { signInTimeoutMs: signInTimeoutMs() as number }),
     // No `terminals`: this process has no PTY surface — see the file header on
     // what a headless deployment gives up — so the terminal routes answer 501

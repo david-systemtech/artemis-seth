@@ -515,6 +515,29 @@ describe('the request body it sends', () => {
     );
   });
 
+  it('carries the always-on skills as names, for the server to read its own copies of', async () => {
+    let sent: unknown;
+    const { origin } = await serve((_request, response, body) => {
+      sent = body;
+      happyStream(response);
+    });
+    await drive(origin, { alwaysOnSkills: ['unslop', 'tdd'] });
+    expect((sent as { artemis?: { alwaysOnSkills?: string[] } }).artemis?.alwaysOnSkills).toEqual(['unslop', 'tdd']);
+  });
+
+  it('sends no alwaysOnSkills for a run that has none, empty list included', async () => {
+    const bodies: unknown[] = [];
+    const { origin } = await serve((_request, response, body) => {
+      bodies.push(body);
+      happyStream(response);
+    });
+    await drive(origin, {});
+    await drive(origin, { alwaysOnSkills: [] });
+    for (const body of bodies) {
+      expect((body as { artemis?: Record<string, unknown> }).artemis ?? {}).not.toHaveProperty('alwaysOnSkills');
+    }
+  });
+
   it('sends no systemPrompt when the run carries a default one', async () => {
     let sent: unknown;
     const { origin } = await serve((_request, response, body) => {
@@ -552,6 +575,29 @@ describe('what the server set aside', () => {
     expect((notices[0] as { text: string }).text).toMatch(/cannot take standing instructions/);
     // The reply itself is untouched.
     expect(events.some((event) => event.type === 'text.delta' && (event as { text: string }).text === 'Hello.')).toBe(true);
+  });
+
+  it('names the always-on skills when they are what the run went without, and both when both', async () => {
+    const dropped = async (ignored: readonly string[]): Promise<string> => {
+      const { origin } = await serve((_request, response) => {
+        response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        response.write(sse(chunk({ role: 'assistant' }, { artemis: { ignored } })));
+        response.write(sse(chunk({}, { finish_reason: 'stop', artemis: { endReason: 'completed' } })));
+        response.write(sse('[DONE]'));
+        response.end();
+      });
+      const events = await drive(origin, { alwaysOnSkills: ['unslop'] });
+      const notices = events.filter(
+        (event) => event.type === 'text.complete' && (event as { synthetic?: boolean }).synthetic === true,
+      );
+      expect(notices).toHaveLength(1);
+      return (notices[0] as { text: string }).text;
+    };
+
+    expect(await dropped(['artemis.alwaysOnSkills'])).toMatch(/started without your always-on skills\./);
+    expect(await dropped(['artemis.systemPrompt', 'artemis.alwaysOnSkills'])).toMatch(
+      /without your prompt library or your always-on skills\./,
+    );
   });
 
   it('says nothing when nothing was set aside', async () => {

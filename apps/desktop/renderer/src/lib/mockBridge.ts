@@ -32,6 +32,7 @@ import type {
   RunEndReason,
   SkillInfo,
   SkillLibraryDocument,
+  ServerSkillsResponse,
   SkillsListResponse,
   RunHandle,
   RunSuggestion,
@@ -823,6 +824,43 @@ function mockSkillsState(): SkillsListResponse {
       syncedAt: Date.now() - 12 * 60_000,
       skillCount: 2,
     })),
+  };
+}
+
+/**
+ * What the mock's Artemis server carries: one skill this machine has too, and
+ * one it does not, so the pane's two interesting rows are both on show.
+ */
+let mockServerSkillSources: SkillLibraryDocument = parseSkillLibraryDocument({
+  version: 1,
+  alwaysOn: [],
+  sources: [{ url: 'https://github.com/demo/agent-skills.git', subdir: 'skills' }],
+});
+
+function mockServerSkillsState(): ServerSkillsResponse {
+  return {
+    available: true,
+    manage: true,
+    skills: [
+      MOCK_SKILLS[3]!,
+      {
+        name: 'deploy-checklist',
+        description: 'The steps this server’s deploys follow, in order.',
+        origin: { kind: 'machine' },
+        dir: '/data/agent/.agents/skills/deploy-checklist',
+        modelInvocable: true,
+        userInvocable: true,
+        bodyChars: 1_800,
+      },
+    ],
+    sources: (mockServerSkillSources.sources ?? []).map((source) => ({
+      source,
+      cloned: true,
+      head: 'a1b2c3d',
+      syncedAt: Date.now() - 4 * 60_000,
+      skillCount: 1,
+    })),
+    accounts: mockRemoteAccounts.map((account) => ({ id: account.id, slug: account.slug, label: account.label })),
   };
 }
 
@@ -2705,6 +2743,19 @@ export function createMockBridge(): ArtemisBridge {
     },
 
     /** The server's banks, and which of its accounts each one reaches. */
+    serverSkills: {
+      list: async () => ok(mockServerSkillsState()),
+      addSource: async (request) => {
+        mockServerSkillSources = withSkillSource(mockServerSkillSources, request.url, request.subdir);
+        return ok(mockServerSkillsState());
+      },
+      removeSource: async (request) => {
+        mockServerSkillSources = withoutSkillSource(mockServerSkillSources, request.id);
+        return ok(mockServerSkillsState());
+      },
+      syncSources: async () => ok(mockServerSkillsState()),
+    },
+
     serverMemoryBanks: {
       list: async () =>
         ok({

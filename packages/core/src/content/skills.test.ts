@@ -130,8 +130,11 @@ describe('listSkills', () => {
     // the same directory.
     const shared = join(root, 'dot-claude', 'skills');
     await skill(shared, 'tdd', '---\ndescription: Red, green.\n---\nWrite the test first.\n');
-    await symlink(shared, join(work, 'skills'), 'dir');
-    await symlink(shared, join(personal, 'skills'), 'dir');
+    // A junction on Windows, as `sharedConfig` lays it down there: a directory
+    // symlink needs a privilege a developer's own account may not hold.
+    const kind = process.platform === 'win32' ? 'junction' : 'dir';
+    await symlink(shared, join(work, 'skills'), kind);
+    await symlink(shared, join(personal, 'skills'), kind);
 
     const skills = await listSkills({ accounts: accounts(), home });
 
