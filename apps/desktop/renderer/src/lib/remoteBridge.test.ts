@@ -474,6 +474,79 @@ describe('the event stream', () => {
     await until(() => opened.length >= 2);
     expect(opened.length).toBeGreaterThanOrEqual(2);
   });
+
+  /*
+   * The restart again, against a server too old to name its feed — the one
+   * case the epoch cannot help with. That server took the stale cursor as its
+   * own and skips everything at or below it for as long as the connection
+   * lives, while its heartbeats keep the watchdog satisfied. Adopting the head
+   * on this side is not enough: only a new connection carries it back.
+   */
+  it('reconnects at once when a server too old to name its feed has restarted', async () => {
+    replies.set('/api/v0/events', [
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([
+          sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":0,"version":"t"}' }),
+          frame(1, textDelta(0)) + frame(2, textDelta(1)) + frame(3, textDelta(2)),
+        ]),
+      },
+      // The restarted server answers the stale cursor, then stays open.
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":1,"version":"t"}' })], true),
+      },
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":1,"version":"t"}' })], true),
+      },
+    ]);
+    bridgeUnderTest();
+
+    await until(() => eventStreams().length >= 3);
+    const [, second, third] = eventStreams();
+    expect(second?.headers['last-event-id']).toBe('3');
+    // Without waiting for that stream to end or fall silent, which it never would.
+    expect(third?.headers['last-event-id']).toBe('1');
+  });
+
+  it('leaves a server that names its feed to heal the stream itself', async () => {
+    replies.set('/api/v0/events', [
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody([
+          sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":0,"version":"t","epoch":"before"}' }),
+          frame(1, textDelta(0)) + frame(2, textDelta(1)) + frame(3, textDelta(2)),
+        ]),
+      },
+      // A server new enough to name its feed refuses the foreign cursor itself
+      // and streams from its own head, so this connection is already right.
+      {
+        ok: true,
+        status: 200,
+        body: scriptedBody(
+          [
+            sseMessage({ event: REMOTE_STREAM_HELLO, data: '{"seq":1,"version":"t","epoch":"after"}' }),
+            frame(2, textDelta(3)),
+          ],
+          true,
+        ),
+      },
+    ]);
+    const bridge = bridgeUnderTest();
+    const seen: AgentEvent[] = [];
+    bridge.runs.onEvent((event) => seen.push(event));
+
+    await until(() => seen.length >= 4);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    // One reconnect for the restart, not a second one on top of it.
+    expect(eventStreams()).toHaveLength(2);
+  });
+
 });
 
 describe('control verbs on the wire', () => {

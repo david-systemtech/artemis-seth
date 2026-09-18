@@ -306,6 +306,12 @@ export function createRemoteBridge(
   let feedEpoch: string | null = null;
   /** How much silence means a dead socket rather than a quiet stream. See `pump`. */
   let silenceLimitMs = options.silenceLimitMs ?? DEFAULT_SILENCE_LIMIT_MS;
+  /**
+   * Set by `dispatch` when a restart shows on a server too old to have noticed
+   * it; `pump` then drops the connection so the next one carries the adopted
+   * cursor. See `dispatch` for why only that server.
+   */
+  let reconnectRequested = false;
 
   function dispatch(message: { id?: string; event?: string; data: string }): void {
     if (message.event === REMOTE_STREAM_HELLO) {
@@ -333,6 +339,16 @@ export function createRemoteBridge(
             hello.seq < lastSeq);
         if (typeof hello.epoch === 'string') feedEpoch = hello.epoch;
         if (typeof hello.seq === 'number' && (lastSeq === null || restarted)) lastSeq = hello.seq;
+        /*
+         * Adopting the head fixes this side only. A server that names its feed
+         * saw the stale cursor for what it was and streams from its own head,
+         * so this connection is already right. One too old to name a feed took
+         * that cursor as its own: it skips everything at or below it for as
+         * long as this connection lives, and its heartbeats keep the silence
+         * watchdog satisfied the whole time. Only a new connection carries the
+         * adopted head back to it.
+         */
+        if (restarted && typeof hello.epoch !== 'string') reconnectRequested = true;
         if (
           options.silenceLimitMs === undefined &&
           typeof hello.heartbeatMs === 'number' &&
@@ -420,6 +436,7 @@ export function createRemoteBridge(
         silence = setTimeout(abortConnection, silenceLimitMs);
       };
       try {
+        reconnectRequested = false;
         heard();
         // Only alongside a cursor: the epoch says whose count that number is.
         const resume =
@@ -448,6 +465,11 @@ export function createRemoteBridge(
           heard();
           for (const message of decoder.feed(text.decode(value, { stream: true }))) {
             dispatch(message);
+          }
+          if (reconnectRequested) {
+            reconnectRequested = false;
+            abortConnection();
+            break;
           }
         }
       } catch {
