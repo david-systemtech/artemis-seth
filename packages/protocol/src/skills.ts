@@ -107,6 +107,18 @@ export interface SkillInfo {
    */
   readonly bodyChars: number;
   /**
+   * The name a Claude session knows the skill by, when that is not the
+   * folder's: its frontmatter `name`.
+   *
+   * The CLI offers a plugin's skill under the name its `SKILL.md` declares and
+   * falls back to the folder only when it declares none, and the bridge is a
+   * plugin — so a skill in `my-tdd/` that says `name: tdd` is typed
+   * `/artemis-skills:tdd`. {@link name} stays the folder's, because that is
+   * what identifies the skill on disk and what an always-on choice refers to.
+   * Absent in the usual case, where the two agree.
+   */
+  readonly offeredAs?: string;
+  /**
    * Accounts that get a skill of this name from a marketplace plugin instead.
    *
    * A Claude run is handed an enabled marketplace plugin whole, so when one

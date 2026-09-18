@@ -193,6 +193,16 @@ describe('the list', () => {
     expect(screen.getByText(/Only on Work\./)).toBeTruthy();
   });
 
+  it('draws the command a session offers, which is the file’s name for the skill and not always the folder’s', async () => {
+    skills = [skill({ name: 'my-tdd', offeredAs: 'tdd' }), skill({ name: 'unslop' })];
+    await renderPane();
+
+    expect(screen.getByText('/artemis-skills:tdd')).toBeTruthy();
+    expect(screen.queryByText('/artemis-skills:my-tdd')).toBeNull();
+    // The switch is still the folder's: that is what an always-on choice refers to.
+    expect(toggle('my-tdd')).toBeTruthy();
+  });
+
   it('says so when a plugin offers the name on some accounts, and what to type there', async () => {
     skills = [
       skill({
