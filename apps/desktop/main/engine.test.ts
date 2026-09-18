@@ -13,6 +13,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { RunInput } from '@rx-artemis/protocol';
+import { composesAlwaysOnSkillsHere } from '@rx-artemis/protocol';
 
 import {
   bankToolsAvailable,
@@ -195,6 +196,28 @@ describe('builtInsFor', () => {
     // unaffected by this set.
     expect(builtInsFor('artemis', every).has('builtin:cerebro')).toBe(false);
     expect(builtInsFor('artemis', new Set())).toEqual(new Set());
+  });
+});
+
+describe('composesAlwaysOnSkillsHere', () => {
+  it('composes them for a provider that runs here and can take an append', () => {
+    expect(composesAlwaysOnSkillsHere('claude', true)).toBe(true);
+    // A local model has no skill mechanism of its own: this is the only way it
+    // is ever told what a skill says.
+    expect(composesAlwaysOnSkillsHere('llamacpp', true)).toBe(true);
+  });
+
+  it('sends nothing to a provider that cannot take an append', () => {
+    // The pane would otherwise be claiming something the model never read.
+    expect(composesAlwaysOnSkillsHere('codex', false)).toBe(false);
+    expect(composesAlwaysOnSkillsHere('opencode', false)).toBe(false);
+  });
+
+  it('leaves a served run to the server, which knows where its own skills are', () => {
+    // The served adapter can take an append, and that is not the question: an
+    // always-on skill names the folder its files are in, and composed here it
+    // would hand an agent on another machine the paths of this one.
+    expect(composesAlwaysOnSkillsHere('artemis', true)).toBe(false);
   });
 });
 

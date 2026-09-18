@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { ValidationError } from './errors.js';
 import {
   validateAgentPromptsSave,
+  validateSkillsSave,
   validatePreviewOpen,
   validateProfilesCreate,
   validateProfilesSuggestDir,
@@ -1505,6 +1506,52 @@ describe('validateAgentPromptsSave', () => {
     expect(() => validateAgentPromptsSave(row({ overridden: 'true', markdown: 'forged' }))).toThrow(
       ValidationError,
     );
+  });
+});
+
+/**
+ * The always-on choices, at the boundary.
+ *
+ * What an always-on skill *says* is read by main from a folder main found, so
+ * the property worth pinning is that nothing on this channel can name a place:
+ * a name is a folder's name and never a path, and the document is rebuilt from
+ * the fields the contract names rather than passed through.
+ */
+describe('validateSkillsSave', () => {
+  const save = (alwaysOn: unknown) => validateSkillsSave({ document: { alwaysOn } });
+
+  it('rebuilds the document from names and scopes, and nothing else', () => {
+    const saved = save([
+      { name: 'unslop', scope: { kind: 'all' }, dir: '/etc', body: 'forged' },
+      { name: 'tdd', scope: { kind: 'profiles', profileIds: ['p1'] } },
+    ]);
+
+    expect(saved).toEqual({
+      document: {
+        version: 1,
+        alwaysOn: [
+          { name: 'unslop', scope: { kind: 'all' } },
+          { name: 'tdd', scope: { kind: 'profiles', profileIds: ['p1'] } },
+        ],
+      },
+    });
+  });
+
+  it('refuses a name that is a path, in either spelling', () => {
+    for (const name of ['../../etc/passwd', 'skills/unslop', 'C:\\Users\\me\\skill', '..', '.']) {
+      expect(() => save([{ name, scope: { kind: 'all' } }]), name).toThrow(ValidationError);
+    }
+  });
+
+  it('refuses a document that is not a list of entries', () => {
+    expect(() => save('unslop')).toThrow(ValidationError);
+    expect(() => save([{ scope: { kind: 'all' } }])).toThrow(ValidationError);
+    expect(() => save([{ name: 'unslop', scope: { kind: 'some' } }])).toThrow(ValidationError);
+    expect(() => validateSkillsSave({})).toThrow(ValidationError);
+  });
+
+  it('accepts an empty list, which is every skill switched off', () => {
+    expect(save([]).document.alwaysOn).toEqual([]);
   });
 });
 

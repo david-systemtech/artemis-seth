@@ -6,6 +6,9 @@
  * this module builds the one channel that lets exactly the wanted surfaces
  * through, for every host — the desktop, the terminal, the server — from one
  * implementation. `bridge.ts` says why each provider needs a different shape.
+ * `skills.ts` reads what those skills *are* — for the pane that lists them, and
+ * for the ones a user has switched always-on.
  */
 
 export * from './bridge.js';
+export * from './skills.js';

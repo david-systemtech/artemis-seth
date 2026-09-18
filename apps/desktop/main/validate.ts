@@ -42,6 +42,8 @@ import { readSchedule } from './routines.js';
 import {
   AGENT_PROMPTS_VERSION,
   AGENT_PROMPT_LIMITS,
+  SKILL_LIBRARY_VERSION,
+  SKILL_LIMITS,
   AttachmentError,
   configDirProblem,
   BUILT_IN_PROMPT_IDS,
@@ -70,6 +72,8 @@ import {
   type AgentPromptScope,
   type AgentPromptsListRequest,
   type AgentPromptsSaveRequest,
+  type SkillsListRequest,
+  type SkillsSaveRequest,
   type Attachment,
   type BuiltInPromptId,
   type MemoryBankAddRequest,
@@ -2645,6 +2649,57 @@ export function validateAgentPromptsSave(raw: unknown): AgentPromptsSaveRequest 
       ...(dismissed === undefined || dismissed.length === 0
         ? {}
         : { dismissedBuiltIns: dismissed as BuiltInPromptId[] }),
+    },
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Skills                                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** Empty; the skills are this machine's folders and main knows where they are. */
+export function validateSkillsList(raw: unknown): SkillsListRequest {
+  requireRequest(raw);
+  return {};
+}
+
+/**
+ * The always-on choices, rebuilt entry by entry.
+ *
+ * Names and scopes and nothing else: there is no field here a renderer could
+ * use to name a directory, which is the property that matters. What an
+ * always-on skill *says* is read by main from a folder main found, so the most
+ * a renderer can do with this channel is switch on a skill that is already on
+ * the machine — never point a run's system prompt at a file of its choosing.
+ *
+ * A name is a folder name, so a path separator in one is refused outright
+ * rather than resolved: it could only ever be an attempt to reach outside the
+ * skills folders.
+ */
+export function validateSkillsSave(raw: unknown): SkillsSaveRequest {
+  const request = requireRequest(raw);
+  const document = requireObject(request['document'], 'document');
+
+  const rawEntries = document['alwaysOn'];
+  if (!Array.isArray(rawEntries)) {
+    throw new ValidationError('document.alwaysOn', 'must be an array');
+  }
+  if (rawEntries.length > SKILL_LIMITS.count) {
+    throw new ValidationError('document.alwaysOn', `must hold at most ${SKILL_LIMITS.count} skills`);
+  }
+
+  return {
+    document: {
+      version: SKILL_LIBRARY_VERSION,
+      alwaysOn: rawEntries.map((value, index) => {
+        const field = `document.alwaysOn[${index}]`;
+        const entry = requireObject(value, field);
+        const name = requireString(entry['name'], `${field}.name`, SKILL_LIMITS.name);
+        if (name.includes('/') || name.includes('\\') || name === '.' || name === '..') {
+          throw new ValidationError(`${field}.name`, 'must be a skill name, not a path');
+        }
+        return { name, scope: validateAgentPromptScope(entry['scope'], `${field}.scope`) };
+      }),
     },
   };
 }
