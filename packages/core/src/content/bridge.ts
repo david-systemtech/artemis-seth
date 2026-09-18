@@ -196,6 +196,20 @@ const PLUGIN_NAME = BRIDGED_SKILL_PLUGIN;
 const BRIDGES_DIR = 'content-bridges';
 
 /**
+ * Is `target` somewhere beneath `root`?
+ *
+ * Asked of `relative`, not of the two strings: this used to be
+ * `startsWith(root + '/')`, which is never true on Windows, where `resolve`
+ * writes backslashes. The cost was quiet and specific — a Codex link that had
+ * become redundant was taken for somebody else's and left in place, so the
+ * skill was listed twice. Found the first time this module's suite ran there.
+ */
+function isInside(root: string, target: string): boolean {
+  const within = relative(resolve(root), resolve(target));
+  return within.length > 0 && !within.startsWith('..') && !isAbsolute(within);
+}
+
+/**
  * The kind of link laid down for a directory: a junction on Windows.
  *
  * For the reason `profiles/xdgFarm.ts` gives at length. A directory symlink
@@ -948,9 +962,7 @@ export async function linkSkillsIntoCodexHome(options: CodexSkillLinkOptions): P
         .catch(() => false));
       // Any of the folders this function links from — the user's Codex skills
       // or a synced source — so a skill that left one of them leaves here too.
-      const fromSource =
-        target !== null &&
-        managed.some((root) => resolve(target).startsWith(`${resolve(root)}/`));
+      const fromSource = target !== null && managed.some((root) => isInside(root, target));
       if (dangling || fromSource) await rm(at, { force: true, recursive: true });
       else wanted.delete(name);
     }
