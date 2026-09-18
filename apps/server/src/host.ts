@@ -47,7 +47,6 @@ import type {
 import { applyPlanLimit, mergePlanUsage } from '@rx-artemis/protocol';
 import {
   RunError,
-  buildContentBridge,
   checkAuthStatus,
   createCatalogue,
   createDefaultProviderRegistry,
@@ -56,13 +55,13 @@ import {
   createServerRoutineStore,
   createSessionLedger,
   createWorkspaceResolver,
-  discoverMarketplacePlugins,
   joinSystemPromptAppends,
   linkSkillsIntoCodexHome,
   machineBankPrompt,
   managedEnvKeys,
   memoryToolServer,
   registryPath,
+  resolveContentPlugins,
   MEMORY_TOOL_SERVER,
   DuplicateProfileLabelError,
   ProfileStore,
@@ -263,11 +262,11 @@ export function createHeadlessHost(
       await linkSkillsIntoCodexHome({ configDir, onWarning: onContentWarning });
       return [];
     }
-    const [bridged, marketplace] = await Promise.all([
-      buildContentBridge({ configDir, dataDir, onWarning: onContentWarning }),
-      discoverMarketplacePlugins({ configDir, onWarning: onContentWarning }),
-    ]);
-    return [...bridged, ...marketplace];
+    // One call, because the two sources overlap: a skill an enabled
+    // marketplace plugin offers must not also be bridged under Artemis's name.
+    // `GET /api/v0/commands` reads through here too, so the menu a client
+    // draws and the run it starts agree. See `resolveContentPlugins`.
+    return resolveContentPlugins({ configDir, dataDir, onWarning: onContentWarning });
   };
 
   const runs = new RunRegistry({

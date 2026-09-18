@@ -143,7 +143,7 @@ function SkillRow({
     <Item size="sm" className="items-start">
       <ItemContent>
         <ItemTitle className="text-xs text-ink">
-          <code className="font-mono text-2xs text-beam-text">{skillSlashCommand(skill.name)}</code>
+          <code className="font-mono text-2xs text-beam-text">{skillSlashCommand(skill.offeredAs ?? skill.name)}</code>
         </ItemTitle>
         <ItemDescription className="line-clamp-none text-2xs leading-relaxed text-ink-muted">
           {skill.description.length > 0
@@ -158,6 +158,21 @@ function SkillRow({
               ? ` Always on adds about ${approximateTokens(skill.bodyChars)} tokens to every run.`
               : ' None of the accounts it reaches is told its always-on skills, so the switch adds nothing to a run.'}
         </ItemDescription>
+        {/* A session is handed an enabled marketplace plugin whole, so where one
+            offers this name Artemis leaves its own copy out rather than offer
+            the skill twice. Said here because the command above is then not
+            the one that works on those accounts. */}
+        {skill.pluginOffers?.map((offer) => (
+          <ItemDescription
+            key={offer.plugin}
+            className="line-clamp-none text-2xs leading-relaxed text-ink-faint"
+          >
+            On {offer.profileIds.map(profileLabel).join(', ')} the {offer.plugin} plugin offers a skill of this
+            name, so sessions there get that one and it is typed as{' '}
+            <code className="font-mono text-2xs text-ink-muted">{offer.command}</code>. Always on still uses
+            your copy.
+          </ItemDescription>
+        ))}
       </ItemContent>
       <ItemActions>
         <Switch

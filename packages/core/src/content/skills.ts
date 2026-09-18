@@ -25,11 +25,17 @@ import { readFile, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import type { ProfileId, ResolvedSkill, SkillInfo, SkillOrigin } from '@rx-artemis/protocol';
-import { SKILL_LIMITS } from '@rx-artemis/protocol';
+import type {
+  ProfileId,
+  ResolvedSkill,
+  SkillInfo,
+  SkillOrigin,
+  SkillPluginOffer,
+} from '@rx-artemis/protocol';
+import { SKILL_LIMITS, skillSlashCommand } from '@rx-artemis/protocol';
 
 import { parseFrontmatter } from '../memorybanks/frontmatter.js';
-import { neutralSkillsDir, skillFoldersIn } from './bridge.js';
+import { marketplaceSkillOffers, neutralSkillsDir, offeredNameOf, skillFoldersIn } from './bridge.js';
 import type { SkillSourceRoot } from './skillSources.js';
 
 /** One account that can be offered skills: a Claude or Codex profile. */
@@ -51,6 +57,11 @@ export interface SkillRoot {
 
 /** What a `SKILL.md` says, reduced to what Artemis reads. */
 export interface SkillDocument {
+  /**
+   * The name a session knows the skill by: its frontmatter `name`, or `null`
+   * when it gives none and the folder's name stands in. See `offeredNameOf`.
+   */
+  readonly declaredName: string | null;
   readonly description: string;
   readonly modelInvocable: boolean;
   readonly userInvocable: boolean;
@@ -59,6 +70,7 @@ export interface SkillDocument {
 }
 
 const UNREADABLE: SkillDocument = {
+  declaredName: null,
   description: '',
   modelInvocable: true,
   userInvocable: true,
@@ -93,7 +105,10 @@ export async function readSkillDocument(dir: string): Promise<SkillDocument> {
   // means — most published skills write it that way, and a line-by-line reader
   // shows them as ">-".
   const description = typeof data?.['description'] === 'string' ? data['description'] : '';
+  const declaredName = data?.['name'];
   return {
+    declaredName:
+      typeof declaredName === 'string' && declaredName.trim().length > 0 ? declaredName.trim() : null,
     description: description.replace(/\s+/g, ' ').trim(),
     // The key disables, so it reads inverted: absent means the model may.
     modelInvocable: !flag(data?.['disable-model-invocation'], false),
@@ -163,6 +178,15 @@ export interface ListSkillsOptions {
  * names both: each is offered a skill by that name, and the switch on the row
  * reaches both. What the row says the skill is for, and what it costs, are the
  * first account's copy's — the other nuance one row cannot carry.
+ *
+ * ## A name a marketplace plugin offers
+ *
+ * A Claude run is given an enabled marketplace plugin whole, and
+ * `resolveContentPlugins` leaves a same-named skill out of the bridge so the
+ * session is not offered it twice. The row still lists the person's copy — it
+ * is theirs, and always-on still reads it — and says which accounts get the
+ * name from a plugin instead, and what it is typed as there. Read through the
+ * function the run itself uses, so the pane cannot describe a different split.
  */
 export async function listSkills(options: ListSkillsOptions): Promise<readonly SkillInfo[]> {
   const home = options.home ?? homedir();
@@ -187,7 +211,31 @@ export async function listSkills(options: ListSkillsOptions): Promise<readonly S
     ...sourceRoots(options.sources ?? []),
   ];
 
-  const byName = new Map<string, SkillInfo>();
+  // What each account's enabled plugins offer. Nothing for a Codex account,
+  // whose config directory has no install record to read.
+  const offersByAccount = await Promise.all(
+    options.accounts.map(async (account) => ({
+      profileId: account.profileId,
+      offers: await marketplaceSkillOffers({ configDir: account.configDir, home }),
+    })),
+  );
+  const pluginOffersFor = (offeredName: string, origin: SkillOrigin): readonly SkillPluginOffer[] => {
+    const byPlugin = new Map<string, ProfileId[]>();
+    for (const { profileId, offers } of offersByAccount) {
+      // An account the skill does not reach has nothing to be displaced from.
+      if (origin.kind === 'profile' && !origin.profileIds.includes(profileId)) continue;
+      const plugin = offers.get(offeredName);
+      if (plugin === undefined) continue;
+      byPlugin.set(plugin, [...(byPlugin.get(plugin) ?? []), profileId]);
+    }
+    return [...byPlugin].map(([plugin, profileIds]) => ({
+      plugin,
+      command: skillSlashCommand(offeredName, plugin),
+      profileIds,
+    }));
+  };
+
+  const byName = new Map<string, SkillInfo & { readonly offeredName: string }>();
   for (const root of roots) {
     for (const folder of await skillFoldersIn(root.dir)) {
       const listed = byName.get(folder.name);
@@ -211,13 +259,27 @@ export async function listSkills(options: ListSkillsOptions): Promise<readonly S
         // What a run is given, not what the file holds: composition cuts a
         // body at the limit, and a price past it is for text no run receives.
         bodyChars: Math.min(document.body.trim().length, SKILL_LIMITS.body),
+        offeredName: offeredNameOf(document.declaredName, folder.name),
       });
     }
   }
 
+  // Plugin offers last, once every row's origin names all the accounts it
+  // reaches: a second account's folder can still widen a row above.
+  const rows = [...byName.values()].map(({ offeredName, ...row }): SkillInfo => {
+    const pluginOffers = pluginOffersFor(offeredName, row.origin);
+    return {
+      ...row,
+      // Said only when it differs: the command is drawn from it, and a pane
+      // that drew the folder's name would show a command no session offers.
+      ...(offeredName === row.name ? {} : { offeredAs: offeredName }),
+      ...(pluginOffers.length === 0 ? {} : { pluginOffers }),
+    };
+  });
+
   // By name, so the list holds still between reads: `readdir` order is the
   // filesystem's business and differs between a laptop and a server.
-  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  return rows.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /* -------------------------------------------------------------------------- */

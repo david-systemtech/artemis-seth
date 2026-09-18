@@ -10,7 +10,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -560,6 +560,33 @@ describe('the skills this machine carries', () => {
     // an empty list would still initialise the SDK's plugin machinery.
     await host.runSource.startRun(started({ profileId: 'prof_personal' }));
     expect(query.options()['plugins']).toBeUndefined();
+  });
+
+  it('offers a skill once when an enabled marketplace plugin publishes the same name', async () => {
+    // The desktop's rule, reached through the same core call: the plugin is
+    // handed over whole, so the bridge is the side that yields.
+    const installPath = join(root, 'plugin-cache', 'pstack');
+    const key = 'pstack@claude-plugins-official';
+    await mkdir(join(installPath, '.claude-plugin'), { recursive: true });
+    await writeFile(join(installPath, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'pstack' }));
+    await mkdir(join(installPath, 'skills', 'unslop'), { recursive: true });
+    await writeFile(join(installPath, 'skills', 'unslop', 'SKILL.md'), '---\nname: unslop\n---\n\nTheirs.\n');
+    await mkdir(join(configDirs.work, 'plugins'), { recursive: true });
+    await writeFile(
+      join(configDirs.work, 'plugins', 'installed_plugins.json'),
+      JSON.stringify({ version: 2, plugins: { [key]: [{ scope: 'user', installPath }] } }),
+    );
+    await writeFile(join(configDirs.work, 'settings.json'), JSON.stringify({ enabledPlugins: { [key]: true } }));
+    await installSkill(configDirs.work, 'unslop');
+    await installSkill(configDirs.work, 'house-rules');
+    const query = installQuery();
+
+    await host.runSource.startRun(started());
+
+    const plugins = pluginsOf(query);
+    expect(plugins.map((plugin) => plugin.path)).toContain(installPath);
+    const bridge = plugins.find((plugin) => plugin.path.startsWith(join(dataDir, 'content-bridges')));
+    expect(await readdir(join(bridge!.path, 'skills'))).toEqual(['house-rules']);
   });
 
   it('lists the commands a run would offer, asked with the same plugins, and answers from memory for a while', async () => {

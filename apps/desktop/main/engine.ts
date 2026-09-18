@@ -129,9 +129,8 @@ import {
   type SessionListScope,
   type SessionNamingPlan,
   type SignInShell,
-  buildContentBridge,
   createSkillSources,
-  discoverMarketplacePlugins,
+  resolveContentPlugins,
   linkSkillsIntoCodexHome,
   listSkills,
   resolveSkills,
@@ -1273,18 +1272,15 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       return [];
     }
 
-    // Concurrent, and independent: one assembles a directory, the other only
-    // reads two files to find directories that already exist.
-    const [bridged, marketplace] = await Promise.all([
-      buildContentBridge({
-        configDir,
-        dataDir: options.userDataDir,
-        extraSkillDirs: (await skillSourceRoots()).map((root) => root.dir),
-        onWarning: (message, error) => log.warn(message, error),
-      }),
-      discoverMarketplacePlugins({ configDir, onWarning: (message, error) => log.warn(message, error) }),
-    ]);
-    return [...bridged, ...marketplace];
+    // One call, because the two sources overlap: a skill the user's own
+    // marketplace plugin provides must not also be bridged under Artemis's
+    // name. See `resolveContentPlugins`.
+    return resolveContentPlugins({
+      configDir,
+      dataDir: options.userDataDir,
+      extraSkillDirs: (await skillSourceRoots()).map((root) => root.dir),
+      onWarning: (message, error) => log.warn(message, error),
+    });
   };
 
   /**
