@@ -33,6 +33,32 @@ describe('looksLikeSecretValue', () => {
     // A masked hint is what the renderer is *supposed* to receive.
     expect(looksLikeSecretValue('sk-ant-...4f2a')).toBe(false);
   });
+
+  it('does not read the tail of an ordinary word as the start of a key', () => {
+    // The memory whose name refused the whole Instructions pane: "ta|sk-needs-
+    // conhost-headless" is `sk-` and twenty-two key-legal characters.
+    expect(looksLikeSecretValue('gamingpc-hidden-task-needs-conhost-headless')).toBe(false);
+    expect(looksLikeSecretValue('banks/cortex/gamingpc-hidden-task-needs-conhost-headless.md')).toBe(false);
+    // Every English word ending in "sk" is the same trap once it is kebab-cased.
+    expect(looksLikeSecretValue('disk-usage-report-for-the-backup-volume')).toBe(false);
+    expect(looksLikeSecretValue('risk-register-for-the-second-quarter')).toBe(false);
+    expect(looksLikeSecretValue('a-mask-ant-colony-simulation-notes')).toBe(false);
+  });
+
+  it('still recognises a key wherever a key can really start', () => {
+    const key = 'sk-0123456789abcdefghijklmnop';
+    for (const carrier of [
+      key,
+      `OPENAI_API_KEY=${key}`,
+      `"${key}"`,
+      `key: ${key}`,
+      `https://example.com/${key}`,
+      `--token=${FAKE_KEY}`,
+      `prefix-${key}`,
+    ]) {
+      expect(looksLikeSecretValue(carrier), carrier).toBe(true);
+    }
+  });
 });
 
 describe('scrubSecrets', () => {
@@ -40,6 +66,11 @@ describe('scrubSecrets', () => {
     const scrubbed = scrubSecrets(`request failed with key ${FAKE_KEY}`);
     expect(scrubbed).not.toContain(FAKE_KEY);
     expect(scrubbed).toContain('[redacted]');
+  });
+
+  it('leaves a file name that merely contains "sk-" in the line', () => {
+    const line = 'installed banks/cortex/gamingpc-hidden-task-needs-conhost-headless.md';
+    expect(scrubSecrets(line)).toBe(line);
   });
 });
 
@@ -130,6 +161,67 @@ describe('assertNoSecrets — event policy', () => {
       result: { stdout: FAKE_KEY },
     };
     expect(() => assertNoSecrets(event, 'push', EVENT_SCAN_POLICY)).not.toThrow();
+  });
+
+  it('delivers a question that quotes a key shape, rather than parking the run on a prompt nobody saw', () => {
+    // The agent's own words. A dropped `permission.request` is not a gap in a
+    // transcript: the run waits on a prompt that was never drawn, and the wait
+    // ends as a refusal the user never gave.
+    const event = {
+      type: 'permission.request',
+      runId: 'r1',
+      seq: 1,
+      ts: 0,
+      requestId: 'req-1',
+      request: {
+        id: 'req-1',
+        runId: 'r1',
+        toolName: 'AskUserQuestion',
+        input: {},
+        requestedAt: 0,
+        question: {
+          questions: [
+            {
+              question: `Send it as \`Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345\`, or as ${FAKE_KEY}?`,
+              header: 'Auth header',
+              multiSelect: false,
+              options: [
+                { label: 'Bearer', description: 'The header form.', preview: `curl -H "x-api-key: ${FAKE_KEY}"` },
+                { label: 'Query', description: 'In the URL.' },
+              ],
+            },
+          ],
+        },
+      },
+    };
+
+    expect(() => assertNoSecrets(event, 'agent-event', EVENT_SCAN_POLICY)).not.toThrow();
+  });
+
+  it('delivers a plan to approve, and what the person said back', () => {
+    const plan = {
+      type: 'permission.request',
+      request: { id: 'req-2', toolName: 'ExitPlanMode', input: {}, plan: { plan: `1. Rotate ${FAKE_KEY}\n2. Redeploy` } },
+    };
+    const resolved = {
+      type: 'permission.resolved',
+      requestId: 'req-1',
+      outcome: 'denied',
+      note: `not with ${FAKE_KEY} in the URL`,
+      answers: [{ question: 'Which header?', options: ['Bearer'], notes: `use ${FAKE_KEY} from the vault` }],
+    };
+
+    expect(() => assertNoSecrets(plan, 'agent-event', EVENT_SCAN_POLICY)).not.toThrow();
+    expect(() => assertNoSecrets(resolved, 'agent-event', EVENT_SCAN_POLICY)).not.toThrow();
+  });
+
+  it('still refuses a profile field inside a question, at any depth', () => {
+    const event = {
+      type: 'permission.request',
+      request: { question: { questions: [{ question: 'Which?', options: [{ label: 'A', publicEnv: {} }] }] } },
+    };
+
+    expect(() => assertNoSecrets(event, 'agent-event', EVENT_SCAN_POLICY)).toThrow(SecretLeakError);
   });
 
   it('still refuses a profile field on an event', () => {
@@ -229,5 +321,66 @@ describe('assertResponseSafe — other content channels', () => {
     expect(() => assertResponseSafe({ run: { runId: 'r1', cwd: `/tmp/${FAKE_KEY}` } }, 'artemis:runs:start')).toThrow(
       SecretLeakError,
     );
+  });
+});
+
+describe('assertResponseSafe — the prompt library', () => {
+  /** What `agent-prompts:list` answers: the document, and the banks that preview a built-in. */
+  const library = (over: { markdown?: string; index?: string; extra?: Record<string, unknown> } = {}) => ({
+    document: {
+      version: 1,
+      prompts: [
+        {
+          id: 'prompt-1',
+          name: 'House rules',
+          markdown: over.markdown ?? 'Always branch before committing.',
+          enabled: true,
+          scope: { kind: 'all' },
+          ...over.extra,
+        },
+      ],
+    },
+    memoryBanks: [
+      {
+        slug: 'cortex',
+        isDefault: true,
+        readonly: false,
+        cli: '/usr/local/bin/cerebro',
+        index: { text: over.index ?? '- [Unraid Paths](banks/cortex/unraid-paths.md)', indexed: 1, total: 1 },
+      },
+    ],
+  });
+
+  it('lists a standing prompt that tells the agent how to send a token', () => {
+    // The user's own instructions, which is exactly where a header shape or a
+    // key format gets written down. Refusing the listing hides the one row the
+    // user would have to edit to make the refusal stop.
+    const markdown = `Call the API with \`Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345\`, and never paste a real \`${FAKE_KEY}\` into a file.`;
+
+    expect(() => assertResponseSafe(library({ markdown }), 'artemis:agent-prompts:list')).not.toThrow();
+  });
+
+  it('echoes it back from a save, so a saved prompt is not reported as a failure', () => {
+    const markdown = 'Set `api_key: 0123456789abcdefghijklmnopqrstuvwxyz` in the fixture only.';
+
+    expect(() =>
+      assertResponseSafe({ document: library({ markdown }).document }, 'artemis:agent-prompts:save'),
+    ).not.toThrow();
+  });
+
+  it('lists the library beside a bank whose index documents a key format', () => {
+    // A team's memory names and descriptions, off the bank's reviewed branch.
+    const index = `- [Rotating The Deploy Key](banks/cortex/rotating-the-deploy-key.md) — tokens look like ${FAKE_KEY}`;
+
+    expect(() => assertResponseSafe(library({ index }), 'artemis:agent-prompts:list')).not.toThrow();
+  });
+
+  it('still refuses a profile field on a prompt, and a key in a field Artemis assembled', () => {
+    expect(() =>
+      assertResponseSafe(library({ extra: { apiKey: 'anything' } }), 'artemis:agent-prompts:list'),
+    ).toThrow(SecretLeakError);
+    expect(() =>
+      assertResponseSafe(library({ extra: { id: FAKE_KEY } }), 'artemis:agent-prompts:list'),
+    ).toThrow(SecretLeakError);
   });
 });
