@@ -10,11 +10,13 @@
  */
 
 import { existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readdir, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import type { AgentEvent, ProviderId, RoutineDraft, ServerConnection } from '@rx-artemis/protocol';
 import type { SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
@@ -586,6 +588,75 @@ describe('the skills this machine carries', () => {
     expect(second).toEqual(first);
     expect(opened).toBe(1);
   });
+
+  it('reads a caller’s always-on skills off its own disk, after the caller’s instructions', async () => {
+    await installSkill(configDirs.work, 'unslop');
+    const query = installQuery();
+
+    await host.runSource.startRun(
+      started({ systemPrompt: 'Follow the house style.', alwaysOnSkills: ['unslop', 'not-carried-here'] }),
+    );
+
+    const append = query.append();
+    // The server's copy of the body, under the heading a local run gives it…
+    expect(append).toContain('# Always-on skill: unslop');
+    expect(append).toContain('Do the thing.');
+    // …after what the person wrote, and with nothing for a name it does not carry.
+    expect(append.indexOf('Follow the house style.')).toBeLessThan(append.indexOf('# Always-on skill: unslop'));
+    expect(append).not.toContain('not-carried-here');
+  });
+
+  it('lists what it carries, and keeps a repository it is given cloned, bridged and removable', async () => {
+    await installSkill(configDirs.work, 'house-rules');
+    // A real repository, reached the way a server reaches one: by URL.
+    const upstream = join(root, 'upstream');
+    await mkdir(join(upstream, 'skills', 'unslop'), { recursive: true });
+    await writeFile(
+      join(upstream, 'skills', 'unslop', 'SKILL.md'),
+      '---\nname: unslop\ndescription: De-slop prose.\n---\n\nEdit.\n',
+    );
+    for (const args of [
+      ['init', '-q', '-b', 'main'],
+      ['add', '-A'],
+      ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'skills'],
+    ]) {
+      execFileSync('git', args, { cwd: upstream });
+    }
+    // Named by an https URL, as a real one is — the only kind the registry
+    // keeps — and pointed at the scratch repository by git's own rewrite rule,
+    // so nothing here touches the network.
+    const url = 'https://skills.test/agent-skills';
+    const gitConfig = {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: `url.${pathToFileURL(upstream).href}.insteadOf`,
+      GIT_CONFIG_VALUE_0: url,
+    };
+    Object.assign(process.env, gitConfig);
+    onTestFinished(() => {
+      for (const key of Object.keys(gitConfig)) delete process.env[key];
+    });
+
+    await host.skillsAdmin.addSource({ url, subdir: 'skills' });
+
+    const listed = await host.skillsAdmin.list({ profileIds: ['prof_work', 'prof_personal'] });
+    expect(listed.skills.map((skill) => [skill.name, skill.origin.kind])).toEqual([
+      ['house-rules', 'profile'],
+      ['unslop', 'source'],
+    ]);
+    expect(listed.sources).toMatchObject([{ source: { url, subdir: 'skills' }, cloned: true, skillCount: 1 }]);
+
+    // A served run on either account is offered the synced skill.
+    const query = installQuery();
+    await host.runSource.startRun(started({ profileId: 'prof_personal' }));
+    expect(await readdir(join(pluginsOf(query)[0]!.path, 'skills'))).toEqual(['unslop']);
+
+    const id = listed.sources[0]!.source.id;
+    expect(await host.skillsAdmin.syncSources(id)).toBe(true);
+    expect(await host.skillsAdmin.syncSources('no-such-source')).toBe(false);
+    expect(await host.skillsAdmin.removeSource(id)).toBe(true);
+    expect(await host.skillsAdmin.removeSource(id)).toBe(false);
+    expect((await host.skillsAdmin.list({ profileIds: [] })).skills).toEqual([]);
+  }, 60_000);
 
   it('answers nothing for a provider that cannot enumerate commands', async () => {
     installQuery();

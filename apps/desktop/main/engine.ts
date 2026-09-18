@@ -1084,20 +1084,39 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     } catch {
       return input;
     }
-    if (!composesAlwaysOnSkillsHere(input.providerId, capabilities.systemPromptAppend)) return input;
+    // Names a served caller sent are for this function alone: whatever it
+    // decides, no adapter below is handed a list it has no use for — except
+    // the one that carries it on to the machine the run executes on.
+    const { alwaysOnSkills: asked, ...rest } = input;
+    const bare: RunInput = asked === undefined ? input : rest;
+    if (!capabilities.systemPromptAppend) return bare;
 
     try {
-      const names = alwaysOnSkillNames(await skillLibrary.read(), input.profileId);
-      if (names.length === 0) return input;
+      const own = alwaysOnSkillNames(await skillLibrary.read(), input.profileId);
+
+      /*
+       * A run on an Artemis server executes there, with the server's skills,
+       * and a skill's text may point at files beside it — so the choice
+       * crosses as names and the server reads the bodies off its own disk.
+       * The memory banks' arrangement, for the same reason.
+       */
+      if (!composesAlwaysOnSkillsHere(input.providerId, capabilities.systemPromptAppend)) {
+        return own.length === 0 ? bare : { ...bare, alwaysOnSkills: own };
+      }
+
+      // This machine's own choice, then whatever a served caller asked for: a
+      // desktop serving a client applies both, as it does standing instructions.
+      const names = [...new Set([...own, ...(asked ?? [])])];
+      if (names.length === 0) return bare;
       const configDir = profileConfigDir(await profiles.require(input.profileId));
       const skills = await resolveSkills(
         names,
         skillRootsFor({ profileId: input.profileId, configDir }, undefined, await skillSourceRoots()),
       );
-      return withSystemPromptAppended(input, composeAlwaysOnSkills(skills));
+      return withSystemPromptAppended(bare, composeAlwaysOnSkills(skills));
     } catch (error) {
       log.warn('Could not compose the always-on skills; starting without them', error);
-      return input;
+      return bare;
     }
   };
 

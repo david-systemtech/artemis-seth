@@ -74,6 +74,7 @@ import type { AgentEvent } from './events.js';
 import type { ProfileId } from './ids.js';
 import type { Capabilities, ProviderId, ProviderKind } from './provider.js';
 import type { RoutineDraft, RoutinePatch, RoutineSnapshot } from './routine.js';
+import { SKILL_LIMITS, type SkillInfo, type SkillSourceStatus } from './skills.js';
 
 /* -------------------------------------------------------------------------- */
 /* Addresses                                                                  */
@@ -417,6 +418,42 @@ export interface ServerCommandsBody {
   readonly object: 'artemis.commands';
   readonly commands: readonly string[];
   readonly accounts: readonly ServerCommandsAccount[];
+}
+
+/**
+ * The body of `GET /api/v0/skills`, and of every write under it — the skills a
+ * run on this server could be offered, and the repositories it keeps cloned to
+ * get them.
+ *
+ * `GET /api/v0/commands` answers "what can be typed"; this answers "what is
+ * installed, what does it say it is for, and where did it come from", which is
+ * what a settings pane draws and what {@link ArtemisChatExtensions.alwaysOnSkills}
+ * is resolved against. Everything in it is the *serving machine's*: `dir` is a
+ * path on its disk, a `profile` origin names its accounts, and a source's
+ * clone lives under its data directory.
+ *
+ * Every write answers with the same body, read after the write, so a client
+ * draws the result rather than predicting it.
+ */
+export interface ServerSkillsBody {
+  readonly object: 'artemis.skills';
+  readonly skills: readonly SkillInfo[];
+  readonly sources: readonly SkillSourceStatus[];
+  /** The accounts a `profile` origin's ids refer to, for labelling a row. */
+  readonly profiles: readonly ServerMemoryBankAccount[];
+  /**
+   * The asking connection may add, pull and remove repositories. False is the
+   * ordinary answer for a token without the administrative grant, and the list
+   * is still read: a person may look at what a server carries without being
+   * able to change it.
+   */
+  readonly manage: boolean;
+}
+
+/** The body of `POST /api/v0/skills/sources`. `subdir` defaults to `skills`. */
+export interface ServerSkillSourceAddRequest {
+  readonly url: string;
+  readonly subdir?: string;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1615,6 +1652,31 @@ export interface ArtemisChatExtensions {
    */
   readonly systemPrompt?: string;
   /**
+   * The skills the caller keeps always on, **by name**, for the server to
+   * resolve against its own copies.
+   *
+   * Names and not text, which is the whole difference from
+   * {@link systemPrompt}. Standing instructions are the caller's own words, so
+   * the caller composes them. A skill is a folder on the machine the run
+   * executes on: its body may point at files beside it, and a served run can
+   * only open the server's. So the choice travels and the content stays put —
+   * the server reads the body of each name it carries and appends them after
+   * the caller's instructions, exactly as the desktop does for a local run.
+   *
+   * A name the server does not carry is skipped without a word, on the same
+   * reasoning as a local run: the choice outlives a skill that is briefly
+   * absent. `GET /api/v0/skills` is where a client learns what is there.
+   *
+   * Looked up among the names the server found on its own disk and never
+   * joined into a path, so a name is not a way to read a file.
+   *
+   * Honoured where {@link systemPrompt} is — an account whose provider can
+   * append to its preset — and named in `artemis.ignored` as
+   * `artemis.alwaysOnSkills` elsewhere. An older server drops the field, and
+   * the run starts without them, which is what it did before this existed.
+   */
+  readonly alwaysOnSkills?: readonly string[];
+  /**
    * Branch the conversation named by {@link sessionId} into a new session,
    * leaving the original whole. The reply announces the branch's own id.
    *
@@ -1812,6 +1874,7 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
     ...(typeof extensions['systemPrompt'] === 'string' && extensions['systemPrompt'].length > 0
       ? { systemPrompt: extensions['systemPrompt'] as string }
       : {}),
+    ...alwaysOnSkillsOrNothing(extensions['alwaysOnSkills']),
     // `true` only: a fork is asked for or it is not, and `false` sent
     // explicitly means the same as absent.
     ...(extensions['forkSession'] === true ? { forkSession: true } : {}),
@@ -1832,6 +1895,29 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
         )),
     ...readRemoteOptions(extensions['remote']),
   };
+}
+
+/**
+ * The always-on names, present only when there is at least one.
+ *
+ * A setting, so it is read like one: a value of the wrong shape is a caller
+ * that sent nothing, and an entry of the wrong shape is dropped from a list
+ * that otherwise stands. Bounded by the limits the desktop's own document is
+ * held to, so a request cannot ask the server to look up more names, or longer
+ * ones, than a skill library can hold. Names are kept exactly as sent — a
+ * skill is known by its folder's name, and trimming one would look up a
+ * different folder.
+ */
+function alwaysOnSkillsOrNothing(value: unknown): { alwaysOnSkills?: readonly string[] } {
+  if (!Array.isArray(value)) return {};
+  const names: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.length === 0 || entry.length > SKILL_LIMITS.name) continue;
+    if (names.includes(entry)) continue;
+    names.push(entry);
+    if (names.length === SKILL_LIMITS.count) break;
+  }
+  return names.length === 0 ? {} : { alwaysOnSkills: names };
 }
 
 /** Spreadable: the field when there is one, nothing when the list was empty. */

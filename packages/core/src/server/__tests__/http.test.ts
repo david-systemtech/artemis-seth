@@ -4,12 +4,20 @@ import type {
   ServerMemoryBank,
   ServerProfile,
   ServerSignInStatus,
+  ServerSkillsBody,
+  SkillInfo,
+  SkillSourceStatus,
 } from '@rx-artemis/protocol';
 import { NO_CAPABILITIES } from '@rx-artemis/protocol';
 
 import type { RemoteAccessEvent } from '../../sessions/lifecycleLog.js';
 import type { Catalogue } from '../catalogue.js';
-import { createArtemisServer, handleServerRequest, type MemoryBankAdmin } from '../http.js';
+import {
+  createArtemisServer,
+  handleServerRequest,
+  type MemoryBankAdmin,
+  type SkillsAdmin,
+} from '../http.js';
 import {
   DuplicateProfileLabelError,
   SignInBusyError,
@@ -996,6 +1004,168 @@ describe('the account surface', () => {
  * director above is: a test about authorisation should not be writing JSON to
  * a temporary directory.
  */
+/**
+ * The skills surface: what this machine carries, and the repositories it
+ * clones them from. A fake seam again — what is under test is who may do what,
+ * and what is refused before the host is asked to clone anything.
+ */
+describe('the skills surface', () => {
+  const ADMIN_TOKEN = 'skills-token-abcdefghijklmnopqrstuvw';
+  const ADMIN = { ...CONNECTION, id: 'conn-skills', token: ADMIN_TOKEN, manageProfiles: true };
+  const asAdmin = { authorization: `Bearer ${ADMIN_TOKEN}` };
+
+  const UNSLOP: SkillInfo = {
+    name: 'unslop',
+    description: 'De-slop prose.',
+    origin: { kind: 'machine' },
+    dir: '/data/agent/.agents/skills/unslop',
+    modelInvocable: true,
+    userInvocable: true,
+    bodyChars: 6_100,
+  };
+
+  /** A host that remembers its sources, so a write can be read back. */
+  function fakeSkills(): SkillsAdmin & { readonly asked: string[][] } {
+    let sources: SkillSourceStatus[] = [];
+    const asked: string[][] = [];
+    return {
+      asked,
+      list: async ({ profileIds }) => {
+        asked.push([...profileIds]);
+        return { skills: [UNSLOP], sources };
+      },
+      addSource: async ({ url, subdir }) => {
+        sources = [...sources, { source: { id: 'agent-skills-1a2b3c4d', url, subdir }, cloned: true, skillCount: 40 }];
+      },
+      removeSource: async (id) => {
+        const had = sources.some((entry) => entry.source.id === id);
+        sources = sources.filter((entry) => entry.source.id !== id);
+        return had;
+      },
+      syncSources: async (id) => id === undefined || sources.some((entry) => entry.source.id === id),
+    };
+  }
+
+  async function skills(
+    url: string,
+    method = 'GET',
+    body?: unknown,
+    seams: { skills?: SkillsAdmin; onRemoteAccess?: (event: RemoteAccessEvent) => void } | 'none' = {},
+    headers: Record<string, string | undefined> = asAdmin,
+  ): ReturnType<typeof handleServerRequest> {
+    return handleServerRequest(
+      { ...request(url, headers, method), ...(body === undefined ? {} : { body }) },
+      {
+        connections: [CONNECTION, ADMIN],
+        version: '1.1.1',
+        catalogue,
+        startedAt: 0,
+        ...(seams === 'none'
+          ? {}
+          : {
+              skills: seams.skills ?? fakeSkills(),
+              ...(seams.onRemoteAccess === undefined ? {} : { onRemoteAccess: seams.onRemoteAccess }),
+            }),
+      },
+    );
+  }
+
+  const REPO = 'https://github.com/david-systemtech/agent-skills';
+
+  it('lets any connection read what the server carries, and says whether it may change it', async () => {
+    const reply = await skills('/api/v0/skills', 'GET', undefined, {}, authorized);
+    expect(reply.status).toBe(200);
+    expect(reply.body).toEqual({
+      object: 'artemis.skills',
+      skills: [UNSLOP],
+      sources: [],
+      profiles: [{ id: 'prof-a', slug: 'work-max', label: 'Work Max' }],
+      manage: false,
+    });
+    expect(((await skills('/api/v0/skills')).body as { manage: boolean }).manage).toBe(true);
+  });
+
+  it('reads only the account folders the asking connection can see', async () => {
+    const seam = fakeSkills();
+    await skills('/api/v0/skills', 'GET', undefined, { skills: seam }, authorized);
+    expect(seam.asked).toEqual([['prof-a']]);
+  });
+
+  it('answers 501 on a build that carries no skills', async () => {
+    expect((await skills('/api/v0/skills', 'GET', undefined, 'none')).status).toBe(501);
+  });
+
+  it('refuses every write to a connection without the grant, and says why', async () => {
+    const seam = fakeSkills();
+    for (const [path, method] of [
+      ['/api/v0/skills/sources', 'POST'],
+      ['/api/v0/skills/sync', 'POST'],
+      ['/api/v0/skills/sources/agent-skills-1a2b3c4d/sync', 'POST'],
+      ['/api/v0/skills/sources/agent-skills-1a2b3c4d', 'DELETE'],
+    ] as const) {
+      const reply = await skills(path, method, { url: REPO }, { skills: seam }, authorized);
+      expect(reply.status).toBe(403);
+    }
+    // Nothing was stored: the read beside them still shows no sources.
+    expect(((await skills('/api/v0/skills', 'GET', undefined, { skills: seam })).body as ServerSkillsBody).sources).toEqual([]);
+  });
+
+  it('adds a repository and answers with what the server now carries', async () => {
+    const seen: RemoteAccessEvent[] = [];
+    const reply = await skills(
+      '/api/v0/skills/sources',
+      'POST',
+      { url: ` ${REPO} ` },
+      { onRemoteAccess: (event) => seen.push(event) },
+    );
+    expect(reply.status).toBe(200);
+    expect((reply.body as ServerSkillsBody).sources).toEqual([
+      // Trimmed, and filed under the default folder when none is named.
+      { source: { id: 'agent-skills-1a2b3c4d', url: REPO, subdir: 'skills' }, cloned: true, skillCount: 40 },
+    ]);
+    // Attributed: this token changed what the accounts here are given.
+    expect(seen).toEqual([{ kind: 'remote.profile.updated', connectionId: 'conn-skills' }]);
+  });
+
+  it('refuses a URL the desktop would refuse, in the same words, before the host hears of it', async () => {
+    const seam = fakeSkills();
+    for (const url of ['file:///etc', '--upload-pack=touch /tmp/x', 'https://user:secret@github.com/a/b', '']) {
+      const reply = await skills('/api/v0/skills/sources', 'POST', { url }, { skills: seam });
+      expect(reply.status).toBe(400);
+    }
+    expect((await skills('/api/v0/skills/sources', 'POST', { url: REPO, subdir: '../up' }, { skills: seam })).status).toBe(400);
+    expect((await skills('/api/v0/skills/sources', 'POST', { url: REPO, subdir: 7 }, { skills: seam })).status).toBe(400);
+    expect(((await skills('/api/v0/skills', 'GET', undefined, { skills: seam })).body as ServerSkillsBody).sources).toEqual([]);
+  });
+
+  it('pulls and removes by id, and says so when there is no such repository', async () => {
+    const seam = fakeSkills();
+    await skills('/api/v0/skills/sources', 'POST', { url: REPO }, { skills: seam });
+
+    expect((await skills('/api/v0/skills/sync', 'POST', undefined, { skills: seam })).status).toBe(200);
+    expect((await skills('/api/v0/skills/sources/agent-skills-1a2b3c4d/sync', 'POST', undefined, { skills: seam })).status).toBe(200);
+    expect((await skills('/api/v0/skills/sources/nope/sync', 'POST', undefined, { skills: seam })).status).toBe(404);
+
+    const removed = await skills('/api/v0/skills/sources/agent-skills-1a2b3c4d', 'DELETE', undefined, { skills: seam });
+    expect((removed.body as ServerSkillsBody).sources).toEqual([]);
+    expect((await skills('/api/v0/skills/sources/agent-skills-1a2b3c4d', 'DELETE', undefined, { skills: seam })).status).toBe(404);
+  });
+
+  it('answers 405 for the wrong verb and 404 for a path it does not have', async () => {
+    expect((await skills('/api/v0/skills', 'POST', {})).status).toBe(405);
+    expect((await skills('/api/v0/skills/sources', 'GET')).status).toBe(405);
+    expect((await skills('/api/v0/skills/sources/x', 'POST', {})).status).toBe(405);
+    expect((await skills('/api/v0/skills/elsewhere', 'GET')).status).toBe(404);
+  });
+
+  it('names the writes in the index only for a connection that may use them', async () => {
+    const plain = JSON.stringify((await skills('/', 'GET', undefined, {}, authorized)).body);
+    expect(plain).toContain('/api/v0/skills');
+    expect(plain).not.toContain('/api/v0/skills/sources');
+    expect(JSON.stringify((await skills('/', 'GET')).body)).toContain('/api/v0/skills/sources/{id}');
+  });
+});
+
 describe('the memory bank surface', () => {
   const ADMIN_TOKEN = 'banks-token-abcdefghijklmnopqrstuvwx';
   const ADMIN = { ...CONNECTION, id: 'conn-banks', token: ADMIN_TOKEN, manageProfiles: true };

@@ -340,9 +340,9 @@ export function alwaysOnSkillNames(
  * The second is where the run executes. A run on an Artemis server happens on
  * that machine, and an always-on skill names the folder its files are in —
  * composed here it would hand an agent working on one disk the paths of
- * another. Such a run is to carry the skills' *names* for the server to compose
- * from its own copy, the memory banks' arrangement for the same reason; until
- * that is built, it is given none.
+ * another. Such a run carries the skills' *names* instead
+ * (`RunInput.alwaysOnSkills`), and the server composes them from its own
+ * copies — the memory banks' arrangement, for the same reason.
  *
  * Here rather than in the engine because the pane asks it too: a skill that
  * only accounts this answers `false` for can reach is priced at nothing.

@@ -90,6 +90,7 @@ import type {
   ServerRoutineDeletedBody,
   ServerRoutinesBody,
   ServerSessionDeletedBody,
+  ServerSkillsBody,
   ServerUsageBody,
   ServerSessionMessagesBody,
   ServerSessionRenamedBody,
@@ -99,11 +100,14 @@ import type {
   RoutineDraft,
   RoutinePatch,
   SessionSummary,
+  SkillInfo,
+  SkillSourceStatus,
 } from '@rx-artemis/protocol';
 import {
   ATTACHMENT_WIRE_BYTES,
   AttachmentError,
   CHAT_EXTENSIONS_FIELD,
+  DEFAULT_SKILL_SOURCE_SUBDIR,
   SERVER_API_VERSION,
   SERVER_HEALTH_PATH,
   SERVER_HOST,
@@ -118,6 +122,8 @@ import {
   readAttachments,
   readChatExtensions,
   reviewParameters,
+  skillSourceSubdirProblem,
+  skillSourceUrlProblem,
   sseEvent,
   visibleToConnection,
 } from '@rx-artemis/protocol';
@@ -360,6 +366,11 @@ export interface ServerContext {
    */
   readonly memoryBanks?: MemoryBankAdmin;
   /**
+   * The skills this machine carries and the repositories it clones them from.
+   * Absent answers `501`: a host that bridges no skills has nothing to list.
+   */
+  readonly skills?: SkillsAdmin;
+  /**
    * Where a run that failed is recorded on the serving machine.
    *
    * Separate from a transport fault: this one *did* reach its caller, as a
@@ -483,6 +494,46 @@ export interface MemoryBankAdmin {
    * the administrative grant.
    */
   setScope(slug: string, scope: ServerMemoryBankScope): Promise<ServerMemoryBank | undefined>;
+}
+
+/**
+ * The serving machine's skills, and the repositories it keeps cloned to get
+ * them.
+ *
+ * Wider than {@link MemoryBankAdmin} on purpose, and the difference is what is
+ * being administered. A memory bank is cloned with a person's credentials and
+ * written to by agents, so adding one stays a job for whoever sits at the
+ * serving machine. A skill source is a read-only cache of a repository, pulled
+ * with whatever access the machine already has and refused outright when its
+ * URL carries a credential — and the point of one is to have the same skills
+ * on every machine, which a server nobody sits at cannot otherwise join. So
+ * the whole lifecycle is here: list, add, pull, remove.
+ *
+ * What a source *is* does not widen what the grant already allows. A token
+ * that may administer this machine can add an account and run an agent on it,
+ * which can write any skill it likes; choosing which repository the server
+ * reads skills from is a smaller power than that, not a larger one.
+ *
+ * Every method resolves. A source that cannot be cloned is stored and reported
+ * with its error, the way the desktop's pane does it, so the caller sees the
+ * reason against the row rather than a request that failed.
+ */
+export interface SkillsAdmin {
+  /**
+   * What a run could be offered. `profileIds` narrows the account folders that
+   * are read to the accounts the asking connection can see; the machine-wide
+   * folder and the sources reach every account and are always read.
+   */
+  list(query: { readonly profileIds: readonly string[] }): Promise<{
+    readonly skills: readonly SkillInfo[];
+    readonly sources: readonly SkillSourceStatus[];
+  }>;
+  /** Store a source and clone it. The URL and folder are already validated. */
+  addSource(source: { readonly url: string; readonly subdir: string }): Promise<void>;
+  /** False when no source has that id. */
+  removeSource(id: string): Promise<boolean>;
+  /** Pull one source, or all of them. False when an id was given and is unknown. */
+  syncSources(id?: string): Promise<boolean>;
 }
 
 /** True when this reply is written incrementally rather than as one body. */
@@ -833,6 +884,17 @@ export async function handleServerRequest(
    */
   if (path === `${apiPrefix}/memory-banks` || path.startsWith(`${apiPrefix}/memory-banks/`)) {
     const reply = await handleMemoryBankRoute(request, context, connection, path, method);
+    return { ...reply, connectionId: connection.id };
+  }
+
+  /*
+   * The skills this machine carries. Owns `/skills` and everything under it.
+   * Above the read-only gate because adding, pulling and removing a repository
+   * are a POST and a DELETE; the handler gates those on the grant itself and
+   * leaves the read open to any connection, which is `/commands`'s rule.
+   */
+  if (path === `${apiPrefix}/skills` || path.startsWith(`${apiPrefix}/skills/`)) {
+    const reply = await handleSkillsRoute(request, context, connection, path, method, visibleProfiles);
     return { ...reply, connectionId: connection.id };
   }
 
@@ -1288,6 +1350,35 @@ function indexBody(context: ServerContext, connection: ServerConnection): Record
                 'The slash commands a session here would offer, the skills installed on this machine among them. Filter with ?profile=<slug>.',
             },
           ]),
+      ...(context.skills === undefined
+        ? []
+        : [
+            {
+              method: 'GET',
+              path: `${apiPrefix}/skills`,
+              description:
+                'The skills installed on this machine, what each is for, and the repositories it keeps cloned to get them.',
+            },
+            ...(connection.manageProfiles === true
+              ? [
+                  {
+                    method: 'POST',
+                    path: `${apiPrefix}/skills/sources`,
+                    description: 'Clone a repository of skills onto this machine and keep it pulled.',
+                  },
+                  {
+                    method: 'POST',
+                    path: `${apiPrefix}/skills/sources/{id}/sync`,
+                    description: 'Pull one repository now. POST /skills/sync pulls them all.',
+                  },
+                  {
+                    method: 'DELETE',
+                    path: `${apiPrefix}/skills/sources/{id}`,
+                    description: 'Stop carrying a repository, and delete its clone.',
+                  },
+                ]
+              : []),
+          ]),
       // The remote bridge surface, named only when this build serves it —
       // the index's rule is that every path on it actually answers.
       ...(context.runs?.listRuns === undefined
@@ -1610,6 +1701,11 @@ export interface ArtemisServerOptions {
    */
   readonly memoryBanks?: MemoryBankAdmin;
   /**
+   * The skills this machine carries. Omit for a host that bridges none — the
+   * surface then answers `501`. See {@link SkillsAdmin}.
+   */
+  readonly skills?: SkillsAdmin;
+  /**
    * Called once per answered request, so the UI can show that something is
    * talking — and so the connection that asked can have its `lastUsedAt`
    * stamped. `connectionId` is absent when nothing authenticated.
@@ -1716,6 +1812,7 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
           ...(profileAdmin === undefined ? {} : { profileAdmin }),
           ...(signIns === undefined ? {} : { signIns }),
           ...(options.memoryBanks === undefined ? {} : { memoryBanks: options.memoryBanks }),
+          ...(options.skills === undefined ? {} : { skills: options.skills }),
           // Same sink as a transport fault: a host that wanted one stream of
           // things-that-went-wrong should not have to subscribe twice, and the
           // notice is already a sentence naming the route it belongs to.
@@ -3043,6 +3140,157 @@ async function handleMemoryBankRoute(
   return ok(reply);
 }
 
+/* -------------------------------------------------------------------------- */
+/* Skills: what this machine carries, and the repositories it clones them from */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `GET /api/v0/skills`, and the writes under `/api/v0/skills/`.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS IS FOR
+ * ---------------------------------------------------------------------------
+ *
+ * A served run is offered the *server's* skills, so a client that wants to
+ * show a person what they can type, or let them keep one always on, has to ask
+ * the server what it has. And a server is the one machine nobody sits at: the
+ * repositories a person keeps cloned everywhere else have no way onto it but
+ * this.
+ *
+ * ---------------------------------------------------------------------------
+ * WHO MAY
+ * ---------------------------------------------------------------------------
+ *
+ * The read is any connection's, narrowed to the accounts it can see — the rule
+ * `/commands` already follows, and for the same reason: it says nothing a turn
+ * on the same token could not find by listing a folder.
+ *
+ * The writes need {@link ServerConnection.manageProfiles}. Refused with `403`
+ * and a sentence rather than the enumeration-proof `404` the account surface
+ * uses, because there is nothing to hide: the read beside them is open, so the
+ * path is known to exist, and a person whose token lacks the grant is better
+ * served by being told so than by a route that pretends not to be there.
+ *
+ * Each write is attributed as `remote.profile.updated`, on the memory-bank
+ * surface's reasoning: what the line records is that this token changed what
+ * the accounts on this machine are given.
+ */
+async function handleSkillsRoute(
+  request: ServerRequestInfo,
+  context: ServerContext,
+  connection: ServerConnection,
+  path: string,
+  method: string,
+  visibleProfiles: () => Promise<readonly ServerProfile[]>,
+): Promise<ServerReply> {
+  const admin = context.skills;
+  if (admin === undefined) {
+    return fail(
+      501,
+      'invalid_request_error',
+      'not_implemented',
+      'This Artemis build serves accounts but carries no skills of its own.',
+    );
+  }
+
+  const apiPrefix = `/api/${SERVER_API_VERSION}`;
+  const manage = connection.manageProfiles === true;
+
+  /** The whole state, read after whatever the request did. */
+  const state = async (): Promise<ServerReply> => {
+    // An administrator is administering the machine, so sees every account's
+    // folder; anyone else sees the accounts they can run turns on.
+    const accounts = manage ? await serverAccounts(context) : (await visibleProfiles()).map(
+      (profile): ServerMemoryBankAccount => ({ id: profile.id, slug: profile.slug, label: profile.label }),
+    );
+    const { skills, sources } = await admin.list({ profileIds: accounts.map((account) => String(account.id)) });
+    const body: ServerSkillsBody = { object: 'artemis.skills', skills, sources, profiles: accounts, manage };
+    return ok(body);
+  };
+
+  if (path === `${apiPrefix}/skills`) {
+    if (method !== 'GET' && method !== 'HEAD') {
+      return fail(
+        405,
+        'invalid_request_error',
+        'method_not_allowed',
+        `The skill list is a GET. Add a repository with POST ${apiPrefix}/skills/sources.`,
+      );
+    }
+    return state();
+  }
+
+  const rest = path.slice(`${apiPrefix}/skills/`.length);
+  const isWrite =
+    rest === 'sync' || rest === 'sources' || /^sources\/[^/]+(\/sync)?$/.test(rest);
+  if (!isWrite) return fail(404, 'invalid_request_error', 'unknown_endpoint', `No route for ${path}.`);
+  if (!manage) {
+    return fail(
+      403,
+      'invalid_request_error',
+      'not_permitted',
+      'This connection may read the skills on this server but not change its repositories. Create one with --manage-profiles to do that.',
+    );
+  }
+  const attributed = async (): Promise<ServerReply> => {
+    context.onRemoteAccess?.({ kind: 'remote.profile.updated', connectionId: connection.id });
+    return state();
+  };
+  const wrongMethod = (allowed: string): ServerReply =>
+    fail(405, 'invalid_request_error', 'method_not_allowed', `${path} takes ${allowed}.`);
+
+  if (rest === 'sync') {
+    if (method !== 'POST') return wrongMethod('POST');
+    await admin.syncSources();
+    return attributed();
+  }
+
+  if (rest === 'sources') {
+    if (method !== 'POST') return wrongMethod('POST');
+    const body = request.body;
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      return fail(400, 'invalid_request_error', 'invalid_body', 'The request body must be a JSON object.');
+    }
+    const record = body as Record<string, unknown>;
+    const url = typeof record['url'] === 'string' ? record['url'].trim() : '';
+    const subdir =
+      record['subdir'] === undefined
+        ? DEFAULT_SKILL_SOURCE_SUBDIR
+        : typeof record['subdir'] === 'string'
+          ? record['subdir'].trim()
+          : null;
+    // The desktop's own rules, from the one place they are written: what this
+    // refuses is what the pane refuses before it sends, in the same words.
+    const problem =
+      subdir === null
+        ? '`subdir` must be a string.'
+        : (skillSourceUrlProblem(url) ?? skillSourceSubdirProblem(subdir));
+    if (problem !== null || subdir === null) {
+      return fail(400, 'invalid_request_error', 'invalid_body', problem ?? '`subdir` must be a string.');
+    }
+    await admin.addSource({ url, subdir });
+    return attributed();
+  }
+
+  // `sources/{id}` and `sources/{id}/sync`.
+  const [, encodedId = '', action] = rest.split('/');
+  let id: string;
+  try {
+    id = decodeURIComponent(encodedId);
+  } catch {
+    return fail(400, 'invalid_request_error', 'invalid_url', 'The source id could not be parsed.');
+  }
+  const unknown = (): ServerReply =>
+    fail(404, 'invalid_request_error', 'unknown_source', `No skill repository with the id "${id}" is kept on this server.`);
+
+  if (action === 'sync') {
+    if (method !== 'POST') return wrongMethod('POST');
+    return (await admin.syncSources(id)) ? attributed() : unknown();
+  }
+  if (method !== 'DELETE') return wrongMethod('DELETE');
+  return (await admin.removeSource(id)) ? attributed() : unknown();
+}
+
 /**
  * Every account on the serving machine, as the scope picker needs it.
  *
@@ -3602,13 +3850,19 @@ async function handleChatCompletions(
     }
   }
 
-  const { systemPrompt, ...withoutSystemPrompt } = extensions;
-  const dropSystemPrompt =
-    systemPrompt !== undefined && account?.capabilities.systemPromptAppend !== true;
-  const applied: ArtemisChatExtensions = dropSystemPrompt ? withoutSystemPrompt : extensions;
-  const ignored: readonly string[] = dropSystemPrompt
-    ? [...review.ignored, 'artemis.systemPrompt']
-    : review.ignored;
+  // Both are text appended to the provider's preset, so one capability
+  // decides both, and each is named separately: a client told only that its
+  // instructions were dropped would still believe its skills were read.
+  const { systemPrompt, alwaysOnSkills, ...withoutAppends } = extensions;
+  const canAppend = account?.capabilities.systemPromptAppend === true;
+  const applied: ArtemisChatExtensions = canAppend ? extensions : withoutAppends;
+  const ignored: readonly string[] = canAppend
+    ? review.ignored
+    : [
+        ...review.ignored,
+        ...(systemPrompt === undefined ? [] : ['artemis.systemPrompt']),
+        ...(alwaysOnSkills === undefined ? [] : ['artemis.alwaysOnSkills']),
+      ];
 
   let workspace;
   try {
@@ -4097,6 +4351,7 @@ async function liveRunOn(
  */
 const STEER_IGNORED: readonly (readonly [keyof ArtemisChatExtensions, string])[] = [
   ['systemPrompt', 'artemis.systemPrompt'],
+  ['alwaysOnSkills', 'artemis.alwaysOnSkills'],
   ['permissionMode', 'artemis.permissionMode'],
   ['thinking', 'artemis.thinking'],
   ['fastMode', 'artemis.fastMode'],
