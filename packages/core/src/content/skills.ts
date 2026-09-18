@@ -26,6 +26,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ProfileId, ResolvedSkill, SkillInfo, SkillOrigin } from '@rx-artemis/protocol';
+import { SKILL_LIMITS } from '@rx-artemis/protocol';
 
 import { parseFrontmatter } from '../memorybanks/frontmatter.js';
 import { neutralSkillsDir, skillFoldersIn } from './bridge.js';
@@ -179,7 +180,9 @@ export async function listSkills(options: ListSkillsOptions): Promise<readonly S
         dir: folder.dir,
         modelInvocable: document.modelInvocable,
         userInvocable: document.userInvocable,
-        bodyChars: document.body.trim().length,
+        // What a run is given, not what the file holds: composition cuts a
+        // body at the limit, and a price past it is for text no run receives.
+        bodyChars: Math.min(document.body.trim().length, SKILL_LIMITS.body),
       });
     }
   }

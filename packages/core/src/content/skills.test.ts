@@ -14,6 +14,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ProfileId } from '@rx-artemis/protocol';
+import { SKILL_LIMITS } from '@rx-artemis/protocol';
 
 import { listSkills, readSkillDocument, resolveSkills, skillRootsFor } from './skills.js';
 
@@ -145,6 +146,17 @@ describe('listSkills', () => {
 
     expect(skills).toHaveLength(1);
     expect(skills[0]).toMatchObject({ description: 'Mine.', origin: { kind: 'profile', profileIds: [WORK] } });
+  });
+
+  it('prices a body past the injection limit at the limit, which is all a run is given', async () => {
+    const body = 'x'.repeat(SKILL_LIMITS.body * 4);
+    await skill(join(home, '.agents', 'skills'), 'huge', `---\ndescription: Long.\n---\n${body}\n`);
+
+    const [huge] = await listSkills({ accounts: accounts(), home });
+
+    // Composition cuts the body at the limit, so the pane's "adds about N
+    // tokens to every run" must not price the three quarters no run receives.
+    expect(huge?.bodyChars).toBe(SKILL_LIMITS.body);
   });
 
   it('is an empty list on a machine with no skills anywhere', async () => {

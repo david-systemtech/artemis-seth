@@ -97,7 +97,8 @@ export interface SkillInfo {
   /** It appears in the `/` menu. False for `user-invocable: false`. */
   readonly userInvocable: boolean;
   /**
-   * How long the body is, in characters.
+   * How much of the body a run is given, in characters: all of it, or
+   * {@link SKILL_LIMITS.body} for one long enough to be cut.
    *
    * What turning it always-on costs: this much text in the system prompt of
    * every run it applies to. Carried so the pane can say so before the switch
