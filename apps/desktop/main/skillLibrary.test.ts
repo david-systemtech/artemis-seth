@@ -134,6 +134,33 @@ describe('SkillLibraryStore', () => {
     expect(landed.alwaysOn.map((entry) => entry.name)).toEqual([' notes ']);
   });
 
+  it('lets the pane and the main process each change their own half, and keeps both', async () => {
+    // The pane saves switches and main adds sources, to one file. A
+    // whole-document write from either would drop the other's half.
+    const store = new SkillLibraryStore({ userDataDir: sandbox() });
+    const url = 'https://github.com/david-systemtech/agent-skills.git';
+
+    await Promise.all([
+      store.update((current) => ({ ...current, alwaysOn: [{ name: 'unslop', scope: { kind: 'all' } }] })),
+      store.update((current) => ({ ...current, sources: [{ id: 'ignored', url, subdir: 'skills' }] })),
+      store.update((current) => ({ ...current, alwaysOn: [...current.alwaysOn, { name: 'tdd', scope: { kind: 'all' } }] })),
+    ]);
+
+    const landed = await store.read();
+    expect(landed.alwaysOn.map((entry) => entry.name)).toEqual(['unslop', 'tdd']);
+    expect(landed.sources?.map((source) => source.url)).toEqual([url]);
+  });
+
+  it('will not build a change on a file it could not read', async () => {
+    // A change built on a guess would save the guess over the real file.
+    const dir = sandbox();
+    writeFileSync(path.join(dir, SKILL_LIBRARY_FILE), '{ not json');
+    const store = new SkillLibraryStore({ userDataDir: dir });
+
+    await expect(store.update((current) => ({ ...current, alwaysOn: [] }))).rejects.toThrow(/not valid JSON/);
+    expect(readFileSync(path.join(dir, SKILL_LIBRARY_FILE), 'utf8')).toBe('{ not json');
+  });
+
   it('refuses a relative user-data directory', () => {
     expect(() => new SkillLibraryStore({ userDataDir: 'relative/path' })).toThrow();
   });

@@ -123,29 +123,51 @@ export class SkillLibraryStore {
     return this.#cache;
   }
 
-  /** Replace the choices. Answers with what was actually stored. */
+  /**
+   * Change the document, starting from what is really stored.
+   *
+   * The pane and the main process edit different halves of this file — the
+   * pane the always-on choices, main the sources — and a whole-document write
+   * from either would silently drop the other's half. So both go through here:
+   * the change is a function of the stored document, read inside the same
+   * serialised step that writes it, and two edits racing each other both land.
+   *
+   * Reads with {@link load}, not {@link read}: a change built on a guess would
+   * save the guess over a file that merely could not be read just now.
+   */
+  async update(
+    change: (current: SkillLibraryDocument) => SkillLibraryDocument,
+  ): Promise<SkillLibraryDocument> {
+    const run = this.#tail.then(async () => this.#store(parseSkillLibraryDocument(change(await this.load()))));
+    this.#tail = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Replace the document whole. Answers with what was actually stored. */
   async write(document: SkillLibraryDocument): Promise<SkillLibraryDocument> {
     const next = parseSkillLibraryDocument(document);
-    const run = this.#tail.then(async () => {
-      const body = `${JSON.stringify(next, null, 2)}\n`;
-      const tmp = `${this.#file}.${randomUUID().slice(0, 8)}.tmp`;
-
-      await mkdir(this.#userDataDir, { recursive: true, mode: 0o700 });
-      await writeFile(tmp, body, { encoding: 'utf8', mode: 0o600 });
-      try {
-        await rename(tmp, this.#file);
-      } catch (error) {
-        await unlink(tmp).catch(() => undefined);
-        throw new WorkspaceError(
-          `Could not write ${this.#file}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      this.#cache = next;
-      return next;
-    });
+    const run = this.#tail.then(async () => this.#store(next));
     // Never left rejected: one transient disk error must not fail every save
     // after it.
     this.#tail = run.catch(() => undefined);
     return run;
+  }
+
+  async #store(next: SkillLibraryDocument): Promise<SkillLibraryDocument> {
+    const body = `${JSON.stringify(next, null, 2)}\n`;
+    const tmp = `${this.#file}.${randomUUID().slice(0, 8)}.tmp`;
+
+    await mkdir(this.#userDataDir, { recursive: true, mode: 0o700 });
+    await writeFile(tmp, body, { encoding: 'utf8', mode: 0o600 });
+    try {
+      await rename(tmp, this.#file);
+    } catch (error) {
+      await unlink(tmp).catch(() => undefined);
+      throw new WorkspaceError(
+        `Could not write ${this.#file}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    this.#cache = next;
+    return next;
   }
 }

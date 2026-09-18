@@ -30,6 +30,7 @@ import { SKILL_LIMITS } from '@rx-artemis/protocol';
 
 import { parseFrontmatter } from '../memorybanks/frontmatter.js';
 import { neutralSkillsDir, skillFoldersIn } from './bridge.js';
+import type { SkillSourceRoot } from './skillSources.js';
 
 /** One account that can be offered skills: a Claude or Codex profile. */
 export interface SkillAccount {
@@ -109,14 +110,23 @@ export async function readSkillDocument(dir: string): Promise<SkillDocument> {
  * The folders one account is offered skills from, in winning order.
  *
  * The order `buildContentBridge` merges in — the account's own folder, then the
- * machine-wide one — so resolving a name here finds the same skill a run on
- * that account would be given.
+ * machine-wide one, then the synced sources — so resolving a name here finds
+ * the same skill a run on that account would be given.
  */
-export function skillRootsFor(account: SkillAccount, home: string = homedir()): readonly SkillRoot[] {
+export function skillRootsFor(
+  account: SkillAccount,
+  home: string = homedir(),
+  sources: readonly SkillSourceRoot[] = [],
+): readonly SkillRoot[] {
   return [
     { dir: join(account.configDir, 'skills'), origin: { kind: 'profile', profileIds: [account.profileId] } },
     { dir: neutralSkillsDir(home), origin: { kind: 'machine' } },
+    ...sourceRoots(sources),
   ];
+}
+
+function sourceRoots(sources: readonly SkillSourceRoot[]): readonly SkillRoot[] {
+  return sources.map(({ id, dir }): SkillRoot => ({ dir, origin: { kind: 'source', sourceId: id } }));
 }
 
 export interface ListSkillsOptions {
@@ -124,6 +134,8 @@ export interface ListSkillsOptions {
   readonly accounts: readonly SkillAccount[];
   /** Defaults to the real home directory. Injected for tests. */
   readonly home?: string;
+  /** The synced sources' skills folders, in the order they were added. */
+  readonly sources?: readonly SkillSourceRoot[];
 }
 
 /**
@@ -139,8 +151,9 @@ export interface ListSkillsOptions {
  *
  * ## One row per name, and the winner is the one a run would get
  *
- * Account folders before the machine-wide one, matching the bridge's
- * precedence. A name that exists in both is listed once, as the account's copy,
+ * Account folders before the machine-wide one, and synced sources last,
+ * matching the bridge's precedence: a skill a person put on the machine by
+ * hand wins the name over the copy that arrived by subscription. A name that exists in both is listed once, as the account's copy,
  * because that is the copy that account's sessions are given. The machine copy
  * still reaches every *other* account — a nuance one row cannot carry, and the
  * uncommon case: the point of the machine folder is to not keep per-account
@@ -171,6 +184,7 @@ export async function listSkills(options: ListSkillsOptions): Promise<readonly S
       ({ dir, profileIds }): SkillRoot => ({ dir, origin: { kind: 'profile', profileIds } }),
     ),
     { dir: neutralSkillsDir(home), origin: { kind: 'machine' } },
+    ...sourceRoots(options.sources ?? []),
   ];
 
   const byName = new Map<string, SkillInfo>();

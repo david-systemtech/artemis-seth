@@ -33,8 +33,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
-import { ARCHIVED_TAG } from '@rx-artemis/protocol';
+import { ARCHIVED_TAG, parseSkillLibraryDocument } from '@rx-artemis/protocol';
 import type {
   AgentEvent,
   Capabilities,
@@ -58,6 +60,7 @@ import {
   managedEnvKeys,
   resolveEnv,
   resolveStoreEnv,
+  skillSourceSkillsDir,
   type Catalogue,
   type ProviderRegistry,
 } from '@rx-artemis/core';
@@ -271,15 +274,35 @@ export function createTuiHost(dataDir: string, options: TuiHostOptions = {}): Tu
   const onWarning = (message: string, error: unknown): void => {
     process.stderr.write(`${message}: ${error instanceof Error ? error.message : String(error)}\n`);
   };
+  /**
+   * The repositories of skills the desktop keeps cloned, as folders to read.
+   *
+   * Read from the desktop's own `skills.json` and never synced from here: this
+   * process does not write to the desktop's data directory, and a clone is a
+   * write. The copies are whatever the desktop last pulled, which is the same
+   * answer the desktop itself would give a run started this minute.
+   */
+  const syncedSkillDirs = async (): Promise<readonly string[]> => {
+    const raw = await readFile(join(dataDir, 'skills.json'), 'utf8').catch(() => null);
+    if (raw === null) return [];
+    try {
+      const library = parseSkillLibraryDocument(JSON.parse(raw) as unknown);
+      return (library.sources ?? []).map((source) => skillSourceSkillsDir(dataDir, source));
+    } catch {
+      return [];
+    }
+  };
+
   const contentPluginsFor = async (profileId: ProfileId, providerId: ProviderId) => {
     if (providerId !== 'claude' && providerId !== 'codex') return [];
     const configDir = profiles.configDirFor(await profiles.require(profileId));
+    const extraSkillDirs = await syncedSkillDirs();
     if (providerId === 'codex') {
-      await linkSkillsIntoCodexHome({ configDir, onWarning });
+      await linkSkillsIntoCodexHome({ configDir, extraSkillDirs, onWarning });
       return [];
     }
     const [bridged, marketplace] = await Promise.all([
-      buildContentBridge({ configDir, dataDir, onWarning }),
+      buildContentBridge({ configDir, dataDir, extraSkillDirs, onWarning }),
       discoverMarketplacePlugins({ configDir, onWarning }),
     ]);
     return [...bridged, ...marketplace];

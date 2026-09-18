@@ -78,6 +78,7 @@ import type {
   RoutineSnapshot,
   SkillInfo,
   SkillLibraryDocument,
+  SkillSourceStatus,
   ToolServerConfig,
 } from '@rx-artemis/protocol';
 
@@ -129,6 +130,7 @@ import {
   type SessionNamingPlan,
   type SignInShell,
   buildContentBridge,
+  createSkillSources,
   discoverMarketplacePlugins,
   linkSkillsIntoCodexHome,
   listSkills,
@@ -145,12 +147,16 @@ import {
   enabledToolServers,
   lowestTierModel,
   mergePlanUsage,
+  skillSourceIdFor,
+  skillSourceLimitProblem,
+  withoutSkillSource,
+  withSkillSource,
 } from '@rx-artemis/protocol';
 
 import { AgentPromptStore } from './agentPrompts.js';
 import { SkillLibraryStore } from './skillLibrary.js';
 import { anyBankAvailable, banksForRun, configureMemoryBanks, isMasterEnabled, promptBanks, syncMemoryBanksInBackground } from './memoryBanks.js';
-import { EngineUnavailableError, ValidationError } from './errors.js';
+import { EngineUnavailableError, ValidationError, WorkspaceError } from './errors.js';
 import { createLogger } from './log.js';
 import { ensureSignInForwarder, stopSignInForwarder } from './signInLoopback.js';
 import { createMemoryBankSecrets } from './memoryBankSecrets.js';
@@ -438,8 +444,26 @@ export interface ArtemisEngine {
    * file cannot be read, rather than handing it a guess it would save over.
    */
   readSkillLibrary(): Promise<SkillLibraryDocument>;
-  /** Replace those choices. Answers with what was actually stored. */
+  /**
+   * Replace those choices. Answers with what was actually stored.
+   *
+   * The *choices*, and only them: the document also lists this machine's skill
+   * sources, which the pane never writes. A URL there is one main will clone,
+   * so it arrives by {@link addSkillSource} and its own validator, never on the
+   * back of a save about switches.
+   */
   writeSkillLibrary(document: SkillLibraryDocument): Promise<SkillLibraryDocument>;
+  /** The repositories kept cloned on this machine, and how each copy is doing. */
+  listSkillSources(): Promise<readonly SkillSourceStatus[]>;
+  /**
+   * Subscribe to a repository of skills and clone it now. Resolves once the
+   * first sync has been tried, so the pane can show the skills or the reason.
+   */
+  addSkillSource(url: string, subdir: string): Promise<void>;
+  /** Unsubscribe, and delete the copy. Always-on choices are left alone. */
+  removeSkillSource(id: string): Promise<void>;
+  /** Pull now: one source, or all of them. Not throttled; a person asked. */
+  syncSkillSources(id?: string): Promise<void>;
 
   startRun(input: RunInput): Promise<RunHandle>;
   sendToRun(
@@ -925,6 +949,17 @@ function createEngine(options: EngineOptions): ArtemisEngine {
 
   const agentPrompts = new AgentPromptStore({ userDataDir });
   const skillLibrary = new SkillLibraryStore({ userDataDir });
+  /*
+   * The repositories of skills this machine subscribes to, kept cloned under
+   * `userData`. Synced behind every run start, throttled — see core's
+   * `skillSources.ts` for why a sync never stands between a person and a run.
+   */
+  const skillSources = createSkillSources({
+    dataDir: userDataDir,
+    onWarning: (message) => log.warn(message),
+  });
+  /** The synced folders, for everything that reads skills off this disk. */
+  const skillSourceRoots = async () => skillSources.roots((await skillLibrary.read()).sources ?? []);
 
   /*
    * The key managers, before the memory banks — because a bank may hold a
@@ -1059,7 +1094,10 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       const names = alwaysOnSkillNames(await skillLibrary.read(), input.profileId);
       if (names.length === 0) return input;
       const configDir = profileConfigDir(await profiles.require(input.profileId));
-      const skills = await resolveSkills(names, skillRootsFor({ profileId: input.profileId, configDir }));
+      const skills = await resolveSkills(
+        names,
+        skillRootsFor({ profileId: input.profileId, configDir }, undefined, await skillSourceRoots()),
+      );
       return withSystemPromptAppended(input, composeAlwaysOnSkills(skills));
     } catch (error) {
       log.warn('Could not compose the always-on skills; starting without them', error);
@@ -1227,14 +1265,23 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     const configDir = profileConfigDir(await profiles.require(profileId));
 
     if (providerId === 'codex') {
-      await linkSkillsIntoCodexHome({ configDir, onWarning: (message, error) => log.warn(message, error) });
+      await linkSkillsIntoCodexHome({
+        configDir,
+        extraSkillDirs: (await skillSourceRoots()).map((root) => root.dir),
+        onWarning: (message, error) => log.warn(message, error),
+      });
       return [];
     }
 
     // Concurrent, and independent: one assembles a directory, the other only
     // reads two files to find directories that already exist.
     const [bridged, marketplace] = await Promise.all([
-      buildContentBridge({ configDir, dataDir: options.userDataDir, onWarning: (message, error) => log.warn(message, error) }),
+      buildContentBridge({
+        configDir,
+        dataDir: options.userDataDir,
+        extraSkillDirs: (await skillSourceRoots()).map((root) => root.dir),
+        onWarning: (message, error) => log.warn(message, error),
+      }),
       discoverMarketplacePlugins({ configDir, onWarning: (message, error) => log.warn(message, error) }),
     ]);
     return [...bridged, ...marketplace];
@@ -1643,10 +1690,39 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       const accounts = (await profiles.list())
         .filter((profile) => profile.providerId === 'claude' || profile.providerId === 'codex')
         .map((profile) => ({ profileId: profile.id, configDir: profileConfigDir(profile) }));
-      return listSkills({ accounts });
+      return listSkills({ accounts, sources: await skillSourceRoots() });
     },
     readSkillLibrary: () => skillLibrary.load(),
-    writeSkillLibrary: (document) => skillLibrary.write(document),
+    writeSkillLibrary: (document) =>
+      skillLibrary.update((current) => ({ ...current, alwaysOn: document.alwaysOn })),
+    listSkillSources: async () => skillSources.status((await skillLibrary.load()).sources ?? []),
+    addSkillSource: async (url, subdir) => {
+      const next = await skillLibrary.update((current) => {
+        // Inside the update, so it is decided against what is stored at this
+        // call's turn and not against a copy read before another add landed.
+        const full = skillSourceLimitProblem(current, url);
+        // A sentence written to be shown, which is what this error is for.
+        if (full !== null) throw new WorkspaceError(full);
+        return withSkillSource(current, url, subdir);
+      });
+      const added = next.sources?.find((source) => source.id === skillSourceIdFor(url));
+      // Tried now rather than left to the next run, so the pane that asked
+      // shows either the skills or git's own reason for their absence.
+      if (added !== undefined) await skillSources.sync(added, { force: true });
+    },
+    removeSkillSource: async (id) => {
+      const source = (await skillLibrary.load()).sources?.find((entry) => entry.id === id);
+      await skillLibrary.update((current) => withoutSkillSource(current, id));
+      if (source !== undefined) await skillSources.remove(source);
+    },
+    syncSkillSources: async (id) => {
+      const sources = (await skillLibrary.load()).sources ?? [];
+      await Promise.all(
+        sources
+          .filter((source) => id === undefined || source.id === id)
+          .map((source) => skillSources.sync(source, { force: true })),
+      );
+    },
 
     startRun: async (input) => {
       // The banks' own `SessionStart` hook cannot run under `settingSources:
@@ -1677,6 +1753,12 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       // they record what the user asked for — the prompt to name the session
       // by, the account to attribute it to — and neither is a fact about the
       // system prompt or the bank directories the run happened to carry.
+      // Behind the run, never before it: a run reads whatever copy of a source
+      // is on disk, and the sync is throttled, so a busy hour is one fetch.
+      void skillLibrary
+        .read()
+        .then((library) => skillSources.syncInBackground(library.sources ?? []))
+        .catch(() => undefined);
       const handle = await runs.start(await withAlwaysOnSkills(await withAgentPrompts(withBanks)));
       namer.noteRun(input, handle.runId);
       owners.noteRun(input, handle.runId);

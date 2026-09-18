@@ -187,6 +187,9 @@ import {
   validateAgentPromptsSave,
   validateSkillsList,
   validateSkillsSave,
+  validateSkillsSourceAdd,
+  validateSkillsSourceRemove,
+  validateSkillsSourceSync,
   validateMemoryBankAdd,
   validateMemoryBankForget,
   validateMemoryBankMemories,
@@ -293,6 +296,20 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
   const withoutServerSessions = <T extends { readonly id: string }>(
     sessions: readonly T[],
   ): readonly T[] => sessions.filter((session) => !server.isServerSession(session.id));
+
+  /**
+   * Everything the Skills pane draws, read in one go: the skills on this disk,
+   * the always-on choices, and the sources with how each copy is doing.
+   */
+  const skillsState = async () => {
+    const host = engine.require();
+    const [skills, document, sources] = await Promise.all([
+      host.listSkills(),
+      host.readSkillLibrary(),
+      host.listSkillSources(),
+    ]);
+    return { skills, document, sources };
+  };
 
   const handlers: ChannelHandlers = {
     /* ---------------------------------------------------------------- */
@@ -789,11 +806,7 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
      */
     [IPC.skillsList]: {
       validate: validateSkillsList,
-      handle: async () => {
-        const host = engine.require();
-        const [skills, document] = await Promise.all([host.listSkills(), host.readSkillLibrary()]);
-        return { skills, document };
-      },
+      handle: () => skillsState(),
     },
 
     [IPC.skillsSave]: {
@@ -801,6 +814,36 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       handle: async (request) => ({
         document: await engine.require().writeSkillLibrary(request.document),
       }),
+    },
+
+    /*
+     * The three that change which skills exist answer with the whole state —
+     * the list, the choices and the sources — because each of them changes the
+     * list, and a pane that patched its own copy would be guessing at what a
+     * clone had just put on the disk.
+     */
+    [IPC.skillsSourceAdd]: {
+      validate: validateSkillsSourceAdd,
+      handle: async (request) => {
+        await engine.require().addSkillSource(request.url, request.subdir ?? 'skills');
+        return skillsState();
+      },
+    },
+
+    [IPC.skillsSourceRemove]: {
+      validate: validateSkillsSourceRemove,
+      handle: async (request) => {
+        await engine.require().removeSkillSource(request.id);
+        return skillsState();
+      },
+    },
+
+    [IPC.skillsSourceSync]: {
+      validate: validateSkillsSourceSync,
+      handle: async (request) => {
+        await engine.require().syncSkillSources(request.id);
+        return skillsState();
+      },
     },
 
     /* ---------------------------------------------------------------- */
