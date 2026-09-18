@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import type { ServerProfile, ServerSignInStatus } from '@rx-artemis/protocol';
+import type {
+  ServerMemoryBank,
+  ServerProfile,
+  ServerSignInStatus,
+} from '@rx-artemis/protocol';
 import { NO_CAPABILITIES } from '@rx-artemis/protocol';
 
 import type { RemoteAccessEvent } from '../../sessions/lifecycleLog.js';
 import type { Catalogue } from '../catalogue.js';
-import { createArtemisServer, handleServerRequest } from '../http.js';
+import { createArtemisServer, handleServerRequest, type MemoryBankAdmin } from '../http.js';
 import {
   DuplicateProfileLabelError,
   SignInBusyError,
@@ -347,6 +351,10 @@ describe('a connection is the identity', () => {
       // always a boolean — a client reading it decides whether to draw a whole
       // surface, and "the field was missing" must not be a third answer.
       manageProfiles: false,
+      // The same class of line, and the one a client with a screenshot in its
+      // composer reads before it sends: a server without it drops attachments
+      // in silence, so its absence has to mean no.
+      acceptsAttachments: true,
     });
     // The caller already has it; putting it in a body puts it in every log and
     // proxy between here and them.
@@ -969,5 +977,253 @@ describe('the account surface', () => {
       authorized,
     );
     expect(seen).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Memory banks: which of this machine's accounts each one reaches             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The surface that was missing, from the router's side.
+ *
+ * A served run has always honoured a bank's scope — `banksForProfile` and
+ * `scopeCoversProfile` decide it, and the `memorybanks/` tests pin that — so
+ * what is pinned here is everything the *router* decides about setting one:
+ * who may see these routes at all, which verb reaches which act, what a
+ * malformed or dishonest scope is answered with, and what lands in the
+ * attribution record. The registry is a fake, for the same reason the sign-in
+ * director above is: a test about authorisation should not be writing JSON to
+ * a temporary directory.
+ */
+describe('the memory bank surface', () => {
+  const ADMIN_TOKEN = 'banks-token-abcdefghijklmnopqrstuvwx';
+  const ADMIN = { ...CONNECTION, id: 'conn-banks', token: ADMIN_TOKEN, manageProfiles: true };
+  const asAdmin = { authorization: `Bearer ${ADMIN_TOKEN}` };
+
+  const CORTEX: ServerMemoryBank = {
+    slug: 'cortex',
+    path: '/data/banks/cortex',
+    role: 'readwrite',
+    enabled: true,
+    profiles: { kind: 'all' },
+  };
+
+  /** A registry that remembers what it was told, so a PATCH can be read back. */
+  function fakeBanks(overrides: Partial<MemoryBankAdmin> = {}): MemoryBankAdmin {
+    let banks: ServerMemoryBank[] = [{ ...CORTEX }];
+    return {
+      list: async () => banks,
+      setScope: async (slug, profiles) => {
+        const found = banks.find((bank) => bank.slug === slug);
+        if (found === undefined) return undefined;
+        const updated = { ...found, profiles };
+        banks = banks.map((bank) => (bank.slug === slug ? updated : bank));
+        return updated;
+      },
+      ...overrides,
+    };
+  }
+
+  async function banks(
+    url: string,
+    method = 'GET',
+    body?: unknown,
+    seams:
+      | { memoryBanks?: MemoryBankAdmin; onRemoteAccess?: (event: RemoteAccessEvent) => void }
+      | 'none' = {},
+    headers: Record<string, string | undefined> = asAdmin,
+  ): ReturnType<typeof handleServerRequest> {
+    return handleServerRequest(
+      { ...request(url, headers, method), ...(body === undefined ? {} : { body }) },
+      {
+        connections: [CONNECTION, ADMIN],
+        version: '1.1.1',
+        catalogue,
+        startedAt: 0,
+        ...(seams === 'none'
+          ? {}
+          : {
+              memoryBanks: seams.memoryBanks ?? fakeBanks(),
+              ...(seams.onRemoteAccess === undefined
+                ? {}
+                : { onRemoteAccess: seams.onRemoteAccess }),
+            }),
+      },
+    );
+  }
+
+  it('tells a connection without the grant that these routes do not exist', async () => {
+    // The account surface's rule, for the same reason: a 403 would tell any
+    // token that this deployment has an administrative surface at all.
+    for (const [path, method] of [
+      ['/api/v0/memory-banks', 'GET'],
+      ['/api/v0/memory-banks/cortex', 'PATCH'],
+    ] as const) {
+      const reply = await banks(path, method, { profiles: { kind: 'all' } }, {}, authorized);
+      expect(reply.status).toBe(404);
+      expect(JSON.stringify((reply as { body: unknown }).body)).not.toMatch(/grant|permission/i);
+    }
+  });
+
+  it('answers 501 to an administrator on a build that keeps no registry', async () => {
+    expect((await banks('/api/v0/memory-banks', 'GET', undefined, 'none')).status).toBe(501);
+    // And the 501 is itself a fact about this installation, so an unprivileged
+    // token still gets the 404.
+    expect((await banks('/api/v0/memory-banks', 'GET', undefined, 'none', authorized)).status).toBe(
+      404,
+    );
+  });
+
+  it('keeps the surface out of the index for a connection without the grant', async () => {
+    const seen = JSON.stringify((await banks('/', 'GET', undefined, {}, authorized)).body);
+    expect(seen).not.toContain('memory-banks');
+    const asAdministrator = JSON.stringify((await banks('/', 'GET')).body);
+    expect(asAdministrator).toContain('/api/v0/memory-banks/{slug}');
+  });
+
+  it('lists the banks and the accounts a scope may name, in one read', async () => {
+    const reply = await banks('/api/v0/memory-banks');
+    expect(reply.status).toBe(200);
+    expect(reply.body).toEqual({
+      object: 'artemis.memory-banks',
+      banks: [CORTEX],
+      // The accounts come with labels: a list of opaque ids is not a checklist.
+      profiles: [{ id: 'prof-a', slug: 'work-max', label: 'Work Max' }],
+    });
+  });
+
+  it('narrows a bank to named accounts and answers with the bank as it now stands', async () => {
+    const registry = fakeBanks();
+    const reply = await banks(
+      '/api/v0/memory-banks/cortex',
+      'PATCH',
+      { profiles: { kind: 'profiles', profileIds: ['prof-a'] } },
+      { memoryBanks: registry },
+    );
+    expect(reply.status).toBe(200);
+    expect(reply.body).toEqual({
+      object: 'artemis.memory-bank',
+      bank: { ...CORTEX, profiles: { kind: 'profiles', profileIds: ['prof-a'] } },
+    });
+    // Stored, not merely echoed.
+    expect((await registry.list())[0]?.profiles).toEqual({
+      kind: 'profiles',
+      profileIds: ['prof-a'],
+    });
+  });
+
+  it('widens back to every account, and takes a scope that names none', async () => {
+    const registry = fakeBanks();
+    await banks(
+      '/api/v0/memory-banks/cortex',
+      'PATCH',
+      { profiles: { kind: 'profiles', profileIds: [] } },
+      { memoryBanks: registry },
+    );
+    // A bank attached to nobody is a legitimate thing to ask for, and is not
+    // the same act as turning the bank off — which the registry's flag does.
+    expect((await registry.list())[0]?.profiles).toEqual({ kind: 'profiles', profileIds: [] });
+
+    const back = await banks(
+      '/api/v0/memory-banks/cortex',
+      'PATCH',
+      { profiles: { kind: 'all' } },
+      { memoryBanks: registry },
+    );
+    expect(back.status).toBe(200);
+    expect((await registry.list())[0]?.profiles).toEqual({ kind: 'all' });
+  });
+
+  it('refuses a scope naming an account this server does not have', async () => {
+    /*
+     * The failure this prevents is silent: a scope naming an id the server has
+     * never had is a bank that reaches nothing, and nothing anywhere would say
+     * so — the run would simply start without its memory, which looks exactly
+     * like the feature being off.
+     */
+    const registry = fakeBanks();
+    const reply = await banks(
+      '/api/v0/memory-banks/cortex',
+      'PATCH',
+      { profiles: { kind: 'profiles', profileIds: ['prof-a', 'prof-ghost'] } },
+      { memoryBanks: registry },
+    );
+    expect(reply.status).toBe(400);
+    expect(JSON.stringify((reply as { body: unknown }).body)).toContain('prof-ghost');
+    expect((await registry.list())[0]?.profiles).toEqual({ kind: 'all' });
+  });
+
+  it('refuses a malformed scope rather than coercing it to every account', async () => {
+    /*
+     * The registry's own reader defaults an unparsable scope to `all`, which is
+     * right for a file somebody edited by hand and exactly wrong here: a typo
+     * in a PATCH would widen a bank to every account on the machine.
+     */
+    const bad: readonly unknown[] = [
+      undefined,
+      null,
+      'all',
+      [],
+      { kind: 'some' },
+      { kind: 'profiles' },
+      { kind: 'profiles', profileIds: ['ok', 7] },
+    ];
+    for (const profiles of bad) {
+      const registry = fakeBanks();
+      const reply = await banks(
+        '/api/v0/memory-banks/cortex',
+        'PATCH',
+        { profiles },
+        { memoryBanks: registry },
+      );
+      expect(reply.status).toBe(400);
+      expect((await registry.list())[0]?.profiles).toEqual({ kind: 'all' });
+    }
+  });
+
+  it('says so when no bank has that slug, and refuses the wrong verb', async () => {
+    const gone = await banks('/api/v0/memory-banks/nope', 'PATCH', { profiles: { kind: 'all' } });
+    expect(gone.status).toBe(404);
+    expect(JSON.stringify((gone as { body: unknown }).body)).toContain('nope');
+
+    expect(
+      (await banks('/api/v0/memory-banks', 'PATCH', { profiles: { kind: 'all' } })).status,
+    ).toBe(405);
+    expect((await banks('/api/v0/memory-banks/cortex', 'GET')).status).toBe(405);
+    // A sub-path this surface does not have is not a bank with an odd name.
+    expect(
+      (await banks('/api/v0/memory-banks/cortex/entries', 'PATCH', { profiles: { kind: 'all' } }))
+        .status,
+    ).toBe(404);
+  });
+
+  it('records the write, and nothing for a read or a refusal', async () => {
+    const seen: RemoteAccessEvent[] = [];
+    const onRemoteAccess = (event: RemoteAccessEvent): void => void seen.push(event);
+
+    await banks('/api/v0/memory-banks', 'GET', undefined, { onRemoteAccess });
+    await banks(
+      '/api/v0/memory-banks/nope',
+      'PATCH',
+      { profiles: { kind: 'all' } },
+      { onRemoteAccess },
+    );
+    await banks(
+      '/api/v0/memory-banks/cortex',
+      'PATCH',
+      { profiles: { kind: 'all' } },
+      { onRemoteAccess },
+      authorized,
+    );
+    expect(seen).toEqual([]);
+
+    await banks(
+      '/api/v0/memory-banks/cortex',
+      'PATCH',
+      { profiles: { kind: 'all' } },
+      { onRemoteAccess },
+    );
+    expect(seen).toEqual([{ kind: 'remote.profile.updated', connectionId: 'conn-banks' }]);
   });
 });

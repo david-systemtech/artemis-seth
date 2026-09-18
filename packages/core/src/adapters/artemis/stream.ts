@@ -13,7 +13,13 @@
  * `error` object, which is the server saying the generation failed.
  */
 
-import type { ArtemisActivity, ArtemisPermissionNotice, PermissionRequest } from '@rx-artemis/protocol';
+import type {
+  ArtemisActivity,
+  ArtemisContextReading,
+  ArtemisPermissionNotice,
+  BackgroundTask,
+  PermissionRequest,
+} from '@rx-artemis/protocol';
 
 /** The Artemis namespace, as much of it as a chunk carried. */
 export interface ServerExtensionsDelta {
@@ -22,6 +28,26 @@ export interface ServerExtensionsDelta {
   readonly activity?: readonly ArtemisActivity[];
   readonly endReason?: string;
   /**
+   * What the server accepted and set aside, by name — `artemis.systemPrompt`
+   * when the serving account's provider cannot append standing instructions.
+   * On the first chunk of a stream, so the run can say so before it answers.
+   */
+  readonly ignored?: readonly string[];
+  /**
+   * The run is on a different account from the route that was sent, because
+   * that account holds the conversation being resumed. On the first chunk,
+   * beside `ignored`, so the transcript can say so before the first token.
+   * Routes and the holding account's own naming, as the server's catalogue
+   * spells them.
+   */
+  readonly redirected?: {
+    readonly from: string;
+    readonly to: string;
+    readonly profileId: string;
+    readonly profileSlug: string;
+    readonly profileLabel: string;
+  };
+  /**
    * The server's own run id, announced once and early on a turn that opted into
    * a remote feature. Distinct from the adapter's local run id — this is the
    * address every native `/api/v0/runs/{id}` route takes, so it is learned off
@@ -29,12 +55,50 @@ export interface ServerExtensionsDelta {
    */
   readonly runId?: string;
   /**
+   * How many stored messages the conversation held when the server's run
+   * began — the seam between the history a client reads off
+   * `/api/v0/sessions/{id}/messages` and the turn this stream carries. Beside
+   * `runId` on the announcement chunk, when the server measured it. A server
+   * older than this field sends none, and the seam stays unknown, which every
+   * client already handled. See `RunHandle.historyOffset`.
+   */
+  readonly historyOffset?: number;
+  /**
+   * The resume cursor: the sequence number of the run event this chunk came
+   * from. Remembered by the adapter, and handed back on
+   * `GET /api/v0/runs/{id}/stream?after=N` when the stream has to be picked
+   * back up. Absent on the chunks that came from no event.
+   */
+  readonly seq?: number;
+  /**
+   * On a resumed stream: the server no longer holds everything after the
+   * cursor. What follows starts at `firstSeq`.
+   */
+  readonly gap?: { readonly afterSeq: number; readonly firstSeq: number };
+  /**
    * A permission prompt the run parked on, or the news that it no longer is.
    * Only present when the request opted into remote permissions; on any other
    * turn the server denies prompts on the spot and none of this crosses the
    * wire.
    */
   readonly permission?: ArtemisPermissionNotice;
+  /**
+   * The run's delegated work, the whole live set, when a chunk carried it.
+   * Passed through as the protocol's own rows: each becomes a
+   * `background.tasks` event the renderer draws from.
+   */
+  readonly tasks?: readonly BackgroundTask[];
+  /**
+   * How full the served conversation's context is, when a chunk stated it.
+   *
+   * Either half may be absent and the two arrive at different times, so this is
+   * a partial reading rather than a complete one — the adapter accumulates it.
+   * A server older than this field sends none, and the reading stays unknown,
+   * which is the state the gauge already draws for a route that will not say.
+   */
+  readonly context?: ArtemisContextReading;
+  /** The server read a message steered into the run, by the server's id. */
+  readonly delivered?: string;
   /**
    * Why the run failed, when {@link endReason} is `error`.
    *
@@ -54,8 +118,21 @@ export interface ServerStreamDelta {
   readonly thinking?: string;
   /** Why generation stopped, on the final chunk that carries one. */
   readonly finishReason?: string;
-  /** Token counts, which arrive only on the final chunk. */
-  readonly usage?: { readonly promptTokens: number; readonly completionTokens: number };
+  /**
+   * Token counts, which arrive only on the final chunk.
+   *
+   * `promptTokens` is the *whole* prompt, on OpenAI's own definition — the two
+   * cache figures are parts of it, not additions to it, so summing all three
+   * counts the cached input twice.
+   */
+  readonly usage?: {
+    readonly promptTokens: number;
+    readonly completionTokens: number;
+    /** The part of the prompt served from the cache, when the server said. */
+    readonly cacheReadTokens?: number;
+    /** The part written into the cache this turn, when the server said. */
+    readonly cacheCreationTokens?: number;
+  };
   /** The server reporting a failed generation. */
   readonly error?: string;
   /** The Artemis namespace, when the chunk carried one. */
@@ -125,13 +202,84 @@ function readExtensions(value: unknown): ServerExtensionsDelta | undefined {
   if (resolvedModel !== undefined) out.resolvedModel = resolvedModel;
   const endReason = asString(record['endReason']);
   if (endReason !== undefined) out.endReason = endReason;
+  const ignored = record['ignored'];
+  if (Array.isArray(ignored)) {
+    const names = ignored.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0);
+    if (names.length > 0) out.ignored = names;
+  }
+  const redirected = asRecord(record['redirected']);
+  if (redirected !== undefined) {
+    const from = asString(redirected['from']);
+    const to = asString(redirected['to']);
+    const profileId = asString(redirected['profileId']);
+    const profileSlug = asString(redirected['profileSlug']);
+    const profileLabel = asString(redirected['profileLabel']);
+    if (
+      from !== undefined &&
+      to !== undefined &&
+      profileId !== undefined &&
+      profileSlug !== undefined &&
+      profileLabel !== undefined
+    ) {
+      out.redirected = { from, to, profileId, profileSlug, profileLabel };
+    }
+  }
   const runId = asString(record['runId']);
   if (runId !== undefined) out.runId = runId;
+  const historyOffset = record['historyOffset'];
+  if (typeof historyOffset === 'number' && Number.isInteger(historyOffset) && historyOffset >= 0) {
+    out.historyOffset = historyOffset;
+  }
   const error = asString(record['error']);
   if (error !== undefined) out.error = error;
+  if (typeof record['seq'] === 'number' && Number.isInteger(record['seq'])) out.seq = record['seq'];
+  const gap = asRecord(record['gap']);
+  if (gap !== undefined && typeof gap['afterSeq'] === 'number' && typeof gap['firstSeq'] === 'number') {
+    out.gap = { afterSeq: gap['afterSeq'], firstSeq: gap['firstSeq'] };
+  }
 
   const permission = readPermissionNotice(record['permission']);
   if (permission !== undefined) out.permission = permission;
+
+  // Rows are validated down to the two fields a renderer cannot draw without
+  // and passed through otherwise: they are the protocol's own shape, and a
+  // second, staler copy of it here would drop every field added upstream.
+  const tasks = record['tasks'];
+  if (Array.isArray(tasks)) {
+    out.tasks = tasks.filter(
+      (task): task is BackgroundTask =>
+        asRecord(task) !== undefined &&
+        asString((task as { id?: unknown }).id) !== undefined &&
+        asString((task as { status?: unknown }).status) !== undefined,
+    );
+  }
+  const delivered = asString(record['delivered']);
+  if (delivered !== undefined) out.delivered = delivered;
+
+  /*
+   * The context reading, validated to the one thing that makes a gauge wrong
+   * rather than merely blank: a non-positive window.
+   *
+   * A zero or negative denominator is not a smaller scale, it is a division by
+   * zero rendered as "100% full" or as nothing at all, and either reads as a
+   * conversation in trouble. Dropped, so the reading degrades to occupancy with
+   * no scale — which is the honest state and one the UI already draws. Token
+   * counts are only floored at zero, since an occupancy of nought is a real
+   * answer for a turn that has not started.
+   */
+  const context = asRecord(record['context']);
+  if (context !== undefined) {
+    const tokens = context['tokens'];
+    const window = context['window'];
+    const reading: { tokens?: number; window?: number } = {};
+    if (typeof tokens === 'number' && Number.isFinite(tokens) && tokens >= 0) {
+      reading.tokens = tokens;
+    }
+    if (typeof window === 'number' && Number.isFinite(window) && window > 0) {
+      reading.window = window;
+    }
+    if (Object.keys(reading).length > 0) out.context = reading;
+  }
 
   const activity = record['activity'];
   if (Array.isArray(activity)) {
@@ -177,9 +325,32 @@ export function readServerChunk(chunk: unknown): ServerStreamDelta | undefined {
     const prompt = usage['prompt_tokens'];
     const completion = usage['completion_tokens'];
     if (typeof prompt === 'number' || typeof completion === 'number') {
+      /*
+       * The cached halves of the prompt, read back so the seam can put them on
+       * the fields they came from.
+       *
+       * Clamped to the prompt rather than trusted: these are *parts* of
+       * `prompt_tokens`, and a server that reported parts larger than the whole
+       * would make the uncached remainder negative — a token count below zero
+       * on a diagnostic panel, from arithmetic rather than from anything that
+       * happened. Absent stays absent: `0` would claim a provider has a prompt
+       * cache and used none of it.
+       */
+      const promptTokens = typeof prompt === 'number' ? prompt : 0;
+      const details = asRecord(usage['prompt_tokens_details']);
+      const cached = details?.['cached_tokens'];
+      const created = usage['cache_creation_input_tokens'];
+      const cacheRead =
+        typeof cached === 'number' && cached >= 0 ? Math.min(cached, promptTokens) : undefined;
+      const cacheCreation =
+        typeof created === 'number' && created >= 0
+          ? Math.min(created, promptTokens - (cacheRead ?? 0))
+          : undefined;
       delta.usage = {
-        promptTokens: typeof prompt === 'number' ? prompt : 0,
+        promptTokens,
         completionTokens: typeof completion === 'number' ? completion : 0,
+        ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
+        ...(cacheCreation === undefined ? {} : { cacheCreationTokens: cacheCreation }),
       };
     }
   }

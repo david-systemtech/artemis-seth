@@ -54,6 +54,7 @@
  * that is the permanent answer rather than a to-do.
  */
 
+import type { BackgroundTask } from './events.js';
 import type { PermissionRequest } from './permissions.js';
 
 /* -------------------------------------------------------------------------- */
@@ -256,10 +257,82 @@ export function reviewParameters(
  */
 export type OpenAiFinishReason = 'stop' | 'length' | 'tool_calls' | 'content_filter';
 
+/**
+ * What a turn cost, in OpenAI's vocabulary.
+ *
+ * ## `prompt_tokens` is the whole prompt, cached parts included
+ *
+ * Which is OpenAI's own definition and worth stating, because the provider
+ * Artemis relays from counts differently and the translation is where this went
+ * wrong. Anthropic reports a *disjoint* triple — `input_tokens` for what was
+ * billed at the full rate, `cache_read_input_tokens` for what came back from
+ * the prompt cache, `cache_creation_input_tokens` for what was written into it
+ * — and the prompt is the sum of all three. Passing the first one through alone
+ * reported a twenty-thousand-token prompt as ten tokens: not a rounding error
+ * but a different measurement, and one that reads as a suspiciously cheap turn
+ * rather than as a missing field.
+ *
+ * So the sum is what goes here, and the parts that OpenAI has a place for go in
+ * the details below.
+ */
 export interface OpenAiUsage {
+  /** The whole prompt, cached and uncached alike. */
   readonly prompt_tokens: number;
   readonly completion_tokens: number;
   readonly total_tokens: number;
+  /**
+   * How much of {@link prompt_tokens} came back from the prompt cache.
+   *
+   * OpenAI's own field, and the one a cost calculation needs: cached input is
+   * billed at a fraction of the full rate everywhere it exists, so a client
+   * that cannot separate it prices every cached turn as though nothing were
+   * cached. Omitted rather than zeroed when the serving provider has no prompt
+   * cache, since `0` is a claim that nothing was cached and absence is not.
+   */
+  readonly prompt_tokens_details?: { readonly cached_tokens: number };
+  /**
+   * How much of {@link prompt_tokens} was *written* into the cache this turn.
+   *
+   * OpenAI has no field for this — its caching is implicit and costs nothing to
+   * populate — so this carries Anthropic's own name, which is what the
+   * OpenAI-shaped relays in the wild (LiteLLM and the proxies built on it)
+   * already emit and read. Same reasoning as `reasoning_content`: where a
+   * de-facto field exists, using it reaches more clients than a private one in
+   * the `artemis` namespace would.
+   *
+   * Worth its own field rather than being folded into the uncached remainder,
+   * because a cache write is billed *above* the full input rate, not below it.
+   */
+  readonly cache_creation_input_tokens?: number;
+}
+
+/**
+ * How full the conversation's context is — which `usage` cannot say.
+ *
+ * Two different questions, and OpenAI's shape only has a field for one of them.
+ * `usage` is a *bill*: what this turn cost, counted once and never again. This
+ * is an *occupancy*: what is sitting in the window right now, which does not
+ * accumulate across turns and which shrinks when the conversation is compacted.
+ * Summing prompt tokens to get it produces a number that only ever rises, on a
+ * gauge whose whole job is to fall when room is made.
+ *
+ * And the denominator is not derivable at all. `window` is a property of the
+ * process serving the model, not of the weights — `llama-server -c 32768`
+ * serves 32k out of a checkpoint trained at 262144 — so a client that guessed
+ * it from the model name would draw a confident scale that is wrong in the
+ * direction that matters least kindly: 12% full on a conversation about to be
+ * truncated. It is stated here or it is not known.
+ *
+ * Both halves are optional and they arrive at different times. The serving
+ * providers report occupancy per assistant message and the window size once, on
+ * the result — so a chunk carrying only `tokens` is the ordinary case, and a
+ * reading is built up rather than received whole.
+ */
+export interface ArtemisContextReading {
+  /** Tokens occupying the window right now. */
+  readonly tokens?: number;
+  /** The window they sit in, when the serving provider has stated one. */
+  readonly window?: number;
 }
 
 /**
@@ -321,16 +394,80 @@ export interface ArtemisResponseExtensions {
    * moment it needs it is usually the moment the stream has already broken.
    */
   readonly runId?: string;
+  /**
+   * How many stored messages the conversation held when the run began — the
+   * seam between what `/api/v0/sessions/{id}/messages` should be read up to
+   * and what this stream carries. Beside `runId` on the announcement chunk,
+   * when the server measured it. See `RunHandle.historyOffset`.
+   */
+  readonly historyOffset?: number;
   /** The concrete model that ran, when the route named an alias. */
   readonly resolvedModel?: string;
-  /** Parameters that were accepted and not applied. See {@link PARAMETER_POLICY}. */
+  /**
+   * What was accepted and not applied: an OpenAI parameter the caller asked to
+   * have ignored (see {@link PARAMETER_POLICY}), or an `artemis.*` extension
+   * the serving account's provider cannot honour, named as `artemis.<field>` —
+   * `artemis.systemPrompt` on an account whose provider has no system-prompt
+   * append. On a stream it rides the first chunk, so a client knows before the
+   * first token; on a whole reply it sits beside the rest of this block.
+   */
   readonly ignored?: readonly string[];
   /** What the agent did. See {@link ArtemisActivity}. */
   readonly activity?: readonly ArtemisActivity[];
   /** A prompt the run is parked on, or the news that it no longer is. */
   readonly permission?: ArtemisPermissionNotice;
+  /**
+   * What the run has delegated — subagents, workflows, backgrounded commands —
+   * as the provider reports it: the whole live set, replacing the last.
+   *
+   * The reply an OpenAI client reads is unaffected; this rides an empty-delta
+   * chunk in the namespace. It exists because a served conversation is
+   * routinely still working after its turn has ended, and a client with no
+   * word of that showed the conversation as finished while a subagent ran on
+   * for another twenty minutes. See `BackgroundTasksEvent` for the shape.
+   */
+  readonly tasks?: readonly BackgroundTask[];
+  /**
+   * How full the served conversation's context is. See
+   * {@link ArtemisContextReading} for why this cannot ride on `usage`.
+   *
+   * Rides an empty-delta chunk as the run reports it, the same way `tasks`
+   * does, and is repeated on the final chunk so a client that joined late — or
+   * that reads only the last thing — still ends holding a reading. An OpenAI
+   * client appends nothing either way.
+   */
+  readonly context?: ArtemisContextReading;
+  /**
+   * The serving run has read a message that was sent into it mid-turn.
+   *
+   * The id is the *server's* filing of the message, which the client did not
+   * choose; a client that steered several times matches deliveries to its own
+   * ids in order, because the queue they were read from is in order too.
+   */
+  readonly delivered?: string;
   /** The true reason the run ended, when `finish_reason` had to flatten it. */
   readonly endReason?: string;
+  /**
+   * The resume cursor: the sequence number of the run event this chunk was
+   * translated from.
+   *
+   * A stream can die under a client — a laptop sleeps, a tunnel drops — while
+   * the run it was watching goes on, kept alive by `artemis.remote.detach`.
+   * The client that comes back asks `GET /api/v0/runs/{runId}/stream?after=N`
+   * for everything after the last chunk it rendered, and this is the `N`. It
+   * rides on every chunk that came from an event; the run announcement and a
+   * session id learned from the run handle carry none, and a client may meet
+   * those twice without harm. Only on the streaming shape: a whole reply has
+   * nothing to resume.
+   */
+  readonly seq?: number;
+  /**
+   * On a resumed stream: the server no longer holds everything the client
+   * asked for. What follows starts at `firstSeq`; the events between the
+   * client's cursor and it are gone, and a client should say so rather than
+   * splice the halves together.
+   */
+  readonly gap?: { readonly afterSeq: number; readonly firstSeq: number };
   /**
    * Why the run failed, when {@link endReason} is `error`.
    *
@@ -355,6 +492,12 @@ export interface OpenAiChatChoice {
   readonly message: {
     readonly role: 'assistant';
     readonly content: string | null;
+    /**
+     * The model's reasoning, when the run produced any. See the same field on
+     * {@link OpenAiChatChunkChoice} for why it travels under this name and
+     * never inside `content`.
+     */
+    readonly reasoning_content?: string;
     readonly tool_calls?: readonly OpenAiToolCall[];
   };
   readonly finish_reason: OpenAiFinishReason;
@@ -380,6 +523,19 @@ export interface OpenAiChatChunkChoice {
   readonly delta: {
     readonly role?: 'assistant';
     readonly content?: string;
+    /**
+     * A fragment of the model's reasoning.
+     *
+     * Not an OpenAI field, and deliberately not folded into `content`: a
+     * client reading the answer must never receive the model's private
+     * working-out as though it were the reply. It rides under the name the
+     * reasoning-capable OpenAI-compatible servers already use (`vllm`,
+     * `llama.cpp`, DeepSeek), so a client that knows the field shows the
+     * reasoning and one that does not ignores it, exactly as it ignores the
+     * `artemis` namespace. Only ever the agent's own reasoning — a subagent's
+     * is reported as activity, not relayed.
+     */
+    readonly reasoning_content?: string;
     readonly tool_calls?: readonly unknown[];
   };
   readonly finish_reason: OpenAiFinishReason | null;

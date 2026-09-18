@@ -42,22 +42,25 @@ import { readSchedule } from './routines.js';
 import {
   AGENT_PROMPTS_VERSION,
   AGENT_PROMPT_LIMITS,
-  ATTACHMENT_LIMITS,
-  attachmentBytes,
-  base64Bytes,
+  DEFAULT_SKILL_SOURCE_SUBDIR,
+  SKILL_LIBRARY_VERSION,
+  SKILL_LIMITS,
+  skillSourceSubdirProblem,
+  skillSourceUrlProblem,
+  AttachmentError,
   configDirProblem,
+  BUILT_IN_PROMPT_IDS,
   isBuiltInPromptId,
-  IMAGE_MEDIA_TYPES,
   isCredentialRoutingEnvKey,
   baseUrlProblem,
-  isImageAttachment,
   isLocalProviderId,
-  isImageMediaType,
   isPermissionMode,
+  readAttachments,
   isProviderEffort,
   isProviderId,
   isSecretEnvKey,
   isValidServerPort,
+  MAX_TOOL_SERVERS,
   normalizeBaseUrl,
   normalizeWorkspace,
   MAX_SERVER_PORT,
@@ -67,10 +70,16 @@ import {
   profileColorProblem,
   profilePlanIdProblem,
   secretRefProblem,
+  toolServersProblem,
   type AgentPrompt,
   type AgentPromptScope,
   type AgentPromptsListRequest,
   type AgentPromptsSaveRequest,
+  type SkillsListRequest,
+  type SkillsSaveRequest,
+  type SkillsSourceAddRequest,
+  type SkillsSourceRemoveRequest,
+  type SkillsSourceSyncRequest,
   type Attachment,
   type BuiltInPromptId,
   type MemoryBankAddRequest,
@@ -79,8 +88,10 @@ import {
   type MemoryBankMemoriesRequest,
   type MemoryBankRetireRequest,
   type MemoryBankSetEnabledRequest,
+  type MemoryBankSetProfilesRequest,
   type MemoryBankSyncRequest,
   type MemoryBankVerifyRemoteRequest,
+  type MemoryBankWireClaudeCodeRequest,
   type MemoryBanksPreflightRequest,
   type MemoryBanksSetMasterEnabledRequest,
   type MemoryBanksStatusRequest,
@@ -92,8 +103,6 @@ import {
   type SecretsConnectionsListRequest,
   type SecretsFetchServerCertRequest,
   type SecretsRefTestRequest,
-  type FileAttachment,
-  type ImageAttachment,
   type JsonObject,
   type JsonValue,
   type PermissionDecision,
@@ -101,6 +110,7 @@ import {
   type PermissionRuleUpdate,
   type ProfileDraft,
   type ProfilePatch,
+  type ToolServerConfig,
   type ProfilesCreateRequest,
   type ProfilesDeleteRequest,
   type ProfilesListRequest,
@@ -149,6 +159,12 @@ import {
   type ServerAccountsUpdateRequest,
   type ServerAccountSignInRequest,
   type ServerAccountSubmitCodeRequest,
+  type ServerMemoryBanksSetProfilesRequest,
+  type ServerRoutinesRequest,
+  type ServerRoutinesCreateRequest,
+  type ServerRoutinesUpdateRequest,
+  type ServerRoutinesDeleteRequest,
+  type ServerRoutinesRunNowRequest,
   type UsagePlanRequest,
   type UpdatesCheckRequest,
   type UpdatesDismissRequest,
@@ -176,6 +192,7 @@ import {
   type TerminalStartRequest,
   type TerminalWriteRequest,
   type WindowRequest,
+  type WorkspaceCreateWorktreeRequest,
   type WorkspaceDescribeRequest,
   type WorkspacePickDirectoryRequest,
 } from '@rx-artemis/protocol';
@@ -613,6 +630,89 @@ function optionalPublicEnv(value: unknown, field: string): Record<string, string
   return out;
 }
 
+/**
+ * A profile's tool servers, as they arrive from the renderer.
+ *
+ * Rebuilt field by field rather than passed through, and checked again with the
+ * protocol's own {@link toolServersProblem}. Both halves matter, and for
+ * different reasons.
+ *
+ * The rebuild is because this list is the *only* thing in the IPC surface that
+ * can name an executable. A hostile or confused renderer must not be able to
+ * ride an unreviewed key into the object the local adapter eventually spawns
+ * from, and the way to guarantee that is to construct the object here out of
+ * the fields this function names.
+ *
+ * The second check is the same belt-and-braces `optionalPublicEnv` keeps: the
+ * store validates too, and neither is allowed to be the only one that does.
+ */
+function optionalToolServers(value: unknown, field: string): ToolServerConfig[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) throw new ValidationError(field, 'must be an array');
+  if (value.length > MAX_TOOL_SERVERS) {
+    throw new ValidationError(field, `must have at most ${MAX_TOOL_SERVERS} entries`);
+  }
+
+  const servers: ToolServerConfig[] = value.map((entry, index) => {
+    const where = `${field}[${String(index)}]`;
+    const raw = requireObject(entry, where);
+    const transport = raw['transport'];
+    if (transport !== 'stdio' && transport !== 'http' && transport !== 'sse') {
+      throw new ValidationError(`${where}.transport`, 'must be "stdio", "http" or "sse"');
+    }
+    return compact<ToolServerConfig>({
+      name: requireString(raw['name'], `${where}.name`, LIMITS.label),
+      transport,
+      // Only the opt-out is carried, so a stored list does not fill with lines
+      // that say nothing. Same rule as `Profile.autoSelect`.
+      enabled: raw['enabled'] === false ? false : undefined,
+      command: optionalString(raw['command'], `${where}.command`, LIMITS.path),
+      args: optionalStringArray(raw['args'], `${where}.args`, LIMITS.envEntries, LIMITS.envValue),
+      env: optionalStringMap(raw['env'], `${where}.env`),
+      url: optionalString(raw['url'], `${where}.url`, LIMITS.envValue),
+      headers: optionalStringMap(raw['headers'], `${where}.headers`),
+      timeoutMs: optionalPositiveInteger(raw['timeoutMs'], `${where}.timeoutMs`),
+    }) as ToolServerConfig;
+  });
+
+  const problem = toolServersProblem(servers);
+  if (problem !== null) throw new ValidationError(field, problem);
+  return servers;
+}
+
+/**
+ * A plain map of strings, for a tool server's headers and environment.
+ *
+ * Deliberately *not* {@link optionalPublicEnv}: that one refuses any key whose
+ * name looks like a credential, which is exactly what a header called
+ * `Authorization` is. The difference is where the value goes — `publicEnv` is
+ * written to `profiles.json` in the clear and is read by the provider CLI,
+ * whereas a tool-server value that holds a literal secret is refused by
+ * {@link toolServersProblem} and a `${NAME}` reference is not a secret at all.
+ */
+function optionalStringMap(value: unknown, field: string): Record<string, string> | undefined {
+  if (value === undefined || value === null) return undefined;
+  const source = requireObject(value, field);
+  const keys = Object.keys(source);
+  if (keys.length > LIMITS.envEntries) {
+    throw new ValidationError(field, `must have at most ${LIMITS.envEntries} entries`);
+  }
+  const out: Record<string, string> = {};
+  for (const key of keys) {
+    if (POLLUTING_KEYS.has(key)) continue;
+    out[key] = requireString(source[key], `${field}.${key}`, LIMITS.envValue);
+  }
+  return out;
+}
+
+function optionalPositiveInteger(value: unknown, field: string): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    throw new ValidationError(field, 'must be a positive number');
+  }
+  return Math.floor(value);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Permissions                                                                */
 /* -------------------------------------------------------------------------- */
@@ -794,6 +894,7 @@ function validateProfileDraft(value: unknown, field: string): ProfileDraft {
     apiKey: isLocalProviderId(providerId)
       ? optionalApiKey(draft['apiKey'], `${field}.apiKey`)
       : undefined,
+    toolServers: optionalToolServers(draft['toolServers'], `${field}.toolServers`),
     color: optionalColor(draft['color'], `${field}.color`),
     planId: optionalPlanId(draft['planId'], providerId, `${field}.planId`),
     autoSelect: optionalBoolean(draft['autoSelect'], `${field}.autoSelect`),
@@ -914,6 +1015,7 @@ function validateProfilePatch(value: unknown, field: string): ProfilePatch {
     publicEnv: optionalPublicEnv(patch['publicEnv'], `${field}.publicEnv`),
     baseUrl: optionalBaseUrl(patch['baseUrl'], `${field}.baseUrl`),
     apiKey: optionalApiKey(patch['apiKey'], `${field}.apiKey`),
+    toolServers: optionalToolServers(patch['toolServers'], `${field}.toolServers`),
     color: optionalColor(patch['color'], `${field}.color`),
     /*
       No provider to check against here, unlike the draft: a patch names only
@@ -955,166 +1057,28 @@ function optionalSystemPrompt(value: unknown, field: string): SystemPromptSpec |
 }
 
 /**
- * Base64 as the Messages API wants it: standard alphabet, correct padding, no
- * whitespace and no `data:` prefix.
+ * Attachments, read by the one reader every boundary uses.
  *
- * Checked by shape rather than by round-tripping through `Buffer`, because
- * `Buffer.from(x, 'base64')` does not validate — it discards anything outside
- * the alphabet and returns whatever it managed to decode. A payload that is
- * half base64 and half something else would sail through a decode check and
- * reach the provider as a corrupt image, or reach `writeFile` in an adapter as
- * a file whose contents nobody predicted.
+ * The rules used to live here, in full — the base64 alphabet check, the
+ * per-kind ceilings, the request total, the duplicate-id check — and they were
+ * right. The problem was that they lived here *only*: the server's bridge route
+ * had a second, weaker set of rules for the same payloads reaching the same
+ * adapters, and a third boundary was about to be opened by the completions
+ * route. Three readings of "what is an attachment" is how one of them ends up
+ * more permissive than anybody intended.
  *
- * ## Why this is not one regex
- *
- * The obvious pattern is
- * `^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`, where the
- * `{4}` group inside a `*` is what enforces the multiple-of-four length. That
- * is a **nested quantifier**, and V8 pushes a backtracking frame per repetition
- * — so on a payload of any real size it does not reject the input, it throws
- * `RangeError: Maximum call stack size exceeded`. That version shipped in the
- * image-only revision of this file and never fired, because five megabytes of
- * image was under the threshold; the first 8MB file attachment found it.
- *
- * So the length rule is arithmetic and the charset rule is a flat character
- * class, which is linear and allocates no frames. `=` appears only in the
- * trailing `={0,2}`, so padding still cannot appear in the middle.
+ * So the rules moved to `readAttachments` in protocol, beside the limits they
+ * enforce, unchanged; what stays here is this file's own error type. The
+ * renderer still enforces every one of these too, so the user finds out while
+ * the image is still in the composer — that is a courtesy, not the boundary.
  */
-const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
-
-function isBase64(value: string): boolean {
-  return value.length % 4 === 0 && BASE64_PATTERN.test(value);
-}
-
-/**
- * The base64 payload both attachment kinds carry.
- *
- * Size before shape: the regex is linear, but scanning a 40MB string before
- * refusing it is work done for a payload that was never going to be accepted.
- */
-function requirePayload(value: unknown, field: string, maxBytes: number): string {
-  if (typeof value !== 'string') throw new ValidationError(field, 'must be a string');
-  if (value.length === 0) throw new ValidationError(field, 'must not be empty');
-  if (base64Bytes(value) > maxBytes) {
-    throw new ValidationError(field, `must decode to at most ${String(maxBytes)} bytes`);
-  }
-  if (!isBase64(value)) {
-    throw new ValidationError(field, 'must be base64 with no data: prefix');
-  }
-  return value;
-}
-
-/**
- * One image crossing IPC.
- *
- * The renderer enforces every one of these limits too, so the user finds out
- * while the image is still in the composer. That is a courtesy, not the
- * boundary: a renderer is not a trusted enforcer of its own limits, and this
- * is the last place the payload can be refused before it is written to a file
- * or billed to the user's account.
- */
-function validateImageAttachment(value: unknown, field: string): ImageAttachment {
-  const attachment = requireObject(value, field);
-
-  const mediaType = attachment['mediaType'];
-  if (!isImageMediaType(mediaType)) {
-    throw new ValidationError(
-      `${field}.mediaType`,
-      `must be one of ${IMAGE_MEDIA_TYPES.join(', ')}`,
-    );
-  }
-
-  return compact<ImageAttachment>({
-    kind: 'image',
-    id: requireId(attachment['id'], `${field}.id`),
-    mediaType,
-    data: requirePayload(attachment['data'], `${field}.data`, ATTACHMENT_LIMITS.bytesPerImage),
-    // A filename, so it is untrusted display text: length-capped like every
-    // other label, and never used to build a path — staged images are named
-    // after a counter for exactly this reason.
-    name: optionalString(attachment['name'], `${field}.name`, ATTACHMENT_LIMITS.nameLength),
-    width: optionalInteger(attachment['width'], `${field}.width`, 1, 1_000_000),
-    height: optionalInteger(attachment['height'], `${field}.height`, 1, 1_000_000),
-  });
-}
-
-/**
- * One file crossing IPC.
- *
- * No format check, deliberately — see {@link FileAttachment}. What is checked
- * is the one field that is *not* inert: `name` is required here (an image's is
- * optional) because the staged file is named after it, so a missing one is a
- * bug rather than a shrug. It is length-capped and NUL-checked by
- * `requireString`, and `safeFileName` in the core adapters reduces it to a
- * single safe path component before anything opens it. Two layers, because the
- * consequence of getting it wrong is a write outside the staging directory.
- */
-function validateFileAttachment(value: unknown, field: string): FileAttachment {
-  const attachment = requireObject(value, field);
-
-  return compact<FileAttachment>({
-    kind: 'file',
-    id: requireId(attachment['id'], `${field}.id`),
-    name: requireString(attachment['name'], `${field}.name`, ATTACHMENT_LIMITS.nameLength),
-    // Free-form: browsers hand over whatever they like, including nothing, and
-    // only `application/pdf` changes any behaviour downstream. Bounded so it
-    // cannot be used as a smuggling channel, and otherwise passed through.
-    mediaType: optionalString(attachment['mediaType'], `${field}.mediaType`, 200),
-    data: requirePayload(attachment['data'], `${field}.data`, ATTACHMENT_LIMITS.bytesPerFile),
-  });
-}
-
 function optionalAttachments(value: unknown, field: string): readonly Attachment[] | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (!Array.isArray(value)) throw new ValidationError(field, 'must be an array');
-  if (value.length === 0) return undefined;
-  // A cheap bound before anything is decoded, so a renderer sending ten
-  // thousand entries is refused by a length check rather than by a loop.
-  if (value.length > ATTACHMENT_LIMITS.images + ATTACHMENT_LIMITS.files) {
-    throw new ValidationError(
-      field,
-      `must have at most ${String(ATTACHMENT_LIMITS.images + ATTACHMENT_LIMITS.files)} entries`,
-    );
+  try {
+    return readAttachments(value, field);
+  } catch (error) {
+    if (error instanceof AttachmentError) throw new ValidationError(error.field, error.detail);
+    throw error;
   }
-
-  const attachments = value.map((entry, index): Attachment => {
-    const at = `${field}[${index}]`;
-    const kind = requireObject(entry, at)['kind'];
-    if (kind === 'image') return validateImageAttachment(entry, at);
-    if (kind === 'file') return validateFileAttachment(entry, at);
-    throw new ValidationError(`${at}.kind`, 'must be "image" or "file"');
-  });
-
-  // Per kind, because the two have different ceilings for different reasons —
-  // an image's bytes become tokens, a file's become a file.
-  const images = attachments.filter(isImageAttachment).length;
-  if (images > ATTACHMENT_LIMITS.images) {
-    throw new ValidationError(field, `must have at most ${String(ATTACHMENT_LIMITS.images)} images`);
-  }
-  const files = attachments.length - images;
-  if (files > ATTACHMENT_LIMITS.files) {
-    throw new ValidationError(field, `must have at most ${String(ATTACHMENT_LIMITS.files)} files`);
-  }
-
-  // The per-attachment ceilings bound one payload; this bounds the request.
-  // Ten files each just under the limit is ten times the memory of one, in the
-  // main process, held while they are written to disk.
-  const total = attachments.reduce((sum, attachment) => sum + attachmentBytes(attachment), 0);
-  if (total > ATTACHMENT_LIMITS.bytesTotal) {
-    throw new ValidationError(
-      field,
-      `must decode to at most ${String(ATTACHMENT_LIMITS.bytesTotal)} bytes in total`,
-    );
-  }
-
-  // Duplicate ids would make the transcript's chips ambiguous and are never
-  // something the composer produces.
-  const ids = new Set(attachments.map((attachment) => attachment.id));
-  if (ids.size !== attachments.length) {
-    throw new ValidationError(field, 'must not contain two attachments with the same id');
-  }
-
-  return attachments;
 }
 
 function validateRunInput(value: unknown, field: string): RunInput {
@@ -1155,6 +1119,7 @@ function validateRunInput(value: unknown, field: string): RunInput {
     runId: optionalId(input['runId'], `${field}.runId`),
     resumeSessionId: optionalId(input['resumeSessionId'], `${field}.resumeSessionId`),
     forkSession: optionalBoolean(input['forkSession'], `${field}.forkSession`),
+    attachToLive: optionalBoolean(input['attachToLive'], `${field}.attachToLive`),
     /*
      * An opaque provider id, not one of Artemis's own — Claude names stored
      * messages by chain uuid — so this is `optionalString` where its
@@ -1430,6 +1395,29 @@ export function validateWorkspacePickDirectory(raw: unknown): WorkspacePickDirec
 export function validateWorkspaceDescribe(raw: unknown): WorkspaceDescribeRequest {
   const request = requireRequest(raw);
   return { path: requireAbsolutePath(request['path'], 'path') };
+}
+
+/**
+ * Splitting a worktree: a directory, and a branch name that is not a path.
+ *
+ * The branch is the field worth a rule. It becomes a directory under the
+ * checkout and a ref in `.git`, so a name free to contain `..`, a leading
+ * slash, or a drive letter is a name free to put the worktree — and its
+ * branch — somewhere nobody chose. The permitted alphabet is exactly what
+ * `suggestedTaskBranch` produces, checked here rather than trusted, because
+ * this channel is reachable by anything running in the renderer and not only
+ * by the code that composes the name.
+ */
+export function validateWorkspaceCreateWorktree(raw: unknown): WorkspaceCreateWorktreeRequest {
+  const request = requireRequest(raw);
+  const branch = requireString(request['branch'], 'branch', LIMITS.label);
+  if (!/^[a-z0-9][a-z0-9-]*(?:\/[a-z0-9][a-z0-9-]*)*$/.test(branch)) {
+    throw new ValidationError(
+      'branch',
+      'must be lowercase letters, digits and dashes, in slash-separated segments',
+    );
+  }
+  return { path: requireAbsolutePath(request['path'], 'path'), branch };
 }
 
 /**
@@ -1878,6 +1866,46 @@ export function validateServerAccounts(raw: unknown): ServerAccountsRequest {
   return { profileId: requireId(request['profileId'], 'profileId') };
 }
 
+/**
+ * Rescoping one of a *server's* banks.
+ *
+ * {@link validateMemoryBankSetProfiles}'s twin, and deliberately a separate
+ * function rather than a shared one: the ids in this scope are the *server's*
+ * account ids, not this machine's, and a validator that took either would be
+ * the one place where the two registries could be confused. They are checked
+ * as strings for the same reason `accountId` is above — their shape is that
+ * server's business.
+ *
+ * Whether an id names an account that exists is the *server's* check, not
+ * this boundary's: it holds the list, and its route refuses a stranger with a
+ * sentence naming it.
+ */
+export function validateServerMemoryBanksSetProfiles(
+  raw: unknown,
+): ServerMemoryBanksSetProfilesRequest {
+  const request = requireRequest(raw);
+  const profileId = requireId(request['profileId'], 'profileId');
+  const slug = requireBankSlug(request['slug'], 'slug');
+  const scope = requireObject(request['profiles'], 'profiles');
+  const kind = requireString(scope['kind'], 'profiles.kind', 20);
+  if (kind === 'all') return { profileId, slug, profiles: { kind: 'all' } };
+  if (kind !== 'profiles') {
+    throw new ValidationError('profiles.kind', 'must be "all" or "profiles"');
+  }
+  const profileIds =
+    optionalStringArray(
+      scope['profileIds'],
+      'profiles.profileIds',
+      MEMORY_BANK_SCOPE_PROFILES,
+      MEMORY_BANK_PROFILE_ID_MAX,
+    ) ?? [];
+  return {
+    profileId,
+    slug,
+    profiles: { kind: 'profiles', profileIds: [...new Set(profileIds)] },
+  };
+}
+
 export function validateServerAccountsCreate(raw: unknown): ServerAccountsCreateRequest {
   const request = requireRequest(raw);
   const provider = request['provider'];
@@ -2240,6 +2268,69 @@ export function validateMemoryBankSetEnabled(raw: unknown): MemoryBankSetEnabled
   return { slug, enabled };
 }
 
+/**
+ * How many profiles one bank may be pinned to, and how long an id may be.
+ *
+ * The profile list is the machine's own and is never long; the cap is here for
+ * the reason every cap on this boundary is — a payload nobody typed should not
+ * be able to make main iterate an arbitrary list.
+ */
+const MEMORY_BANK_SCOPE_PROFILES = 50;
+const MEMORY_BANK_PROFILE_ID_MAX = 64;
+
+/**
+ * Which profiles a bank reaches — the one bank setting the CLI has no room
+ * for, and the one with consequences in three directions: which runs are
+ * briefed about the bank, whose projects it is installed into, and which runs
+ * may read its directory.
+ *
+ * The ids are deduplicated rather than refused. A list that names a profile
+ * twice means the same thing as one that names it once, and rejecting it would
+ * be the boundary failing a request it understands perfectly.
+ *
+ * Whether an id names a profile that exists is deliberately not checked here:
+ * the profile list is main's, the scope is stored as written, and a bank
+ * scoped to a profile that is later deleted is a bank that reaches nobody —
+ * which is what it already meant.
+ */
+export function validateMemoryBankSetProfiles(raw: unknown): MemoryBankSetProfilesRequest {
+  const request = requireRequest(raw);
+  const slug = requireBankSlug(request['slug'], 'slug');
+  const scope = requireObject(request['profiles'], 'profiles');
+  const kind = requireString(scope['kind'], 'profiles.kind', 20);
+  if (kind === 'all') return { slug, profiles: { kind: 'all' } };
+  if (kind !== 'profiles') {
+    throw new ValidationError('profiles.kind', 'must be "all" or "profiles"');
+  }
+  const profileIds =
+    optionalStringArray(
+      scope['profileIds'],
+      'profiles.profileIds',
+      MEMORY_BANK_SCOPE_PROFILES,
+      MEMORY_BANK_PROFILE_ID_MAX,
+    ) ?? [];
+  return { slug, profiles: { kind: 'profiles', profileIds: [...new Set(profileIds)] } };
+}
+
+/**
+ * Wiring a bank into stock Claude Code, or out of it.
+ *
+ * The same two fields and the same strictness as
+ * {@link validateMemoryBankSetEnabled}, and for a sharper version of its
+ * reason: what this writes is not Artemis's own state but *another program's*
+ * configuration — a managed block in each profile's `CLAUDE.md`, a slash
+ * command, a session-start hook. A default in either direction would edit
+ * files the user did not ask to have edited, or leave behind wiring they asked
+ * to have removed.
+ */
+export function validateMemoryBankWireClaudeCode(raw: unknown): MemoryBankWireClaudeCodeRequest {
+  const request = requireRequest(raw);
+  const slug = requireBankSlug(request['slug'], 'slug');
+  const enabled = optionalBoolean(request['enabled'], 'enabled');
+  if (enabled === undefined) throw new ValidationError('enabled', 'is required');
+  return { slug, enabled };
+}
+
 /** Forgetting names a bank; everything else is main's. */
 export function validateMemoryBankForget(raw: unknown): MemoryBankForgetRequest {
   const request = requireRequest(raw);
@@ -2535,14 +2626,133 @@ export function validateAgentPromptsSave(raw: unknown): AgentPromptsSaveRequest 
     );
   }
 
+  // Built-ins the user removed. Bounded by how many Artemis ships — a list
+  // longer than that cannot be describing this build's prompts — and each entry
+  // has to name one, for the same reason `builtIn` on a row has to: a
+  // dismissal for a prompt that does not exist is a hand-edit or a bug, and
+  // storing it would let it shadow a prompt a later build ships under that id.
+  const dismissed = optionalStringArray(
+    document['dismissedBuiltIns'],
+    'document.dismissedBuiltIns',
+    BUILT_IN_PROMPT_IDS.length,
+    200,
+  );
+  for (const [index, entry] of (dismissed ?? []).entries()) {
+    if (!isBuiltInPromptId(entry)) {
+      throw new ValidationError(
+        `document.dismissedBuiltIns[${index}]`,
+        'names no prompt this build ships',
+      );
+    }
+  }
+
   return {
     document: {
       version: AGENT_PROMPTS_VERSION,
       prompts: rawPrompts.map((entry, index) =>
         validateAgentPrompt(entry, `document.prompts[${index}]`),
       ),
+      ...(dismissed === undefined || dismissed.length === 0
+        ? {}
+        : { dismissedBuiltIns: dismissed as BuiltInPromptId[] }),
     },
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Skills                                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** Empty; the skills are this machine's folders and main knows where they are. */
+export function validateSkillsList(raw: unknown): SkillsListRequest {
+  requireRequest(raw);
+  return {};
+}
+
+/**
+ * The always-on choices, rebuilt entry by entry.
+ *
+ * Names and scopes and nothing else: there is no field here a renderer could
+ * use to name a directory, which is the property that matters. What an
+ * always-on skill *says* is read by main from a folder main found, so the most
+ * a renderer can do with this channel is switch on a skill that is already on
+ * the machine — never point a run's system prompt at a file of its choosing.
+ *
+ * A name is a folder name, so a path separator in one is refused outright
+ * rather than resolved: it could only ever be an attempt to reach outside the
+ * skills folders.
+ */
+export function validateSkillsSave(raw: unknown): SkillsSaveRequest {
+  const request = requireRequest(raw);
+  const document = requireObject(request['document'], 'document');
+
+  const rawEntries = document['alwaysOn'];
+  if (!Array.isArray(rawEntries)) {
+    throw new ValidationError('document.alwaysOn', 'must be an array');
+  }
+  if (rawEntries.length > SKILL_LIMITS.count) {
+    throw new ValidationError('document.alwaysOn', `must hold at most ${SKILL_LIMITS.count} skills`);
+  }
+
+  return {
+    document: {
+      version: SKILL_LIBRARY_VERSION,
+      alwaysOn: rawEntries.map((value, index) => {
+        const field = `document.alwaysOn[${index}]`;
+        const entry = requireObject(value, field);
+        const name = requireString(entry['name'], `${field}.name`, SKILL_LIMITS.name);
+        if (name.includes('/') || name.includes('\\') || name === '.' || name === '..') {
+          throw new ValidationError(`${field}.name`, 'must be a skill name, not a path');
+        }
+        return { name, scope: validateAgentPromptScope(entry['scope'], `${field}.scope`) };
+      }),
+    },
+  };
+}
+
+/**
+ * A repository to subscribe to.
+ *
+ * The one string on this surface that becomes an argument to a program: main
+ * hands it to `git clone`. The rule is the protocol's, so the pane's disabled
+ * Add button and this refusal cannot drift — three transports, no leading
+ * hyphen, no credential in the URL — and the message is the rule's own, which
+ * is written to be shown.
+ */
+export function validateSkillsSourceAdd(raw: unknown): SkillsSourceAddRequest {
+  const request = requireRequest(raw);
+  const url = requireString(request['url'], 'url', SKILL_LIMITS.url).trim();
+  const urlProblem = skillSourceUrlProblem(url);
+  if (urlProblem !== null) throw new ValidationError('url', urlProblem);
+
+  const subdir = (optionalString(request['subdir'], 'subdir', SKILL_LIMITS.subdir) ?? DEFAULT_SKILL_SOURCE_SUBDIR).trim();
+  const subdirProblem = skillSourceSubdirProblem(subdir);
+  if (subdirProblem !== null) throw new ValidationError('subdir', subdirProblem);
+
+  return { url, subdir };
+}
+
+/**
+ * A source id names a folder main will delete, so it is held to the alphabet
+ * `skillSourceIdFor` writes and nothing wider. Main still looks the id up in
+ * its own list before acting; this is the first of the two checks, not the only.
+ */
+function requireSkillSourceId(value: unknown, field: string): string {
+  const id = requireString(value, field, 120);
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) {
+    throw new ValidationError(field, 'must be a skill source id');
+  }
+  return id;
+}
+
+export function validateSkillsSourceRemove(raw: unknown): SkillsSourceRemoveRequest {
+  const request = requireRequest(raw);
+  return { id: requireSkillSourceId(request['id'], 'id') };
+}
+
+export function validateSkillsSourceSync(raw: unknown): SkillsSourceSyncRequest {
+  const request = requireRequest(raw);
+  return request['id'] === undefined ? {} : { id: requireSkillSourceId(request['id'], 'id') };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2777,6 +2987,13 @@ export function validateRoutinesCreate(raw: unknown): RoutinesCreateRequest {
   if (!isProviderId(providerId)) throw new ValidationError('draft.providerId', 'is not a provider');
 
   const model = optionalString(draft['model'], 'draft.model', 200);
+  // Both bounded rather than trusted from the form: they are written to the
+  // file the host reads on every boot, and the engine — not this validator —
+  // is what rejects an effort or a mode the provider does not know, so the
+  // shape check here is only length. A mode is at most a couple of dozen
+  // characters (`bypassPermissions`); effort is a short provider word.
+  const effort = optionalString(draft['effort'], 'draft.effort', 100);
+  const permissionMode = optionalString(draft['permissionMode'], 'draft.permissionMode', 40);
   const paused = optionalBoolean(draft['paused'], 'draft.paused');
 
   const built: RoutineDraft = {
@@ -2786,6 +3003,8 @@ export function validateRoutinesCreate(raw: unknown): RoutinesCreateRequest {
     profileId: requireString(draft['profileId'], 'draft.profileId', 200),
     providerId,
     ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }),
+    ...(permissionMode === undefined ? {} : { permissionMode: permissionMode as RoutineDraft['permissionMode'] }),
     schedule: requireSchedule(draft['schedule'], 'draft.schedule'),
     ...(paused === undefined ? {} : { paused }),
   };
@@ -2830,6 +3049,25 @@ export function validateRoutinesUpdate(raw: unknown): RoutinesUpdateRequest {
     model = patch['model'];
   }
 
+  /*
+   * `effort: ''` clears, exactly as `model: ''` does, so the empty string is
+   * read by hand rather than through `optionalString` (which refuses empties).
+   * A mode never clears — a routine always opens in *some* mode — so it is an
+   * ordinary optional string, bounded and passed through for the engine to
+   * check against the provider's set.
+   */
+  let effort: string | undefined;
+  if (patch['effort'] !== undefined && patch['effort'] !== null) {
+    if (typeof patch['effort'] !== 'string') {
+      throw new ValidationError('patch.effort', 'must be a string');
+    }
+    if (patch['effort'].length > 100) {
+      throw new ValidationError('patch.effort', 'must be at most 100 characters');
+    }
+    effort = patch['effort'];
+  }
+  const permissionMode = optionalString(patch['permissionMode'], 'patch.permissionMode', 40);
+
   const built: RoutinePatch = {
     ...(name === undefined ? {} : { name }),
     ...(instructions === undefined ? {} : { instructions }),
@@ -2837,6 +3075,10 @@ export function validateRoutinesUpdate(raw: unknown): RoutinesUpdateRequest {
     ...(profileId === undefined ? {} : { profileId }),
     ...(providerId === undefined || providerId === null ? {} : { providerId }),
     ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }),
+    ...(permissionMode === undefined
+      ? {}
+      : { permissionMode: permissionMode as RoutinePatch['permissionMode'] }),
     ...(patch['schedule'] === undefined || patch['schedule'] === null
       ? {}
       : { schedule: requireSchedule(patch['schedule'], 'patch.schedule') }),
@@ -2854,4 +3096,116 @@ export function validateRoutinesDelete(raw: unknown): RoutinesDeleteRequest {
 export function validateRoutinesRunNow(raw: unknown): RoutinesRunNowRequest {
   const request = requireRequest(raw);
   return { id: requireString(request['id'], 'id', 100) };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Routines on a remote server                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The server-routine channels, validated the way the account channels are:
+ * `profileId` names the local Artemis-Server profile — which server — and the
+ * ones that act on a routine take the server's own id for it, checked as a
+ * string because its shape is that server's business. A server routine carries
+ * no `cwd`; the server pins its directory, so the field is neither read here
+ * nor sent.
+ */
+export function validateServerRoutines(raw: unknown): ServerRoutinesRequest {
+  const request = requireRequest(raw);
+  return { profileId: requireId(request['profileId'], 'profileId') };
+}
+
+export function validateServerRoutinesCreate(raw: unknown): ServerRoutinesCreateRequest {
+  const request = requireRequest(raw);
+  const draft = requireObject(request['draft'], 'draft');
+
+  const providerId = draft['providerId'];
+  if (!isProviderId(providerId)) throw new ValidationError('draft.providerId', 'is not a provider');
+  const model = optionalString(draft['model'], 'draft.model', 200);
+  const effort = optionalString(draft['effort'], 'draft.effort', 100);
+  const permissionMode = optionalString(draft['permissionMode'], 'draft.permissionMode', 40);
+  const paused = optionalBoolean(draft['paused'], 'draft.paused');
+
+  const built: RoutineDraft = {
+    name: requireString(draft['name'], 'draft.name', ROUTINE_NAME_MAX),
+    instructions: requireString(draft['instructions'], 'draft.instructions', ROUTINE_INSTRUCTIONS_MAX),
+    profileId: requireString(draft['profileId'], 'draft.profileId', 200),
+    providerId,
+    ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }),
+    ...(permissionMode === undefined
+      ? {}
+      : { permissionMode: permissionMode as RoutineDraft['permissionMode'] }),
+    schedule: requireSchedule(draft['schedule'], 'draft.schedule'),
+    ...(paused === undefined ? {} : { paused }),
+  };
+  return { profileId: requireId(request['profileId'], 'profileId'), draft: built };
+}
+
+export function validateServerRoutinesUpdate(raw: unknown): ServerRoutinesUpdateRequest {
+  const request = requireRequest(raw);
+  const patch = requireObject(request['patch'], 'patch');
+
+  const name = optionalString(patch['name'], 'patch.name', ROUTINE_NAME_MAX);
+  const instructions = optionalString(
+    patch['instructions'],
+    'patch.instructions',
+    ROUTINE_INSTRUCTIONS_MAX,
+  );
+  const paused = optionalBoolean(patch['paused'], 'patch.paused');
+  const permissionMode = optionalString(patch['permissionMode'], 'patch.permissionMode', 40);
+
+  // `model` and `effort` clear on the empty string, which `optionalString`
+  // refuses, so both are read by hand — the same convention the local
+  // routine patch uses.
+  let model: string | undefined;
+  if (patch['model'] !== undefined && patch['model'] !== null) {
+    if (typeof patch['model'] !== 'string' || patch['model'].length > 200) {
+      throw new ValidationError('patch.model', 'must be a string of at most 200 characters');
+    }
+    model = patch['model'];
+  }
+  let effort: string | undefined;
+  if (patch['effort'] !== undefined && patch['effort'] !== null) {
+    if (typeof patch['effort'] !== 'string' || patch['effort'].length > 100) {
+      throw new ValidationError('patch.effort', 'must be a string of at most 100 characters');
+    }
+    effort = patch['effort'];
+  }
+
+  const built: RoutinePatch = {
+    ...(name === undefined ? {} : { name }),
+    ...(instructions === undefined ? {} : { instructions }),
+    ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }),
+    ...(permissionMode === undefined
+      ? {}
+      : { permissionMode: permissionMode as RoutinePatch['permissionMode'] }),
+    ...(patch['schedule'] === undefined || patch['schedule'] === null
+      ? {}
+      : { schedule: requireSchedule(patch['schedule'], 'patch.schedule') }),
+    ...(paused === undefined ? {} : { paused }),
+  };
+  return {
+    profileId: requireId(request['profileId'], 'profileId'),
+    routineId: requireString(request['routineId'], 'routineId', LIMITS.id),
+    patch: built,
+  };
+}
+
+export function validateServerRoutinesDelete(raw: unknown): ServerRoutinesDeleteRequest {
+  const request = requireRequest(raw);
+  return {
+    profileId: requireId(request['profileId'], 'profileId'),
+    routineId: requireString(request['routineId'], 'routineId', LIMITS.id),
+  };
+}
+
+/** @see validateServerRoutinesDelete */
+export function validateServerRoutinesRunNow(raw: unknown): ServerRoutinesRunNowRequest {
+  const request = requireRequest(raw);
+  return {
+    profileId: requireId(request['profileId'], 'profileId'),
+    routineId: requireString(request['routineId'], 'routineId', LIMITS.id),
+  };
 }

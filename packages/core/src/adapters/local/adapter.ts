@@ -30,17 +30,21 @@
  * hosted provider is, here, a server either answering or not.
  */
 
+import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import type {
   AgentError,
   AgentEvent,
+  Attachment,
   Capabilities,
   MessageId,
   PermissionDecision,
   PermissionRequestId,
   ProviderId,
   RunId,
+  RunInput,
   RunStatus,
   SessionId,
+  UsageScope,
   UsageSnapshot,
 } from '@rx-artemis/protocol';
 import {
@@ -58,6 +62,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
+import { composeProviderEnv } from '../env.js';
 import { AsyncQueue, createDeferred } from '../stream.js';
 import type { Deferred } from '../stream.js';
 
@@ -85,10 +90,13 @@ import * as sessionStore from './sessionStore.js';
 import { LOCAL_PROFILE_DIR_ENV } from './sessionStore.js';
 import type { StoredEvent, StoredTurnMessage } from './sessionStore.js';
 import { parseLlamaServerModels, parseOllamaTags } from './catalogues.js';
+import { readContextWindow } from './contextWindow.js';
 import { parseNativeCatalogue, parseOpenAiCatalogue } from '../lmstudio/catalogue.js';
 import { readEventLine, splitEvents, ToolCallAccumulator } from './stream.js';
 import { runAgentLoop } from './loop.js';
-import type { ChatMessage, CompletionResult } from './loop.js';
+import type { ChatMessage, CompletionResult, QueuedMessage } from './loop.js';
+import { connectToolServers, mergeToolServers } from './mcp.js';
+import type { ConnectedToolServers } from './mcp.js';
 import { toolsForRisk, toWireTools } from './tools.js';
 import type { ToolSpec } from './tools.js';
 import { describeConfinement, resolveSandbox, wrapCommand } from './commandSandbox.js';
@@ -177,6 +185,17 @@ export const LOCAL_CAPABILITIES: Capabilities = {
   usageReporting: true,
   // Local inference has no price to report. Not a gap — there is no number.
   costReporting: false,
+  /*
+   * Both halves of the readout, which needed two different sources.
+   *
+   * The occupancy is arithmetic on what the completion already carries: the
+   * whole conversation is re-sent every turn, so this turn's `prompt_tokens`
+   * plus what the model wrote *is* what the window is holding. The size of the
+   * window is not in the completion at all and is asked for separately — see
+   * `contextWindow.ts` for the chain and for why an unknown denominator is a
+   * supported state rather than a failure.
+   */
+  contextReporting: true,
   // No plan, no limits, nothing to be near the end of.
   planUsageReporting: false,
   // We build the message array ourselves, so a system prompt is just its first
@@ -185,6 +204,19 @@ export const LOCAL_CAPABILITIES: Capabilities = {
   // We own the loop, so we can park it — and must. Every tool call is offered
   // to the user before it runs, under the modes below.
   interactivePermissions: true,
+  /*
+   * We own the loop, so we can also interrupt it with words rather than only
+   * with a stop button.
+   *
+   * `true` in the same sense the Claude adapter means it, and with the same
+   * caveat said out loud: nothing can amend a completion that is already
+   * streaming. What this promises is that a message sent mid-turn is *taken*,
+   * and delivered at the next boundary — after the current round of tool
+   * calls, or after the answer the model was writing when it arrived. `send`
+   * reports `deliveredImmediately: false` for exactly that reason, and the
+   * `message.delivered` event is what tells the renderer the wait is over.
+   */
+  midRunSteering: true,
   /*
    * The server stores no conversation, so Artemis stores it — see
    * `sessionStore.ts`. Everything below follows from owning the file rather
@@ -217,6 +249,33 @@ export const LOCAL_CAPABILITIES: Capabilities = {
    */
   permissionModes: ['plan', 'default', 'acceptEdits', 'bypassPermissions'],
 };
+
+/**
+ * What the host can hand this adapter that it could not build itself.
+ *
+ * One field, and it is the same field the Claude adapter has — see
+ * {@link import('../claude.js').ClaudeAdapterOptions.agentToolServers}. The
+ * asymmetry that used to exist here was not a decision: `packages/core` may not
+ * import Electron, so the browser tools are built in `apps/desktop/main` and
+ * injected, and only the Claude adapter had somewhere to inject them *into*.
+ * Now that this provider has an MCP client of its own (`mcp.ts`), the same
+ * factory serves both, and a run against a local model gets
+ * `mcp__artemisBrowser__browser_read` under the name a Claude run knows it by.
+ */
+export interface LocalAdapterOptions {
+  /**
+   * Extra tool servers to give a run, built per run by the host.
+   *
+   * Per **run**, not per adapter, for the reason the Claude seam is: the
+   * factory closes over the run id, so a tool acts on *this* conversation's
+   * browser and the model has no way to name another. The run input rides
+   * along because which servers a run should get is the input's to say.
+   */
+  readonly agentToolServers?: (
+    runId: RunId,
+    input: RunInput,
+  ) => Record<string, McpServerConfig> | undefined;
+}
 
 /** No account to sign in to. See the module header. */
 function localCredentials(): ProviderCredentialSpec {
@@ -279,23 +338,49 @@ function authHeaders(env: Readonly<Record<string, string | undefined>>): Record<
   return key !== undefined && key.trim() !== '' ? { authorization: `Bearer ${key.trim()}` } : {};
 }
 
-/** Token counts in the shape the seam expects. */
-function toUsage(usage: StreamUsage): UsageSnapshot {
+/**
+ * Token counts in the shape the seam expects, plus the context reading.
+ *
+ * ## Why the totals are a sum and the occupancy deliberately is not
+ *
+ * These servers are stateless, so this adapter re-sends the whole conversation
+ * on every request. `prompt_tokens` is therefore not "what this message cost" —
+ * it is the measured size of everything the model has been told so far, counted
+ * by the tokenizer that will count it again next turn. Add what the model just
+ * wrote, which is appended to that same conversation, and the total is exactly
+ * what the next request will carry: the current occupancy.
+ *
+ * That is why the reading is taken from the newest completion rather than
+ * accumulated. A turn with four tool calls makes five requests, and each one's
+ * `prompt_tokens` already includes every token the four before it added — so
+ * summing them would count the opening prompt five times and report a window
+ * several times over-full. The totals *are* summed, because those are spend and
+ * spend does accumulate; the occupancy is a measurement and only the latest one
+ * is current.
+ */
+function toUsage(
+  totals: StreamUsage,
+  latest: StreamUsage,
+  scope: UsageScope,
+  contextWindow: number | undefined,
+): UsageSnapshot {
   return {
-    scope: 'final',
+    scope,
     tokens: {
-      inputTokens: usage.promptTokens,
-      outputTokens: usage.completionTokens,
+      inputTokens: totals.promptTokens,
+      outputTokens: totals.completionTokens,
     },
+    contextTokens: latest.promptTokens + latest.completionTokens,
+    ...(contextWindow === undefined ? {} : { contextWindow }),
   };
 }
 
 /**
  * One turn against a local server.
  *
- * Streams until the server says it is done, then ends. `send` is refused rather
- * than queued: without `midRunSteering` the composer is already disabled, and a
- * silently queued message that arrives a turn later is worse than a refusal.
+ * Streams until the server says it is done, then ends — unless the user says
+ * something else in the meantime, in which case the turn takes that in at its
+ * next boundary and keeps going. See {@link LocalRun.send}.
  *
  * The turn is one turn *of a conversation*, which is a claim this class has to
  * make good on by itself: the server it talks to is stateless, so continuity is
@@ -343,8 +428,49 @@ class LocalRun implements Run {
   /** What each tool call looked like live, keyed by the id its result carries. */
   readonly #toolEvents = new Map<string, StoredEvent[]>();
   #usage: UsageSnapshot | undefined;
+  /**
+   * What the turn has spent, summed over its completions.
+   *
+   * A turn is one request per tool call plus one, and this used to hold only
+   * the last of them — so a turn that read six files reported the tokens of the
+   * final, shortest exchange as though it were the whole turn. Spend
+   * accumulates; see {@link toUsage} for why the *context* reading beside it
+   * deliberately does not.
+   */
+  #totals: StreamUsage = { promptTokens: 0, completionTokens: 0 };
+  /** The newest completion's own counts — the current context occupancy. */
+  #latest: StreamUsage | undefined;
+  /**
+   * The denominator, asked for once and shared by every completion in the run.
+   *
+   * Started at the top of {@link #drive} rather than lazily on the first usage
+   * event, so the two probes overlap the model's first prefill instead of
+   * landing after it — a window that arrives a completion late means the first
+   * gauge the user sees has no scale on it.
+   */
+  #contextWindow: Promise<number | undefined> | undefined;
+  /**
+   * The same number once it has landed, readable without awaiting.
+   *
+   * The stream loop is the hot path — it is what turns bytes into visible text
+   * — and a usage chunk arriving there must not make it wait on an HTTP
+   * request. So the promise writes its answer here when it settles and the loop
+   * reads whatever is there. Missing it costs nothing: the renderer falls back
+   * to the window this model reported last time, and the run's final snapshot
+   * carries the real one.
+   */
+  #windowValue: number | undefined;
   /** Approvals the loop is parked on, keyed by the id the renderer answers. */
   readonly #pending = new Map<PermissionRequestId, Deferred<'allow' | 'deny'>>();
+  /**
+   * What the user has said since the loop last looked.
+   *
+   * Drained by the loop at each turn boundary rather than read, so a message
+   * taken from here is one that will be delivered — a queue that could be read
+   * twice would deliver twice. Emptied by an interrupt, because nothing here
+   * survives an abort and `stillQueued` must not claim otherwise.
+   */
+  readonly #queued: QueuedMessage[] = [];
   /** What this machine can enforce. Resolved once; see `#sandbox`. */
   #resolvedSandbox: ResolvedSandbox | undefined;
   /** The run's own writable scratch, made on first use and removed at the end. */
@@ -353,12 +479,22 @@ class LocalRun implements Run {
   readonly #abort = new AbortController();
   readonly #input: ResolvedRunInput;
   readonly #flavour: LocalFlavour;
+  readonly #options: LocalAdapterOptions;
+  /**
+   * The tool servers this run reached, once it has reached them.
+   *
+   * Opened once per run rather than per turn, exactly as the Claude adapter
+   * builds its servers once per launch: the connections hold the handlers, and
+   * a second set mid-conversation would be a second browser for one dock.
+   */
+  #servers: ConnectedToolServers | undefined;
 
-  constructor(input: ResolvedRunInput, flavour: LocalFlavour) {
+  constructor(input: ResolvedRunInput, flavour: LocalFlavour, options: LocalAdapterOptions = {}) {
     this.runId = input.runId;
     this.providerId = flavour.id;
     this.#input = input;
     this.#flavour = flavour;
+    this.#options = options;
     this.#sessionId = input.resumeSessionId ?? (randomUUID() as SessionId);
     /*
      * Stopping a run must not be able to leave it stopped *and* waiting.
@@ -422,8 +558,21 @@ class LocalRun implements Run {
    */
   #toolsForMode(): readonly ToolSpec[] {
     const mode = this.#input.permissionMode ?? 'default';
-    if (mode === 'plan') return toolsForRisk(false, false);
-    return toolsForRisk(true, true);
+    /*
+     * The servers' tools go through the same filter as Artemis's own.
+     *
+     * A tool server's tools are tools, so `plan` withholds the ones that change
+     * something there too — which for a server means everything that did not
+     * declare `readOnlyHint`. That is the conservative reading and the right
+     * one: plan mode's promise is that nothing happened, and a promise that
+     * covered only the four tools in this package would be a promise about the
+     * wrong thing the moment a GitHub server was configured.
+     */
+    const built = mode === 'plan' ? toolsForRisk(false, false) : toolsForRisk(true, true);
+    const fromServers = (this.#servers?.tools ?? []).filter(
+      (tool) => mode !== 'plan' || tool.risk === 'read',
+    );
+    return [...built, ...fromServers];
   }
 
   /**
@@ -432,6 +581,13 @@ class LocalRun implements Run {
    * `acceptEdits` and `bypassPermissions` skip the prompt. Neither widens the
    * OS sandbox: approval and confinement are separate axes, and a mode that
    * quietly did both would make "stop asking me" mean "and also let it out".
+   *
+   * `acceptEdits` does not cover a tool server, and that is deliberate. The
+   * mode's bargain is that the edits it stops asking about are edits to this
+   * working directory, which the user is looking at and git can undo. A server
+   * acts somewhere else — a repository, a vault, a live page — so its calls
+   * keep asking, and only `bypassPermissions` silences them. See
+   * {@link ToolSpec.server}.
    */
   async #approve(call: ToolCall, tool: ToolSpec): Promise<'allow' | 'deny'> {
     // Nothing more is run once the user has stopped the turn, and nothing more
@@ -441,7 +597,7 @@ class LocalRun implements Run {
 
     const mode = this.#input.permissionMode ?? 'default';
     if (mode === 'bypassPermissions') return 'allow';
-    if (mode === 'acceptEdits' && tool.risk !== 'execute') return 'allow';
+    if (mode === 'acceptEdits' && tool.risk !== 'execute' && tool.server === undefined) return 'allow';
 
     const requestId = `${this.runId}-perm-${this.#permissionSeq++}` as PermissionRequestId;
     let input: Record<string, unknown> = {};
@@ -520,6 +676,56 @@ class LocalRun implements Run {
     }
   }
 
+  /**
+   * Start asking how big this server's window is. Idempotent.
+   *
+   * Fired at the top of the run rather than when the first count arrives, so
+   * the request overlaps the model's prefill. The result is cached across runs
+   * by `contextWindow.ts`, so this is one pair of requests per server and model
+   * for the life of the process, not one per turn.
+   */
+  #startContextProbe(): void {
+    this.#contextWindow ??= readContextWindow({
+      flavourId: this.#flavour.id,
+      baseUrl: baseUrl(this.#flavour, this.#input.env),
+      model: this.#input.model,
+      headers: authHeaders(this.#input.env),
+      // Stopping the run stops the probe: nothing is waiting for a gauge on a
+      // conversation the user has just abandoned.
+      signal: this.#abort.signal,
+    });
+    void this.#contextWindow.then(
+      (window) => {
+        this.#windowValue = window;
+      },
+      () => undefined,
+    );
+  }
+
+  /**
+   * Fold one completion's counts into the run, and say so immediately.
+   *
+   * The `usage` event is the point of this: the readout used to move only when
+   * a turn ended, because the only snapshot this adapter ever emitted rode on
+   * `run.end`. A long turn — the kind where knowing how full the window is
+   * actually changes what you do next — showed nothing at all until it was too
+   * late to act on it. Now every completion in the turn reports, so the gauge
+   * climbs while the tool calls go past.
+   *
+   * `cumulative` rather than `delta` because {@link #totals} is a real running
+   * total and the store adds `delta` snapshots to what it already holds —
+   * sending both the sum and an instruction to sum it would double the count.
+   */
+  #recordUsage(usage: StreamUsage): void {
+    this.#totals = {
+      promptTokens: this.#totals.promptTokens + usage.promptTokens,
+      completionTokens: this.#totals.completionTokens + usage.completionTokens,
+    };
+    this.#latest = usage;
+    this.#usage = toUsage(this.#totals, usage, 'cumulative', this.#windowValue);
+    this.#emit({ type: 'usage', usage: this.#usage } as never);
+  }
+
   /** One streamed completion, in the shape the loop asks for. */
   async #complete(messages: readonly ChatMessage[], tools: readonly ToolSpec[]): Promise<CompletionResult> {
     const url = `${baseUrl(this.#flavour, this.#input.env)}/v1/chat/completions`;
@@ -561,7 +767,7 @@ class LocalRun implements Run {
         if (delta === 'done') break;
 
         if (delta.error !== undefined) throw adapterError('provider_unavailable', delta.error);
-        if (delta.usage !== undefined) this.#usage = toUsage(delta.usage);
+        if (delta.usage !== undefined) this.#recordUsage(delta.usage);
         if (delta.finishReason !== undefined) finishReason = delta.finishReason;
         if (delta.toolCalls !== undefined) calls.add(delta.toolCalls);
         if (delta.thinking !== undefined) {
@@ -656,8 +862,89 @@ class LocalRun implements Run {
     ];
   }
 
+  /**
+   * Artemis's own words in the transcript, marked as Artemis's.
+   *
+   * There is no notice event in the protocol, so it goes where an adapter's own
+   * words go: a synthetic assistant block, which the transcript renders and
+   * nothing mistakes for the model's. Not persisted — this is news about *this*
+   * run's setup, and a replayed transcript claiming a server was unreachable
+   * six weeks ago would be worse than saying nothing.
+   */
+  #notice(text: string): void {
+    this.#emit({
+      type: 'text.complete',
+      messageId: `${this.runId}-notice-${this.#messageSeq++}` as MessageId,
+      role: 'assistant',
+      text,
+      synthetic: true,
+    } as never);
+  }
+
+  /**
+   * Open this run's tool servers, if it was given any.
+   *
+   * Before `session.started`, because that event names the run's tools and a
+   * list that grew afterwards would be a list the user could not trust. Bounded
+   * by the connect timeout in `mcp.ts`, and never fatal: a server that will not
+   * start is said out loud and the run continues with the tools it does have.
+   */
+  async #openToolServers(): Promise<void> {
+    // Two sources, one list: what the host built for this run, and what the
+    // profile records. See `mergeToolServers` for who wins a name.
+    const merged = mergeToolServers(
+      this.#options.agentToolServers?.(this.runId, this.#input),
+      this.#input.toolServers,
+    );
+    for (const problem of merged.problems) {
+      this.#notice(`The "${problem.server}" tool server was not used: ${problem.detail}`);
+    }
+    if (Object.keys(merged.servers).length === 0) return;
+
+    const connected = await connectToolServers(merged.servers, {
+      /*
+       * The host environment under the profile's, unscrubbed.
+       *
+       * Not the environment `shell` gets, and the difference is the point. The
+       * shell's is stripped of anything credential-shaped because the *model*
+       * writes the command that reads it. A tool server is named by the user in
+       * settings and spawned by Artemis; the model never sees its environment
+       * and cannot influence what it does with one. Stripping it here would
+       * mean a GitHub server could never hold a token, which is the whole
+       * reason for configuring one.
+       *
+       * It is also why the docs say to name only servers you would run
+       * yourself: this is the user's own environment, handed to the user's own
+       * choice of program.
+       */
+      env: composeProviderEnv(this.#input.env, {
+        ...(this.#input.inheritHostEnv === undefined
+          ? {}
+          : { inheritHostEnv: this.#input.inheritHostEnv }),
+      }),
+      cwd: this.#input.cwd,
+      signal: this.#abort.signal,
+    });
+    this.#servers = connected;
+
+    for (const problem of connected.problems) {
+      this.#notice(`The "${problem.server}" tool server is not available: ${problem.detail}`);
+    }
+  }
+
   async #drive(): Promise<void> {
     try {
+      // Before anything is sent, so the two small requests it makes overlap the
+      // prefill rather than queue behind it — and the tool servers opening below.
+      this.#startContextProbe();
+
+      // Before the session is announced, and inside the try: a failure here is
+      // an ordinary run-ending error with an ordinary `run.end`, not a promise
+      // rejection escaping a fire-and-forget call in the constructor. Awaited
+      // rather than started, because `session.started` announces the tool names
+      // and a server's tools are part of that list.
+      await this.#openToolServers();
+
       this.#emit({
         type: 'session.started',
         sessionId: this.#sessionId,
@@ -723,7 +1010,30 @@ class LocalRun implements Run {
               }),
           env: sandboxEnv(this.#input.env, []),
           signal: this.#abort.signal,
+          /*
+           * A private address is reachable when someone is watching, or when
+           * they have said not to ask.
+           *
+           * `default` prompts for every `http_fetch`, so the address is on
+           * screen before it is fetched; `bypassPermissions` is the user
+           * saying they have decided. `acceptEdits` is neither — its bargain
+           * is about edits to this directory, not about the network — so an
+           * unattended turn under it stays off the LAN. `plan` never reaches
+           * here, because the tool is not offered. See `httpFetch.ts`.
+           */
+          allowPrivateNetwork:
+            (this.#input.permissionMode ?? 'default') === 'default' ||
+            this.#input.permissionMode === 'bypassPermissions',
           shell: (command, signal) => this.#shell(command, signal),
+          // Only when there is something to call. Absent, `executeTool` keeps
+          // answering "no tool called that exists", which on a run with no
+          // servers is exactly true.
+          ...(this.#servers === undefined
+            ? {}
+            : {
+                callServerTool: (name, args, signal) =>
+                  (this.#servers as ConnectedToolServers).call(name, args, signal),
+              }),
         },
         approve: (call, tool) => this.#approve(call, tool),
         onToolStart: (call) => {
@@ -754,6 +1064,22 @@ class LocalRun implements Run {
         onAppend: (message) => {
           this.#persist([{ message, events: this.#storedEvents(message) }]);
         },
+        takeQueued: () => this.#queued.splice(0),
+        /*
+         * The fold, reported.
+         *
+         * `message.delivered` naming the caller's own id is what takes the
+         * "Queued" chip off the row the renderer already drew and the count off
+         * the composer's strip — the same event the Claude path emits when the
+         * CLI records a fold. No text event goes with it: the row is already on
+         * screen, and a second one would be the record of a message being
+         * *read* sitting under the record of it being sent.
+         */
+        onDelivered: (message) => {
+          if (message.id !== undefined) {
+            this.#emit({ type: 'message.delivered', messageId: message.id as MessageId } as never);
+          }
+        },
       });
 
       // The transcript is on disk before the turn is declared over, so a
@@ -761,12 +1087,29 @@ class LocalRun implements Run {
       // conversation rather than one still being written.
       await this.#writes;
 
+      /*
+       * The last chance to state the denominator.
+       *
+       * `final` is the snapshot the renderer *remembers* — it files the window
+       * against the model so the next run has a scale from its first token. A
+       * probe that landed after the last completion would otherwise be thrown
+       * away, and the memory would never fill. Awaiting is all but free: this
+       * started at the top of the run, so by here it has long settled, and a
+       * server that has not answered by now is bounded by the probe's own
+       * deadline rather than by this line.
+       */
+      const contextWindow = await this.#contextWindow?.catch(() => undefined);
+      const usage =
+        this.#latest === undefined
+          ? this.#usage
+          : toUsage(this.#totals, this.#latest, 'final', contextWindow);
+
       this.#status = 'ended';
       this.#emit({
         type: 'run.end',
         reason: 'completed',
         sessionId: this.#sessionId,
-        ...(this.#usage === undefined ? {} : { usage: this.#usage }),
+        ...(usage === undefined ? {} : { usage }),
       } as never);
     } catch (error) {
       const aborted = this.#abort.signal.aborted;
@@ -775,11 +1118,14 @@ class LocalRun implements Run {
       // what makes "stop" different from "undo".
       await this.#writes;
       this.#status = 'ended';
+      // The same accounting a clean ending carries: the tokens counted so far
+      // were spent whether or not the turn was let finish.
       this.#emit({
         type: 'run.end',
         reason: aborted ? 'interrupted' : 'error',
         sessionId: this.#sessionId,
         ...(aborted ? {} : { error: toError(error, this.#flavour) }),
+        ...(this.#usage === undefined ? {} : { usage: this.#usage }),
       } as never);
     } finally {
       // Every parked approval is released, or a disposed run leaves the loop
@@ -787,21 +1133,71 @@ class LocalRun implements Run {
       // listener has already done this; a run that ended some other way with a
       // prompt still open has not.
       this.#refuseAllPending();
+      // Every connection this run opened, closed with it. A stdio server is a
+      // child process: leaving one behind would leak one per run, and the run
+      // that leaked it is the one that can name it.
+      if (this.#servers !== undefined) await this.#servers.close();
       if (this.#scratch !== undefined) void rm(this.#scratch, { recursive: true, force: true });
       this.#queue.close();
     }
   }
 
-  send(): Promise<SendResult> {
-    // Refused rather than queued: `midRunSteering` is false, so the composer is
-    // already disabled, and a message silently delivered a turn later is worse
-    // than one that was plainly not accepted.
-    return Promise.reject(
-      adapterError('invalid_request', `${this.#flavour.label} cannot take a message mid-turn.`),
-    );
+  /**
+   * Take a message into the turn that is already running.
+   *
+   * ## Why this reports `deliveredImmediately: false`
+   *
+   * Because it is queued, and the queue is read at a boundary. A completion
+   * that is already streaming cannot be amended — there is no protocol for it
+   * and no server that would accept one — so the honest answer is "accepted,
+   * not yet read", and `message.delivered` is what later says it was.
+   *
+   * The wait is short and bounded: the next boundary is the end of the current
+   * round of tool calls, or the end of the answer the model was writing. It is
+   * never the end of the *run*, which is what makes this different from
+   * queueing a second turn.
+   *
+   * The refusals carry `details.reason: 'run_ended'` because the renderer's
+   * steer path branches on exactly that to carry the user's words into a fresh
+   * run rather than stranding them under a red banner.
+   */
+  send(text: string, attachments?: readonly Attachment[], messageId?: MessageId): Promise<SendResult> {
+    if (this.#status === 'ended' || this.#abort.signal.aborted) {
+      return Promise.reject(
+        adapterError(
+          'invalid_request',
+          `Run ${this.runId} has already ended; start a new run with resumeSessionId to continue.`,
+          { details: { reason: 'run_ended', runId: this.runId } },
+        ),
+      );
+    }
+    // Refused rather than dropped. `imageInput` is false for this provider, so
+    // a caller that got here has misread the capability, and an attachment
+    // silently discarded turns "what is wrong with this screenshot?" into a
+    // question about nothing.
+    if (attachments !== undefined && attachments.length > 0) {
+      return Promise.reject(
+        adapterError('invalid_request', `${this.#flavour.label} runs cannot take attachments.`),
+      );
+    }
+    if (text.trim() === '') {
+      return Promise.reject(adapterError('invalid_request', 'A message needs some text in it.'));
+    }
+
+    this.#queued.push({ text, ...(messageId === undefined ? {} : { id: messageId }) });
+    return Promise.resolve({ deliveredImmediately: false });
   }
 
   interrupt(): Promise<InterruptResult> {
+    /*
+     * Anything undelivered dies here, and `stillQueued` says so by being empty.
+     *
+     * That field means "accepted, not yet executed, and *will* still run".
+     * Nothing in this queue survives the abort — the loop it was waiting for is
+     * about to unwind — so listing it would be a promise this adapter cannot
+     * keep, and the renderer clears its own queued set when the turn resolves.
+     */
+    this.#queued.length = 0;
     this.#abort.abort();
     return Promise.resolve({ stillQueued: [] });
   }
@@ -819,6 +1215,7 @@ class LocalRun implements Run {
 
 
   dispose(): Promise<void> {
+    this.#queued.length = 0;
     this.#abort.abort();
     this.#queue.close();
     return Promise.resolve();
@@ -863,7 +1260,10 @@ async function hasBinary(binary: string): Promise<boolean> {
 }
 
 /** Build the adapter for one local server. */
-export function createLocalAdapter(flavour: LocalFlavour): ProviderAdapter {
+export function createLocalAdapter(
+  flavour: LocalFlavour,
+  options?: LocalAdapterOptions,
+): ProviderAdapter {
   return {
     id: flavour.id,
     label: flavour.label,
@@ -1058,7 +1458,7 @@ export function createLocalAdapter(flavour: LocalFlavour): ProviderAdapter {
           ),
         );
       }
-      return Promise.resolve(new LocalRun(input, flavour));
+      return Promise.resolve(new LocalRun(input, flavour, options ?? {}));
     },
   } as ProviderAdapter;
 }

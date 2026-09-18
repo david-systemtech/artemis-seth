@@ -12,6 +12,12 @@
  *
  *  - **No session naming.** The desktop titles new conversations with a model
  *    call; here a session lists under its first prompt. Cosmetic.
+ *  - **No prompt library of its own.** A served run's standing instructions
+ *    are the client's, carried on the wire; what this process adds is the
+ *    memory-bank prompt for the banks *this* machine carries, composed from
+ *    this machine's own registry — see `withMemoryBanks` below, which every
+ *    path that starts a run goes through, and `memoryBanks.ts`, which keeps
+ *    those banks installed and fresh without anybody's cron.
  *  - **No plan-usage polling, no update checks, no notifications.** All
  *    window furniture.
  *  - **Permission prompts on the completions surface are auto-denied**, exactly
@@ -27,17 +33,35 @@
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { PlanUsage, ProfileId, ProviderId, RunId } from '@rx-artemis/protocol';
+import type {
+  PlanUsage,
+  ProfileId,
+  ProviderId,
+  RunId,
+  RunInput,
+  ServerConnection,
+  ServerMemoryBankScope,
+  SessionDelegatedWork,
+} from '@rx-artemis/protocol';
 import {
   RunError,
+  buildContentBridge,
   checkAuthStatus,
   createCatalogue,
   createDefaultProviderRegistry,
   createPushFeed,
   createRemoteRunGuard,
+  createServerRoutineStore,
   createSessionLedger,
   createWorkspaceResolver,
+  discoverMarketplacePlugins,
+  joinSystemPromptAppends,
+  linkSkillsIntoCodexHome,
+  machineBankPrompt,
   managedEnvKeys,
+  memoryToolServer,
+  registryPath,
+  MEMORY_TOOL_SERVER,
   DuplicateProfileLabelError,
   ProfileStore,
   resolveEnv,
@@ -45,6 +69,8 @@ import {
   SessionLifecycleLog,
   SESSION_LIFECYCLE_LOG_FILE,
   type Catalogue,
+  type CommandSource,
+  type MemoryBankAdmin,
   type ProfileAdmin,
   type ProviderRegistry,
   type PushFeed,
@@ -52,12 +78,19 @@ import {
   type RemoteRunGuard,
   type RunSource,
   type ServerProfileRecord,
+  type ServerRoutineStore,
   type SessionLedger,
   type SessionSource,
   type UsageSource,
   type WorkspaceResolver,
+  takesHostToolServers,
 } from '@rx-artemis/core';
 
+import {
+  createServerMemoryBanks,
+  mergeBankDirectories,
+  withSystemPromptAppended,
+} from './memoryBanks.js';
 import { createFileProfileSecrets } from './secrets.js';
 
 /**
@@ -66,6 +99,20 @@ import { createFileProfileSecrets } from './secrets.js';
  * rule.
  */
 const MAX_SESSION_TITLE = 200;
+
+/**
+ * How long a slash-command reading is answered from memory.
+ *
+ * The reading opens the provider's CLI and asks it — a control call, never a
+ * turn — which is a second or two this process should not spend on every
+ * settle of every client's composer. A minute is long enough that a busy
+ * connection is answered from memory and short enough that a skill dropped
+ * into the container shows up in the next menu rather than the next release.
+ */
+const COMMAND_CACHE_MS = 60_000;
+
+/** The providers this host hands its tool servers to — core's list, shared with the desktop. */
+const takesHostTools = takesHostToolServers;
 
 export interface HeadlessHost {
   readonly profiles: ProfileStore;
@@ -77,8 +124,28 @@ export interface HeadlessHost {
   readonly runSource: RunSource;
   readonly sessionSource: SessionSource;
   readonly usageSource: UsageSource;
+  /**
+   * What `GET /api/v0/commands` answers through: the slash commands a session
+   * on one served account would offer, this machine's skills among them.
+   * Read with the same plugins a run here is given, so the two agree.
+   */
+  readonly commandSource: CommandSource;
+  /**
+   * Routines that fire *in this server*, on schedule, with every client closed.
+   *
+   * The half of the routines feature that only a server can offer: the desktop
+   * fires appointments while it is open, and this fires them whether or not
+   * anything is watching. Scoped per connection exactly as the session ledger
+   * is — see `server/routines.ts` in core.
+   */
+  readonly routines: ServerRoutineStore;
   /** What the account-administration routes act through. See `signin.ts`. */
   readonly profileAdmin: ProfileAdmin;
+  /**
+   * What the memory-bank routes act through: the registry this process keeps,
+   * read and rescoped over the wire. See `memoryBanks.ts`.
+   */
+  readonly memoryBankAdmin: MemoryBankAdmin;
   /** Every push the server can stream to a remote client. See `server/feed.ts`. */
   readonly feed: PushFeed;
   /** Interrupt-on-disconnect for bridge-started runs. See `server/guard.ts`. */
@@ -97,8 +164,57 @@ export interface HeadlessHost {
   dispose(): Promise<void>;
 }
 
-export function createHeadlessHost(dataDir: string): HeadlessHost {
-  const providers = createDefaultProviderRegistry({});
+export function createHeadlessHost(
+  dataDir: string,
+  /**
+   * The configured connections, read live. A routine outlives the request that
+   * made it, so a firing looks its own connection up here to learn where to
+   * run — and a revoked token's routines find no connection and quietly do
+   * nothing. Defaults to none, for the CLI verbs that build a host to add an
+   * account and never serve.
+   */
+  connections: () => readonly ServerConnection[] = () => [],
+): HeadlessHost {
+  const providers = createDefaultProviderRegistry({
+    claude: {
+      /*
+       * The memory tools, built per run by this process — the same seam the
+       * desktop hands its browser and task tools across, and the only tools a
+       * headless deployment has to give. `memoryTools` is declared below and
+       * captured, not called, until a run starts.
+       */
+      agentToolServers: (_runId, input) => memoryTools(input),
+      /*
+       * The provider started a turn nobody asked for — register it.
+       *
+       * It does that when background work settles, and a subagent that outlived
+       * its turn can park on a permission prompt the same way. Without this the
+       * adapter has nowhere to report the turn and drops it — so a served client
+       * watched its subagent spin for ever after it had finished, and never got
+       * the agent's sentence about the result. `runs` is declared below and
+       * captured, not called, until a process is live. Same wiring as the
+       * desktop's `engine.ts` and the terminal's `host.ts`, and swallowed for
+       * the same reason: this runs inside the adapter's own event pump.
+       */
+      onContinuation: (run, context) => {
+        try {
+          runs.adopt(run, context);
+        } catch (error) {
+          process.stderr.write(
+            `Could not adopt the provider's own turn on run ${run.runId}: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        }
+      },
+    },
+    /*
+     * The same factory, for the provider whose loop is Artemis's own. One
+     * call, not a second one built for the occasion — see the desktop's
+     * `engine.ts`, which says the same thing about the same pair.
+     */
+    local: {
+      agentToolServers: (_runId, input) => memoryTools(input),
+    },
+  });
   const managed = [...new Set(providers.list().flatMap((adapter) => managedEnvKeys(adapter.credentials)))];
 
   const profiles = new ProfileStore({
@@ -122,9 +238,55 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
     });
   };
 
+  /**
+   * This machine's own skills, slash commands and marketplace plugins,
+   * delivered to the run — the desktop's `contentPluginsFor` and the
+   * terminal's, through the same core seam. Resolved per run, so a skill
+   * dropped into the container while it is up works on the next message. A
+   * bridge that cannot be built is a line on stderr and a run without it,
+   * never a run that does not start.
+   *
+   * Whose content this is deserves stating: the *server's*. A run reaches the
+   * `skills/` of the account it runs as and the `~/.agents/skills` of the user
+   * this process runs as — nothing from the client's disk, which is why
+   * `GET /api/v0/commands` exists for the client to learn what is here.
+   */
+  const onContentWarning = (message: string, error: unknown): void => {
+    process.stderr.write(`${message}: ${error instanceof Error ? error.message : String(error)}\n`);
+  };
+  const contentPluginsFor = async (profileId: ProfileId, providerId: ProviderId) => {
+    if (providerId !== 'claude' && providerId !== 'codex') return [];
+    const configDir = profiles.configDirFor(await profiles.require(profileId));
+    if (providerId === 'codex') {
+      await linkSkillsIntoCodexHome({ configDir, onWarning: onContentWarning });
+      return [];
+    }
+    const [bridged, marketplace] = await Promise.all([
+      buildContentBridge({ configDir, dataDir, onWarning: onContentWarning }),
+      discoverMarketplacePlugins({ configDir, onWarning: onContentWarning }),
+    ]);
+    return [...bridged, ...marketplace];
+  };
+
   const runs = new RunRegistry({
     resolveAdapter: (id) => providers.get(id),
-    resolveRun: async ({ profileId, providerId }) => ({ env: await envFor(profileId, providerId) }),
+    resolveRun: async ({ profileId, providerId }) => {
+      const [env, plugins] = await Promise.all([
+        envFor(profileId, providerId),
+        contentPluginsFor(profileId, providerId),
+      ]);
+      return { env, plugins };
+    },
+    /*
+     * Far above the registry's default of a thousand, because here the tail
+     * is not a courtesy to a window that reloaded: it is what a client that
+     * slept through a served turn is replayed on `GET /api/v0/runs/{id}/stream`.
+     * A turn streams a text delta per token, so a thousand events is a few
+     * minutes of output; a laptop lid is closed for longer than that. Each
+     * event is a small object, and the runs a headless server holds at once
+     * are few, so the memory is cheap next to the reply it saves.
+     */
+    historyLimit: 50_000,
   });
 
   const catalogue = createCatalogue({
@@ -351,9 +513,196 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
     },
   };
 
+  /**
+   * The slash commands a session on one account would offer, for the route.
+   *
+   * Cached per account and directory for {@link COMMAND_CACHE_MS}, and
+   * in-flight reads are shared, so two clients settling at once cost one CLI.
+   * Asked with the same plugins a run here is given — the whole point: this
+   * machine's skills arrive on that channel, and a list without them would be
+   * missing exactly the rows the client is asking for.
+   */
+  const commandCache = new Map<string, { readonly at: number; readonly value: Promise<readonly string[]> }>();
+  const commandSource: CommandSource = {
+    list: (query) => {
+      const providerId = query.providerId as ProviderId;
+      const profileId = query.profileId as ProfileId;
+      const adapter = providers.get(providerId);
+      const listCommands = adapter?.listCommands?.bind(adapter);
+      if (listCommands === undefined) return Promise.resolve([]);
+
+      // The query has to start somewhere that exists — the same substitution
+      // the desktop's engine makes for a column with no directory yet.
+      const cwd = query.cwd ?? dataDir;
+      const key = `${providerId} ${profileId} ${cwd}`;
+      const cached = commandCache.get(key);
+      if (cached !== undefined && Date.now() - cached.at < COMMAND_CACHE_MS) return cached.value;
+
+      const value = (async (): Promise<readonly string[]> => {
+        const [env, plugins] = await Promise.all([
+          envFor(profileId, providerId),
+          contentPluginsFor(profileId, providerId),
+        ]);
+        return listCommands({ env, cwd, plugins });
+      })().catch((error: unknown) => {
+        // The contract says the adapter resolves; if one rejects, that is a
+        // bug in the adapter and not a reason to answer nothing for a minute
+        // — the failure is dropped from the cache and the next ask retries.
+        commandCache.delete(key);
+        process.stderr.write(
+          `Could not list slash commands for ${providerId}: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+        return [];
+      });
+      commandCache.set(key, { at: Date.now(), value });
+      return value;
+    },
+  };
+
+  /**
+   * The banks this machine carries, kept installed and fresh by this process.
+   * See `memoryBanks.ts` for what is synchronous and what is not.
+   */
+  const banks = createServerMemoryBanks({ dataDir });
+
+  /** Can this provider take an append on top of its own preset? */
+  const canAppend = (providerId: string): boolean =>
+    providers.get(providerId as ProviderId)?.capabilities.systemPromptAppend === true;
+
+  /**
+   * The memory tools for one run, or nothing.
+   *
+   * Nothing for a provider that cannot take them, and nothing for an account
+   * that carries no bank — a server whose every call answers "no memory bank
+   * reaches this run" teaches the model the feature is broken rather than that
+   * it is not configured here.
+   *
+   * No credential is supplied. This process has no key manager and no window
+   * to authorise one, so `landing.credential` is left unset and core falls
+   * back to `git credential fill` — the container's ambient helper, or a
+   * deploy key on an ssh remote, which is exactly how `memoryBanks.ts` already
+   * pulls. See its header.
+   */
+  const memoryTools = (
+    input: RunInput,
+  ): Record<string, ReturnType<typeof memoryToolServer>> | undefined => {
+    try {
+      if (!takesHostTools(input.providerId) || !banks.reaches(input.profileId)) return undefined;
+      return {
+        [MEMORY_TOOL_SERVER]: memoryToolServer({
+          dataDir,
+          cliRegistryPath: registryPath(),
+          profileId: input.profileId,
+          cwd: input.cwd,
+          log: (line) => process.stderr.write(`memory banks: ${line}\n`),
+        }),
+      };
+    } catch (error) {
+      // A run starts without the tools rather than not at all: memory is an
+      // augmentation, and an augmentation that can fail a turn is a liability.
+      process.stderr.write(
+        `memory banks: could not build the memory tools: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return undefined;
+    }
+  };
+
+  /**
+   * This machine's memory-bank prompt for one run.
+   *
+   * Here and not on the client, because the prompt is about the machine the
+   * run executes on — the banks *this* container carries, at the paths they
+   * have here. The client's rendering would name its own slugs and a path on a
+   * laptop; the desktop keeps that built-in off the wire for exactly this
+   * reason. What the run contributes is which of them it may see (its
+   * account's scope), which slice of each it is shown (its project), whether
+   * the index is carried inline (its provider), and whether it can write
+   * through the memory tools or has to be taught the bank's CLI (its provider
+   * again — see {@link takesHostTools}, which decides both).
+   *
+   * Never throws: a bank that cannot be read is a run that starts without it.
+   */
+  const bankPrompt = (run: {
+    readonly providerId: string;
+    readonly profileId: string;
+    readonly cwd: string;
+  }): string | undefined => {
+    try {
+      return machineBankPrompt({
+        dataDir,
+        profileId: run.profileId,
+        cwd: run.cwd,
+        providerId: run.providerId,
+        toolsAvailable: takesHostTools(run.providerId),
+      });
+    } catch (error) {
+      process.stderr.write(
+        `memory banks: could not compose the prompt: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return undefined;
+    }
+  };
+
+  /**
+   * A run about to start, with this machine's banks folded into it.
+   *
+   * The whole-`RunInput` paths — the remote bridge and this server's own
+   * routines — go through here, which is the half that used to be missing:
+   * both started runs on a machine whose banks were installed for them and
+   * described to nobody. Three things happen, in this order, because the
+   * install has to be on disk before the provider reads the project's memory
+   * file at the start of the first turn:
+   *
+   *  1. the banks in scope are installed for this project, synchronously, and
+   *     a pull is scheduled in the background;
+   *  2. their prompt is appended, for a provider that can take an append —
+   *     after the caller's own standing instructions, never replacing them;
+   *  3. their checkouts are attached as readable directories, so a run whose
+   *     tool sandbox is rooted at `cwd` can still open the files the index
+   *     points at.
+   *
+   * A no-op returns the input by reference, so a server with no banks starts
+   * exactly the run it would have started before any of this existed.
+   */
+  const withMemoryBanks = (input: RunInput): RunInput => {
+    banks.prepare({ profileId: input.profileId, cwd: input.cwd });
+    const withPrompt = canAppend(input.providerId)
+      ? withSystemPromptAppended(input, bankPrompt(input))
+      : input;
+    const directories = mergeBankDirectories(
+      input.additionalDirectories,
+      banks.directoriesFor(input.profileId),
+    );
+    return directories === input.additionalDirectories
+      ? withPrompt
+      : { ...withPrompt, additionalDirectories: directories };
+  };
+
   const runSource: RunSource = {
     startRun: (input) => {
       const permissionMode = clampMode(input.providerId as ProviderId, input.permissionMode);
+      /*
+       * The banks this account carries, installed for this project before the
+       * run starts — see `withMemoryBanks`, which does the same for the two
+       * paths that carry a whole `RunInput`. This one cannot: a completions
+       * caller may not choose a tool set or a directory, so the bank
+       * checkouts are not attached here and the prompt is the only thing the
+       * run gets. A Claude harness loads the installed index itself.
+       */
+      banks.prepare({ profileId: input.profileId, cwd: input.cwd });
+
+      /*
+       * What the run is told, on top of the serving provider's preset: the
+       * client's own standing instructions (the route has already set the
+       * field aside for a provider that cannot append), then this machine's
+       * memory-bank prompt, scoped to the account the turn bills.
+       *
+       * The wire and the adapter both refuse a replacement, so an append is
+       * the only shape that reaches here.
+       */
+      const instructions = canAppend(input.providerId)
+        ? joinSystemPromptAppends(input.systemPrompt, bankPrompt(input))
+        : undefined;
       return runs.start({
         providerId: input.providerId as ProviderId,
         profileId: input.profileId as ProfileId,
@@ -366,7 +715,20 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
         ...(input.resumeSessionId === undefined
           ? {}
           : { resumeSessionId: input.resumeSessionId as never }),
+        // The caller's own conversation being reshaped — see the completions
+        // route, which has already checked the account can honour them.
+        ...(input.forkSession === undefined ? {} : { forkSession: input.forkSession }),
+        ...(input.rewindToMessageId === undefined
+          ? {}
+          : { rewindToMessageId: input.rewindToMessageId as never }),
         ...(permissionMode === undefined ? {} : { permissionMode: permissionMode as never }),
+        ...(instructions === undefined
+          ? {}
+          : { systemPrompt: { kind: 'append', text: instructions } as const }),
+        // Already read and bounded by the route. The registry refuses them once
+        // more against this account's own `imageInput` and `fileInput`, which
+        // is the check that knows which provider is behind the route.
+        ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
       } as never);
     },
     subscribe: (listener) => runs.subscribe(listener),
@@ -380,10 +742,46 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
       await runs.dispose(runId as RunId);
     },
 
-    // The observation surface (ADR 0004). No `liveWork`: the headless host
-    // keeps no background-work ledger, and the route's contract makes the
-    // empty answer it degrades to an honest one.
+    // The observation surface (ADR 0004).
     listRuns: async (query) => runs.list(query.cwd),
+    /*
+     * Conversations still working, the same three sets the desktop's engine
+     * answers, from the same two sources: the registry for open turns, and
+     * each adapter's own ledger for the work that outlives one — a
+     * backgrounded subagent, a workflow, a registered schedule.
+     *
+     * This used to be absent, on the reasoning that the headless host keeps
+     * no ledger of its own. It never needed one: the Claude adapter holds the
+     * ledger, exactly as it does under the desktop, and the answer was one
+     * call away. Without it a client — a remote window, or a desktop driving
+     * a served account — was told nothing was working on this machine, so a
+     * conversation with a subagent twenty minutes into its task read as
+     * finished the moment its turn ended. `delegated` is what lets that
+     * client redraw the rows after a reload or a sleep.
+     */
+    liveWork: async () => {
+      const holding = new Set<string>();
+      const working = new Set<string>();
+      for (const handle of runs.list()) {
+        if (handle.status !== 'ended' && handle.sessionId !== undefined) {
+          holding.add(String(handle.sessionId));
+          working.add(String(handle.sessionId));
+        }
+      }
+      const delegated = new Map<string, SessionDelegatedWork>();
+      for (const adapter of providers.list()) {
+        for (const sessionId of adapter.sessionsHoldingWork?.() ?? []) holding.add(String(sessionId));
+        // An adapter without the split falls back to its retention set — the
+        // conservative reading, and the desktop engine's.
+        for (const sessionId of adapter.sessionsWorking?.() ?? adapter.sessionsHoldingWork?.() ?? []) {
+          working.add(String(sessionId));
+        }
+        for (const entry of adapter.delegatedWork?.() ?? []) {
+          if (!delegated.has(String(entry.sessionId))) delegated.set(String(entry.sessionId), entry);
+        }
+      }
+      return { sessionIds: [...holding], working: [...working], delegated: [...delegated.values()] };
+    },
     getRun: async (runId) => runs.get(runId as RunId),
     runEvents: async (query) => {
       const after = query.afterSeq ?? -1;
@@ -397,8 +795,10 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
 
     // The control surface. `startUserRun` takes the whole RunInput — the
     // routes have already enforced the token's scope, and the registry
-    // enforces capabilities exactly as it does for a window.
-    startUserRun: (input) => runs.start(input),
+    // enforces capabilities exactly as it does for a window. The banks go in
+    // here rather than in the routes, so every bridge-started run gets them
+    // whatever route started it.
+    startUserRun: (input) => runs.start(withMemoryBanks(input)),
     send: async (runId, text, attachments) => {
       const outcome = await runs.send(runId as RunId, text, attachments);
       return { deliveredImmediately: outcome.deliveredImmediately };
@@ -406,6 +806,30 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
     interruptRun: (runId) => runs.interrupt(runId as RunId),
     stopTask: (runId, taskId) => runs.stopTask(runId as RunId, taskId),
   };
+
+  /*
+   * The server's own routines: appointments that fire here, on schedule, with
+   * no client attached. Started through `startUserRun` — a routine is the
+   * connection owner's own scheduled work, so it runs with the whole
+   * `RunInput` (metadata and mode and all), the same entry point the remote
+   * bridge uses — and pinned to the connection's directory, resolved afresh on
+   * every firing exactly as a completion's is. Its scheduler is begun by the
+   * `serve` command after the port is bound and stopped by {@link dispose}.
+   *
+   * Through `withMemoryBanks` for the same reason the bridge is: a firing is
+   * the most unattended run this process starts, and the one most in need of
+   * the standing knowledge the banks hold.
+   */
+  const routines = createServerRoutineStore({
+    dataDir,
+    runs: {
+      start: (input) => runs.start(withMemoryBanks(input)),
+      subscribe: (listener) => runs.subscribe(listener),
+    },
+    workspaces,
+    catalogue,
+    connections,
+  });
 
   /*
    * Interrupt-on-disconnect, and the attribution record in one wiring: a
@@ -469,6 +893,10 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
         runId: query.runId as never,
         env: await envFor(query.profileId as ProfileId, profile.providerId),
         ...(query.cwd === undefined ? {} : { cwd: query.cwd }),
+        // The page the route was asked for, in the adapter's own unit — the
+        // same stored messages `countSessionMessages` answers in.
+        ...(query.limit === undefined ? {} : { limit: query.limit }),
+        ...(query.offset === undefined ? {} : { offset: query.offset }),
       });
     },
     /*
@@ -532,12 +960,24 @@ export function createHeadlessHost(dataDir: string): HeadlessHost {
     runSource,
     sessionSource,
     usageSource,
+    commandSource,
+    routines,
     profileAdmin,
+    memoryBankAdmin: {
+      // Synchronous underneath — the registry is one small file — and promised
+      // here because the seam is shaped for a host whose store is not.
+      list: () => Promise.resolve(banks.list()),
+      setScope: (slug: string, scope: ServerMemoryBankScope) =>
+        Promise.resolve(banks.setScope(slug, scope)),
+    },
     feed,
     guard,
     recordAccess: (event) => accessLog.record(event),
     dispose: async () => {
       guard.dispose();
+      // Before the registry: a firing in flight would otherwise be torn out
+      // from under its own history row on the way down.
+      await routines.dispose();
       await runs.disposeAll();
       await ledger.flush();
       await workspaces.disposeAll();

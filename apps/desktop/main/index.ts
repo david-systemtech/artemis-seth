@@ -27,9 +27,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, session } from 'electron';
 
-import { IPC_PUSH, PREFS_READ_CHANNEL, PREFS_WRITE_CHANNEL } from '@rx-artemis/protocol';
+import {
+  IPC_PUSH,
+  PREFS_READ_CHANNEL,
+  PREFS_WRITE_CHANNEL,
+  SUGGESTED_TASK_SERVER,
+} from '@rx-artemis/protocol';
 
-import { profilesRoot } from '@rx-artemis/core';
+import { MEMORY_TOOL_SERVER, memoryToolServer, profilesRoot } from '@rx-artemis/core';
 
 import { APP_NAME, flavouredAppName, previousUserDataDir } from './appNames.js';
 import { configurePrefs, readPrefsSync, writePrefs } from './prefs.js';
@@ -66,6 +71,8 @@ import {
   browserToolServer,
   externalBrowserToolServer,
 } from './browserTools.js';
+import { suggestedTaskToolServer } from './taskTools.js';
+import { banksForRun, isMasterEnabled, memoryToolServerOptions } from './memoryBanks.js';
 import { createServerHost, type ServerHost } from './server.js';
 import { createRoutineHost, type RoutineHost } from './routines.js';
 import { createTerminalHost, type TerminalHost } from './terminal.js';
@@ -205,6 +212,7 @@ const devServerUrl = process.env['ELECTRON_RENDERER_URL'] ?? null;
 
 let ipcLayer: IpcLayer | null = null;
 let stopEventForwarding: (() => void) | null = null;
+let stopAskNotifying: (() => void) | null = null;
 let stopSuggestionForwarding: (() => void) | null = null;
 let stopTerminalForwarding: (() => void) | null = null;
 let stopBrowserForwarding: (() => void) | null = null;
@@ -426,32 +434,64 @@ async function bootstrap(): Promise<void> {
     appVersion: app.getVersion(),
     ...(sdkExecutablePath === undefined ? {} : { sdkExecutablePath }),
     /*
-     * The agent's browser tools, built per run.
+     * The agent's own tools, built per run.
      *
      * This is the composition root doing the one thing only it can: `core` is
      * forbidden from importing Electron, and a tool that drives a
      * `WebContentsView` is Electron all the way down. So the factory is handed
      * across the wall here, closing over the host that owns the views.
      */
-    agentToolServers: (runId, input) =>
+    agentToolServers: (runId, input) => {
       /*
-       * Which browser the agent gets is the run input's call — see the
-       * decision table on `agentBrowserServers`. The builders are lazy so a
-       * run that gets the Chrome bridge (or the external opener) never
-       * constructs the embedded server it will not use.
+       * The memory tools, when there is something for them to reach.
+       *
+       * Two gates, and they are the same two the prompt's built-in answers to:
+       * the user has switched the banks on for Artemis, and this run's account
+       * carries at least one. A run that fails either gets no server at all
+       * rather than an empty one — a tool the model can call and be told "no
+       * bank reaches this run" teaches it the feature is broken.
+       *
+       * Everything the server needs beyond the run itself comes from
+       * `memoryBanks.ts`, which owns the locations and the credentials; this
+       * root supplies only what only a run knows.
        */
-      agentBrowserServers(input, {
-        embedded: () =>
-          browserToolServer(runId, {
-            ensure: (run, url) => browsers.openForAgent(run, url),
-            current: (run) => browsers.agentBrowserFor(run),
-            host: browsers,
-          }),
-        // The same guarded door every other external open goes through: the
-        // tool has already vetted the scheme, and this vets it again on the
-        // way out because model output does not get a second-chance rule.
-        external: () => externalBrowserToolServer((url) => openExternalSafely(url)),
-      }),
+      const memory =
+        isMasterEnabled() && banksForRun(input.profileId).length > 0
+          ? memoryToolServerOptions(input)
+          : null;
+
+      return {
+        /*
+         * Which browser the agent gets is the run input's call — see the
+         * decision table on `agentBrowserServers`. The builders are lazy so a
+         * run that gets the Chrome bridge (or the external opener) never
+         * constructs the embedded server it will not use. It answers
+         * `undefined` for the Chrome case, which spreads to nothing.
+         */
+        ...agentBrowserServers(input, {
+          embedded: () =>
+            browserToolServer(runId, {
+              ensure: (run, url) => browsers.openForAgent(run, url),
+              current: (run) => browsers.agentBrowserFor(run),
+              host: browsers,
+            }),
+          // The same guarded door every other external open goes through: the
+          // tool has already vetted the scheme, and this vets it again on the
+          // way out because model output does not get a second-chance rule.
+          external: () => externalBrowserToolServer((url) => openExternalSafely(url)),
+        }),
+        /*
+         * Suggested tasks, on every run and under no preference.
+         *
+         * Nothing about it depends on the input: it opens no surface, spends no
+         * quota and cannot act, so there is no arrangement of a run in which
+         * offering it would be wrong. The only thing that turns it off is a
+         * provider that cannot take host tools at all, which never reaches here.
+         */
+        [SUGGESTED_TASK_SERVER]: suggestedTaskToolServer(),
+        ...(memory === null ? {} : { [MEMORY_TOOL_SERVER]: memoryToolServer(memory) }),
+      };
+    },
   });
 
   // The updater exists before the IPC layer because the layer's handlers
@@ -527,6 +567,26 @@ async function bootstrap(): Promise<void> {
   });
   stopEventForwarding = forwardAgentEvents(engineHost);
   stopSuggestionForwarding = forwardRunSuggestions(engineHost);
+  /*
+   * A question the agent stops to ask waits for the person it was asked of —
+   * the server no longer answers on their behalf after a quarter of an hour
+   * (see `server/runs.ts`) — so the person has to find out it is waiting. The
+   * pane pins the card and the sidebar marks the session, but both are only
+   * visible to someone looking at Artemis. When no window is focused, an OS
+   * notification says so once per question; when one is, the card in the
+   * pane is the notification, and a system toast over it would be noise.
+   */
+  stopAskNotifying = engineHost.ready
+    ? engineHost.require().subscribe((event) => {
+        if (event.type !== 'permission.request') return;
+        if (BrowserWindow.getFocusedWindow() !== null) return;
+        if (!Notification.isSupported()) return;
+        new Notification({
+          title: 'Waiting for your answer',
+          body: 'An agent stopped to ask you something. It will wait until you answer.',
+        }).show();
+      })
+    : null;
   stopTerminalForwarding = forwardTerminalEvents(terminals);
   stopBrowserForwarding = forwardBrowserEvents(browsers);
   // Reads every profile's plan limits on a timer, so the profile menu can say
@@ -623,6 +683,7 @@ app.on('before-quit', (event) => {
   // adapter make the app unquittable.
   event.preventDefault();
   stopEventForwarding?.();
+  stopAskNotifying?.();
   // Local ends of any loopback sign-ins: plain HTTP servers on fixed ports,
   // exactly the kind of thing that must not outlive the app that opened them.
   stopAllSignInForwarders();

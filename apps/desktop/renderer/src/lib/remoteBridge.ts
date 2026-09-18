@@ -46,6 +46,7 @@ import type {
   ProviderEffortOption,
   ProviderModelOption,
   RemoteGapPayload,
+  RemoteHelloPayload,
   RunsListResponse,
   ServerConnectionInfo,
   ServerErrorBody,
@@ -74,6 +75,7 @@ import {
   REMOTE_EVENTS_PATH,
   REMOTE_LIVE_WORK_PATH,
   REMOTE_RUNS_PATH,
+  REMOTE_STREAM_EPOCH_PARAM,
   REMOTE_STREAM_GAP,
   REMOTE_STREAM_HELLO,
   REMOTE_TERMINALS_PATH,
@@ -111,6 +113,28 @@ const DIALOG_REASON =
 /* The bridge                                                                 */
 /* -------------------------------------------------------------------------- */
 
+
+/**
+ * How many of the server's heartbeats a stream may miss before it is dead.
+ *
+ * One missed heartbeat is a busy network; three in a row is a socket nobody is
+ * on the other end of. Generous on purpose — the cost of waiting is a window a
+ * few seconds late, the cost of being hasty is a reconnect storm on a slow link.
+ */
+const SILENCE_HEARTBEATS = 3;
+
+/**
+ * The silence limit until a hello names the server's heartbeat: three of its
+ * default fifteen seconds. Also what a server older than `heartbeatMs` gets.
+ */
+const DEFAULT_SILENCE_LIMIT_MS = 45_000;
+
+/**
+ * A floor under the derived limit, so a server configured with a very short
+ * heartbeat cannot turn every quiet moment into a reconnect.
+ */
+const MIN_SILENCE_LIMIT_MS = 10_000;
+
 /**
  * Build the bridge for one configured connection.
  *
@@ -129,6 +153,12 @@ export function createRemoteBridge(
      * to stop consuming its scripted responses.
      */
     readonly signal?: AbortSignal;
+    /**
+     * How long the event stream may be silent before it is taken for dead.
+     * Normally derived from the heartbeat the server's hello names; pinned by
+     * tests, and by a deployment that knows something about its network.
+     */
+    readonly silenceLimitMs?: number;
   } = {},
 ): ArtemisBridge {
   const origin = config.origin.replace(/\/+$/, '');
@@ -266,14 +296,66 @@ export function createRemoteBridge(
    * window closes.
    */
   let lastSeq: number | null = null;
+  /**
+   * Which feed {@link lastSeq} was counted by, once a hello has said.
+   *
+   * A feed's seqs start over with the process that serves it, so a cursor is
+   * only meaningful together with this. Sent back on reconnect, and compared
+   * against every hello — see `dispatch`.
+   */
+  let feedEpoch: string | null = null;
+  /** How much silence means a dead socket rather than a quiet stream. See `pump`. */
+  let silenceLimitMs = options.silenceLimitMs ?? DEFAULT_SILENCE_LIMIT_MS;
+  /**
+   * Set by `dispatch` when a restart shows on a server too old to have noticed
+   * it; `pump` then drops the connection so the next one carries the adopted
+   * cursor. See `dispatch` for why only that server.
+   */
+  let reconnectRequested = false;
 
   function dispatch(message: { id?: string; event?: string; data: string }): void {
     if (message.event === REMOTE_STREAM_HELLO) {
       try {
-        const hello = JSON.parse(message.data) as { seq?: number };
-        // Only when this window has no cursor yet: a reconnect keeps its own,
-        // which is behind the head by exactly the replay now arriving.
-        if (lastSeq === null && typeof hello.seq === 'number') lastSeq = hello.seq;
+        const hello = JSON.parse(message.data) as Partial<RemoteHelloPayload>;
+        /*
+         * A reconnect keeps its own cursor, which is behind the head by exactly
+         * the replay now arriving — *when both were counted by the same feed*.
+         * Seqs start over with the serving process, so across a restart the
+         * cursor names a count that no longer exists, and keeping it is what
+         * left a window deaf: the server skipped everything at or below the
+         * stale number, which on a fresh feed is everything.
+         *
+         * Two tells, either sufficient. The epoch is exact. The head standing
+         * *behind* the cursor is the same fact read off a server too old to
+         * name one: no feed's head is ever behind a number it handed out.
+         * Either way this hello's head is the only honest starting point, and
+         * what the old cursor promised is gone — which the renderer's stall
+         * sweep heals per run, exactly as it does for a reported gap.
+         */
+        const restarted =
+          lastSeq !== null &&
+          typeof hello.seq === 'number' &&
+          ((typeof hello.epoch === 'string' && feedEpoch !== null && hello.epoch !== feedEpoch) ||
+            hello.seq < lastSeq);
+        if (typeof hello.epoch === 'string') feedEpoch = hello.epoch;
+        if (typeof hello.seq === 'number' && (lastSeq === null || restarted)) lastSeq = hello.seq;
+        /*
+         * Adopting the head fixes this side only. A server that names its feed
+         * saw the stale cursor for what it was and streams from its own head,
+         * so this connection is already right. One too old to name a feed took
+         * that cursor as its own: it skips everything at or below it for as
+         * long as this connection lives, and its heartbeats keep the silence
+         * watchdog satisfied the whole time. Only a new connection carries the
+         * adopted head back to it.
+         */
+        if (restarted && typeof hello.epoch !== 'string') reconnectRequested = true;
+        if (
+          options.silenceLimitMs === undefined &&
+          typeof hello.heartbeatMs === 'number' &&
+          hello.heartbeatMs > 0
+        ) {
+          silenceLimitMs = Math.max(MIN_SILENCE_LIMIT_MS, hello.heartbeatMs * SILENCE_HEARTBEATS);
+        }
       } catch {
         // A malformed hello costs the cursor's starting point, nothing more.
       }
@@ -331,14 +413,43 @@ export function createRemoteBridge(
   async function pump(): Promise<void> {
     let failures = 0;
     while (!ended()) {
+      /*
+       * A socket that died without saying so reads as a quiet stream for ever:
+       * `reader.read()` neither resolves nor throws, the loop below never
+       * reaches its retry, and the window shows the last thing it heard until
+       * something else opens a connection. The server sends a heartbeat
+       * comment on a quiet stream precisely so that silence can mean
+       * something; this is the other half — several heartbeats of nothing
+       * aborts the connection, and the ordinary reconnect takes it from there.
+       * The clock covers the connect as well: a request that never answers is
+       * the same failure one step earlier.
+       */
+      const connection = new AbortController();
+      let silence: ReturnType<typeof setTimeout> | undefined;
+      const abortConnection = (): void => {
+        if (silence !== undefined) clearTimeout(silence);
+        connection.abort();
+      };
+      options.signal?.addEventListener('abort', abortConnection, { once: true });
+      const heard = (): void => {
+        if (silence !== undefined) clearTimeout(silence);
+        silence = setTimeout(abortConnection, silenceLimitMs);
+      };
       try {
-        const response = await fetch(`${origin}${REMOTE_EVENTS_PATH}`, {
+        reconnectRequested = false;
+        heard();
+        // Only alongside a cursor: the epoch says whose count that number is.
+        const resume =
+          lastSeq !== null && feedEpoch !== null
+            ? `?${REMOTE_STREAM_EPOCH_PARAM}=${encodeURIComponent(feedEpoch)}`
+            : '';
+        const response = await fetch(`${origin}${REMOTE_EVENTS_PATH}${resume}`, {
           headers: {
             authorization,
             accept: 'text/event-stream',
             ...(lastSeq === null ? {} : { 'last-event-id': String(lastSeq) }),
           },
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
+          signal: connection.signal,
         });
         if (!response.ok || response.body === null) {
           throw new Error(`the event stream answered ${String(response.status)}`);
@@ -353,9 +464,21 @@ export function createRemoteBridge(
           for (const message of decoder.feed(text.decode(value, { stream: true }))) {
             dispatch(message);
           }
+          // Any bytes count, a heartbeat comment included — that is its job.
+          // After the dispatch, so that a hello naming a slower heartbeat
+          // starts the clock it asks for rather than the one it replaced.
+          heard();
+          if (reconnectRequested) {
+            reconnectRequested = false;
+            abortConnection();
+            break;
+          }
         }
       } catch {
         // Fall through to the retry below; the cursor survives.
+      } finally {
+        if (silence !== undefined) clearTimeout(silence);
+        options.signal?.removeEventListener('abort', abortConnection);
       }
       if (ended()) break;
       failures += 1;
@@ -774,6 +897,12 @@ export function createRemoteBridge(
         const segments = request.path.split('/').filter((part) => part.length > 0);
         return ok({ path: request.path, name: segments.at(-1) ?? request.path });
       },
+      // The repository is on the serving machine and `git` would have to run
+      // there. Refusing is the honest answer and the one the chip's menu can
+      // show as a reason; a worktree made on *this* machine would be a
+      // directory the run can never reach.
+      createWorktree: async () =>
+        absent('Worktrees are made on the serving machine, which this connection cannot reach.'),
     },
 
     sharedConfig: {
@@ -806,6 +935,11 @@ export function createRemoteBridge(
       sync: async () => absent(LOCAL_SETTINGS_REASON),
       retire: async () => absent(LOCAL_SETTINGS_REASON),
       setEnabled: async () => absent(LOCAL_SETTINGS_REASON),
+      setProfiles: async () => absent(LOCAL_SETTINGS_REASON),
+      // Stock Claude Code's wiring is files in the serving machine's profile
+      // directories, written by a CLI that lives in a bank on that machine.
+      // Nothing about it is reachable from here.
+      wireClaudeCode: async () => absent(LOCAL_SETTINGS_REASON),
       forget: async () => absent(LOCAL_SETTINGS_REASON),
       setMasterEnabled: async () => absent(LOCAL_SETTINGS_REASON),
     },
@@ -843,6 +977,17 @@ export function createRemoteBridge(
         absent('Standing instructions are composed on the serving machine, where runs start.'),
       save: async () =>
         absent('Standing instructions are composed on the serving machine, where runs start.'),
+    },
+
+    // A skill is a folder on the machine a run executes on, and which of them
+    // are always on is that machine's own setting. A window onto another
+    // machine shows that machine's Settings for it, not a copy kept here.
+    skills: {
+      list: async () => absent('Skills are read on the serving machine, where runs start.'),
+      save: async () => absent('Skills are read on the serving machine, where runs start.'),
+      addSource: async () => absent('Skills are read on the serving machine, where runs start.'),
+      removeSource: async () => absent('Skills are read on the serving machine, where runs start.'),
+      syncSources: async () => absent('Skills are read on the serving machine, where runs start.'),
     },
 
     preview: {
@@ -971,6 +1116,25 @@ export function createRemoteBridge(
       signInStatus: async () => absent(SERVER_ACCOUNTS_REASON),
       submitCode: async () => absent(SERVER_ACCOUNTS_REASON),
       cancelSignIn: async () => absent(SERVER_ACCOUNTS_REASON),
+    },
+
+    // And the banks on such a server, for the same reason: `profileId` names a
+    // local Artemis-Server profile, and a remote window has none.
+    serverMemoryBanks: {
+      list: async () => absent(SERVER_ACCOUNTS_REASON),
+      setProfiles: async () => absent(SERVER_ACCOUNTS_REASON),
+    },
+
+    // Managing a *third* server's routines from inside a remote window is a
+    // machine-to-machine hop this bridge does not make — the same rule that
+    // makes `serverAccounts` absent here. A remote window drives its own host,
+    // not the servers that host points at.
+    serverRoutines: {
+      list: async () => absent(SERVER_ACCOUNTS_REASON),
+      create: async () => absent(SERVER_ACCOUNTS_REASON),
+      update: async () => absent(SERVER_ACCOUNTS_REASON),
+      delete: async () => absent(SERVER_ACCOUNTS_REASON),
+      runNow: async () => absent(SERVER_ACCOUNTS_REASON),
     },
 
     /*

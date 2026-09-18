@@ -2,9 +2,14 @@
  * What the first frame opens as.
  *
  * `launch()` is the seam between the flags, the remembered preferences and
- * the settings a conversation starts with. It reads two files and spawns
- * nothing, so it can be driven against a temporary data directory holding
- * one account.
+ * the settings a conversation starts with. It reads a few small files —
+ * accounts, what was last chosen, what was last typed — and spawns nothing,
+ * so it can be driven against a temporary data directory holding one account.
+ *
+ * Every file it reads is under a temporary root here, the prompt history and
+ * the snippets included: both are real files in a real state directory, and a
+ * test that reached the developer's own would be reading their prompts and
+ * could write over their templates.
  */
 
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -23,6 +28,8 @@ let stateDir: string;
 let cacheDir: string;
 let cwd: string;
 const opened: Launched[] = [];
+/** Put back after the one test that sets it; the whole file runs in one process. */
+const savedStateDirEnv = process.env['ARTEMIS_TUI_STATE_DIR'];
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'artemis-launch-'));
@@ -44,6 +51,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   for (const launched of opened.splice(0)) await launched.host.dispose();
+  if (savedStateDirEnv === undefined) delete process.env['ARTEMIS_TUI_STATE_DIR'];
+  else process.env['ARTEMIS_TUI_STATE_DIR'] = savedStateDirEnv;
   await rm(root, { recursive: true, force: true });
 });
 
@@ -56,6 +65,21 @@ async function open(extra: Record<string, unknown>): Promise<Launched> {
 
 async function remember(preferences: unknown): Promise<void> {
   await writeFile(join(stateDir, 'preferences.json'), JSON.stringify({ version: 1, preferences }));
+}
+
+/** A history file as a previous launch would have left it, in `dir`. */
+async function typed(dir: string, ...texts: readonly string[]): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  await writeFile(
+    join(dir, 'history.jsonl'),
+    texts.map((text, i) => `${JSON.stringify({ ts: i + 1, text, cwd })}\n`).join(''),
+  );
+}
+
+/** A snippets file as somebody would have left it, in `dir`. */
+async function saved(dir: string, ...snippets: readonly { readonly name: string; readonly body: string }[]): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, 'snippets.json'), JSON.stringify({ version: 1, snippets }));
 }
 
 describe('launch', () => {
@@ -94,5 +118,52 @@ describe('launch', () => {
     expect(settings.fastMode).toBeUndefined();
     expect(settings.ultracode).toBeUndefined();
     expect(settings.effort).toBeUndefined();
+  });
+
+  it('opens carrying what was typed before, read from the state directory it was given', async () => {
+    await typed(stateDir, 'first prompt', 'second prompt');
+
+    const { history } = await open({});
+
+    // Newest first, which is the order the composer walks them in.
+    expect(history.size).toBe(2);
+    expect(history.recent({ kind: 'folder', cwd })).toEqual(['second prompt', 'first prompt']);
+  });
+
+  it('takes the history and the snippets from ARTEMIS_TUI_STATE_DIR when no state directory is named', async () => {
+    // The override `tuiStateDir` honours has to move everything the state
+    // directory holds along with the preferences, or a temporary state
+    // directory is not temporary.
+    const elsewhere = join(root, 'elsewhere');
+    await typed(elsewhere, 'typed under the override');
+    await saved(elsewhere, { name: 'under-the-override', body: 'saved elsewhere' });
+    process.env['ARTEMIS_TUI_STATE_DIR'] = elsewhere;
+
+    const result = await launch({ dataDir, cwd, cacheDir, profile: 'Work' });
+    if (!result.ok) throw new Error(result.error);
+    opened.push(result.launched);
+
+    expect(result.launched.history.recent({ kind: 'all' })).toEqual(['typed under the override']);
+    expect(result.launched.snippets.list().map((snippet) => snippet.name)).toEqual(['under-the-override']);
+  });
+
+  it('opens on an empty history when nothing has been typed here yet', async () => {
+    expect((await open({})).history.size).toBe(0);
+  });
+
+  it('opens carrying the saved snippets, read from the state directory it was given', async () => {
+    // Read at launch for the reason the history is: `;;` and `/snip` are
+    // keystrokes, and neither is allowed to wait on a disk.
+    await saved(stateDir, { name: 'review-diff', body: 'Review the diff against ${1:main}.' }, { name: 'explain', body: 'Explain @$1.' });
+
+    const { snippets } = await open({});
+
+    // Alphabetical, which is the order the menu and the file are in.
+    expect(snippets.list().map((snippet) => snippet.name)).toEqual(['explain', 'review-diff']);
+    expect(snippets.get('explain')?.body).toBe('Explain @$1.');
+  });
+
+  it('opens on no snippets when nothing has been saved, rather than failing', async () => {
+    expect((await open({})).snippets.list()).toEqual([]);
   });
 });

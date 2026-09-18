@@ -2,12 +2,16 @@
  * The standing prompts — the rule half of the Instructions pane.
  * ============================================================================
  *
- * No longer a pane of its own: `InstructionsSection` composes these groups
- * above the memory banks, on the argument the old nav made from a distance —
- * a prompt library is the general case of "what the agent is told before the
- * conversation starts", and the banks are its best-known instance. The file
- * keeps its name because the section id `agents` is a frozen address, and the
- * file answering for an address is easier to find when it is named after it.
+ * No longer a pane of its own: `InstructionsSection` composes these groups,
+ * and the file keeps its name because the section id `agents` is a frozen
+ * address, and the file answering for an address is easier to find when it is
+ * named after it.
+ *
+ * The memory banks were composed under these groups for a while, on the
+ * argument that a prompt library is the general case of "what the agent is
+ * told before the conversation starts" and a bank is its best-known instance.
+ * They have their own pane again — a bank outgrew being a paragraph — and what
+ * is left of the adjacency here is one built-in row and the sentence under it.
  *
  * A prompt library and the rules for which accounts each prompt reaches. What
  * the user writes here is appended to the provider's own system prompt on every
@@ -115,6 +119,25 @@ function isEditableBuiltIn(prompt: AgentPrompt): boolean {
   return prompt.builtIn === 'builtin:cerebro';
 }
 
+/**
+ * The one built-in that does not answer to this pane's scope.
+ *
+ * The memory-banks prompt is rendered per run out of the banks the run's
+ * profile carries, so "which profiles does it reach" is already answered —
+ * under Memory banks, one bank at a time, by attaching each to every profile
+ * or to a chosen set. A second scope here would be a second answer to the same
+ * question, and the two would disagree the first time someone used both: a
+ * profile ticked here and carrying no bank gets a prompt about nothing, and a
+ * profile carrying a bank but unticked here gets the bank's directory with no
+ * word about what it is for.
+ */
+function scopedByBanks(prompt: AgentPrompt): boolean {
+  return prompt.builtIn === 'builtin:cerebro';
+}
+
+/** What the banks prompt says instead of a scope, in the row and in the editor. */
+const BANKS_SCOPE_LINE = 'Sent with every bank the run’s profile carries.';
+
 /** What a profile can be told, and why not when it cannot. */
 interface ScopeTarget {
   readonly profile: ProfileMetadata;
@@ -211,11 +234,32 @@ export function AgentPromptsGroups({
                 />
               ))}
             </div>
-            <div className="px-3 py-2.5">
+            <div className="flex flex-wrap items-center gap-2 px-3 py-2.5">
               <Button size="sm" variant="outline" onClick={addPrompt}>
                 <PlusIcon aria-hidden="true" />
                 New prompt
               </Button>
+              {/* One of Artemis's prompts the user removed can be met again.
+                  Offered here, beside "New prompt", because that is what it
+                  is: adding a prompt to the library, in its shipped state —
+                  not an undo of the removal, which took the user's edits to
+                  it along. Absent when nothing was removed, so a library that
+                  never touched a built-in reads exactly as it did. */}
+              {pane.dismissedBuiltIns.map((id) => (
+                <Button
+                  key={id}
+                  size="sm"
+                  variant="ghost"
+                  className="text-ink-faint"
+                  onClick={() => {
+                    pane.restoreBuiltIn(id);
+                    setSelectedId(id);
+                  }}
+                >
+                  <RotateCcwIcon aria-hidden="true" />
+                  Bring back “{BUILT_IN_AGENT_PROMPTS[id]?.name ?? id}”
+                </Button>
+              ))}
             </div>
           </SettingsGroup>
 
@@ -345,8 +389,10 @@ function PromptRow({
         <span className="text-2xs leading-snug text-ink-faint">
           {prompt.enabled
             ? unavailable
-              ? `On, but not sent — ${builtIn?.requires ?? 'its precondition'} is not true on this machine.`
-              : `Sent to ${describeScope(prompt.scope, targets)}.`
+              ? `On, but not sent — it needs ${builtIn?.requires ?? 'a precondition this machine does not meet'}.`
+              : scopedByBanks(prompt)
+                ? BANKS_SCOPE_LINE
+                : `Sent to ${describeScope(prompt.scope, targets)}.`
             : 'Off — kept, never sent.'}
         </span>
       </button>
@@ -395,6 +441,13 @@ function PromptEditor({
   };
 
   const remove = (): void => {
+    // A built-in is removed through the pane's own mutator, which also records
+    // the removal — filtering the row out alone would have it back on the next
+    // read. See `AgentPromptsDocument.dismissedBuiltIns`.
+    if (prompt.builtIn !== undefined) {
+      pane.removeBuiltIn(prompt.builtIn);
+      return;
+    }
     pane.setPrompts(pane.prompts.filter((p) => p.id !== prompt.id));
   };
 
@@ -426,12 +479,19 @@ function PromptEditor({
             )}{' '}
             It is only sent when {builtIn.requires}.
           </p>
-          {editableBuiltIn && overridden ? (
-            <Button size="sm" variant="outline" onClick={reset} className="shrink-0">
-              <RotateCcwIcon aria-hidden="true" />
-              Reset to Artemis's default
-            </Button>
-          ) : null}
+          <div className="flex shrink-0 items-center gap-1">
+            {editableBuiltIn && overridden ? (
+              <Button size="sm" variant="outline" onClick={reset}>
+                <RotateCcwIcon aria-hidden="true" />
+                Reset to Artemis's default
+              </Button>
+            ) : null}
+            <DeleteButton
+              name={prompt.name}
+              onConfirm={remove}
+              description="Artemis's text stays with Artemis, so nothing is lost: “Bring back” under the list puts it back in its shipped state. Any edits or narrowing you made to it go with the row. To stop sending it without removing it, turn it off instead."
+            />
+          </div>
         </div>
       ) : (
         <div className="flex items-end gap-2 px-3 py-2.5">
@@ -453,7 +513,8 @@ function PromptEditor({
       {unavailable ? (
         <p className="flex items-center gap-1.5 px-3 py-2.5 text-2xs leading-relaxed text-ink-faint">
           <StatusDot tone="amber" />
-          Not being sent right now — {builtIn?.requires} is not true on this machine.
+          Not being sent right now — it needs{' '}
+          {builtIn?.requires ?? 'a precondition this machine does not meet'}.
         </p>
       ) : null}
 
@@ -496,7 +557,19 @@ function PromptEditor({
         />
       </div>
 
-      <ScopePicker prompt={prompt} targets={targets} onChange={(scope) => patch({ scope })} />
+      {/*
+        One sentence where the picker would be, rather than a picker that is
+        disabled or simply absent. Absent would leave the one prompt in the
+        library with nothing under it saying who gets it, and disabled would
+        be this pane claiming to own an answer it does not hold.
+      */}
+      {scopedByBanks(prompt) ? (
+        <p className="px-3 py-2.5 text-2xs leading-relaxed text-ink-faint">
+          {BANKS_SCOPE_LINE} Attach banks to profiles under Memory banks.
+        </p>
+      ) : (
+        <ScopePicker prompt={prompt} targets={targets} onChange={(scope) => patch({ scope })} />
+      )}
     </SettingsGroup>
   );
 }
@@ -504,9 +577,12 @@ function PromptEditor({
 function DeleteButton({
   name,
   onConfirm,
+  description = 'The text goes with it, and nothing here keeps a copy. To stop sending a prompt without losing what it says, turn it off instead.',
 }: {
   readonly name: string;
   readonly onConfirm: () => void;
+  /** What deleting costs. The default is written for a prompt the user wrote. */
+  readonly description?: string;
 }): ReactElement {
   return (
     <AlertDialog>
@@ -518,10 +594,7 @@ function DeleteButton({
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>Delete “{name}”?</AlertDialogTitle>
-          <AlertDialogDescription>
-            The text goes with it, and nothing here keeps a copy. To stop sending a prompt without
-            losing what it says, turn it off instead.
-          </AlertDialogDescription>
+          <AlertDialogDescription>{description}</AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel>Keep it</AlertDialogCancel>

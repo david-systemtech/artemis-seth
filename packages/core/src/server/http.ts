@@ -60,20 +60,35 @@ import { timingSafeEqual } from 'node:crypto';
 import type { PlanUsage } from '@rx-artemis/protocol';
 import type {
   AgentEvent,
+  ArtemisChatExtensions,
+  Attachment,
+  Capabilities,
+  OpenAiChatChunk,
   OpenAiChatRequest,
   OpenAiModelList,
   ProviderId,
+  RunHandle,
   RunId,
   RunsInterruptResponse,
   RunsRespondPermissionResponse,
   RunsSendResponse,
   ServerHealthBody,
+  ServerMemoryBank,
+  ServerMemoryBankAccount,
+  ServerMemoryBankBody,
+  ServerMemoryBankScope,
+  ServerMemoryBanksBody,
   ServerModel,
   ServerModelsBody,
   ServerConnection,
+  ServerCommandsAccount,
+  ServerCommandsBody,
   ServerProfile,
   ServerProfileCreatedBody,
   ServerProfilesBody,
+  ServerRoutineBody,
+  ServerRoutineDeletedBody,
+  ServerRoutinesBody,
   ServerSessionDeletedBody,
   ServerUsageBody,
   ServerSessionMessagesBody,
@@ -81,16 +96,26 @@ import type {
   ServerSessionsBody,
   ServerSessionTaggedBody,
   ServerSessionSummary,
+  RoutineDraft,
+  RoutinePatch,
   SessionSummary,
 } from '@rx-artemis/protocol';
 import {
+  ATTACHMENT_WIRE_BYTES,
+  AttachmentError,
+  CHAT_EXTENSIONS_FIELD,
   SERVER_API_VERSION,
   SERVER_HEALTH_PATH,
   SERVER_HOST,
   SSE_DONE,
+  SSE_HEARTBEAT,
   connectionHasExpired,
   describeConnection,
+  isFileAttachment,
+  isImageAttachment,
+  mergeAttachments,
   parseModelRoute,
+  readAttachments,
   readChatExtensions,
   reviewParameters,
   sseEvent,
@@ -99,10 +124,17 @@ import {
 
 import type { Catalogue } from './catalogue.js';
 import {
+  attachmentsFromMessages,
   chatChunk,
   chatResponse,
+  promptFromMessages,
+  resumeTurn,
   runTurn,
+  steerTurn,
+  type ResumeRequest,
   type RunSource,
+  type SteerRequest,
+  type TurnEvent,
   type TurnResult,
 } from './completions.js';
 import { RunError } from '../sessions/errors.js';
@@ -110,6 +142,8 @@ import type { RemoteAccessEvent } from '../sessions/lifecycleLog.js';
 import type { PushFeed } from './feed.js';
 import type { RemoteRunGuard } from './guard.js';
 import { workspaceKeyFor, type LedgerScope, type SessionLedger } from './ledger.js';
+import type { ServerRoutineStore } from './routines.js';
+import { resolveResumeModel, type RouteRedirect } from './sessionHome.js';
 import { handleRemoteRequest, isRemotePath, type RemoteStreamOptions } from './remote.js';
 import { CORS_HEADERS, JSON_HEADERS, fail, ok } from './replies.js';
 import { createRunDirectory, reviewPermissionDecision, type RunDirectory } from './runs.js';
@@ -144,6 +178,18 @@ export interface ServerRequestInfo {
    * stream.
    */
   readonly body?: unknown;
+  /**
+   * The body was refused for its size before it was ever parsed.
+   *
+   * Carried as its own flag rather than left to be inferred from a missing
+   * `body`, because the two need different answers and for years got the same
+   * one: a body that is not JSON is a caller who sent the wrong thing, and a
+   * body that is too large is a caller who sent the right thing and too much of
+   * it. Both arrived here as `body: undefined` and were answered `400 The
+   * request body must be a JSON object`, which sent everyone who ever attached
+   * a screenshot to a served conversation looking for a bug in their JSON.
+   */
+  readonly bodyOversize?: boolean;
   /** Aborts when the client hangs up mid-turn. */
   readonly signal?: { readonly aborted: boolean };
 }
@@ -223,8 +269,19 @@ export interface ServerContext {
   readonly ledger?: SessionLedger;
   /** How to read each account's plan gauge. Absent answers 501. */
   readonly usage?: UsageSource;
+  /** How to enumerate an account's slash commands. Absent answers 501. */
+  readonly commands?: CommandSource;
   /** How to read stored sessions. Required alongside {@link ledger}. */
   readonly sessions?: SessionSource;
+  /**
+   * Routines that fire *in the server*, scoped per connection.
+   *
+   * Absent means this build keeps no server-side schedule and the routine
+   * routes answer `501` — a catalogue-only deployment, or a test that is not
+   * about routines. Present, it is the store the routes read and write, and its
+   * scheduler is the thing that fires an appointment with every client closed.
+   */
+  readonly routines?: ServerRoutineStore;
   /**
    * Host-header names this server answers to, besides the loopback set.
    *
@@ -297,6 +354,12 @@ export interface ServerContext {
   /** The one sign-in this server will drive at a time. See `signin.ts`. */
   readonly signIns?: SignInDirector;
   /**
+   * This machine's memory-bank registry, for the surface that scopes a bank to
+   * some of its accounts. Absent answers `501` to an administrator and `404`
+   * to everyone else, exactly as {@link profileAdmin} does.
+   */
+  readonly memoryBanks?: MemoryBankAdmin;
+  /**
    * Where a run that failed is recorded on the serving machine.
    *
    * Separate from a transport fault: this one *did* reach its caller, as a
@@ -330,6 +393,10 @@ export interface SessionSource {
     readonly sessionId: string;
     readonly runId: string;
     readonly cwd?: string;
+    /** Page size in stored messages; the whole conversation when absent. */
+    readonly limit?: number;
+    /** Page offset in stored messages. Defaults to 0. */
+    readonly offset?: number;
   }): Promise<{ readonly events: readonly AgentEvent[]; readonly hasMore: boolean }>;
   /**
    * Store a title against a session, exactly as a local rename would.
@@ -370,6 +437,52 @@ export interface UsageSource {
   read(query: {
     readonly profileIds: readonly string[];
   }): Promise<readonly { readonly profileId: string; readonly label: string; readonly usage: PlanUsage }[]>;
+}
+
+/**
+ * The host's slash-command reads: what a session on one account would offer.
+ *
+ * A method rather than a list, for the reason {@link UsageSource} is: the
+ * answer costs a provider control call per account — the CLI is opened and
+ * asked, never prompted — so the host decides what "fresh enough" means and
+ * answers from its own cache. `cwd` is the directory a turn on the asking
+ * connection would run in, when the connection has one; the host substitutes
+ * somewhere that exists when it does not. `undefined` marks a host that
+ * cannot enumerate commands at all, and the route answers 501.
+ *
+ * Resolves rather than rejects, on the contract `ProviderAdapter.listCommands`
+ * states: an account whose CLI is away answers an empty list.
+ */
+export interface CommandSource {
+  list(query: {
+    readonly profileId: string;
+    readonly providerId: string;
+    readonly cwd?: string;
+  }): Promise<readonly string[]>;
+}
+
+/**
+ * The serving machine's memory-bank registry, reduced to what the routes make
+ * of it: read every bank, and change which accounts one of them reaches.
+ *
+ * Deliberately not the whole of `memory-banks.json`. Adding, forgetting,
+ * cloning and pulling a bank are jobs for whoever administers the serving
+ * machine — they touch its disk and its git credentials — and none of them is
+ * what a remote client is missing. What it *is* missing is the one field the
+ * CLI registry has no room for and nothing on the wire could reach: the scope.
+ * So this seam is a read and one write.
+ */
+export interface MemoryBankAdmin {
+  /** Every bank in the registry, in registry order, scope included. */
+  list(): Promise<readonly ServerMemoryBank[]>;
+  /**
+   * Replace one bank's account scope and persist it.
+   *
+   * `undefined` when no bank has that slug, which the route turns into the
+   * same 404 an unknown account gets — said only to a caller who already holds
+   * the administrative grant.
+   */
+  setScope(slug: string, scope: ServerMemoryBankScope): Promise<ServerMemoryBank | undefined>;
 }
 
 /** True when this reply is written incrementally rather than as one body. */
@@ -416,6 +529,38 @@ const CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
 const MAX_BODY_BYTES = 1_000_000;
 
 /**
+ * The routes that may carry attachments, and so may be larger.
+ *
+ * A megabyte is not "far more than a conversation needs" once a conversation
+ * can include a screenshot: base64 adds a third to a payload that is already
+ * megabytes, so under the flat cap every real image was answered with `400 The
+ * request body must be a JSON object` — a message about JSON, for a body that
+ * was perfectly good JSON and merely large. Nothing in the reply said so, which
+ * is why this was read as "the server cannot take attachments" rather than as a
+ * limit.
+ *
+ * Listed rather than derived from the method, because the widening should be
+ * exactly as wide as the feature that needs it: these four routes hand their
+ * bodies to `readAttachments`, and every other route on this server keeps the
+ * cap it has always had.
+ */
+const ATTACHMENT_BODY_PATHS: readonly string[] = [
+  CHAT_COMPLETIONS_PATH,
+  `/api/${SERVER_API_VERSION}/runs`,
+];
+
+/** The cap for one request: the wide one only where attachments may ride. */
+function bodyCapFor(path: string): number {
+  const route = path.split('?')[0] ?? path;
+  const wide =
+    ATTACHMENT_BODY_PATHS.includes(route) ||
+    // `POST /api/v0/runs/{id}/messages` and the bridge's `/send`: the same
+    // attachments, into a run that is already going.
+    /^\/api\/[^/]+\/runs\/[^/]+\/(?:messages|send)$/.test(route);
+  return wide ? ATTACHMENT_WIRE_BYTES : MAX_BODY_BYTES;
+}
+
+/**
  * Answer one request.
  *
  * Never throws: a fault becomes a 500 with an error body, because a rejected
@@ -449,6 +594,30 @@ export async function handleServerRequest(
     return fail(400, 'invalid_request_error', 'invalid_url', 'The request path could not be parsed.');
   }
   const path = normalizePath(url.pathname);
+
+  /*
+   * Too large, answered before the route is even found.
+   *
+   * Ahead of authentication on purpose, and it gives nothing away: the socket
+   * layer has already refused to read the body, so there is nothing left to do
+   * with this request whoever sent it, and a caller who has to guess whether
+   * their token or their payload was the problem is a caller who will guess
+   * wrong. The cap named in the message is the one this route actually has,
+   * which is how a client learns that the wide one exists.
+   */
+  if (request.bodyOversize === true) {
+    const cap = bodyCapFor(path);
+    return fail(
+      413,
+      'invalid_request_error',
+      'payload_too_large',
+      `The request body is larger than this route accepts (${String(cap)} bytes). ${
+        cap === MAX_BODY_BYTES
+          ? 'Only the routes that start or steer a run carry attachments, and only they are given more room.'
+          : 'Attachments are sent base64-encoded, which adds a third to their size.'
+      }`,
+    );
+  }
 
   if (path === SERVER_HEALTH_PATH) {
     const health: ServerHealthBody = {
@@ -653,6 +822,21 @@ export async function handleServerRequest(
   }
 
   /*
+   * Which of this machine's memory banks reaches which of its accounts.
+   *
+   * Dispatched beside the account surface above, under the same grant and with
+   * the same enumeration-proof 404, because it is the same kind of act: a
+   * token deciding what the accounts on somebody else's machine may see. It
+   * owns `/memory-banks` and nothing else, so it cannot shadow the bridge or
+   * the account routes however this block is reordered. Above the read-only
+   * gate below because its write is a PATCH.
+   */
+  if (path === `${apiPrefix}/memory-banks` || path.startsWith(`${apiPrefix}/memory-banks/`)) {
+    const reply = await handleMemoryBankRoute(request, context, connection, path, method);
+    return { ...reply, connectionId: connection.id };
+  }
+
+  /*
    * The session mutations: rename, tag, delete.
    *
    * POST and DELETE, so they sit above the read-only gate below.
@@ -761,6 +945,20 @@ export async function handleServerRequest(
     }
   }
 
+  /*
+   * The routine surface: the whole of `/api/v0/routines`, dispatched here
+   * because it writes (POST, PATCH, DELETE) and would otherwise be refused by
+   * the read-only method gate below before its route was ever resolved. Its
+   * own GET is answered here too rather than falling through, so one block owns
+   * the scope rule the whole surface shares. Disjoint from every other
+   * prefix — `/runs`, `/profiles`, `/sessions` — so nothing above can shadow it
+   * and it can shadow nothing.
+   */
+  if (path === `${apiPrefix}/routines` || path.startsWith(`${apiPrefix}/routines/`)) {
+    const reply = await handleRoutinesRequest(request, context, connection, method, path, visibleProfiles);
+    return { ...reply, connectionId: connection.id };
+  }
+
   if (method !== 'GET' && method !== 'HEAD') {
     // 405 only for a route that genuinely exists and genuinely refuses the
     // verb. Anything else is a 404, because "wrong method" on a path this
@@ -863,6 +1061,70 @@ export async function handleServerRequest(
     return answer(body);
   }
 
+  /*
+   * The slash commands a session here would offer, asked before there is one.
+   *
+   * What a remote composer's menu is filled from. The serving machine's own
+   * skills and commands reach a served run through the same content bridge a
+   * local run gets, so the names in this list are the names that machine
+   * would honour — and a client holding the token learns them here rather
+   * than keeping a copy of every skill on its own disk. One reading per
+   * visible account, because a skill under one profile's directory reaches
+   * that account alone; the union is what a menu wants before a route is
+   * picked, and the per-account rows are what a person debugging a missing
+   * skill wants. `?profile=<slug|id>` narrows to one account.
+   */
+  if (path === `${apiPrefix}/commands`) {
+    if (context.commands === undefined) {
+      return fail(
+        501,
+        'invalid_request_error',
+        'not_implemented',
+        'This Artemis build cannot enumerate slash commands.',
+      );
+    }
+    const source = context.commands;
+    const wanted = url.searchParams.get('profile');
+    const profiles = (await visibleProfiles()).filter(
+      (profile) => wanted === null || profile.slug === wanted || String(profile.id) === wanted,
+    );
+    if (wanted !== null && profiles.length === 0) {
+      return fail(
+        404,
+        'invalid_request_error',
+        'profile_not_found',
+        `No account is served as "${wanted}". List them at ${apiPrefix}/profiles.`,
+      );
+    }
+    // Where a turn on this connection would run, when that is a real
+    // directory. A scratch workspace is made per session and there is no
+    // session here, so the host picks somewhere that exists instead.
+    const cwd = connection.workspace.kind === 'directory' ? connection.workspace.path : undefined;
+    const accounts: readonly ServerCommandsAccount[] = await Promise.all(
+      profiles.map(async (profile) => ({
+        profileId: profile.id,
+        profileSlug: profile.slug,
+        profileLabel: profile.label,
+        providerId: profile.provider.id,
+        // The seam's contract is that it resolves; a host that breaks it
+        // costs the reader one account's rows, not the whole menu.
+        commands: await source
+          .list({
+            profileId: String(profile.id),
+            providerId: profile.provider.id,
+            ...(cwd === undefined ? {} : { cwd }),
+          })
+          .catch((): readonly string[] => []),
+      })),
+    );
+    const body: ServerCommandsBody = {
+      object: 'artemis.commands',
+      commands: [...new Set(accounts.flatMap((account) => account.commands))],
+      accounts,
+    };
+    return answer(body);
+  }
+
   if (path === `${apiPrefix}/sessions`) {
     if (context.ledger === undefined || context.sessions === undefined) {
       return fail(
@@ -904,6 +1166,24 @@ export async function handleServerRequest(
     }
     const entry = context.ledger.get(sessionId);
     if (entry === undefined) return unknownSession();
+    /*
+     * The page the client asked for. A window attaching to a run in progress
+     * reads the turns *before* it as `limit: historyOffset` — see `RunHandle`
+     * — and until these were read the route answered the whole file under
+     * that ask, so the turn in progress was drawn once from the file and
+     * again from the run. Anything but a whole number is refused outright
+     * rather than read as "everything": a client that sent a limit meant one.
+     */
+    const limit = pageNumber(url.searchParams.get('limit'));
+    const offset = pageNumber(url.searchParams.get('offset'));
+    if (limit === 'invalid' || offset === 'invalid') {
+      return fail(
+        400,
+        'invalid_request_error',
+        'invalid_page',
+        '`limit` and `offset` must be whole numbers.',
+      );
+    }
     const replay = await context.sessions.messages({
       profileId: entry.profileId,
       sessionId,
@@ -911,6 +1191,8 @@ export async function handleServerRequest(
       // and the consumer re-stamps them into its own transcript anyway.
       runId: `server-replay:${sessionId}`,
       cwd: entry.cwd,
+      ...(limit === undefined ? {} : { limit }),
+      ...(offset === undefined ? {} : { offset }),
     });
     const body: ServerSessionMessagesBody = {
       object: 'artemis.session.messages',
@@ -932,6 +1214,21 @@ export async function handleServerRequest(
 }
 
 /**
+ * A page number off the query string: absent, a whole number, or junk.
+ *
+ * Three answers rather than two because the route has to tell "no page asked
+ * for" from "a page asked for badly". The first is the whole conversation, as
+ * the route has always answered; the second is refused, because a client that
+ * sent a limit meant one, and reading it as "everything" would hand back the
+ * exact over-read the parameter exists to prevent.
+ */
+function pageNumber(raw: string | null): number | undefined | 'invalid' {
+  if (raw === null) return undefined;
+  return /^\d+$/.test(raw) ? Number(raw) : 'invalid';
+}
+
+
+/**
  * The index: what this server is and where the rest of it is.
  *
  * Present because the first thing anyone does with a new local server is open
@@ -949,6 +1246,7 @@ export async function handleServerRequest(
 function indexBody(context: ServerContext, connection: ServerConnection): Record<string, unknown> {
   const apiPrefix = `/api/${SERVER_API_VERSION}`;
   const managesProfiles = connection.manageProfiles === true && context.profileAdmin !== undefined;
+  const managesBanks = connection.manageProfiles === true && context.memoryBanks !== undefined;
   return {
     object: 'artemis.server',
     version: context.version,
@@ -978,6 +1276,18 @@ function indexBody(context: ServerContext, connection: ServerConnection): Record
         path: `${apiPrefix}/models/{profile}/{model}`,
         description: 'One route, in full.',
       },
+      // Named only when this build has the seam — the index's rule is that
+      // every path on it actually answers.
+      ...(context.commands === undefined
+        ? []
+        : [
+            {
+              method: 'GET',
+              path: `${apiPrefix}/commands`,
+              description:
+                'The slash commands a session here would offer, the skills installed on this machine among them. Filter with ?profile=<slug>.',
+            },
+          ]),
       // The remote bridge surface, named only when this build serves it —
       // the index's rule is that every path on it actually answers.
       ...(context.runs?.listRuns === undefined
@@ -1016,6 +1326,21 @@ function indexBody(context: ServerContext, connection: ServerConnection): Record
               method: 'POST',
               path: `${apiPrefix}/profiles/{id}/signin/code`,
               description: 'Hand the code the user pasted to the login that is waiting for it.',
+            },
+          ]
+        : []),
+      ...(managesBanks
+        ? [
+            {
+              method: 'GET',
+              path: `${apiPrefix}/memory-banks`,
+              description:
+                "This machine's memory banks, and the accounts each reaches, with the accounts to choose from.",
+            },
+            {
+              method: 'PATCH',
+              path: `${apiPrefix}/memory-banks/{slug}`,
+              description: 'Choose which accounts one bank reaches, or all of them.',
             },
           ]
         : []),
@@ -1234,8 +1559,12 @@ export interface ArtemisServerOptions {
   readonly ledger?: SessionLedger;
   /** How to read stored sessions. Required alongside {@link ledger}. */
   readonly sessions?: SessionSource;
+  /** Routines that fire in the server. Absent answers 501. See {@link ServerContext.routines}. */
+  readonly routines?: ServerRoutineStore;
   /** How to read each account's plan gauge. Absent answers 501. */
   readonly usage?: UsageSource;
+  /** How to enumerate an account's slash commands. Absent answers 501. */
+  readonly commands?: CommandSource;
   /** See {@link ServerContext.allowedHosts}. */
   readonly allowedHosts?: readonly string[] | 'any';
   /** See {@link ServerContext.feed}. */
@@ -1274,6 +1603,12 @@ export interface ArtemisServerOptions {
   readonly signIns?: SignInDirector;
   /** How long an unfinished sign-in lives. See `signin.ts`. */
   readonly signInTimeoutMs?: number;
+  /**
+   * This machine's memory-bank registry. Omit for a deployment that carries no
+   * banks — the surface then answers `501` to an administrator and `404` to
+   * everyone else, exactly as {@link profileAdmin} does.
+   */
+  readonly memoryBanks?: MemoryBankAdmin;
   /**
    * Called once per answered request, so the UI can show that something is
    * talking — and so the connection that asked can have its `lastUsedAt`
@@ -1366,7 +1701,9 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
           ...(options.workspaces === undefined ? {} : { workspaces: options.workspaces }),
           ...(options.ledger === undefined ? {} : { ledger: options.ledger }),
           ...(options.sessions === undefined ? {} : { sessions: options.sessions }),
+          ...(options.routines === undefined ? {} : { routines: options.routines }),
           ...(options.usage === undefined ? {} : { usage: options.usage }),
+          ...(options.commands === undefined ? {} : { commands: options.commands }),
           ...(options.allowedHosts === undefined ? {} : { allowedHosts: options.allowedHosts }),
           ...(options.feed === undefined ? {} : { feed: options.feed }),
           ...(options.remoteStream === undefined ? {} : { remoteStream: options.remoteStream }),
@@ -1378,6 +1715,7 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
             : { onRemoteAccess: options.onRemoteAccess }),
           ...(profileAdmin === undefined ? {} : { profileAdmin }),
           ...(signIns === undefined ? {} : { signIns }),
+          ...(options.memoryBanks === undefined ? {} : { memoryBanks: options.memoryBanks }),
           // Same sink as a transport fault: a host that wanted one stream of
           // things-that-went-wrong should not have to subscribe twice, and the
           // notice is already a sentence naming the route it belongs to.
@@ -1446,15 +1784,32 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
    * the router answers `400` with a message, which is a better failure than a
    * parse exception with no route context.
    */
-  async function readJsonBody(request: IncomingMessage): Promise<{ body?: unknown }> {
+  async function readJsonBody(
+    request: IncomingMessage,
+  ): Promise<{ body?: unknown; bodyOversize?: boolean }> {
     if (request.method !== 'POST' && request.method !== 'PATCH') return {};
 
+    /*
+     * Per route, because only the routes that carry attachments have a reason
+     * to be large. `request.url` is a path here, read the same way the router
+     * will read it; a path so malformed that `URL` will not have it gets the
+     * narrow cap, and then the router's own `invalid_url`.
+     */
+    let cap = MAX_BODY_BYTES;
+    try {
+      cap = bodyCapFor(normalizePath(new URL(request.url ?? '/', 'http://localhost').pathname));
+    } catch {
+      // Left at the narrow cap.
+    }
     const chunks: Buffer[] = [];
     let size = 0;
     for await (const chunk of request) {
       const buffer = chunk as Buffer;
       size += buffer.length;
-      if (size > MAX_BODY_BYTES) return { body: undefined };
+      // Reading stops here and the router answers; the rest of the upload is
+      // abandoned, exactly as it was under the single flat cap. What changed is
+      // only what the caller is told about it — see `bodyOversize`.
+      if (size > cap) return { bodyOversize: true };
       chunks.push(buffer);
     }
 
@@ -1552,6 +1907,209 @@ function unknownSession(): ServerReply {
 }
 
 /* -------------------------------------------------------------------------- */
+/* The routine surface                                                        */
+/* -------------------------------------------------------------------------- */
+
+/** The routine equivalent of {@link unknownSession}: "not yours" reads as "not there". */
+function unknownRoutine(): ServerReply {
+  return fail(404, 'invalid_request_error', 'unknown_routine', 'No such routine for this connection.');
+}
+
+/** A string field a routine draft may carry, or `undefined` when absent. Wrong
+ * types and over-length strings are dropped — the store is the final gate on a
+ * routine's usability, and this only has to keep a client bug from becoming a
+ * type error. */
+function wireString(value: unknown, max: number): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value.length <= max ? value : undefined;
+}
+
+/** Read a routine draft off the wire. `cwd`, `scope` and `connectionId` are the
+ * server's to decide, so a draft that names them is read as if it had not. */
+function readWireRoutineDraft(value: unknown): { readonly value: RoutineDraft } | { readonly error: string } {
+  if (typeof value !== 'object' || value === null) {
+    return { error: 'The request body must be a JSON object.' };
+  }
+  const draft = (value as { draft?: unknown }).draft;
+  if (typeof draft !== 'object' || draft === null) {
+    return { error: '`draft` must be an object.' };
+  }
+  const record = draft as Record<string, unknown>;
+  const name = record['name'];
+  const instructions = record['instructions'];
+  const profileId = record['profileId'];
+  const providerId = record['providerId'];
+  if (typeof name !== 'string' || name.trim().length === 0 || name.length > 200) {
+    return { error: '`draft.name` must be a non-empty string of at most 200 characters.' };
+  }
+  if (typeof instructions !== 'string' || instructions.trim().length === 0 || instructions.length > 20_000) {
+    return { error: '`draft.instructions` must be a non-empty string of at most 20000 characters.' };
+  }
+  if (typeof profileId !== 'string' || profileId.length === 0) {
+    return { error: '`draft.profileId` names the account each firing bills.' };
+  }
+  if (typeof providerId !== 'string' || providerId.length === 0) {
+    return { error: '`draft.providerId` is required.' };
+  }
+  if (typeof record['schedule'] !== 'object' || record['schedule'] === null) {
+    return { error: '`draft.schedule` is required.' };
+  }
+  const model = wireString(record['model'], 200);
+  const effort = wireString(record['effort'], 100);
+  const permissionMode = wireString(record['permissionMode'], 40);
+  return {
+    value: {
+      name: name.trim(),
+      instructions,
+      profileId,
+      providerId: providerId as ProviderId,
+      schedule: record['schedule'] as RoutineDraft['schedule'],
+      ...(model === undefined ? {} : { model }),
+      ...(effort === undefined ? {} : { effort }),
+      ...(permissionMode === undefined
+        ? {}
+        : { permissionMode: permissionMode as RoutineDraft['permissionMode'] }),
+      ...(typeof record['paused'] === 'boolean' ? { paused: record['paused'] } : {}),
+    },
+  };
+}
+
+/** Read a routine edit off the wire. Only the fields a server routine will
+ * actually change are read; the rest are the routine's fixed identity. */
+function readWireRoutinePatch(value: unknown): { readonly value: RoutinePatch } | { readonly error: string } {
+  if (typeof value !== 'object' || value === null) {
+    return { error: 'The request body must be a JSON object.' };
+  }
+  const patch = (value as { patch?: unknown }).patch;
+  if (typeof patch !== 'object' || patch === null) {
+    return { error: '`patch` must be an object.' };
+  }
+  const record = patch as Record<string, unknown>;
+  const built: {
+    -readonly [K in keyof RoutinePatch]: RoutinePatch[K];
+  } = {};
+  const name = wireString(record['name'], 200);
+  if (name !== undefined) built.name = name;
+  if (typeof record['instructions'] === 'string' && record['instructions'].length <= 20_000) {
+    built.instructions = record['instructions'];
+  }
+  // Empty clears, exactly as the store's own merge reads it.
+  if (typeof record['model'] === 'string' && record['model'].length <= 200) built.model = record['model'];
+  if (typeof record['effort'] === 'string' && record['effort'].length <= 100) built.effort = record['effort'];
+  const permissionMode = wireString(record['permissionMode'], 40);
+  if (permissionMode !== undefined) {
+    built.permissionMode = permissionMode as RoutinePatch['permissionMode'];
+  }
+  if (typeof record['schedule'] === 'object' && record['schedule'] !== null) {
+    built.schedule = record['schedule'] as RoutinePatch['schedule'];
+  }
+  if (typeof record['paused'] === 'boolean') built.paused = record['paused'];
+  return { value: built };
+}
+
+/**
+ * The whole of `/api/v0/routines`, scoped by the connection's workspace key.
+ *
+ * The scope rule is the session surface's, applied to a different noun: a token
+ * touches exactly the routines whose `scope` matches its own pin, create stamps
+ * that pin, and every "not yours" answers like "not there". The store is the
+ * one that enforces it — this resolves the scope and the id and hands them
+ * over.
+ */
+async function handleRoutinesRequest(
+  request: ServerRequestInfo,
+  context: ServerContext,
+  connection: ServerConnection,
+  method: string,
+  path: string,
+  visibleProfiles: () => Promise<readonly ServerProfile[]>,
+): Promise<ServerReply> {
+  const apiPrefix = `/api/${SERVER_API_VERSION}`;
+  const store = context.routines;
+  if (store === undefined) {
+    return fail(
+      501,
+      'invalid_request_error',
+      'not_implemented',
+      'This Artemis build serves its catalogue but keeps no server-side routines.',
+    );
+  }
+  const scope = workspaceKeyFor(connection);
+
+  if (path === `${apiPrefix}/routines`) {
+    if (method === 'GET') {
+      const body: ServerRoutinesBody = { object: 'artemis.routines', routines: store.listFor(scope) };
+      return ok(body);
+    }
+    if (method === 'POST') {
+      const draft = readWireRoutineDraft(request.body);
+      if ('error' in draft) {
+        return fail(400, 'invalid_request_error', 'invalid_body', draft.error);
+      }
+      // The account each firing bills must be one this connection can see —
+      // otherwise a token could schedule work on an account it may not run,
+      // and enumerate the hidden ones by which ids are accepted.
+      const profiles = await visibleProfiles();
+      if (!profiles.some((profile) => String(profile.id) === draft.value.profileId)) {
+        return fail(404, 'invalid_request_error', 'unknown_profile', 'No such account for this connection.');
+      }
+      try {
+        const routine = await store.create({ draft: draft.value, connection });
+        const body: ServerRoutineBody = { object: 'artemis.routine', routine };
+        return ok(body);
+      } catch (error) {
+        return fail(
+          400,
+          'invalid_request_error',
+          'invalid_body',
+          error instanceof Error ? error.message : 'The routine could not be created.',
+        );
+      }
+    }
+    return fail(405, 'invalid_request_error', 'method_not_allowed', `${method} is not supported on ${path}.`);
+  }
+
+  const rest = path.slice(`${apiPrefix}/routines/`.length);
+  const isRunNow = method === 'POST' && rest.endsWith('/run-now');
+  const idText = isRunNow ? rest.slice(0, -'/run-now'.length) : rest;
+  // Anything with a further slash is a sub-route this surface does not have.
+  if (idText.length === 0 || idText.includes('/')) return unknownRoutine();
+  let id: string;
+  try {
+    id = decodeURIComponent(idText);
+  } catch {
+    return fail(400, 'invalid_request_error', 'invalid_url', 'The routine id could not be parsed.');
+  }
+  if (id.length === 0) return unknownRoutine();
+
+  if (isRunNow) {
+    const routine = await store.runNow(scope, id);
+    if (routine === undefined) return unknownRoutine();
+    const body: ServerRoutineBody = { object: 'artemis.routine', routine };
+    return ok(body);
+  }
+
+  if (method === 'PATCH') {
+    const patch = readWireRoutinePatch(request.body);
+    if ('error' in patch) {
+      return fail(400, 'invalid_request_error', 'invalid_body', patch.error);
+    }
+    const routine = await store.update(scope, id, patch.value);
+    if (routine === undefined) return unknownRoutine();
+    const body: ServerRoutineBody = { object: 'artemis.routine', routine };
+    return ok(body);
+  }
+
+  if (method === 'DELETE') {
+    const removed = await store.remove(scope, id);
+    if (!removed) return unknownRoutine();
+    const body: ServerRoutineDeletedBody = { object: 'artemis.routine.deleted', deleted: true };
+    return ok(body);
+  }
+
+  return fail(405, 'invalid_request_error', 'method_not_allowed', `${method} is not supported on ${path}.`);
+}
+
+/* -------------------------------------------------------------------------- */
 /* The completions surface's own run verbs                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -1565,10 +2123,19 @@ function unknownSession(): ServerReply {
  */
 const OWNED_RUN_ACTIONS = new Set(['messages', 'permission', 'interrupt']);
 
+/**
+ * The one `GET` on an owned run: `GET /api/v0/runs/{id}/stream?after=N`, the
+ * completions stream picked back up. A verb of this surface and not the
+ * bridge's, because what it replays is the *completions* translation of the
+ * run — OpenAI-shaped chunks — which only this surface speaks; the bridge's
+ * `events` replay hands back raw engine events to a window.
+ */
+const OWNED_RUN_STREAM = 'stream';
+
 /** One completions run, and what its own client asked of it. */
 interface OwnedRunAction {
   readonly runId: RunId;
-  readonly action: 'messages' | 'permission' | 'interrupt';
+  readonly action: 'messages' | 'permission' | 'interrupt' | 'stream';
   /**
    * The connection owns this run. False only for `messages` and `permission`,
    * which are refused rather than passed on; an unowned `interrupt` never
@@ -1599,7 +2166,7 @@ function ownedCompletionsRunAction(
   method: string,
   path: string,
 ): OwnedRunAction | undefined {
-  if (method !== 'POST') return undefined;
+  if (method !== 'POST' && method !== 'GET') return undefined;
   const prefix = `/api/${SERVER_API_VERSION}/runs/`;
   if (!path.startsWith(prefix)) return undefined;
 
@@ -1607,7 +2174,11 @@ function ownedCompletionsRunAction(
   const separator = rest.indexOf('/');
   if (separator <= 0) return undefined;
   const action = rest.slice(separator + 1);
-  if (!OWNED_RUN_ACTIONS.has(action)) return undefined;
+  // `stream` is the only GET here; every other GET under `/runs` is the
+  // bridge's, and every POST here is one of the three verbs.
+  if (method === 'GET' ? action !== OWNED_RUN_STREAM : !OWNED_RUN_ACTIONS.has(action)) {
+    return undefined;
+  }
 
   let runId: string;
   try {
@@ -1623,6 +2194,48 @@ function ownedCompletionsRunAction(
   const owned = context.runDirectory?.owns(connection.id, runId) === true;
   if (!owned && action === 'interrupt') return undefined;
   return { runId, action: action as OwnedRunAction['action'], owned };
+}
+
+/**
+ * Claim a run nobody owns for the connection whose conversation it is in.
+ *
+ * A run the provider started on its own — the turn it takes when a subagent
+ * settles — has no connection behind it, and until now no client could reach
+ * its stream: the route answered 404, the pane read idle, and the first thing
+ * that put the turn on screen was a message typed into it, which
+ * `steerLiveRun` claims on exactly these terms. The terms: the run is live,
+ * it names a session, and the caller's scope may access that session — which
+ * is what the resume gate checks before a completions request may continue
+ * it. Idempotent, and never for a run another connection holds: `claim`
+ * keeps the first owner, and the answer is read back rather than assumed.
+ *
+ * False for everything else, including a build with no ledger: a run without
+ * a conversation to be owned through stays exactly as unreachable as before.
+ */
+async function claimSessionRun(
+  context: ServerContext,
+  connection: ServerConnection,
+  runId: RunId,
+): Promise<boolean> {
+  const getRun = context.runs?.getRun;
+  const directory = context.runDirectory;
+  const ledger = context.ledger;
+  if (getRun === undefined || directory === undefined || ledger === undefined) return false;
+
+  let handle: RunHandle | undefined;
+  try {
+    handle = await getRun(runId);
+  } catch {
+    return false;
+  }
+  if (handle === undefined || handle.status === 'ended' || handle.sessionId === undefined) {
+    return false;
+  }
+  const profiles = visibleToConnection(connection, await context.catalogue.read({}));
+  if (!ledger.mayAccess(scopeFor(connection, profiles), String(handle.sessionId))) return false;
+
+  directory.claim({ runId, connectionId: connection.id, permissions: true });
+  return directory.owns(connection.id, runId);
 }
 
 /**
@@ -1645,13 +2258,15 @@ async function handleOwnedRunAction(
   connection: ServerConnection,
   request: ServerRequestInfo,
   route: OwnedRunAction,
-): Promise<ServerReply> {
-  if (!route.owned) return unknownRun();
+): Promise<ServerReply | ServerStreamReply> {
+  if (!route.owned && !(await claimSessionRun(context, connection, route.runId))) {
+    return unknownRun();
+  }
 
   const runs = context.runs;
   const directory = context.runDirectory;
   if (runs === undefined || directory === undefined) {
-    // Unreachable while `owned` is true — nothing can own a run without a
+    // Unreachable while the run is owned — nothing can own a run without a
     // directory — but written as a refusal rather than an assertion, because a
     // router that threw here would take out the socket.
     return unknownRun();
@@ -1681,10 +2296,74 @@ async function handleOwnedRunAction(
     record();
     return interruptOwnedRun(runs, route.runId);
   }
+  if (route.action === 'stream') {
+    record();
+    return streamOwnedRun(context, runs, directory, connection, request, route.runId);
+  }
   if (route.action === 'messages') {
     return sendToOwnedRun(runs, route.runId, request.body, record);
   }
   return answerOwnedPermission(runs, directory, route.runId, request.body, record);
+}
+
+/**
+ * Pick an owned run's completions stream back up.
+ *
+ * The client lost its socket with the run still going — `artemis.remote.detach`
+ * kept it — and is back with the last cursor it rendered. What it gets is the
+ * same stream it would have had: every chunk after that cursor, translated
+ * exactly as the original request translated them, then the live tail until
+ * the run ends. See `resumeTurn` for what is replayed and what is not.
+ *
+ * Attaching is recorded on the directory as the opposite of detaching: the
+ * run's own deadline stops and its parked prompts' deadline starts, because
+ * somebody is in front of them again. When this stream goes too, the run is
+ * handed back to the directory as it was the first time.
+ */
+function streamOwnedRun(
+  context: ServerContext,
+  runs: RunSource,
+  directory: RunDirectory,
+  connection: ServerConnection,
+  request: ServerRequestInfo,
+  runId: RunId,
+): ServerReply | ServerStreamReply {
+  const url = new URL(request.url, 'http://artemis.invalid');
+  const rawAfter = url.searchParams.get('after');
+  let afterSeq: number | undefined;
+  if (rawAfter !== null) {
+    if (!/^\d+$/.test(rawAfter)) {
+      return fail(400, 'invalid_request_error', 'invalid_after', '`after` must be a whole number.');
+    }
+    afterSeq = Number(rawAfter);
+  }
+
+  directory.noteAttached(runId);
+
+  const resume: ResumeRequest = {
+    runId,
+    ...(afterSeq === undefined ? {} : { afterSeq }),
+    ...(request.signal === undefined ? {} : { signal: request.signal }),
+    onDetach: (id: RunId) => directory.noteDetached(id),
+  };
+  return {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+    },
+    connectionId: connection.id,
+    stream: streamResume({
+      id: `chatcmpl-${Math.random().toString(36).slice(2, 12)}`,
+      created: Math.floor(Date.now() / 1000),
+      route: directory.routeOf(runId) ?? 'artemis',
+      runs,
+      request: resume,
+      heartbeatMs: context.remoteStream?.heartbeatMs ?? DEFAULT_COMPLETIONS_HEARTBEAT_MS,
+    }),
+  };
 }
 
 /**
@@ -1699,6 +2378,44 @@ async function handleOwnedRunAction(
  */
 function unknownRun(): ServerReply {
   return fail(404, 'invalid_request_error', 'unknown_run', 'No such run for this connection.');
+}
+
+/**
+ * An attachment this server will not take, as a reply.
+ *
+ * `AttachmentError` already carries the field and the reason, and both are
+ * safe to repeat: every string in it was written here, about a value the caller
+ * sent. Anything else caught where one of these was expected is a fault in the
+ * reader rather than a fact about the request, so it becomes a 500 with nothing
+ * in it — the same discipline `runFailure` keeps one function below.
+ */
+function attachmentFailure(error: unknown): ServerReply {
+  return error instanceof AttachmentError
+    ? fail(400, 'invalid_request_error', 'invalid_body', error.message)
+    : fail(500, 'server_error', 'internal_error', 'The attachments could not be read.');
+}
+
+/**
+ * Name the kind of attachment an account cannot carry, if any.
+ *
+ * Per kind rather than as one flag, because the two travel by different
+ * mechanisms and a provider can plausibly have one and not the other — an image
+ * needs a place on the wire, a file needs the adapter to stage it and say
+ * where. The registry behind the run applies exactly this test again; doing it
+ * here is what turns "the run failed" into a 400 that names the account.
+ *
+ * An account whose capabilities this build could not read answers `undefined`
+ * — unknown is not a refusal, and the registry is still there.
+ */
+function unsupportedAttachment(
+  attachments: readonly Attachment[] | undefined,
+  capabilities: Capabilities | undefined,
+): 'images' | 'files' | undefined {
+  if (attachments === undefined || attachments.length === 0) return undefined;
+  if (capabilities === undefined) return undefined;
+  if (!capabilities.imageInput && attachments.some(isImageAttachment)) return 'images';
+  if (!capabilities.fileInput && attachments.some(isFileAttachment)) return 'files';
+  return undefined;
 }
 
 /**
@@ -1720,12 +2437,16 @@ function runFailure(error: unknown): ServerReply {
 /**
  * Another message into a run that is already going.
  *
- * Attachments are deliberately not read from the wire. `RunSource.send` carries
- * them because the desktop's own IPC path needs them, but nothing on this
- * boundary validates a base64 blob, and an unchecked one would travel from a
- * bearer token straight into an adapter's argument encoder. Text is the whole
- * of what a remote steer needs today; images can be added when there is a
- * validator to put in front of them.
+ * Attachments used to be deliberately dropped here, on the reasoning that
+ * nothing on this boundary validated a base64 blob and an unchecked one would
+ * travel from a bearer token straight into an adapter's argument encoder. That
+ * was the right call for as long as it was true. `readAttachments` is now that
+ * validator — the same one the IPC boundary and the bridge's own start route
+ * use, stated once in protocol — so the reason has gone and the drop with it.
+ *
+ * The drop was never cheap. A steer is how a person mid-conversation says "here
+ * is the screenshot I meant", and the text arriving alone made the agent answer
+ * about a picture it had not been given.
  */
 async function sendToOwnedRun(
   runs: RunSource,
@@ -1744,10 +2465,16 @@ async function sendToOwnedRun(
   if (typeof text !== 'string' || text.trim().length === 0) {
     return fail(400, 'invalid_request_error', 'invalid_body', '`text` must be a non-empty string.');
   }
+  let attachments: readonly Attachment[] | undefined;
+  try {
+    attachments = readAttachments((body as { attachments?: unknown }).attachments, 'attachments');
+  } catch (error) {
+    return attachmentFailure(error);
+  }
 
   try {
     record();
-    const outcome = await runs.send(runId, text);
+    const outcome = await runs.send(runId, text, attachments);
     const reply: RunsSendResponse = {
       runId,
       deliveredImmediately: outcome.deliveredImmediately,
@@ -2156,6 +2883,209 @@ async function handleProfileAdminRoute(
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* Memory banks: which of this machine's accounts each one reaches             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `GET /api/v0/memory-banks` and `PATCH /api/v0/memory-banks/{slug}`.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS IS FOR
+ * ---------------------------------------------------------------------------
+ *
+ * A served run has always been given only the banks its account is in scope
+ * for — every path that attaches or lists one filters on `scopeCoversProfile`.
+ * What was missing was any way to *say* which accounts that is. The desktop
+ * writes the scope into its own `memory-banks.json` through its settings pane;
+ * a headless server's copy of that file had one writer, a text editor on the
+ * serving machine, so in practice every bank on a server was `{kind:'all'}`
+ * and reached every account it served.
+ *
+ * These two routes are the missing writer. The read carries the server's
+ * accounts alongside the banks so a client can draw the checklist from one
+ * request rather than joining ids against the catalogue itself.
+ *
+ * ---------------------------------------------------------------------------
+ * WHO MAY
+ * ---------------------------------------------------------------------------
+ *
+ * {@link ServerConnection.manageProfiles}, and the enumeration-proof 404 for
+ * everyone else — `handleProfileAdminRoute`'s rule, adopted wholesale because
+ * the reasoning transfers exactly. Scoping a bank decides what the accounts on
+ * this machine may read and write, which is an administrative act on the
+ * serving machine and not a thing a connection that merely runs turns should
+ * be able to discover, let alone do. The order is the same too: grant first,
+ * then the seam, then the body, so a build with no registry answers `501` to
+ * an administrator and `404` to everyone else.
+ *
+ * The write is attributed as `remote.profile.updated`: the line carries ids
+ * and never values (see `RemoteAccessEvent`), and what it records is that this
+ * token changed what an account on this machine reaches. One line per bank
+ * touched would be a second kind saying the same thing about the same act.
+ */
+async function handleMemoryBankRoute(
+  request: ServerRequestInfo,
+  context: ServerContext,
+  connection: ServerConnection,
+  path: string,
+  method: string,
+): Promise<ServerReply> {
+  const missing = (): ServerReply =>
+    fail(404, 'invalid_request_error', 'unknown_endpoint', `No route for ${path}.`);
+
+  if (connection.manageProfiles !== true) return missing();
+
+  const banks = context.memoryBanks;
+  if (banks === undefined) {
+    return fail(
+      501,
+      'invalid_request_error',
+      'not_implemented',
+      'This Artemis build serves accounts but keeps no memory-bank registry.',
+    );
+  }
+
+  const apiPrefix = `/api/${SERVER_API_VERSION}`;
+
+  if (path === `${apiPrefix}/memory-banks`) {
+    if (method !== 'GET' && method !== 'HEAD') {
+      return fail(
+        405,
+        'invalid_request_error',
+        'method_not_allowed',
+        'The bank list is a GET. Scope one with PATCH /api/v0/memory-banks/{slug}.',
+      );
+    }
+    // A read, and so not attributed — the section comment on the account
+    // surface says why: a client polls this to draw a pane.
+    const body: ServerMemoryBanksBody = {
+      object: 'artemis.memory-banks',
+      banks: await banks.list(),
+      profiles: await serverAccounts(context),
+    };
+    return ok(body);
+  }
+
+  let slug: string;
+  try {
+    slug = decodeURIComponent(path.slice(`${apiPrefix}/memory-banks/`.length));
+  } catch {
+    return fail(400, 'invalid_request_error', 'invalid_url', 'The bank slug could not be parsed.');
+  }
+  // A slug with a slash in it is a sub-path this surface does not have, not a
+  // bank with an odd name: the registry's own slugs are `[a-z0-9-]`.
+  if (slug.length === 0 || slug.includes('/')) return missing();
+
+  if (method !== 'PATCH') {
+    return fail(
+      405,
+      'invalid_request_error',
+      'method_not_allowed',
+      "A bank's accounts are changed with PATCH.",
+    );
+  }
+
+  const body = request.body;
+  if (typeof body !== 'object' || body === null) {
+    return fail(400, 'invalid_request_error', 'invalid_body', 'The request body must be a JSON object.');
+  }
+  const scope = parseBankScope((body as Record<string, unknown>)['profiles']);
+  if (typeof scope === 'string') {
+    return fail(400, 'invalid_request_error', 'invalid_body', scope);
+  }
+  if (scope.kind === 'profiles') {
+    /*
+     * Every named account has to exist on this machine.
+     *
+     * Refused rather than stored, because the failure it prevents is silent:
+     * a scope naming an id this server has never had is a bank that reaches
+     * nothing, and nothing anywhere would say so — the run would simply start
+     * without its memory, which is indistinguishable from the feature being
+     * off. A caller told which id is wrong can fix it.
+     */
+    const known = new Set((await serverAccounts(context)).map((account) => String(account.id)));
+    const stranger = scope.profileIds.find((id) => !known.has(id));
+    if (stranger !== undefined) {
+      return fail(
+        400,
+        'invalid_request_error',
+        'unknown_profile',
+        `No account on this server has the id "${stranger}". List them at ${apiPrefix}/profiles.`,
+      );
+    }
+  }
+
+  let updated: ServerMemoryBank | undefined;
+  try {
+    updated = await banks.setScope(slug, scope);
+  } catch (error) {
+    return fail(
+      500,
+      'server_error',
+      'registry_write_failed',
+      error instanceof Error ? error.message : 'The bank registry could not be written.',
+    );
+  }
+  if (updated === undefined) {
+    return fail(
+      404,
+      'invalid_request_error',
+      'unknown_bank',
+      `No memory bank called "${slug}" is registered on this server.`,
+    );
+  }
+  context.onRemoteAccess?.({
+    kind: 'remote.profile.updated',
+    connectionId: connection.id,
+  });
+  const reply: ServerMemoryBankBody = { object: 'artemis.memory-bank', bank: updated };
+  return ok(reply);
+}
+
+/**
+ * Every account on the serving machine, as the scope picker needs it.
+ *
+ * The *whole* catalogue rather than {@link visibleToConnection}'s narrowing,
+ * which is the same choice the account-administration routes make: they too
+ * act on the store rather than on what this token may run turns against. A
+ * connection restricted to one account but granted administration is still
+ * administering the machine, and a picker that hid the accounts it is allowed
+ * to scope a bank to would produce scopes nobody could explain.
+ */
+async function serverAccounts(context: ServerContext): Promise<readonly ServerMemoryBankAccount[]> {
+  const profiles = await context.catalogue.read();
+  return profiles.map((profile) => ({ id: profile.id, slug: profile.slug, label: profile.label }));
+}
+
+/**
+ * Read a scope off the wire. A sentence on refusal, so the caller can correct
+ * it — this is a body an administrator wrote, not a value from a stranger.
+ *
+ * Nothing is coerced. An unparsable scope used to become `{kind:'all'}` in the
+ * registry's own reader, which is the right default for a file somebody edited
+ * by hand and exactly the wrong one here: a typo in a PATCH would widen a bank
+ * to every account on the machine.
+ */
+function parseBankScope(value: unknown): ServerMemoryBankScope | string {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return '`profiles` must be `{ "kind": "all" }` or `{ "kind": "profiles", "profileIds": [...] }`.';
+  }
+  const record = value as Record<string, unknown>;
+  if (record['kind'] === 'all') return { kind: 'all' };
+  if (record['kind'] !== 'profiles') {
+    return '`profiles.kind` must be "all" or "profiles".';
+  }
+  const ids = record['profileIds'];
+  if (!Array.isArray(ids)) return '`profiles.profileIds` must be an array of account ids.';
+  if (ids.some((id) => typeof id !== 'string' || id.length === 0)) {
+    return '`profiles.profileIds` must hold non-empty account ids.';
+  }
+  // Duplicates are the caller's, not an error: a checklist that sent one twice
+  // means the same thing once, and the registry stores what it is given.
+  return { kind: 'profiles', profileIds: [...new Set(ids as string[])] };
+}
+
 /** No flow for this account. Not an error state — nobody has started one. */
 function noSignIn(): ServerReply {
   return fail(
@@ -2305,43 +3235,96 @@ async function describeScopedSessions(
     group.ids.add(entry.sessionId);
   }
 
-  const described = new Map<string, SessionSummary>();
-  for (const group of groups.values()) {
-    const profile = bySlug.get(group.profileId);
-    if (profile === undefined) continue;
+  /*
+   * One read per (profile × directory), kept, so the second pass below can
+   * consult a store the first pass already opened without opening it again.
+   */
+  const pages = new Map<string, readonly SessionSummary[]>();
+  const pageFor = async (
+    profile: ServerProfile,
+    cwd: string,
+  ): Promise<readonly SessionSummary[]> => {
+    const key = `${String(profile.id)}\u0000${cwd}`;
+    const cached = pages.get(key);
+    if (cached !== undefined) return cached;
+    let page: readonly SessionSummary[] = [];
     try {
-      const page = await sessions.list({
-        providerId: String(profile.provider.id),
-        profileId: group.profileId,
-        cwd: group.cwd,
-        limit: 200,
-      });
-      for (const summary of page.sessions) {
-        if (group.ids.has(String(summary.id))) described.set(String(summary.id), summary);
-      }
+      page = (
+        await sessions.list({
+          providerId: String(profile.provider.id),
+          profileId: String(profile.id),
+          cwd,
+          limit: 200,
+        })
+      ).sessions;
     } catch {
       // One unreadable store must not fail the listing — the other groups'
       // conversations are still real. The missing ones simply do not appear,
       // which is also what a store mid-rotation looks like.
     }
+    pages.set(key, page);
+    return page;
+  };
+
+  /** Each conversation a store could describe, and whose store it was in. */
+  const described = new Map<string, { summary: SessionSummary; profileId: string }>();
+  for (const group of groups.values()) {
+    const profile = bySlug.get(group.profileId);
+    if (profile === undefined) continue;
+    for (const summary of await pageFor(profile, group.cwd)) {
+      const id = String(summary.id);
+      if (group.ids.has(id)) described.set(id, { summary, profileId: group.profileId });
+    }
+  }
+
+  /*
+   * The second pass: entries whose transcript the ledger's own account does
+   * not hold.
+   *
+   * Dropping them was what made a conversation vanish with its transcript
+   * intact. The ledger is last-writer-wins and is written the moment a resume
+   * is accepted — before the provider has looked for the file — so a resume
+   * sent on the wrong account re-recorded the session against that account,
+   * and every listing after that looked in the wrong store. The transcript
+   * was in another visible store the whole time. So the other stores are
+   * asked for that directory, the row is reported under the account that
+   * actually holds it, and the ledger is corrected so the next listing needs
+   * no second pass. Only an entry no visible store can describe is dropped,
+   * and that one really is gone.
+   */
+  for (const entry of entries) {
+    if (described.has(entry.sessionId)) continue;
+    for (const profile of profiles) {
+      if (String(profile.id) === entry.profileId) continue;
+      const summary = (await pageFor(profile, entry.cwd)).find(
+        (candidate) => String(candidate.id) === entry.sessionId,
+      );
+      if (summary === undefined) continue;
+      described.set(entry.sessionId, { summary, profileId: String(profile.id) });
+      ledger.reattribute(entry.sessionId, String(profile.id));
+      break;
+    }
   }
 
   const rows: ServerSessionSummary[] = [];
   for (const entry of entries) {
-    const summary = described.get(entry.sessionId);
-    if (summary === undefined) continue;
-    const profile = bySlug.get(entry.profileId);
+    const found = described.get(entry.sessionId);
+    if (found === undefined) continue;
+    const { summary } = found;
+    const profile = bySlug.get(found.profileId);
     rows.push({
       id: entry.sessionId,
       title: summary.title,
       ...(summary.firstPrompt === undefined ? {} : { firstPrompt: summary.firstPrompt }),
       updatedAt: summary.updatedAt,
-      profileSlug: profile?.slug ?? entry.profileId,
+      profileSlug: profile?.slug ?? found.profileId,
       // The ledger's account, not the store's: `SessionSummary.profileId` is a
       // pick when several profiles reach one store (see `profileIsUnknown`),
-      // and the ledger *knows* which connection ran this one. The provider is
-      // the account's own, which is the only one it could have been.
-      profileId: entry.profileId,
+      // and the ledger *knows* which connection ran this one — corrected
+      // above where the store it named turned out not to hold the file. The
+      // provider is the account's own, which is the only one it could have
+      // been.
+      profileId: found.profileId,
       providerId: String(profile?.provider.id ?? summary.providerId),
       // The store's own tag, so a client can tell an archived conversation
       // from a live one. The tag route writes this; dropping it here made
@@ -2394,7 +3377,28 @@ async function handleChatCompletions(
     );
   }
 
-  const extensions = readChatExtensions(body);
+  let extensions: ArtemisChatExtensions;
+  try {
+    // The one field in here that throws rather than dropping: an attachment is
+    // the subject of the message, not a setting on it. See its own note.
+    extensions = readChatExtensions(body);
+  } catch (error) {
+    return attribute(attachmentFailure(error));
+  }
+  // Bounded where the request is validated, per the wire type's promise. The
+  // whole body is already capped, but a system prompt is the one caller-supplied
+  // string large enough to be worth its own limit — mirroring `runInput.ts`'s
+  // `LIMITS.systemPrompt`, so the completions and bridge surfaces agree.
+  if (extensions.systemPrompt !== undefined && extensions.systemPrompt.length > 200_000) {
+    return attribute(
+      fail(
+        400,
+        'invalid_request_error',
+        'invalid_body',
+        '`artemis.systemPrompt` is too long (max 200000 characters).',
+      ),
+    );
+  }
   /*
    * `ignoreUnsupported` is read here rather than in `readChatExtensions`
    * because it is not a *setting for the run* — it changes how this request is
@@ -2417,8 +3421,8 @@ async function handleChatCompletions(
   // The route is resolved against what *this connection* may see, so a model
   // outside its allowance is indistinguishable from one that does not exist.
   const profiles = visibleToConnection(connection, await context.catalogue.read({}));
-  const model = findModel(profiles, chat.model);
-  if (model === undefined) {
+  const requested = findModel(profiles, chat.model);
+  if (requested === undefined) {
     return attribute(modelNotFound(chat.model));
   }
 
@@ -2437,6 +3441,174 @@ async function handleChatCompletions(
       return attribute(unknownSession());
     }
   }
+
+  /*
+   * The account that holds the conversation continues it.
+   *
+   * A transcript lives in one account's store and the provider looks nowhere
+   * else, so a resume on any other route fails before its first token — and
+   * used to take the conversation with it, because the ownership record below
+   * was written first. The route is corrected here instead, and the reply says
+   * so. Nothing is read on the ordinary path: see `sessionHome.ts`.
+   */
+  const resumed: { readonly model: ServerModel; readonly redirected?: RouteRedirect } =
+    extensions.sessionId === undefined
+      ? { model: requested }
+      : await resolveResumeModel({
+          sessions: context.sessions,
+          ledger: context.ledger,
+          profiles,
+          requested,
+          sessionId: extensions.sessionId,
+        });
+  const { model, redirected } = resumed;
+
+  /*
+   * The account behind the route, needed here rather than further down because
+   * the steer branch below returns before ever reaching that point and carries
+   * attachments of its own.
+   */
+  const account = profiles.find((profile) => String(profile.id) === String(model.profileId));
+
+  /*
+   * Attachments, from both places one request can name them.
+   *
+   * `artemis.attachments` is what an Artemis client sends; `image_url` content
+   * parts are what every off-the-shelf OpenAI client sends, and neither is more
+   * correct than the other. They are merged and then held to the ceilings
+   * *together*, because each list can be legal on its own while the pair is
+   * four images too many.
+   */
+  let attachments: readonly Attachment[] | undefined;
+  try {
+    attachments = mergeAttachments(
+      extensions.attachments,
+      attachmentsFromMessages(chat.messages),
+      `${CHAT_EXTENSIONS_FIELD}.attachments`,
+    );
+  } catch (error) {
+    return attribute(attachmentFailure(error));
+  }
+
+  /*
+   * Refused rather than dropped, like the fork and the rewind below and for the
+   * same reason — only more so. A setting quietly not applied costs the caller
+   * a feature; a screenshot quietly not delivered costs them the question, and
+   * the answer comes back confident and about nothing. The account's own
+   * `imageInput` and `fileInput` decide it, because a server fronts several
+   * providers and they do not agree.
+   */
+  const unsupported = unsupportedAttachment(attachments, account?.capabilities);
+  if (unsupported !== undefined) {
+    return attribute(
+      fail(
+        400,
+        'invalid_request_error',
+        'unsupported_parameter',
+        `The account behind ${model.route} cannot accept ${unsupported} in a prompt.`,
+      ),
+    );
+  }
+  if (attachments !== undefined) extensions = { ...extensions, attachments };
+
+  /*
+   * A message to a conversation the server is still working on is a steer,
+   * not a second run.
+   *
+   * The server can be working on a conversation with no client attached:
+   * the provider opens a turn of its own when a subagent finishes, and the
+   * registry adopts it, while the client that started the conversation saw
+   * its last turn end and shows an idle pane. What that client sends next —
+   * "did the session stop? keep going", on 2026-09-16 — arrives here as an
+   * ordinary resume. Starting a run on it put a second CLI on a transcript
+   * the first was still writing; the adapters now refuse that, and a refusal
+   * alone would lose the message. So it goes into the live run as the steer
+   * it was, and the caller follows that run from the start — everything it
+   * missed, then the live tail — which is the answer to what it was asking.
+   */
+  if (extensions.sessionId !== undefined) {
+    const live = await liveRunOn(context.runs, extensions.sessionId);
+    if (live !== undefined) {
+      return attribute(
+        await steerLiveRun({
+          context,
+          connection,
+          request,
+          chat,
+          extensions,
+          model,
+          live,
+          ignored: review.ignored,
+          ...(redirected === undefined ? {} : { redirected }),
+        }),
+      );
+    }
+  }
+
+  /*
+   * Standing instructions reach the run only where the serving account's
+   * provider can append to its preset. Codex and OpenCode have no append —
+   * `systemPromptAppend: false` on their descriptors, and the catalogue
+   * publishes that per account — and their adapters never read the field, so
+   * a prompt handed to them would be accepted and silently unread. That is the
+   * one failure the capability flag exists to prevent, and it is the reverse of
+   * the permission mode's convention: a mode is dropped quietly because the
+   * run then opens in the serving user's setting, which is a real outcome; an
+   * instruction the model never saw is not an outcome, it is a client that
+   * believes it was heard. So the field is dropped *and reported*, under
+   * `artemis.ignored` beside any lenient parameter, and a client can say so.
+   *
+   * `account` itself is resolved above, before the steer branch returns.
+   */
+
+  /*
+   * Forking and rewinding, refused rather than dropped.
+   *
+   * Both reshape the conversation the caller is continuing — a fork writes the
+   * next turn to a new session, a rewind cuts the stored one before it — and
+   * a request for either that was quietly set aside would produce the worst
+   * kind of wrong answer: a turn appended to the conversation the caller
+   * believed they had branched from or wound back. So each needs the session
+   * it acts on, and the serving account's provider has to be able to honour
+   * it; the catalogue publishes both flags per account for exactly this
+   * check, and the registry behind the run would refuse anyway, only later
+   * and with less to say.
+   */
+  if (extensions.forkSession === true || extensions.rewindToMessageId !== undefined) {
+    const wanted = extensions.forkSession === true ? 'artemis.forkSession' : 'artemis.rewindToMessageId';
+    if (extensions.sessionId === undefined) {
+      return attribute(
+        fail(
+          400,
+          'invalid_request_error',
+          'invalid_body',
+          `\`${wanted}\` needs \`artemis.sessionId\`: there is no conversation to ${extensions.forkSession === true ? 'fork' : 'rewind'}.`,
+        ),
+      );
+    }
+    const capable =
+      extensions.forkSession === true
+        ? account?.capabilities.forkSession === true
+        : account?.capabilities.rewind === true;
+    if (!capable) {
+      return attribute(
+        fail(
+          400,
+          'invalid_request_error',
+          'unsupported_parameter',
+          `The account behind ${model.route} cannot ${extensions.forkSession === true ? 'fork' : 'rewind'} a conversation, so \`${wanted}\` cannot be honoured.`,
+        ),
+      );
+    }
+  }
+
+  const { systemPrompt, ...withoutSystemPrompt } = extensions;
+  const dropSystemPrompt =
+    systemPrompt !== undefined && account?.capabilities.systemPromptAppend !== true;
+  const applied: ArtemisChatExtensions = dropSystemPrompt ? withoutSystemPrompt : extensions;
+  const ignored: readonly string[] = dropSystemPrompt
+    ? [...review.ignored, 'artemis.systemPrompt']
+    : review.ignored;
 
   let workspace;
   try {
@@ -2482,14 +3654,16 @@ async function handleChatCompletions(
       runId,
       connectionId: connection.id,
       permissions: extensions.remote?.permissions === true,
+      route: model.route,
     });
   };
   const turn = {
     model,
     cwd: workspace.path,
     request: chat,
-    extensions,
-    ignored: review.ignored,
+    extensions: applied,
+    ignored,
+    ...(redirected === undefined ? {} : { redirected }),
     ...(request.signal === undefined ? {} : { signal: request.signal }),
     // Absent when this build has no directory: with nothing to hold the
     // deadline, a detach would be an abandonment, so the turn keeps its old
@@ -2539,6 +3713,7 @@ async function handleChatCompletions(
         model,
         record,
         claim,
+        heartbeatMs: context.remoteStream?.heartbeatMs ?? DEFAULT_COMPLETIONS_HEARTBEAT_MS,
         ...(context.onRunFailure === undefined ? {} : { report: context.onRunFailure }),
       }),
     };
@@ -2574,9 +3749,249 @@ async function handleChatCompletions(
       model: model.route,
       created,
       result,
-      ignored: review.ignored,
+      ignored,
+      ...(redirected === undefined ? {} : { redirected }),
       ...(model.resolvedModel === undefined ? {} : { resolvedModel: model.resolvedModel }),
     }),
+  });
+}
+
+/** How often a quiet completions stream writes a comment. See {@link paced}. */
+const DEFAULT_COMPLETIONS_HEARTBEAT_MS = 15_000;
+
+/** What {@link paced} yields when its source has been quiet for a heartbeat. */
+const HEARTBEAT = Symbol('heartbeat');
+
+/**
+ * Pull from a generator, and say something when it has nothing to say.
+ *
+ * An SSE stream that is silent for minutes — an agent inside a long tool call
+ * produces no chunk, because activity is reported on the final chunk rather
+ * than streamed — is indistinguishable, from the client's side, from a
+ * connection that has died. The bridge's feed solved this with a heartbeat
+ * comment; the completions stream had none, so a client could not tell a
+ * working agent from a dead socket, and a NAT or relay with an idle timeout
+ * could cut a quiet stream without either side noticing until the next write.
+ * This is the same heartbeat for this stream: while the source has no next
+ * value within `heartbeatMs`, a comment is yielded instead and the source's
+ * pending `next()` is raced again — never called twice.
+ *
+ * `finally` returns the source, so a consumer that walks away (a client that
+ * hung up) tears the turn down exactly as `for await` would have.
+ */
+async function* paced<T>(
+  source: AsyncGenerator<T>,
+  heartbeatMs: number,
+): AsyncGenerator<T | typeof HEARTBEAT> {
+  try {
+    let next = source.next();
+    for (;;) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const tick = new Promise<typeof HEARTBEAT>((resolve) => {
+        timer = setTimeout(() => resolve(HEARTBEAT), heartbeatMs);
+      });
+      const outcome = await Promise.race([next, tick]);
+      if (timer !== undefined) clearTimeout(timer);
+      if (outcome === HEARTBEAT) {
+        yield HEARTBEAT;
+        continue;
+      }
+      if (outcome.done === true) return;
+      yield outcome.value;
+      next = source.next();
+    }
+  } finally {
+    await source.return(undefined);
+  }
+}
+
+/** The three fields every chunk of one stream shares. */
+interface ChunkFrame {
+  readonly id: string;
+  readonly model: string;
+  readonly created: number;
+}
+
+/**
+ * One turn event as the chunk that carries it, or `undefined` for one that
+ * rides on no chunk of its own.
+ *
+ * Shared by the original stream and a resumed one, which is the point: a
+ * client that comes back must be shown the same bytes for the same event it
+ * would have seen had its socket held. Every chunk translated from a run event
+ * carries that event's `seq` on the Artemis namespace — the cursor a client
+ * resumes from — and the ones that come from nowhere in the event stream
+ * carry none.
+ */
+function chunkFor(
+  event: TurnEvent,
+  frame: ChunkFrame,
+  hooks: {
+    /** Called once with the run's id, before anything else is written. */
+    readonly claim?: (runId: string) => void;
+    /** Called with every session id the run announces. See the ledger. */
+    readonly record?: (sessionId: string) => void;
+    /** Where a failed run is said out loud on the serving machine. */
+    readonly report?: (error: unknown) => void;
+  },
+): OpenAiChatChunk | undefined {
+  const seq = event.seq === undefined ? {} : { seq: event.seq };
+  const stamped = (extensions: Record<string, unknown>) =>
+    Object.keys(extensions).length === 0 && event.seq === undefined
+      ? {}
+      : { artemis: { ...extensions, ...seq } as OpenAiChatChunk['artemis'] };
+
+  switch (event.kind) {
+    case 'text':
+      return chatChunk({ ...frame, delta: { content: event.text }, ...stamped({}) });
+
+    // The agent's reasoning, on the field the reasoning-capable OpenAI-shaped
+    // servers already use and never on `content`. An OpenAI client that does
+    // not know the field appends nothing; an Artemis client draws a thinking
+    // row from it — which is the whole reason it is here: without it, a
+    // served turn showed its answer and none of the thinking behind it.
+    case 'thinking':
+      return chatChunk({ ...frame, delta: { reasoning_content: event.text }, ...stamped({}) });
+
+    // The run id, first of everything the turn has to say, and on the same
+    // empty-delta chunk the session id rides — an OpenAI client appends
+    // nothing and moves on. This is the only place a completions caller can
+    // learn the id, and the run actions take it, so a client that means to
+    // steer or reattach after the stream breaks has to be holding it before
+    // it does.
+    case 'run':
+      hooks.claim?.(event.runId);
+      return chatChunk({
+        ...frame,
+        delta: {},
+        ...stamped({
+          runId: event.runId,
+          // The seam beside the address, when the registry measured one: the
+          // client that started this run is the one that cannot count it.
+          ...(event.historyOffset === undefined ? {} : { historyOffset: event.historyOffset }),
+        }),
+      });
+
+    // A prompt the run is parked on, or the news that it is settled. Only for
+    // a caller that asked for these; see `ArtemisRemoteOptions`. Its answer
+    // comes back on POST /api/v0/runs/{runId}/permission rather than on this
+    // stream, because a stream is one-way and this one is often already dead
+    // by the time anyone looks at the question.
+    case 'permission':
+      return chatChunk({ ...frame, delta: {}, ...stamped({ permission: event.notice }) });
+
+    // The session id, the moment the run reports one — an empty delta with
+    // only the Artemis namespace filled in. OpenAI clients append nothing and
+    // move on; an Artemis client resumes from it, and a stream that dies
+    // mid-turn has still told its caller where the conversation lives. The
+    // final chunk repeats it, which is what pre-existing clients read.
+    case 'session':
+      hooks.record?.(event.sessionId);
+      return chatChunk({ ...frame, delta: {}, ...stamped({ sessionId: event.sessionId }) });
+
+    // Only ever on a resumed stream: the server no longer holds everything
+    // that was asked for, and says so before sending what it has.
+    case 'gap':
+      return chatChunk({
+        ...frame,
+        delta: {},
+        ...stamped({ gap: { afterSeq: event.afterSeq, firstSeq: event.firstSeq } }),
+      });
+
+    // `activity` is not streamed as its own event: an OpenAI client parses
+    // every `data:` line as a chunk, and one it cannot parse is a hard error
+    // in most SDKs. It rides on the final chunk instead.
+    case 'activity':
+      return undefined;
+
+    // What the run has delegated, on an empty delta: an OpenAI client appends
+    // nothing, an Artemis client redraws its rows. The whole set each time,
+    // which is the event's own contract.
+    case 'tasks':
+      return chatChunk({ ...frame, delta: {}, ...stamped({ tasks: event.tasks }) });
+
+    // How full the conversation is, on the same empty delta. `usage` could not
+    // carry it — see `ArtemisContextReading` — and waiting for the final chunk
+    // would mean the reading only ever arrives once there is nothing left to
+    // decide with it. An OpenAI client appends nothing; an Artemis client moves
+    // its context gauge while the turn is still running.
+    case 'context':
+      return chatChunk({ ...frame, delta: {}, ...stamped({ context: event.reading }) });
+
+    // A steered message was read. Same empty delta; the client clears its
+    // "queued" marker.
+    case 'delivered':
+      return chatChunk({ ...frame, delta: {}, ...stamped({ delivered: event.messageId }) });
+
+    // Nothing but the cursor: the run moved and the wire had no words for
+    // it. An OpenAI client appends nothing; an Artemis client advances the
+    // position it would resume from, and can tell a quiet agent from a
+    // stream that has stalled. See the kind's own comment.
+    case 'cursor':
+      return chatChunk({ ...frame, delta: {}, ...stamped({}) });
+
+    case 'done': {
+      const { result } = event;
+      if (result.sessionId !== undefined) hooks.record?.(result.sessionId);
+      // Said out loud on the way past. A streamed failure reaches its caller,
+      // so it is not what `onError` was written for — but it left no trace
+      // anywhere on the serving machine either, and "the run failed" with the
+      // reason only ever travelling *away* from the server is what made this
+      // undiagnosable from the side that could actually fix it.
+      if (result.error !== undefined) {
+        hooks.report?.(new Error(`run on ${frame.model} failed: ${result.error}`));
+      }
+      return chatChunk({
+        ...frame,
+        delta: {},
+        finishReason: result.finishReason,
+        ...(result.usage === undefined ? {} : { usage: result.usage }),
+        artemis: {
+          ...(result.sessionId === undefined ? {} : { sessionId: result.sessionId }),
+          ...(result.activity.length === 0 ? {} : { activity: result.activity }),
+          // Repeated here even though the reading already crossed on its own
+          // chunk: a client that reconnected mid-turn, or one that renders only
+          // the terminal chunk, must not finish the turn holding no reading at
+          // all when the server has one.
+          ...(result.context === undefined ? {} : { context: result.context }),
+          endReason: result.endReason,
+          /*
+           * The reason, on the only chunk that can carry it.
+           *
+           * A stream cannot answer 502 — the 200 went out with the headers
+           * — so where the whole-response path returns `result.error` as
+           * the body of one, this is the only place the same sentence can
+           * be said. Without it a streaming client sees `endReason:
+           * "error"` on an empty delta and has nothing to render but a
+           * guess, which is exactly what every remote failure looked like:
+           * a run that never started, reported as an unexplained one.
+           */
+          ...(result.error === undefined ? {} : { error: result.error }),
+          ...seq,
+        },
+      });
+    }
+
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * A mid-stream failure, as the chunk that stops the stream cleanly.
+ *
+ * A stream cannot change its status code — the 200 went out with the headers
+ * — so the failure is reported *in* the stream. A client that sees the socket
+ * close without `[DONE]` reports a network error, which is the wrong
+ * diagnosis.
+ */
+function failureChunk(frame: ChunkFrame, error: unknown): OpenAiChatChunk {
+  return chatChunk({
+    ...frame,
+    delta: {
+      content: `\n\n[the run failed: ${error instanceof Error ? error.message : 'unknown error'}]`,
+    },
+    finishReason: 'stop',
   });
 }
 
@@ -2586,7 +4001,9 @@ async function handleChatCompletions(
  * The shape is OpenAI's exactly: a first chunk carrying the role, then one per
  * text fragment, then a chunk with `finish_reason`, then `[DONE]`. Clients
  * depend on that order — several treat the first chunk as the signal that the
- * stream is live, and every one of them stops at the sentinel.
+ * stream is live, and every one of them stops at the sentinel. A quiet stretch
+ * carries a comment every `heartbeatMs`, which the sentinel-reading clients
+ * ignore by definition and an Artemis client uses to tell silence from death.
  */
 async function* streamTurn(input: {
   readonly id: string;
@@ -2600,141 +4017,301 @@ async function* streamTurn(input: {
   readonly claim?: (runId: string) => void;
   /** Where a failed run is said out loud on the serving machine. */
   readonly report?: (error: unknown) => void;
+  readonly heartbeatMs?: number;
 }): AsyncIterable<string> {
   const { id, created, model } = input;
+  const frame: ChunkFrame = { id, model: model.route, created };
+  const hooks = {
+    ...(input.claim === undefined ? {} : { claim: input.claim }),
+    ...(input.record === undefined ? {} : { record: input.record }),
+    ...(input.report === undefined ? {} : { report: input.report }),
+  };
 
+  // What was accepted and not applied rides the role chunk — first, so a
+  // client learns before the first token that something it sent was set
+  // aside. The whole-response shape carries the same list on its `artemis`
+  // block; a streaming client had no way to see it at all until now. A resume
+  // moved to the account holding the conversation rides the same chunk, for
+  // the same reason.
+  const { ignored, redirected } = input.turn;
   yield sseEvent(
-    chatChunk({ id, model: model.route, created, delta: { role: 'assistant' } }),
+    chatChunk({
+      ...frame,
+      delta: { role: 'assistant' },
+      ...(ignored.length === 0 && redirected === undefined
+        ? {}
+        : {
+            artemis: {
+              ...(ignored.length === 0 ? {} : { ignored }),
+              ...(redirected === undefined ? {} : { redirected }),
+            },
+          }),
+    }),
   );
 
   try {
-    for await (const event of runTurn(input.runs, input.turn)) {
-      if (event.kind === 'text') {
-        yield sseEvent(chatChunk({ id, model: model.route, created, delta: { content: event.text } }));
+    const source = paced(
+      runTurn(input.runs, input.turn),
+      input.heartbeatMs ?? DEFAULT_COMPLETIONS_HEARTBEAT_MS,
+    );
+    for await (const item of source) {
+      if (item === HEARTBEAT) {
+        yield SSE_HEARTBEAT;
         continue;
       }
-
-      // The run id, first of everything the turn has to say, and on the same
-      // empty-delta chunk the session id rides — an OpenAI client appends
-      // nothing and moves on. This is the only place a completions caller can
-      // learn the id, and the three run actions take it, so a client that means
-      // to steer or reattach after the stream breaks has to be holding it
-      // before it does.
-      if (event.kind === 'run') {
-        input.claim?.(event.runId);
-        yield sseEvent(
-          chatChunk({
-            id,
-            model: model.route,
-            created,
-            delta: {},
-            artemis: { runId: event.runId },
-          }),
-        );
-        continue;
-      }
-
-      // A prompt the run is parked on, or the news that it is settled. Only for
-      // a caller that asked for these; see `ArtemisRemoteOptions`. Its answer
-      // comes back on POST /api/v0/runs/{runId}/permission rather than on this
-      // stream, because a stream is one-way and this one is often already dead
-      // by the time anyone looks at the question.
-      if (event.kind === 'permission') {
-        yield sseEvent(
-          chatChunk({
-            id,
-            model: model.route,
-            created,
-            delta: {},
-            artemis: { permission: event.notice },
-          }),
-        );
-        continue;
-      }
-
-      // The session id, the moment the run reports one — an empty delta with
-      // only the Artemis namespace filled in. OpenAI clients append nothing and
-      // move on; an Artemis client resumes from it, and a stream that dies
-      // mid-turn has still told its caller where the conversation lives. The
-      // final chunk repeats it, which is what pre-existing clients read.
-      if (event.kind === 'session') {
-        input.record?.(event.sessionId);
-        yield sseEvent(
-          chatChunk({
-            id,
-            model: model.route,
-            created,
-            delta: {},
-            artemis: { sessionId: event.sessionId },
-          }),
-        );
-        continue;
-      }
-
-      if (event.kind === 'done') {
-        const { result } = event;
-        if (result.sessionId !== undefined) input.record?.(result.sessionId);
-        // Said out loud on the way past. A streamed failure reaches its caller,
-        // so it is not what `onError` was written for — but it left no trace
-        // anywhere on the serving machine either, and "the run failed" with the
-        // reason only ever travelling *away* from the server is what made this
-        // undiagnosable from the side that could actually fix it.
-        if (result.error !== undefined) {
-          input.report?.(new Error(`run on ${model.route} failed: ${result.error}`));
-        }
-        yield sseEvent(
-          chatChunk({
-            id,
-            model: model.route,
-            created,
-            delta: {},
-            finishReason: result.finishReason,
-            ...(result.usage === undefined ? {} : { usage: result.usage }),
-            artemis: {
-              ...(result.sessionId === undefined ? {} : { sessionId: result.sessionId }),
-              ...(result.activity.length === 0 ? {} : { activity: result.activity }),
-              endReason: result.endReason,
-              /*
-               * The reason, on the only chunk that can carry it.
-               *
-               * A stream cannot answer 502 — the 200 went out with the headers
-               * — so where the whole-response path returns `result.error` as
-               * the body of one, this is the only place the same sentence can
-               * be said. Without it a streaming client sees `endReason:
-               * "error"` on an empty delta and has nothing to render but a
-               * guess, which is exactly what every remote failure looked like:
-               * a run that never started, reported as an unexplained one.
-               */
-              ...(result.error === undefined ? {} : { error: result.error }),
-            },
-          }),
-        );
-      }
-      // `activity` is not streamed as its own event: an OpenAI client parses
-      // every `data:` line as a chunk, and one it cannot parse is a hard error
-      // in most SDKs. It rides on the final chunk instead.
+      const chunk = chunkFor(item, frame, hooks);
+      if (chunk !== undefined) yield sseEvent(chunk);
     }
   } catch (error) {
-    /*
-     * A stream cannot change its status code — the 200 went out with the
-     * headers — so a mid-stream failure is reported *in* the stream, as a final
-     * chunk that stops cleanly. A client that sees the socket close without
-     * `[DONE]` reports a network error, which is the wrong diagnosis.
-     */
-    yield sseEvent(
-      chatChunk({
-        id,
-        model: model.route,
-        created,
-        delta: {
-          content: `\n\n[the run failed: ${
-            error instanceof Error ? error.message : 'unknown error'
-          }]`,
-        },
-        finishReason: 'stop',
-      }),
+    yield sseEvent(failureChunk(frame, error));
+  }
+
+  yield sseEvent(SSE_DONE);
+}
+
+/**
+ * The run still going on a conversation, if the engine has one.
+ *
+ * `listRuns` answers only live runs, and a handle carries its session id from
+ * the moment the run knows it, so this is one scan. A build without the
+ * observation surface answers nothing — and its adapters refuse the second
+ * run on their own, so the outcome there is a refusal rather than a fork.
+ */
+async function liveRunOn(
+  runs: RunSource | undefined,
+  sessionId: string,
+): Promise<RunHandle | undefined> {
+  if (runs?.listRuns === undefined) return undefined;
+  const handles = await runs.listRuns({});
+  return handles.find(
+    (handle) => handle.status !== 'ended' && String(handle.sessionId) === sessionId,
+  );
+}
+
+/**
+ * The `artemis.*` fields a steer cannot carry, named so the caller knows.
+ *
+ * A turn already running has its mode, its effort and its instructions; what
+ * goes in is the message. Reported under `ignored` on the same terms as a
+ * field the serving provider cannot honour — accepted, set aside, and said.
+ */
+const STEER_IGNORED: readonly (readonly [keyof ArtemisChatExtensions, string])[] = [
+  ['systemPrompt', 'artemis.systemPrompt'],
+  ['permissionMode', 'artemis.permissionMode'],
+  ['thinking', 'artemis.thinking'],
+  ['fastMode', 'artemis.fastMode'],
+  ['ultracode', 'artemis.ultracode'],
+];
+
+/**
+ * Send a completions caller's message into the run already serving its
+ * conversation, and answer with that run's stream.
+ *
+ * Ownership first, on the one rule the run surface has: a run belongs to the
+ * connection that started it. A run the provider started on its own has no
+ * such connection, and the resume gate has already proven this caller owns
+ * the conversation it is in — so the claim is made here, idempotently, and a
+ * run another connection already holds is refused rather than shared. The
+ * caller is then attached exactly as a client picking a lost stream back up
+ * is, deadlines and all, and its request's `artemis` fields ride the reply as
+ * the run's do.
+ *
+ * `409` throughout, and never a fork: a fork or a rewind reshapes a
+ * conversation that is mid-sentence, and a build with no directory cannot say
+ * whose the run is. Both are told to wait or stop the turn, which is the
+ * truth, and neither is quietly turned into a second run — which is the whole
+ * failure this exists to end.
+ */
+async function steerLiveRun(input: {
+  readonly context: ServerContext;
+  readonly connection: ServerConnection;
+  readonly request: ServerRequestInfo;
+  readonly chat: OpenAiChatRequest;
+  readonly extensions: ArtemisChatExtensions;
+  readonly model: ServerModel;
+  readonly live: RunHandle;
+  readonly ignored: readonly string[];
+  readonly redirected?: RouteRedirect;
+}): Promise<ServerReply | ServerStreamReply> {
+  const { context, connection, extensions, model, live } = input;
+  const runs = context.runs;
+  const directory = context.runDirectory;
+  const busy = (detail: string): ServerReply =>
+    fail(409, 'invalid_request_error', 'session_busy', detail);
+
+  if (extensions.forkSession === true || extensions.rewindToMessageId !== undefined) {
+    return busy(
+      'This conversation is still working on its last message. Stop it before forking or rewinding it.',
+    );
+  }
+  if (runs === undefined || runs.send === undefined || directory === undefined) {
+    return busy(
+      'This conversation is still working on its last message. Wait for it to finish, or stop it, before sending another.',
     );
   }
 
+  directory.claim({
+    runId: live.runId,
+    connectionId: connection.id,
+    permissions: extensions.remote?.permissions === true,
+    route: model.route,
+  });
+  if (!directory.owns(connection.id, live.runId)) {
+    return busy(
+      'This conversation is being driven from another connection. Wait for that turn to finish before sending another.',
+    );
+  }
+  directory.noteSeen(live.runId);
+  directory.noteAttached(live.runId);
+
+  const ignored = [
+    ...input.ignored,
+    ...STEER_IGNORED.filter(([field]) => extensions[field] !== undefined).map(([, name]) => name),
+  ];
+  const steer: SteerRequest = {
+    runId: live.runId,
+    prompt: promptFromMessages(input.chat.messages, { resuming: true }),
+    // Already read, merged and refused-if-unsupported by the route above; a
+    // steer into a live run stages them beside what its opening prompt staged.
+    ...(extensions.attachments === undefined ? {} : { attachments: extensions.attachments }),
+    ...(extensions.sessionId === undefined ? {} : { sessionId: extensions.sessionId }),
+    ...(input.request.signal === undefined ? {} : { signal: input.request.signal }),
+    onDetach: (id: RunId) => directory.noteDetached(id),
+  };
+  const id = `chatcmpl-${Math.random().toString(36).slice(2, 12)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  if (input.chat.stream === true) {
+    return {
+      status: 200,
+      headers: {
+        ...CORS_HEADERS,
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+      },
+      connectionId: connection.id,
+      stream: streamSteer({
+        id,
+        created,
+        model,
+        runs,
+        request: steer,
+        ignored,
+        ...(input.redirected === undefined ? {} : { redirected: input.redirected }),
+        heartbeatMs: context.remoteStream?.heartbeatMs ?? DEFAULT_COMPLETIONS_HEARTBEAT_MS,
+      }),
+    };
+  }
+
+  let result: TurnResult | undefined;
+  try {
+    for await (const event of steerTurn(runs, steer)) {
+      if (event.kind === 'done') result = event.result;
+    }
+  } catch (error) {
+    return fail(
+      502,
+      'server_error',
+      'run_failed',
+      error instanceof Error ? error.message : 'The message could not be sent into the running turn.',
+    );
+  }
+  if (result === undefined) {
+    return fail(502, 'server_error', 'no_result', 'The run ended without producing a reply.');
+  }
+  if (result.error !== undefined && result.text.length === 0) {
+    return fail(502, 'server_error', 'run_failed', result.error);
+  }
+  return {
+    status: 200,
+    headers: { ...JSON_HEADERS, ...CORS_HEADERS },
+    body: chatResponse({
+      id,
+      model: model.route,
+      created,
+      result,
+      ignored,
+      ...(input.redirected === undefined ? {} : { redirected: input.redirected }),
+      ...(model.resolvedModel === undefined ? {} : { resolvedModel: model.resolvedModel }),
+    }),
+  };
+}
+
+/**
+ * A steered run's stream: the role chunk a fresh turn opens with — this
+ * caller has no message open yet — then the run picked up from the start.
+ */
+async function* streamSteer(input: {
+  readonly id: string;
+  readonly created: number;
+  readonly model: ServerModel;
+  readonly runs: RunSource;
+  readonly request: SteerRequest;
+  readonly ignored: readonly string[];
+  readonly redirected?: RouteRedirect;
+  readonly heartbeatMs: number;
+}): AsyncIterable<string> {
+  const frame: ChunkFrame = { id: input.id, model: input.model.route, created: input.created };
+  const { ignored, redirected } = input;
+  yield sseEvent(
+    chatChunk({
+      ...frame,
+      delta: { role: 'assistant' },
+      ...(ignored.length === 0 && redirected === undefined
+        ? {}
+        : {
+            artemis: {
+              ...(ignored.length === 0 ? {} : { ignored }),
+              ...(redirected === undefined ? {} : { redirected }),
+            },
+          }),
+    }),
+  );
+  try {
+    for await (const item of paced(steerTurn(input.runs, input.request), input.heartbeatMs)) {
+      if (item === HEARTBEAT) {
+        yield SSE_HEARTBEAT;
+        continue;
+      }
+      const chunk = chunkFor(item, frame, {});
+      if (chunk !== undefined) yield sseEvent(chunk);
+    }
+  } catch (error) {
+    yield sseEvent(failureChunk(frame, error));
+  }
+  yield sseEvent(SSE_DONE);
+}
+
+/**
+ * A run's completions stream, picked back up after its cursor.
+ *
+ * No role chunk: the client that asks for this already has the message open
+ * and is appending to it. Otherwise the same bytes the original stream would
+ * have carried, from the same translation, with the same heartbeat — and the
+ * same sentinel at the end, so a client can tell "the run is over" from "the
+ * socket died again".
+ */
+async function* streamResume(input: {
+  readonly id: string;
+  readonly created: number;
+  readonly route: string;
+  readonly runs: RunSource;
+  readonly request: ResumeRequest;
+  readonly heartbeatMs: number;
+}): AsyncIterable<string> {
+  const frame: ChunkFrame = { id: input.id, model: input.route, created: input.created };
+  try {
+    for await (const item of paced(resumeTurn(input.runs, input.request), input.heartbeatMs)) {
+      if (item === HEARTBEAT) {
+        yield SSE_HEARTBEAT;
+        continue;
+      }
+      const chunk = chunkFor(item, frame, {});
+      if (chunk !== undefined) yield sseEvent(chunk);
+    }
+  } catch (error) {
+    yield sseEvent(failureChunk(frame, error));
+  }
   yield sseEvent(SSE_DONE);
 }

@@ -21,6 +21,8 @@
  * event pump, so nothing here may block or throw.
  */
 
+import { randomUUID } from 'node:crypto';
+
 import type { RemoteStreamChannel } from '@rx-artemis/protocol';
 
 /**
@@ -72,6 +74,18 @@ export interface PushFeed {
   since(afterSeq: number): FeedReplay;
   /** The seq of the newest event ever published — `0` before the first. */
   head(): number;
+  /**
+   * Which feed these seqs are counted by.
+   *
+   * Seqs start at 1 with every feed, and a feed lives exactly as long as the
+   * process that made it. A client that reconnects across a server restart
+   * therefore arrives holding a number from a *different* count, and the number
+   * alone cannot say so: `since(9000)` on a feed whose head is 12 is not
+   * "nothing new yet", it is a question about another feed entirely. The epoch
+   * is what lets both ends tell the two apart — fresh per feed, opaque, and
+   * compared for equality and nothing else.
+   */
+  readonly epoch: string;
 }
 
 /**
@@ -90,10 +104,13 @@ export interface PushFeedOptions {
   readonly retention?: number;
   /** Hears about listeners that threw. Defaults to silence. */
   readonly onError?: (error: unknown) => void;
+  /** Pin the epoch. For tests — a real feed mints its own. */
+  readonly epoch?: string;
 }
 
 export function createPushFeed(options: PushFeedOptions = {}): PushFeed {
   const retention = Math.max(0, options.retention ?? DEFAULT_RETENTION);
+  const epoch = options.epoch ?? randomUUID();
   const retained: FeedEvent[] = [];
   const listeners = new Set<(event: FeedEvent) => void>();
   let seq = 0;
@@ -101,6 +118,8 @@ export function createPushFeed(options: PushFeedOptions = {}): PushFeed {
   let firstRetained = 1;
 
   return {
+    epoch,
+
     publish(channel, payload, scope = {}): void {
       seq += 1;
       const event: FeedEvent = { seq, channel, payload, scope };

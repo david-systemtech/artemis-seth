@@ -86,13 +86,20 @@ import {
   type SessionsListRequest,
   type AgentPromptsListRequest,
   type AgentPromptsSaveRequest,
+  type SkillsListRequest,
+  type SkillsSaveRequest,
+  type SkillsSourceAddRequest,
+  type SkillsSourceRemoveRequest,
+  type SkillsSourceSyncRequest,
   type MemoryBankAddRequest,
   type MemoryBankForgetRequest,
   type MemoryBankMemoriesRequest,
   type MemoryBankRetireRequest,
   type MemoryBankSetEnabledRequest,
+  type MemoryBankSetProfilesRequest,
   type MemoryBankSyncRequest,
   type MemoryBankVerifyRemoteRequest,
+  type MemoryBankWireClaudeCodeRequest,
   type MemoryBanksPreflightRequest,
   type MemoryBanksSetMasterEnabledRequest,
   type SecretsConnectionDeleteRequest,
@@ -117,6 +124,12 @@ import {
   type ServerAccountsUpdateRequest,
   type ServerAccountSignInRequest,
   type ServerAccountSubmitCodeRequest,
+  type ServerMemoryBanksSetProfilesRequest,
+  type ServerRoutinesRequest,
+  type ServerRoutinesCreateRequest,
+  type ServerRoutinesUpdateRequest,
+  type ServerRoutinesDeleteRequest,
+  type ServerRoutinesRunNowRequest,
   type PlanUsagePush,
   type MenuOpenSettings,
   type UpdateState,
@@ -149,6 +162,7 @@ import {
   type TerminalWriteRequest,
   type WindowRequest,
   type WindowState,
+  type WorkspaceCreateWorktreeRequest,
   type WorkspaceDescribeRequest,
   type WorkspacePickDirectoryRequest,
 } from '@rx-artemis/protocol';
@@ -693,6 +707,8 @@ const bridge: ArtemisBridge = Object.freeze({
     pickDirectory: (request: WorkspacePickDirectoryRequest) =>
       invoke(IPC.workspacePickDirectory, request),
     describe: (request: WorkspaceDescribeRequest) => invoke(IPC.workspaceDescribe, request),
+    createWorktree: (request: WorkspaceCreateWorktreeRequest) =>
+      invoke(IPC.workspaceCreateWorktree, request),
   }),
 
   /**
@@ -723,6 +739,9 @@ const bridge: ArtemisBridge = Object.freeze({
     sync: (request: MemoryBankSyncRequest) => invoke(IPC.memoryBankSync, request),
     retire: (request: MemoryBankRetireRequest) => invoke(IPC.memoryBankRetire, request),
     setEnabled: (request: MemoryBankSetEnabledRequest) => invoke(IPC.memoryBankSetEnabled, request),
+    setProfiles: (request: MemoryBankSetProfilesRequest) => invoke(IPC.memoryBankSetProfiles, request),
+    wireClaudeCode: (request: MemoryBankWireClaudeCodeRequest) =>
+      invoke(IPC.memoryBankWireClaudeCode, request),
     forget: (request: MemoryBankForgetRequest) => invoke(IPC.memoryBankForget, request),
     setMasterEnabled: (request: MemoryBanksSetMasterEnabledRequest) => invoke(IPC.memoryBanksSetMasterEnabled, request),
   }),
@@ -753,6 +772,15 @@ const bridge: ArtemisBridge = Object.freeze({
   agentPrompts: Object.freeze({
     list: (request: AgentPromptsListRequest) => invoke(IPC.agentPromptsList, request),
     save: (request: AgentPromptsSaveRequest) => invoke(IPC.agentPromptsSave, request),
+  }),
+
+  /** This machine's skills, and which are always on. Same two verbs; see {@link IPC}. */
+  skills: Object.freeze({
+    list: (request: SkillsListRequest) => invoke(IPC.skillsList, request),
+    save: (request: SkillsSaveRequest) => invoke(IPC.skillsSave, request),
+    addSource: (request: SkillsSourceAddRequest) => invoke(IPC.skillsSourceAdd, request),
+    removeSource: (request: SkillsSourceRemoveRequest) => invoke(IPC.skillsSourceRemove, request),
+    syncSources: (request: SkillsSourceSyncRequest) => invoke(IPC.skillsSourceSync, request),
   }),
 
   preview: Object.freeze({
@@ -841,6 +869,29 @@ const bridge: ArtemisBridge = Object.freeze({
       invoke(IPC.serverAccountsSubmitCode, request),
     cancelSignIn: (request: ServerAccountSignInRequest) =>
       invoke(IPC.serverAccountsCancelSignIn, request),
+  }),
+
+  /**
+   * The memory banks on a remote server, and which of its accounts each
+   * reaches. One machine further away than `memoryBanks`, which is this one's.
+   */
+  serverMemoryBanks: Object.freeze({
+    list: (request: ServerAccountsRequest) => invoke(IPC.serverMemoryBanksList, request),
+    setProfiles: (request: ServerMemoryBanksSetProfilesRequest) =>
+      invoke(IPC.serverMemoryBanksSetProfiles, request),
+  }),
+
+  /**
+   * Routines on a remote server. The same one-machine-further rule as
+   * `serverAccounts`: an id names which server, and the appointments live and
+   * fire there. Distinct from `routines`, which are this machine's own.
+   */
+  serverRoutines: Object.freeze({
+    list: (request: ServerRoutinesRequest) => invoke(IPC.serverRoutinesList, request),
+    create: (request: ServerRoutinesCreateRequest) => invoke(IPC.serverRoutinesCreate, request),
+    update: (request: ServerRoutinesUpdateRequest) => invoke(IPC.serverRoutinesUpdate, request),
+    delete: (request: ServerRoutinesDeleteRequest) => invoke(IPC.serverRoutinesDelete, request),
+    runNow: (request: ServerRoutinesRunNowRequest) => invoke(IPC.serverRoutinesRunNow, request),
   }),
 
   usagePlan: Object.freeze({

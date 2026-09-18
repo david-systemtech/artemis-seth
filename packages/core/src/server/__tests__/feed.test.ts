@@ -71,4 +71,17 @@ describe('createPushFeed', () => {
     feed.publish(CHANNEL, 'b');
     expect(seen).toEqual(['a']);
   });
+
+  it('names itself, and no two feeds share the name', () => {
+    // Seqs start at 1 in every feed, so the number alone cannot say which
+    // count it belongs to. The epoch is what can — see `PushFeed.epoch`.
+    const one = createPushFeed();
+    const two = createPushFeed();
+    expect(one.epoch.length).toBeGreaterThan(0);
+    expect(one.epoch).not.toBe(two.epoch);
+  });
+
+  it('keeps an epoch it was given', () => {
+    expect(createPushFeed({ epoch: 'this-process' }).epoch).toBe('this-process');
+  });
 });

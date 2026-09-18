@@ -1,21 +1,24 @@
 /**
- * Memory banks — Cerebro generalized, as the instance half of Instructions.
+ * Memory banks — the repositories of durable facts the agents maintain.
  * ============================================================================
  *
- * No longer a pane of its own: `InstructionsSection` composes these groups
- * under the prompt library, because a bank is one instance of the rule the
- * prompts state — what the agent is told before the conversation starts. The
- * file keeps its name for the same reason `AgentsSection.tsx` keeps its own:
- * the section id `cerebro` is a frozen address that resolves here, and the
- * file is easier to find when it is named after what the address meant.
+ * Its own pane again. The banks were composed under Instructions for a while,
+ * on the true observation that a bank is one instance of the rule the prompts
+ * state — what the agent is told before the conversation starts. What broke
+ * that arrangement is that a bank stopped being one paragraph: it now carries
+ * a name and a description of its own, a *format* (a `BANK.md` manifest, or
+ * either of the two layouts the cerebro CLI wrote), a set of profiles it is
+ * attached to, and a per-entry validation report. None of that reads as a
+ * footnote under someone else's heading. The frozen section id `cerebro`
+ * resolves here, which is why the file keeps the name the address meant.
  *
  * The banks run themselves: a sync at every run start, agents drafting into
  * them, pull requests reviewing them. So the surface exists for the two moments
  * automation cannot cover. Onboarding — joining, creating, or adopting a bank
  * — and *inspection*, when a person wants to read what agents have been
  * remembering, prune what no longer holds, and decide which banks this
- * machine carries. Everything else here is deliberately a window, not a
- * control surface.
+ * machine carries and which profiles carry them. Everything else here is
+ * deliberately a window, not a control surface.
  *
  * ---------------------------------------------------------------------------
  * ADDING A MEMORY IS NOT A PANE ACTION
@@ -37,17 +40,32 @@
  * TWO KINDS OF SWITCH, AND WHY BOTH ARE BUTTONS
  * ---------------------------------------------------------------------------
  *
- * Each bank has a wiring switch (the CLI's, honoured by stock Claude Code's
- * hook too) and Artemis has one master gate (prompt + run-start syncs). Both
- * render as buttons, not `Switch`es: the per-bank one spawns `enable`/
- * `disable` and a sync, takes seconds and can fail, and a toggle that
- * animates to a position it then has to animate back from is lying twice.
+ * Each bank has an on/off switch (the registry flag, and the installs that
+ * follow it) and Artemis has one master gate (prompt + run-start syncs). Both
+ * render as buttons, not `Switch`es: the per-bank one rewrites every project's
+ * memory, takes seconds and can fail, and a toggle that animates to a position
+ * it then has to animate back from is lying twice. The same argument makes
+ * "Wire for stock Claude Code" a button — a third control, on its own row,
+ * because what it writes is *another program's* setup and folding it into the
+ * bank's switch would edit files the user never asked Artemis to touch.
+ *
+ * The profile checkboxes are the exception that proves the rule: they are
+ * checkboxes because ticking three of five profiles is a *list* being built,
+ * and a list of buttons that each take a second to answer is not a list. They
+ * still go through the same busy slot and the same receipt — the registry's
+ * answer after the write is what the next render draws.
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ReactElement } from 'react';
 import type {
+  ProfileId,
+  ServerMemoryBank,
+  ServerMemoryBankAccount,
+  ServerMemoryBankScope,
+  ServerMemoryBanksListResponse,
   MemoryBankAuthInput,
+  MemoryBankFormat,
   MemoryBankInfo,
   MemoryBankMemory,
   MemoryBankRole,
@@ -59,10 +77,17 @@ import type {
 } from '@rx-artemis/protocol';
 import { secretRefProblem } from '@rx-artemis/protocol';
 
-import type { MemoryBanksPane } from '../../hooks/useMemoryBanks';
+import { useMemoryBanks, type MemoryBanksPane } from '../../hooks/useMemoryBanks';
 import { useSecretManagers } from '../../hooks/useSecretManagers';
+import {
+  describeMemoryBank,
+  readServerMemoryBanks,
+  setServerMemoryBankProfiles,
+  useApp,
+} from '../../state/store';
+import { ReasonButton } from '../disabled-reason';
 import { CodeBlock, Fold, Row, StatusDot, ToneBadge } from '../primitives';
-import { SettingsGroup } from './pane';
+import { SettingsGroup, SettingsPane } from './pane';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -75,10 +100,37 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 
 /**
- * The whole-library sync, for the Instructions pane's title row.
+ * The pane.
+ *
+ * Thin on purpose: the reading, the groups and every action already live below,
+ * so what this adds is the title row and the deep-link anchor. The anchor is on
+ * the wrapper rather than on a group because `openSettings('cerebro', { row:
+ * 'memory-banks' })` is a request for *the banks*, and the group it used to
+ * name — the bank cards — is the one group a machine with no bank does not
+ * render.
+ */
+export function MemoryBanksSection(): ReactElement {
+  const pane = useMemoryBanks();
+
+  return (
+    <div data-settings-row="memory-banks">
+      <SettingsPane
+        title="Memory banks"
+        description="Shared git repositories of durable facts, maintained by the agents and reviewed like code. Each bank reaches the profiles you attach it to."
+        actions={<SyncAllButton pane={pane} />}
+      >
+        <MemoryBankGroups pane={pane} />
+      </SettingsPane>
+    </div>
+  );
+}
+
+/**
+ * The whole-library sync, for the pane's title row.
  *
  * Rendered only when there is something to sync and the master gate is up —
  * the same condition the old pane's `actions` slot used — because a sync
@@ -114,6 +166,7 @@ export function MemoryBankGroups({ pane }: { readonly pane: MemoryBanksPane }): 
 
       {pane.status !== null && hasBanks ? <MasterGroup pane={pane} /> : null}
       {pane.status !== null && hasBanks ? <BanksGroup pane={pane} /> : null}
+      <ServerBanksGroups />
       {pane.status !== null ? <AddGroup pane={pane} first={!hasBanks} /> : null}
 
       {pane.lastAction !== null ? (
@@ -124,6 +177,219 @@ export function MemoryBankGroups({ pane }: { readonly pane: MemoryBanksPane }): 
         />
       ) : null}
     </>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Banks on an Artemis Server                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The banks on every Artemis Server this machine holds a profile for.
+ * ============================================================================
+ *
+ * A group per server, below this machine's own banks, because they are a
+ * different registry on a different computer: a bank on a server is a checkout
+ * *there*, scoped by *its* account ids, and the checklist above — which ticks
+ * this machine's profiles — can no more name them than a run here can read
+ * them. A server wears every one of its accounts behind one local profile, so
+ * without this the only thing this pane could have said about a served bank is
+ * that it reached all of them.
+ *
+ * Which is what it did. A served run has always honoured a bank's scope — the
+ * server filters on it before attaching a checkout, before composing the
+ * prompt, and before the memory tools list anything — but nothing could ever
+ * set one: `memory-banks.json` on the serving machine had a single writer, a
+ * text editor over SSH. These checkboxes are the writer that was missing.
+ *
+ * Only the scope is editable here, deliberately. Adding, cloning and pulling a
+ * bank touch the serving machine's disk and its git credentials, and belong to
+ * whoever administers it; what a person at this end is missing is the one
+ * field nothing on the wire could reach.
+ *
+ * A server that cannot answer the surface renders nothing — no row, no error.
+ * That covers an older server, one with no registry, and a token without
+ * account administration, which the server refuses to tell apart on purpose.
+ * All three mean there is nothing here to edit, and a settings pane that grew
+ * an error line for every sleeping server would be unusable.
+ */
+function ServerBanksGroups(): ReactElement | null {
+  const profiles = useApp((s) => s.profiles);
+  const servers = useMemo(
+    () =>
+      profiles.filter((profile) => profile.providerId === 'artemis' && profile.disabled !== true),
+    [profiles],
+  );
+  if (servers.length === 0) return null;
+  return (
+    <>
+      {servers.map((profile) => (
+        <ServerBanksGroup key={profile.id} profileId={profile.id} label={profile.label} />
+      ))}
+    </>
+  );
+}
+
+function ServerBanksGroup({
+  profileId,
+  label,
+}: {
+  readonly profileId: ProfileId;
+  readonly label: string;
+}): ReactElement | null {
+  const [listing, setListing] = useState<ServerMemoryBanksListResponse | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  /*
+   * Read into this component rather than into the store, the rule every pane
+   * that renders another machine's state keeps — see `readServerAccounts`:
+   * one pane looks at it, so caching it would mean inventing an invalidation
+   * rule for a thing nobody else reads. The profile is the server, so it is
+   * the whole dependency list: repointing one at a different address is a
+   * different set of banks.
+   */
+  useEffect(() => {
+    let live = true;
+    setListing(null);
+    void readServerMemoryBanks(profileId).then((answer) => {
+      if (live && !('error' in answer)) setListing(answer);
+    });
+    return () => {
+      live = false;
+    };
+  }, [profileId]);
+
+  if (listing === null || !listing.available || listing.banks.length === 0) return null;
+
+  /*
+   * The server's answer is what the next render draws, exactly as the local
+   * cards draw the registry's: a checkbox that moved because it was clicked
+   * rather than because the write landed would show a scope the server does
+   * not have. A refused write leaves the box where it was and reports itself
+   * through the store's own failure banner.
+   */
+  const apply = (slug: string, profiles: ServerMemoryBankScope): void => {
+    setBusy(slug);
+    void setServerMemoryBankProfiles(profileId, slug, profiles)
+      .then((bank) => {
+        if (bank === null) return;
+        setListing((current) =>
+          current === null
+            ? current
+            : {
+                ...current,
+                banks: current.banks.map((entry) => (entry.slug === bank.slug ? bank : entry)),
+              },
+        );
+      })
+      .finally(() => setBusy(null));
+  };
+
+  return (
+    <SettingsGroup label={`Banks on ${label} (${listing.banks.length})`}>
+      <div className="flex flex-col divide-y divide-hairline">
+        {listing.banks.map((bank) => (
+          <ServerBankCard
+            key={bank.slug}
+            bank={bank}
+            accounts={listing.accounts}
+            busy={busy === bank.slug || !listing.manageProfiles}
+            onChange={(profiles) => apply(bank.slug, profiles)}
+          />
+        ))}
+      </div>
+    </SettingsGroup>
+  );
+}
+
+function ServerBankCard({
+  bank,
+  accounts,
+  busy,
+  onChange,
+}: {
+  readonly bank: ServerMemoryBank;
+  readonly accounts: readonly ServerMemoryBankAccount[];
+  readonly busy: boolean;
+  readonly onChange: (profiles: ServerMemoryBankScope) => void;
+}): ReactElement {
+  const scope = bank.profiles;
+  const all = scope.kind === 'all';
+
+  const toggle = (id: string, on: boolean): void => {
+    const current = scope.kind === 'profiles' ? scope.profileIds : [];
+    onChange({
+      kind: 'profiles',
+      profileIds: on ? [...current, id] : current.filter((entry) => entry !== id),
+    });
+  };
+
+  return (
+    <div className="flex flex-col gap-2 px-3 py-2.5">
+      <div className="flex items-center gap-2">
+        <StatusDot tone={bank.enabled ? 'mint' : 'amber'} />
+        <span className="font-mono text-xs text-ink">{bank.slug}</span>
+        {bank.role === 'readonly' ? <ToneBadge tone="neutral">read-only</ToneBadge> : null}
+        {bank.enabled ? null : <ToneBadge tone="amber">off</ToneBadge>}
+      </div>
+      <Row label="Repo">{bank.path}</Row>
+
+      <div className="flex flex-col gap-1.5 pt-1">
+        <span className="chrome-label text-ink-faint">Accounts</span>
+
+        {/*
+          "Every account" above the list rather than beside it, the same
+          argument the local picker makes: it is the default, and the list
+          underneath is what narrowing looks like. Unticking it hands back
+          every account ticked, so narrowing does not first detach the bank
+          from everything and make the user re-tick what they already had.
+        */}
+        <label className="flex cursor-pointer items-center gap-2">
+          <Checkbox
+            checked={all}
+            disabled={busy}
+            onCheckedChange={(next) =>
+              onChange(
+                next === true
+                  ? { kind: 'all' }
+                  : { kind: 'profiles', profileIds: accounts.map((account) => String(account.id)) },
+              )
+            }
+            aria-label={`Attach “${bank.slug}” to every account on this server`}
+          />
+          <span className="flex flex-col">
+            <span className="text-xs leading-snug text-ink">Every account</span>
+            <span className="text-2xs leading-snug text-ink-faint">
+              Including accounts added later.
+            </span>
+          </span>
+        </label>
+
+        {all ? null : (
+          <div className="flex flex-col gap-1 border-t border-hairline pt-2">
+            {accounts.length === 0 ? (
+              <span className="text-2xs text-ink-faint">
+                This server serves no accounts yet — add one under Profiles and it will appear here.
+              </span>
+            ) : null}
+            {accounts.map((account) => (
+              <label key={String(account.id)} className="flex cursor-pointer items-center gap-2">
+                <Checkbox
+                  checked={
+                    scope.kind === 'profiles' && scope.profileIds.includes(String(account.id))
+                  }
+                  disabled={busy}
+                  onCheckedChange={(next) => toggle(String(account.id), next === true)}
+                  aria-label={`Attach “${bank.slug}” to ${account.label}`}
+                />
+                <span className="text-xs leading-snug text-ink">{account.label}</span>
+                <span className="text-2xs text-ink-faint">{account.slug}</span>
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -180,6 +446,22 @@ function BanksGroup({ pane }: { readonly pane: MemoryBanksPane }): ReactElement 
   );
 }
 
+/**
+ * How a bank is kept on disk, in the words a person can act on.
+ *
+ * Worth a badge because it is the fact that decides what everything else here
+ * means: a `manifest` bank describes its own layout and schema, the two legacy
+ * ones are read with the shapes the cerebro CLI baked in, and `null` is a
+ * registered directory that is not a bank at all — which is a condition, not a
+ * format, and the only one of the four that is a problem.
+ */
+function formatLabel(format: MemoryBankFormat | null): string {
+  if (format === 'manifest') return 'BANK.md';
+  if (format === 'legacy-projects') return 'cerebro · by project';
+  if (format === 'legacy-flat') return 'cerebro · flat';
+  return 'not a bank';
+}
+
 function BankCard({
   bank,
   pane,
@@ -189,16 +471,30 @@ function BankCard({
 }): ReactElement {
   const working = pane.busy === 'switch';
   // Controlled, because `Fold` routes `onOpenChange` only in controlled mode —
-  // and opening is when the bank's memories are actually worth a CLI spawn.
+  // and opening is when the bank's memories are actually worth reading.
   const [memoriesOpen, setMemoriesOpen] = useState(false);
-  const profiles = pane.status?.profiles ?? [];
-  const wired = profiles.filter((profile) => profile.banks[bank.slug] === true).length;
+  /*
+   * How many entries the bank refused, and how many of the reasons are here.
+   * `validationErrors` is the count and `problems` is the first few lines of
+   * it, so the summary counts with the former and falls back to the latter for
+   * a problem the bank has as a whole — an unreadable manifest is one line and
+   * no failed entries.
+   */
+  const problemCount = bank.validationErrors > 0 ? bank.validationErrors : bank.problems.length;
 
   return (
     <div className="flex flex-col gap-1.5 px-3 py-2.5">
       <div className="flex items-center gap-2">
         <StatusDot tone={bank.enabled && bank.exists ? 'mint' : 'amber'} />
         <span className="font-mono text-xs font-medium text-ink">{bank.slug}</span>
+        {/* Only when it says something the slug does not. A bank called after
+            its own slug would otherwise print its name twice. */}
+        {bank.name !== bank.slug ? (
+          <span className="truncate text-xs text-ink-muted">{bank.name}</span>
+        ) : null}
+        <ToneBadge tone={bank.format === null ? 'signal' : 'neutral'}>
+          {formatLabel(bank.format)}
+        </ToneBadge>
         <ToneBadge tone="neutral">{bank.role === 'readonly' ? 'read-only' : 'read-write'}</ToneBadge>
         {bank.isDefault ? <ToneBadge tone="neutral">default</ToneBadge> : null}
         {!bank.exists ? <ToneBadge tone="signal">missing on disk</ToneBadge> : null}
@@ -215,6 +511,7 @@ function BankCard({
           </ToneBadge>
         ) : null}
         <span className="ml-auto flex items-center gap-1">
+          <DescribeButton bank={bank} />
           {bank.enabled ? (
             <Button
               size="sm"
@@ -238,34 +535,56 @@ function BankCard({
           <ForgetButton bank={bank} pane={pane} />
         </span>
       </div>
+      {/*
+        What the button above starts, in one line, and only on a bank that has
+        no manifest yet — which is the bank the offer is really for, and the
+        only card where a person is being asked to do something they did not
+        come here to do. A bank that already describes itself keeps the button
+        (its manifest can always be better) and drops the pitch.
+      */}
+      {bank.format !== 'manifest' ? (
+        <p className="text-2xs leading-relaxed text-ink-faint">
+          Starts a conversation in the bank&apos;s checkout that reads the tree, proposes a BANK.md,
+          asks you what it cannot infer, and lands it through the bank&apos;s review path.
+        </p>
+      ) : null}
+      {/* The bank's own line about itself, from its manifest. It is the
+          routing signal the prompt carries, so a person deciding which
+          profiles to attach it to should be reading the same sentence the
+          model will. */}
+      {bank.description !== null ? (
+        <p className="text-2xs leading-relaxed text-ink-muted">{bank.description}</p>
+      ) : null}
       <Row label="Repo">{bank.path}</Row>
       <Row label="Remote">{bank.remote ?? 'none — changes commit locally'}</Row>
       <Row label="Bank">
         {`${bank.memories} memories${bank.mirrored > 0 ? ` (${bank.mirrored} mirrored, read-only)` : ''} · ${bank.validationErrors} validation errors · installed in ${bank.projects} projects`}
       </Row>
+      <BankProfiles bank={bank} pane={pane} />
+      <BankClaudeCode bank={bank} pane={pane} />
       {/*
-        The registry flag and the on-disk wiring are two different facts, and
-        they have disagreed in the wild: a bank can be "on" while no profile
-        carries its block (the setup flow records the flag; `enable` does the
-        wiring, and an enable that failed leaves exactly this state). Saying so
-        — with the repair right there — is what turns a silent nothing into a
-        one-click fix.
+        What the bank's reader would not accept, folded rather than listed: on
+        a healthy bank it is nothing, on a broken one it is a file-by-file
+        report that would bury every other fact on the card. The count is on
+        the summary so a person can see there is something to open without
+        opening it.
       */}
-      {bank.enabled && bank.exists && profiles.length > 0 && wired === 0 ? (
-        <div className="flex items-center gap-2">
-          <p className="text-2xs leading-relaxed text-amber">
-            On, but no profile carries its block — the wiring step never completed on this machine.
-          </p>
-          <Button
-            size="sm"
-            variant="outline"
-            className="text-2xs"
-            disabled={pane.busy !== null}
-            onClick={() => pane.setEnabled(bank.slug, true)}
-          >
-            {working ? 'Wiring…' : 'Wire profiles'}
-          </Button>
-        </div>
+      {bank.problems.length > 0 ? (
+        <Fold
+          summary={
+            <span className="text-2xs text-amber">
+              {problemCount === 1 ? '1 entry has problems' : `${problemCount} entries have problems`}
+            </span>
+          }
+        >
+          <ul className="flex flex-col gap-0.5 pt-1">
+            {bank.problems.map((problem) => (
+              <li key={problem} className="font-mono text-2xs leading-relaxed break-words text-ink-muted">
+                {problem}
+              </li>
+            ))}
+          </ul>
+        </Fold>
       ) : null}
       {/*
         A reference that stopped resolving degrades this one bank and says so
@@ -292,6 +611,213 @@ function BankCard({
   );
 }
 
+/**
+ * How a bank gets a manifest, or a better one.
+ *
+ * A `BANK.md` is not a form. Nearly all of it is already in the tree — where
+ * the memories are, what the folder levels mean, how changes reach the remote
+ * — and the two or three things that are not are questions for the person. So
+ * this is a button that starts a conversation rather than a dialog that asks
+ * for a name, a glob and a scope template: the store action opens a column in
+ * the bank's checkout, sends the first message and closes this dialog behind
+ * it. See `describeMemoryBank`, and `renderDescribeBankPrompt` for the words.
+ *
+ * Two labels for one action. A bank with a manifest is being *revised*, and a
+ * button offering to describe a bank that already describes itself would be
+ * proposing work the user can see on the card is done.
+ *
+ * Not dimmed by `pane.busy`, unlike everything else on this card: it spawns no
+ * CLI, writes nothing, and produces no receipt to race the pane's one receipt
+ * line for. Missing on disk is the one refusal — there is no tree to read and
+ * no directory to run in — and it is a reason rather than a silent grey, the
+ * house rule `disabled-reason.tsx` states.
+ */
+function DescribeButton({ bank }: { readonly bank: MemoryBankInfo }): ReactElement {
+  return (
+    <ReasonButton
+      size="sm"
+      variant="ghost"
+      className="text-2xs"
+      disabled={!bank.exists}
+      disabledReason={`${bank.path} is not on disk, so there is no tree to read and nowhere to run.`}
+      onClick={() =>
+        void describeMemoryBank({
+          slug: bank.slug,
+          path: bank.path,
+          format: bank.format,
+          name: bank.name,
+        })
+      }
+    >
+      {bank.format === 'manifest' ? 'Revise BANK.md…' : 'Describe this bank…'}
+    </ReasonButton>
+  );
+}
+
+/**
+ * Which profiles this bank reaches.
+ *
+ * Deliberately the same control, and the same argument, as the prompt
+ * library's scope picker: "Every profile" is a checkbox *above* the list
+ * rather than a mode beside it, because it is the default and the list
+ * underneath is what narrowing looks like. Unticking it hands back every
+ * profile ticked, so the act of narrowing does not itself detach the bank
+ * from everything and make the user re-tick what they already had.
+ *
+ * The profiles come from the app store — the same list the prompt scope picker
+ * reads — rather than from the status reading's own `profiles` array, which is
+ * a different set of facts under a similar name: those are the CLI's view of
+ * which profile directories carry a managed block, for stock Claude Code's
+ * benefit. What a bank is attached to is Artemis's own record, keyed by
+ * Artemis's own profile ids.
+ *
+ * Every profile is tickable, including one whose provider cannot take an
+ * appended system prompt. A bank is not only a prompt: it is installed into
+ * the profile's project memory and handed to the run as a readable directory,
+ * both of which happen whatever the provider is.
+ */
+function BankProfiles({
+  bank,
+  pane,
+}: {
+  readonly bank: MemoryBankInfo;
+  readonly pane: MemoryBanksPane;
+}): ReactElement {
+  const profiles = useApp((s) => s.profiles);
+  const scope = bank.profiles;
+  const all = scope.kind === 'all';
+  const busy = pane.busy !== null;
+
+  const toggle = (id: string, on: boolean): void => {
+    const current = scope.kind === 'profiles' ? scope.profileIds : [];
+    pane.setProfiles(bank.slug, {
+      kind: 'profiles',
+      profileIds: on ? [...current, id] : current.filter((entry) => entry !== id),
+    });
+  };
+
+  return (
+    <div className="flex flex-col gap-1.5 pt-1">
+      <span className="chrome-label text-ink-faint">Profiles</span>
+
+      <label className="flex cursor-pointer items-center gap-2">
+        <Checkbox
+          checked={all}
+          disabled={busy}
+          onCheckedChange={(next) =>
+            pane.setProfiles(
+              bank.slug,
+              next === true
+                ? { kind: 'all' }
+                : { kind: 'profiles', profileIds: profiles.map((profile) => profile.id) },
+            )
+          }
+          aria-label={`Attach “${bank.slug}” to every profile`}
+        />
+        <span className="flex flex-col">
+          <span className="text-xs leading-snug text-ink">Every profile</span>
+          <span className="text-2xs leading-snug text-ink-faint">
+            Including accounts added later.
+          </span>
+        </span>
+      </label>
+
+      {all ? null : (
+        <div className="flex flex-col gap-1 border-t border-hairline pt-2">
+          {profiles.length === 0 ? (
+            <span className="text-2xs text-ink-faint">
+              No profiles yet — add one in Profiles and it will appear here.
+            </span>
+          ) : null}
+          {profiles.map((profile) => (
+            <label key={profile.id} className="flex cursor-pointer items-center gap-2">
+              <Checkbox
+                checked={scope.kind === 'profiles' && scope.profileIds.includes(profile.id)}
+                disabled={busy}
+                onCheckedChange={(next) => toggle(profile.id, next === true)}
+                aria-label={`Attach “${bank.slug}” to ${profile.label}`}
+              />
+              <span className="text-xs leading-snug text-ink">{profile.label}</span>
+              <span className="text-2xs text-ink-faint">{profile.providerId}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * What *stock Claude Code* on this machine carries of this bank, and the one
+ * button that changes it.
+ *
+ * The distinction this row exists to draw: none of it is Artemis's path.
+ * Artemis reads the bank through its own code, installs its memories itself and
+ * runs with `settingSources: []`, so the managed block and the session-start
+ * hook are inert under Artemis and always were. They matter to the person who
+ * *also* opens these profiles in `claude` — and for them, wiring is a real
+ * setup step that nothing else performs.
+ *
+ * So it is an action rather than a consequence of switching the bank on, and
+ * its state is read back out of the files rather than remembered: how many
+ * profiles carry the block, and whether the hook is there. A pane that said
+ * "wired" from its own memory would keep saying it after someone edited a
+ * `CLAUDE.md` by hand.
+ *
+ * The refusal is the interesting case. `enable` and `disable` are the *bank's*
+ * CLI — its block is namespaced by its slug and its hook is its own dialect —
+ * and Artemis ships no copy to stand in for a bank that carries none. That is
+ * a reason on a dimmed button, not a hidden one: a bank with no `bin/cerebro`
+ * is perfectly healthy, and the sentence has to say so.
+ */
+function BankClaudeCode({
+  bank,
+  pane,
+}: {
+  readonly bank: MemoryBankInfo;
+  readonly pane: MemoryBanksPane;
+}): ReactElement {
+  const profiles = pane.status?.profiles ?? [];
+  const carrying = profiles.filter((profile) => profile.banks[bank.slug] === true).length;
+  const hooked = profiles.some((profile) => profile.hook);
+  const wired = carrying > 0;
+  const working = pane.busy === 'wire';
+
+  return (
+    <div className="flex flex-col gap-1.5 border-t border-hairline pt-2">
+      <span className="chrome-label text-ink-faint">Stock Claude Code</span>
+      <div className="flex items-start gap-3">
+        <p className="min-w-0 flex-1 text-2xs leading-relaxed text-ink-muted">
+          {profiles.length === 0
+            ? 'No Claude Code profile directories on this machine, so there is nothing to wire.'
+            : `Managed block in ${carrying} of ${profiles.length} ${
+                profiles.length === 1 ? 'profile' : 'profiles'
+              } · session-start sync hook ${hooked ? 'installed' : 'not installed'}.`}
+        </p>
+        <ReasonButton
+          size="sm"
+          variant={wired ? 'ghost' : 'outline'}
+          className="text-2xs"
+          disabled={!bank.embedsCli || pane.busy !== null}
+          disabledReason={
+            bank.embedsCli
+              ? undefined
+              : `${bank.slug} embeds no cerebro CLI, so nothing here can write stock Claude Code’s block, command and hook. Artemis’s own runs are unaffected.`
+          }
+          onClick={() => pane.wireClaudeCode(bank.slug, !wired)}
+        >
+          {working ? '…' : wired ? 'Unwire' : 'Wire for stock Claude Code'}
+        </ReasonButton>
+      </div>
+      <p className="text-2xs leading-relaxed text-ink-faint">
+        Stock Claude Code sessions on this machine read a managed block in each profile&apos;s
+        CLAUDE.md and sync at session start through the bank&apos;s own cerebro CLI. Artemis&apos;s
+        own runs need none of this.
+      </p>
+    </div>
+  );
+}
+
 function BankMemories({
   bank,
   pane,
@@ -309,39 +835,36 @@ function BankMemories({
     return all.filter(
       (memory) =>
         memory.name.toLowerCase().includes(needle) ||
+        memory.title.toLowerCase().includes(needle) ||
         memory.description.toLowerCase().includes(needle) ||
-        (memory.org ?? '').toLowerCase().includes(needle) ||
-        (memory.project ?? '').toLowerCase().includes(needle) ||
+        scopeLabel(memory).toLowerCase().includes(needle) ||
         memory.body.toLowerCase().includes(needle),
     );
   }, [loaded, query]);
 
   /**
-   * Org → project buckets, in the CLI's own order (it sorts by org, project,
-   * name, so insertion order is already the display order). A flat classic
-   * bank renders without headers at all — one bucket named nothing would be a
-   * header saying nothing.
+   * Buckets by the entry's own scope labels, in the reader's order (it sorts
+   * by scope then name, so insertion order is already the display order).
+   *
+   * The labels are the bank's vocabulary, not Artemis's — `org / project` for a
+   * cortex-shaped bank, `brand / system` for a brand-first one — so the header
+   * is whatever the bank's own folders say, joined. A flat bank renders without
+   * headers at all: one bucket named nothing would be a header saying nothing.
    */
   const groups = useMemo(() => {
-    const buckets = new Map<
-      string,
-      { readonly org: string | null; readonly project: string | null; readonly items: MemoryBankMemory[] }
-    >();
+    const buckets = new Map<string, { readonly label: string; readonly items: MemoryBankMemory[] }>();
     for (const memory of visible) {
-      // A separator no path segment can contain, written as an escape rather
-      // than as the byte itself so this file stays text to grep and to diff.
-      const key = `${memory.org ?? ''}\x00${memory.project ?? ''}`;
-      const bucket = buckets.get(key);
+      const label = scopeLabel(memory);
+      const bucket = buckets.get(label);
       if (bucket === undefined) {
-        buckets.set(key, { org: memory.org, project: memory.project, items: [memory] });
+        buckets.set(label, { label, items: [memory] });
       } else {
         bucket.items.push(memory);
       }
     }
     return [...buckets.values()];
   }, [visible]);
-  const flat =
-    groups.length <= 1 && (groups[0]?.org ?? null) === null && (groups[0]?.project ?? null) === null;
+  const flat = groups.length <= 1 && (groups[0]?.label ?? '') === '';
 
   if (loaded === undefined) {
     return <p className="text-2xs leading-relaxed text-ink-faint">Reading the bank…</p>;
@@ -367,9 +890,9 @@ function BankMemories({
         ))
       ) : (
         groups.map((group) => (
-          <div key={`${group.org ?? '·'}/${group.project ?? '·'}`} className="flex flex-col gap-1.5">
+          <div key={group.label} className="flex flex-col gap-1.5">
             <p className="pt-1 font-mono text-2xs font-medium text-ink-muted">
-              {[group.org, group.project].filter((part) => part !== null).join(' / ') || 'unfiled'}
+              {group.label.length > 0 ? group.label : 'unfiled'}
               {` · ${group.items.length}`}
             </p>
             {group.items.map((memory) => (
@@ -380,6 +903,21 @@ function BankMemories({
       )}
     </div>
   );
+}
+
+/**
+ * The folders this entry sits under, in the bank's own words.
+ *
+ * `{ org: 'systemtech', project: 'artemis' }` reads `systemtech / artemis`;
+ * `{ brand: 'cool-jams', system: 'ops' }` reads `cool-jams / ops`. Empty for a
+ * flat bank, which is what the caller turns into `unfiled` — here it stays
+ * empty, because an empty label is also the key that says "these belong
+ * together and have no heading".
+ */
+function scopeLabel(memory: MemoryBankMemory): string {
+  return Object.values(memory.scope)
+    .filter((part) => part.length > 0)
+    .join(' / ');
 }
 
 function MemoryCard({
@@ -397,8 +935,16 @@ function MemoryCard({
     <div className="flex flex-col gap-1 rounded-md border border-hairline bg-panel px-3 py-2.5">
       <div className="flex items-center gap-2">
         <span className="font-mono text-xs font-medium text-ink">{memory.name}</span>
+        {/* The heading the index lists it under, when it is not just the name
+            again — which is the ordinary case for a bank that writes them. */}
+        {memory.title !== memory.name ? (
+          <span className="truncate text-xs text-ink-muted">{memory.title}</span>
+        ) : null}
         <ToneBadge tone="neutral">{memory.type}</ToneBadge>
         {memory.readonly ? <ToneBadge tone="neutral">mirror · read-only</ToneBadge> : null}
+        {/* Browsable but not installed, which is the whole reason it is listed:
+            the person who can fix it has to be able to find it. */}
+        {memory.problems.length > 0 ? <ToneBadge tone="signal">not installed</ToneBadge> : null}
         <span className="ml-auto">
           {/* Retirement is a write; a read-only bank takes none, and a mirror
               memory is not the bank's to retire on any machine. */}
@@ -408,6 +954,15 @@ function MemoryCard({
         </span>
       </div>
       <p className="text-2xs leading-relaxed text-ink-muted">{memory.description}</p>
+      {memory.problems.length > 0 ? (
+        <ul className="flex flex-col gap-0.5">
+          {memory.problems.map((problem) => (
+            <li key={problem} className="text-2xs leading-relaxed text-signal">
+              {problem}
+            </li>
+          ))}
+        </ul>
+      ) : null}
       <Fold summary={<span className="text-2xs">file body</span>}>
         <CodeBlock text={memory.body} className="max-h-56" />
       </Fold>
@@ -533,29 +1088,40 @@ export function slugFromRemote(remote: string): string {
  *
  * This list replaced a single machine-wide gate (`preflight.ready`, which is
  * false if *any* check failed), and the replacement is the point of the
- * change. The doctor answers for the whole machine: it probes a destination
- * directory, a `PATH` shim for the bare `cerebro` verb, a git identity for
- * commits, and — before any bank is registered — reachability of the upstream
- * repository the CLI defaults to, which is a private repo an outside user can
- * only ever fail. Joining a bank from your own git URL needs none of those. It
- * needs the CLI to be runnable and git to exist, and the remote's own
- * readability is what the Verify button is for.
+ * change. The preflight answers for the whole machine; each mode needs a
+ * different part of that answer, and a check outside a mode's part is not a
+ * reason to refuse its button.
  *
- * The ids are the CLI's own (`gather_checks` in `resources/cerebro`), plus
- * `cli` — main's synthesised row for "there is no CLI on this machine at all".
+ * What each mode genuinely cannot do without:
  *
- * Creating and adopting are gated harder, and on different things: both write
- * a commit the moment they run, so an unset git identity really does stop
- * them, and both are aimed at a directory, so the destination check is about
- * the thing the user typed rather than about a default.
+ *  - **join** clones, so it needs `git`. The remote's own readability is what
+ *    the Verify button is for, not a machine check.
+ *  - **create** starts a repository and writes the first commit — the
+ *    `BANK.md` the bank starts from — so it needs `git` *and* an identity to
+ *    commit as.
+ *  - **adopt** registers a directory that is already a bank. It writes
+ *    nothing and clones nothing, so nothing on this machine stops it.
+ *
+ * `remote` is on every list, and it is not the CLI's old probe of a default
+ * upstream: it is the synthetic row `remoteBridge` answers with when this
+ * window is driving *another machine's* Artemis. The banks live over there and
+ * are managed over there, so all three buttons have to be off — the version
+ * that left Join enabled produced a click whose only result was `add`
+ * refusing, with the reason in a receipt nobody had a reason to read.
+ *
+ * `python` and `cli` are informational now and deliberately off every list.
+ * Nothing on the reading path spawns the CLI any more — Artemis parses the
+ * banks itself — so a machine with no Python joins, creates and adopts
+ * exactly like any other. The rows still render, because the CLI is still how
+ * a stock Claude Code user drives the same bank by hand.
  *
  * Everything left off this list still renders — a warning about `gh` is worth
  * reading before the first pull request — it simply does not disable a button.
  */
 const BLOCKING_CHECKS: Readonly<Record<AddMode, readonly string[]>> = {
-  join: ['cli', 'python', 'git'],
-  create: ['cli', 'python', 'git', 'git-identity', 'repo'],
-  adopt: ['cli', 'python', 'git', 'git-identity', 'repo'],
+  join: ['remote', 'git'],
+  create: ['remote', 'git', 'git-identity'],
+  adopt: ['remote'],
 };
 
 /** What a verify came to, from the click until the answer lands. */
@@ -915,7 +1481,7 @@ function AddGroup({
       {first ? (
         <p className="px-3 py-2.5 text-2xs leading-relaxed text-ink-muted">
           No memory bank is on this machine yet. Join your team&apos;s bank from its git remote,
-          create a fresh local one (shareable later — the CLI travels inside it), or adopt a
+          create a fresh local one (shareable later — give it a remote and push), or adopt a
           folder that already is a bank. From then on it maintains itself: agents record durable
           facts as they surface, and every change lands as a reviewed commit or pull request.
         </p>
@@ -949,8 +1515,8 @@ function AddGroup({
           {mode === 'join'
             ? 'Clones the bank from its git remote. Memories you record land as auto-merging pull requests.'
             : mode === 'create'
-              ? 'Starts an empty bank on this machine. No remote, no network — memories land as plain commits. Add a remote later to share it.'
-              : 'Registers a directory that already holds a bank (a memories/ folder).'}
+              ? 'Starts an empty bank on this machine, with a BANK.md describing it that the bank goes on from. No remote, no network — memories land as plain commits. Add a remote later to share it.'
+              : 'Registers a directory that already holds a bank — a BANK.md, a cerebro.json projects layout, or a memories/ folder.'}
         </p>
         <div className="flex flex-wrap items-center gap-2">
           <Input

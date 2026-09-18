@@ -136,22 +136,25 @@ import {
   BotIcon,
   BrainIcon,
   ChevronRightIcon,
+  CircleStopIcon,
+  ClipboardListIcon,
   FilePenLineIcon,
   FileTextIcon,
+  GitForkIcon,
   GlobeIcon,
+  HourglassIcon,
   InfoIcon,
   ListChecksIcon,
+  MessageCircleQuestionMarkIcon,
+  PaperclipIcon,
   PlugIcon,
   SearchIcon,
+  ShieldAlertIcon,
   SparklesIcon,
   SquareArrowOutUpRightIcon,
   TerminalIcon,
-  GitForkIcon,
-  Undo2Icon,
-  CircleStopIcon,
-  HourglassIcon,
-  PaperclipIcon,
   TriangleAlertIcon,
+  Undo2Icon,
   WrenchIcon,
   type LucideIcon,
 } from 'lucide-react';
@@ -164,6 +167,8 @@ import { useActivityGroup, useTranscriptItem, useTranscriptRows } from '../hooks
 import { recallFold, rememberFold } from '../lib/foldMemory';
 import { formatBytes } from '../lib/attachments';
 import { detectArtifact } from '../lib/artifact';
+import { registerRowJumper } from '../lib/rowJump';
+import { FindInSession } from './FindInSession';
 import { detectFileEdit } from '@rx-artemis/transcript';
 import { previewablePath } from '../lib/preview';
 import {
@@ -197,6 +202,7 @@ import {
 } from '@rx-artemis/transcript';
 import {
   isGroupId,
+  isSuggestedTaskCall,
   type ActivityGroup,
   type AssistantItem,
   type CommandItem,
@@ -208,9 +214,11 @@ import {
   type UserItem,
 } from '@rx-artemis/transcript';
 import { DiffView } from './DiffView';
+import { SuggestedTaskCard } from './SuggestedTask';
 import { ActivityIndicator } from './Activity';
 import { ConversationLoading, EmptyState } from './EmptyState';
 import { InlinePermission } from './InlinePermission';
+import { focusParkedAsk } from './ParkedAsks';
 import { Markdown } from './Markdown';
 import { CodeBlock, Fold, StatusDot, ToneBadge, toneClasses, type Tone } from './primitives';
 import { StreamingText } from './StreamingText';
@@ -388,6 +396,37 @@ export function Transcript(): ReactElement {
     lastTop.current = el.scrollTop;
   }, []);
 
+  /**
+   * The way in from outside: the documents list in the dock asks for a row by
+   * id, and this is the one component holding the scroller. See
+   * `lib/rowJump.ts` for why it is a registry rather than a prop.
+   *
+   * Unpins deliberately. Being taken to a row is a request to read it, and a
+   * follower that snapped back to the tail on the next token would have shown
+   * the row for exactly one frame. The jump button is the way back down, and
+   * it is offered for the same reason it is after a manual scroll.
+   */
+  const pane = usePaneRef();
+  useEffect(
+    () =>
+      registerRowJumper(pane.id, (rowId) => {
+        const scroller = scrollRef.current;
+        if (!scroller) return false;
+        const wrapper = scroller.querySelector(
+          `[data-row-id="${rowId.replace(/["\\]/g, '\\$&')}"]`,
+        );
+        const target = wrapper?.firstElementChild;
+        if (!(target instanceof HTMLElement)) return false;
+        pinned.current = false;
+        setShowJump(true);
+        target.scrollIntoView({ block: 'center' });
+        lastTop.current = scroller.scrollTop;
+        flashRow(target);
+        return true;
+      }),
+    [pane],
+  );
+
   return (
     <div className="relative min-h-0 flex-1">
       <div
@@ -427,6 +466,11 @@ export function Transcript(): ReactElement {
         </div>
       </div>
 
+      {/* ⌘F, over the conversation rather than in it: the bar floats above the
+          scroller so opening it neither reflows the transcript nor moves the
+          line someone is reading. See `FindInSession`. */}
+      <FindInSession scope={contentRef} />
+
       {showJump ? (
         <Button
           variant="outline"
@@ -447,12 +491,39 @@ export function Transcript(): ReactElement {
 /* Row dispatch                                                               */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Mark a row the reader was just taken to, briefly.
+ *
+ * The Web Animations API rather than a class: the row already carries
+ * `turn-in`'s animation, and a class that set `animation` over it would replay
+ * the entrance when it was removed. A wash of the accent that fades is enough
+ * to answer "which one" without touching the row's own styling. Absent under
+ * jsdom, where nothing is drawn — hence the guard.
+ */
+function flashRow(row: HTMLElement): void {
+  if (typeof row.animate !== 'function') return;
+  row.animate(
+    [
+      { backgroundColor: 'color-mix(in oklab, var(--color-beam) 22%, transparent)' },
+      { backgroundColor: 'transparent' },
+    ],
+    { duration: 1400, easing: 'ease-out' },
+  );
+}
+
 const Row = memo(function Row({ id }: { readonly id: string }): ReactElement | null {
   // A group id names a fold of several tool calls rather than one item, and
   // subscribes to a different slice of the model. Splitting before the item
   // lookup keeps `ItemRow` on the single-id subscription that rule 2 requires.
-  if (isGroupId(id)) return <ActivityRow id={id} />;
-  return <ItemRow id={id} />;
+  //
+  // The wrapper has no box — `display: contents` leaves the `Line` inside it
+  // as the flex item the column spaces — and exists so a row can be found by
+  // id from outside the list. See `lib/rowJump.ts`.
+  return (
+    <div data-row-id={id} className="contents">
+      {isGroupId(id) ? <ActivityRow id={id} /> : <ItemRow id={id} />}
+    </div>
+  );
 });
 
 const ItemRow = memo(function ItemRow({ id }: { readonly id: string }): ReactElement | null {
@@ -857,7 +928,7 @@ function AssistantRow({ item }: { readonly item: AssistantItem }): ReactElement 
   // Which repository a bare `#123` in the answer names — the directory's
   // origin, read once per workspace change. Stable for the same reason `cwd`
   // is: it moves only when the column points somewhere else.
-  const repo = usePane((s) => s.workspace?.github ?? null);
+  const origin = usePane((s) => s.workspace?.origin ?? null);
 
   return (
     <Line
@@ -883,7 +954,7 @@ function AssistantRow({ item }: { readonly item: AssistantItem }): ReactElement 
             <div className={STREAMING_TEXT}>{item.text}</div>
           ) : (
             <div className="md text-ink">
-              <Markdown files={files} repo={repo}>{item.text}</Markdown>
+              <Markdown files={files} origin={origin}>{item.text}</Markdown>
             </div>
           )}
         </BubbleContent>
@@ -1107,7 +1178,32 @@ function ThinkingRow({ item }: { readonly item: ThinkingItem }): ReactElement {
  * on a handful of rows per session is the cheaper half of the trade against
  * putting `cwd` into `ToolCard`'s props and out of its own memo.
  */
-function ToolRow({ item }: { readonly item: ToolItem }): ReactElement {
+function ToolRow({ item }: { readonly item: ToolItem }): ReactElement | null {
+  /*
+   * An offer, not a call.
+   *
+   * `suggest_task` is a tool the *host* defines, whose handler does nothing and
+   * whose only product is this row — see `@rx-artemis/protocol`'s
+   * `suggestedTasks`. Drawing it as a tool card would file a question to the
+   * reader as a report of work, under a `tool` label, with the prompt shown as
+   * a quoted argument. So the row is the chip, and the gutter says so.
+   *
+   * `null` when the chip declines to draw: a malformed call, or one this column
+   * has put away. A dismissed suggestion leaves no gap — the offer is gone, and
+   * a `tool` card left in its place would be the machinery the chip exists to
+   * spare the reader.
+   */
+  if (isSuggestedTaskCall(item)) {
+    return (
+      <Line label="task" tone="beam" ts={item.ts} className="my-1">
+        <SuggestedTaskCard item={item} />
+      </Line>
+    );
+  }
+  return <ToolCallRow item={item} />;
+}
+
+function ToolCallRow({ item }: { readonly item: ToolItem }): ReactElement {
   const cwd = usePane((s) => s.cwd);
   const platform = useApp((s) => s.platform);
   const artifact = useMemo(
@@ -1510,12 +1606,16 @@ const MemberCard = memo(function MemberCard({ id }: { readonly id: string }): Re
 });
 
 /**
- * A parked request, answered where it happened.
+ * A parked request: a marker while it waits, the record once it is settled.
  *
- * The card itself is `InlinePermission`; this only supplies the transcript's
- * row chrome. Pending requests get a coloured rail label so they are findable
- * by scrolling as well as by the status line's counter — amber for an approval,
- * because that is a risk decision, and cyan for a question, because it is not.
+ * The card itself is `InlinePermission`, and while the request is pending it
+ * is drawn in the composer's `ParkedAsks` strip rather than here — the one
+ * place on screen wherever the transcript is scrolled. This row keeps the
+ * ask's place in the story: pending, it says the ask is waiting below and
+ * jumps there; settled, it is the same record it always was, in the same
+ * spot. The rail label still marks it, so a reader scrolling back can see
+ * where the agent stopped to ask — amber for an approval, because that is a
+ * risk decision, and cyan for a question, because it is not.
  */
 function PermissionRow({ item }: { readonly item: PermissionItem }): ReactElement {
   const pending = item.state === 'pending';
@@ -1527,8 +1627,60 @@ function PermissionRow({ item }: { readonly item: PermissionItem }): ReactElemen
       ts={item.ts}
       className={pending ? 'my-1' : undefined}
     >
-      <InlinePermission item={item} />
+      {pending ? <ParkedMarker item={item} /> : <InlinePermission item={item} />}
     </Line>
+  );
+}
+
+/**
+ * Where a pending request stands in the transcript.
+ *
+ * Not the card, on purpose: two live cards would be two drafts of one answer
+ * and two elements contending for focus when the request lands. One line
+ * saying what is waiting, and a button to the card. The tint matches the card
+ * it points at — cyan for a question, amber for an approval or a plan — so the
+ * marker and the pin read as the same thing seen twice.
+ */
+function ParkedMarker({ item }: { readonly item: PermissionItem }): ReactElement {
+  // The strip is this column's, and so is the request: a marker on the left
+  // must not open the pin on the right.
+  const pane = usePaneRef();
+  const question = item.request.question;
+  const plan = item.request.plan;
+  const Icon = question ? MessageCircleQuestionMarkIcon : plan ? ClipboardListIcon : ShieldAlertIcon;
+  const waiting = question
+    ? question.questions.length === 1
+      ? 'The agent has a question'
+      : `The agent has ${String(question.questions.length)} questions`
+    : plan
+      ? "The agent's plan is waiting for your sign-off"
+      : 'A tool call is waiting for your approval';
+  return (
+    <div
+      className={cn(
+        'flex items-center gap-2 rounded-lg border px-2.5 py-1.5',
+        question ? 'border-cyan/45 bg-cyan/6' : 'border-amber/45 bg-amber/8',
+      )}
+    >
+      <Icon
+        className={cn('size-3.5 shrink-0', question ? 'text-cyan' : 'text-amber')}
+        aria-hidden="true"
+      />
+      <p className="min-w-0 flex-1 text-2xs leading-snug text-ink-muted">
+        <span className="font-medium text-ink">{waiting}.</span> It is pinned above the prompt
+        box until you answer, so it cannot scroll out of reach.
+      </p>
+      <Button
+        size="xs"
+        variant="ghost"
+        className="shrink-0"
+        onClick={() => {
+          focusParkedAsk(pane.id, item.requestId);
+        }}
+      >
+        Answer below
+      </Button>
+    </div>
   );
 }
 

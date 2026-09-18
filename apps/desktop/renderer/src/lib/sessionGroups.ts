@@ -86,6 +86,24 @@
  * the profile that owns it, not globally, because each profile has its own
  * provider config directory. Two profiles could in principle surface the same
  * id, and duplicate React keys inside one list silently drop a row.
+ *
+ * ## A third way out of a project: a group the user made
+ *
+ * Everything above files a session somewhere the *machine* decided — the
+ * directory it ran in, or one of the two shelves at the ends of the list. That
+ * is the right default and the wrong only option, and the case that proves it
+ * is an Artemis Server: every conversation held on one shares a single working
+ * directory, so the entire server's history lands under one heading with no way
+ * to tell a week of unrelated work apart.
+ *
+ * So there is a fourth kind of section — see {@link CustomGroup} — holding
+ * whatever the user dragged into it, from any project, filed by the same
+ * `sessionKey` values pins and the archive use. Groups sit between Pinned and
+ * the project headings, keep their stored order, and lift their members out of
+ * the project list exactly the way pinning does. Pinned and Archived still win:
+ * a grouped session that is also pinned shows under Pinned, because the two
+ * shelves are about *where your attention is* and a group is about how the
+ * history is filed, and only one of those can have the row.
  */
 
 import { isArchived, type ProfileId, type SessionSummary } from '@rx-artemis/protocol';
@@ -482,6 +500,298 @@ export function sessionKeyAliases(session: SessionSummary): readonly string[] {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Groups the user made                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One group a person created and dragged sessions into.
+ *
+ * Deliberately *not* called `SessionGroup`: that name was taken years earlier
+ * by a project bucket, which is the thing this exists to be an alternative to.
+ * Renaming the older type to free the better name would have touched every
+ * caller of `groupSessionsByProject` for a cosmetic win, so the newer concept
+ * takes the adjective instead.
+ *
+ * Three fields and no more. The `id` is what membership points at, so it must
+ * outlive every rename — filing by name would re-home every session in a group
+ * the moment its heading was corrected for a typo. The `name` is what the
+ * heading shows and is the only part the user edits. `collapsed` is optional
+ * and absent-means-open, the same polarity `collapsedProjects` uses and for the
+ * same reason: a group that has never been touched should be open, and a fold
+ * state nobody has expressed should not have to be written down.
+ *
+ * There is no `sessions` array. Membership lives in one flat
+ * {@link GroupMembership} record beside the group list rather than inside the
+ * group, because a session belongs to at most one group and the question asked
+ * on every render is "which group is this row in" — one lookup against a record
+ * rather than a scan of every group's array. It also makes the two halves fail
+ * independently: a corrupt membership entry loses one row's filing, where a
+ * corrupt array inside a group would take the group with it.
+ */
+export interface CustomGroup {
+  readonly id: string;
+  readonly name: string;
+  readonly collapsed?: boolean;
+}
+
+/**
+ * Session key → group id.
+ *
+ * Keys are {@link sessionKey} values, the same strings `pinnedSessions` stores,
+ * so everything the aliasing note on {@link sessionKeyAliases} says about a
+ * shared store applies here unchanged — and is honoured by {@link groupIdOf}.
+ */
+export type GroupMembership = Readonly<Record<string, string>>;
+
+/** One custom group, with the sessions filed into it. */
+export interface CustomGroupSection {
+  readonly group: CustomGroup;
+  /** Newest first, filtered by the query like every other section. */
+  readonly sessions: readonly SessionSummary[];
+}
+
+/**
+ * Which group this session is filed under, if any.
+ *
+ * Matched exactly the way pins and the archive are matched — every alias first,
+ * then an id-only match for a row in a shared store whose stored key has gone
+ * stale. See {@link entriesFiling} for the whole argument; the short version is
+ * that the profile half of a shared row's key changes the first time the
+ * session is opened, and a group that emptied itself because of a background
+ * correction the user never asked for would be indistinguishable from the app
+ * losing their filing.
+ *
+ * The alias loop runs first and answers for every ordinary row without touching
+ * the record's key list, which matters because this is called once per session
+ * per render of the sidebar.
+ */
+export function groupIdOf(
+  session: SessionSummary,
+  membership: GroupMembership,
+): string | undefined {
+  for (const key of sessionKeyAliases(session)) {
+    const id = membership[key];
+    if (id !== undefined) return id;
+  }
+  // Only for shared rows, and only ever as a fallback: for an unshared session
+  // the old guarantee stands that one profile's entry must not claim another
+  // profile's row. See `entriesFiling`.
+  if (!isSharedRow(session)) return undefined;
+  for (const [key, id] of Object.entries(membership)) {
+    if (entryId(key) === session.id) return id;
+  }
+  return undefined;
+}
+
+/**
+ * Lift the grouped sessions out of the list the projects are built from.
+ *
+ * The same shape of move {@link partitionSessions} makes for Pinned and
+ * Archived, and a separate step for the same reason: a grouped session *leaves*
+ * its project heading rather than picking up a marker inside it. Called after
+ * that partition, on `active` alone, which is what gives Pinned and Archived
+ * their precedence — a row that has already been lifted onto a shelf is not
+ * here to be lifted again.
+ *
+ * ## Empty groups still get a section
+ *
+ * A group with nothing in it is the state every group starts in, and the only
+ * way to put the first session in one is to drop a row onto its heading. A
+ * section that appeared only once it had a member would therefore be
+ * unreachable by the gesture that creates its first member. Project headings
+ * behave the opposite way — they are derived from the sessions, so an empty one
+ * is a contradiction — which is exactly the difference between furniture the
+ * app infers and furniture the user put there.
+ *
+ * The one exception is a filter: while a query is typed, a group with no match
+ * is dropped like an unmatched project, because "No match" is the answer and a
+ * column of empty headings under it reads as a broken search rather than as a
+ * set of drop targets. Drag-and-drop into a group while searching is not a
+ * gesture anyone makes — the row being dragged is one of the matches.
+ *
+ * Membership naming a group that no longer exists is treated as ungrouped
+ * rather than dropped or repaired: {@link deleteSessionGroup} sweeps the
+ * entries it owns, so a survivor is either a hand-edited preferences file or a
+ * group that went away in another window, and in both cases the session's
+ * project heading is the correct place to find it.
+ */
+export function liftSessionGroups(
+  sessions: readonly SessionSummary[],
+  groups: readonly CustomGroup[],
+  membership: GroupMembership,
+  options: GroupOptions = {},
+): {
+  readonly sections: readonly CustomGroupSection[];
+  readonly ungrouped: readonly SessionSummary[];
+} {
+  // The common case is a sidebar nobody has made a group in, and walking every
+  // session to discover that is waste on the list's hot path.
+  if (groups.length === 0) return { sections: [], ungrouped: sessions };
+
+  const buckets = new Map<string, SessionSummary[]>();
+  for (const group of groups) buckets.set(group.id, []);
+
+  const ungrouped: SessionSummary[] = [];
+  for (const session of sessions) {
+    const id = groupIdOf(session, membership);
+    const bucket = id === undefined ? undefined : buckets.get(id);
+    if (bucket) bucket.push(session);
+    else ungrouped.push(session);
+  }
+
+  const query = options.query ?? '';
+  const sections: CustomGroupSection[] = [];
+  for (const group of groups) {
+    // Ordered and filtered by the same function the flat sections use, so a
+    // group's rows cannot drift from Pinned's in how they sort or in what a
+    // search hides.
+    const kept = orderSessions(buckets.get(group.id) ?? [], options);
+    if (query && kept.length === 0) continue;
+    sections.push({ group, sessions: kept });
+  }
+  return { sections, ungrouped };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Arranging the groups                                                       */
+/* -------------------------------------------------------------------------- */
+
+/** Which side of its anchor a moved group lands on. */
+export type GroupEdge = 'before' | 'after';
+
+/**
+ * The group list with one group moved to sit directly beside another.
+ *
+ * The stored order is the order the headings are drawn in, and it is the
+ * user's to arrange. It is never derived — not from names, which would move a
+ * shelf every time its label was corrected, and not from recency, which is the
+ * reshuffling the project headings were cured of (see the file header). A new
+ * group starts at the bottom and stays where it is put.
+ *
+ * Named by an anchor and a side rather than by an index, because that is what
+ * both callers know: a drop lands *next to* the heading under the pointer, and
+ * "Move up" means *before the one above*. An index would have to be an index
+ * into this list, and a filtered sidebar draws only some of it.
+ *
+ * Returns the **same array** when nothing moved — an unknown id, a group moved
+ * beside itself, one that already sits there — so the caller can tell a real
+ * move from a drag that ended where it began, and write nothing for the latter.
+ */
+export function moveGroup(
+  groups: readonly CustomGroup[],
+  id: string,
+  anchorId: string,
+  edge: GroupEdge,
+): readonly CustomGroup[] {
+  if (id === anchorId) return groups;
+  const from = groups.findIndex((group) => group.id === id);
+  const moved = groups[from];
+  if (moved === undefined) return groups;
+
+  const rest = groups.filter((group) => group.id !== id);
+  const anchor = rest.findIndex((group) => group.id === anchorId);
+  if (anchor === -1) return groups;
+
+  // An index into `rest` is also the index the group ends up at, so landing on
+  // the index it came from is the list it already was.
+  const to = edge === 'before' ? anchor : anchor + 1;
+  if (to === from) return groups;
+  return [...rest.slice(0, to), moved, ...rest.slice(to)];
+}
+
+/** Where a dragged group would land, and where to draw the line that says so. */
+export interface GroupDrop {
+  readonly anchorId: string;
+  readonly edge: GroupEdge;
+  /**
+   * The boundary the group would land on, in list pixels.
+   *
+   * The top of the anchor's heading, or the bottom of the *last row drawn under
+   * it* — not the bottom of its heading. An open group is its heading and its
+   * rows, and a line drawn between the two would promise a position inside the
+   * group that does not exist.
+   */
+  readonly lineY: number;
+  /** False when dropping here would leave the order exactly as it is. */
+  readonly changes: boolean;
+}
+
+/**
+ * Resolve a point in the list to the place a dragged group would land.
+ *
+ * Pure geometry over the flattened rows and their offsets, so the one rule is
+ * stated once and can be tested without a pointer: every group is a **block** —
+ * its heading plus whatever rows are drawn under it — and the upper half of a
+ * block means *before* that group, the lower half *after* it. A point above the
+ * whole stack means before the first group and a point below it means after the
+ * last, so a heading dragged anywhere in the sidebar lands at the nearest end
+ * rather than being refused: the shelves above and below the stack are not
+ * places a group can go, but they are an unambiguous direction.
+ *
+ * `offsets` is the virtualiser's own array — `offsets[i]` is where row `i`
+ * starts and `offsets[i + 1]` where it ends — passed in rather than recomputed
+ * so this cannot disagree with where the rows were actually drawn.
+ *
+ * `draggedId` is optional because a drop target cannot read a drag's payload
+ * until the drop (see `groupDrag.ts`); the list remembers which heading it
+ * handed out and passes it when it knows. It only ever decides
+ * {@link GroupDrop.changes}.
+ *
+ * `null` when there is nothing to arrange: fewer than two groups on screen.
+ */
+export function groupDropAt(
+  rows: readonly ListRow[],
+  offsets: readonly number[],
+  y: number,
+  draggedId?: string | null,
+): GroupDrop | null {
+  const blocks: { readonly id: string; readonly top: number; bottom: number }[] = [];
+  rows.forEach((row, index) => {
+    const bottom = offsets[index + 1] ?? 0;
+    if (row.kind === 'group-header') {
+      blocks.push({ id: row.groupId, top: offsets[index] ?? 0, bottom });
+      return;
+    }
+    // A group's rows directly follow its heading, so the open block is theirs.
+    const open = blocks[blocks.length - 1];
+    if (row.kind === 'session' && open !== undefined && row.groupId === open.id) open.bottom = bottom;
+  });
+
+  const first = blocks[0];
+  const last = blocks[blocks.length - 1];
+  if (first === undefined || last === undefined || blocks.length < 2) return null;
+
+  let at: number;
+  let edge: GroupEdge;
+  if (y < first.top) {
+    at = 0;
+    edge = 'before';
+  } else if (y >= last.bottom) {
+    at = blocks.length - 1;
+    edge = 'after';
+  } else {
+    // The blocks tile the stretch between those two ends, so the first one
+    // whose bottom is past the point is the one holding it.
+    const found = blocks.findIndex((block) => y < block.bottom);
+    at = found === -1 ? blocks.length - 1 : found;
+    const block = blocks[at] ?? last;
+    edge = y < (block.top + block.bottom) / 2 ? 'before' : 'after';
+  }
+
+  const target = blocks[at] ?? last;
+  const from = draggedId == null ? -1 : blocks.findIndex((block) => block.id === draggedId);
+  const stays =
+    from !== -1 &&
+    (at === from || (edge === 'before' && at === from + 1) || (edge === 'after' && at === from - 1));
+  return {
+    anchorId: target.id,
+    edge,
+    lineY: edge === 'before' ? target.top : target.bottom,
+    changes: !stays,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Flattening, for the virtualised list                                       */
 /* -------------------------------------------------------------------------- */
 
@@ -528,6 +838,41 @@ export interface ArchiveHeaderRow {
   readonly collapsed: boolean;
 }
 
+/**
+ * A custom group's heading.
+ *
+ * Its own kind for the reason the two section headings have theirs: nothing a
+ * project heading renders applies. There is no directory to name and no "you
+ * are here" to mark — a group spans projects by construction — and there *is*
+ * something neither of the others has, an id the rename, the delete and every
+ * drop need to name the group they are acting on.
+ *
+ * The name travels on the row rather than being looked up from the id at paint
+ * time, so the heading component stays a function of its props and does not
+ * have to subscribe to the group list to draw its own label.
+ */
+export interface GroupHeaderRow {
+  readonly kind: 'group-header';
+  readonly key: string;
+  /** {@link CustomGroup.id} — what a rename, a delete or a drop names. */
+  readonly groupId: string;
+  readonly name: string;
+  /** Sessions in the group — the full count, even when it is folded shut. */
+  readonly count: number;
+  readonly collapsed: boolean;
+  /**
+   * The groups drawn directly above and below this one, when there are any.
+   *
+   * What the heading's "Move up" and "Move down" name as their anchor. Taken
+   * from the sections actually being drawn rather than from the stored list, so
+   * while a filter hides some groups a move still lands somewhere the reader
+   * can see it land. Absent at either end of the stack, which is what disables
+   * the item.
+   */
+  readonly previousGroupId?: string;
+  readonly nextGroupId?: string;
+}
+
 export interface SessionRow {
   readonly kind: 'session';
   readonly key: string;
@@ -549,9 +894,19 @@ export interface SessionRow {
    * styled as put-away without a second lookup per frame.
    */
   readonly archived?: boolean;
+  /**
+   * The custom group this row is sitting in, when it is sitting in one.
+   *
+   * Same bargain as {@link pinned} and {@link archived}: the row's menu has to
+   * know whether to offer "Remove from group", and which group to tick in the
+   * "Move to group" list, and the flattening has already answered that question
+   * once. Asking again per row per frame would be a second lookup that can
+   * disagree with the section the row is actually drawn under.
+   */
+  readonly groupId?: string;
 }
 
-export type ListRow = HeaderRow | PinnedHeaderRow | ArchiveHeaderRow | SessionRow;
+export type ListRow = HeaderRow | PinnedHeaderRow | ArchiveHeaderRow | GroupHeaderRow | SessionRow;
 
 /**
  * Groups → one flat array of rows.
@@ -580,6 +935,18 @@ export type ListRow = HeaderRow | PinnedHeaderRow | ArchiveHeaderRow | SessionRo
  * these are *passed* has nothing to do with the order they are drawn in, and a
  * third positional argument that renders first would read as the opposite of
  * what it does.
+ *
+ * ## Custom groups sit between the pin shelf and the projects
+ *
+ * Below Pinned because a pin is the strongest claim in the list — "I am coming
+ * back to this one" outranks "this is how I have filed my history" — and above
+ * the projects because a group is something a person made and a project heading
+ * is something the app inferred from a path. The furniture someone built by
+ * hand goes at eye level; the furniture that was always there holds the rest.
+ *
+ * Unlike every other section, a group with nothing in it still draws its
+ * heading: it is the drop target that puts the first session into it. See
+ * {@link liftSessionGroups}.
  */
 export function flattenGroups(
   groups: readonly SessionGroup[],
@@ -587,6 +954,8 @@ export function flattenGroups(
   sections?: {
     readonly pinned?: SessionSection;
     readonly archived?: SessionSection;
+    /** The user's own groups, in stored order. See {@link CustomGroup}. */
+    readonly groups?: readonly CustomGroupSection[];
   },
 ): readonly ListRow[] {
   const rows: ListRow[] = [];
@@ -621,6 +990,46 @@ export function flattenGroups(
       }
     }
   }
+
+  /*
+   * The user's groups, in the order the user arranged them (see
+   * {@link moveGroup}), each one always drawing its heading.
+   *
+   * Their section indices start two past the end of the project array, after
+   * the two the flat sections took. The number identifies a section rather than
+   * describing where it sits — see the note on Pinned's index above — and
+   * numbering the groups last is what leaves every project's index equal to its
+   * own position in `groups`, which is the one thing that field is read for.
+   */
+  const custom = sections?.groups ?? [];
+  custom.forEach((section, index) => {
+    const folded = section.group.collapsed === true;
+    const previous = custom[index - 1]?.group.id;
+    const next = custom[index + 1]?.group.id;
+    rows.push({
+      kind: 'group-header',
+      // Prefixed and keyed on the id rather than the name: two groups may
+      // honestly be called the same thing, and a duplicate React key silently
+      // drops the second heading.
+      key: `h:group:${section.group.id}`,
+      groupId: section.group.id,
+      name: section.group.name,
+      count: section.sessions.length,
+      collapsed: folded,
+      ...(previous === undefined ? {} : { previousGroupId: previous }),
+      ...(next === undefined ? {} : { nextGroupId: next }),
+    });
+    if (folded) return;
+    for (const session of section.sessions) {
+      rows.push({
+        kind: 'session',
+        key: sessionKey(session),
+        session,
+        group: groups.length + 2 + index,
+        groupId: section.group.id,
+      });
+    }
+  });
 
   groups.forEach((group, index) => {
     const folded = collapsed.has(group.project);

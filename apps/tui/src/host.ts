@@ -33,8 +33,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
-import { ARCHIVED_TAG } from '@rx-artemis/protocol';
+import { ARCHIVED_TAG, parseSkillLibraryDocument } from '@rx-artemis/protocol';
 import type {
   AgentEvent,
   Capabilities,
@@ -57,6 +59,7 @@ import {
   managedEnvKeys,
   resolveEnv,
   resolveStoreEnv,
+  skillSourceSkillsDir,
   type Catalogue,
   type ProviderRegistry,
 } from '@rx-artemis/core';
@@ -129,6 +132,23 @@ export interface TuiHost {
     cwd: string,
     archived: boolean,
   ): Promise<boolean>;
+  /**
+   * Give a stored conversation a name of its own.
+   *
+   * The adapter's `setSessionTitle` — the same door the automatic namer writes
+   * through, and the same one the desktop's rename handler and the server's
+   * `/rename` route take. Deliberately not a second path: a typed title and a
+   * generated one are the same fact about a session, and two writes into one
+   * store would eventually disagree about which of them `titleIsCustom`
+   * describes.
+   *
+   * `false` for a provider whose store has no such field — Codex has
+   * `thread/name/set` and Claude the SDK's own, but an adapter is entitled to
+   * have neither — so the caller can say so rather than appearing to succeed.
+   * The title is trimmed and capped here, because whoever stores it is who has
+   * to say what was stored.
+   */
+  renameSession(profileId: ProfileId, providerId: ProviderId, sessionId: SessionId, cwd: string, title: string): Promise<boolean>;
   /** Destroy a stored conversation. The transcript file goes; nothing here can undo it. */
   deleteSession(profileId: ProfileId, providerId: ProviderId, sessionId: SessionId, cwd: string): Promise<boolean>;
   /**
@@ -151,6 +171,12 @@ export interface ModelListing {
   readonly live: boolean;
 }
 
+/**
+ * Longest title stored for a conversation. The desktop's engine and the
+ * server's host cap at the same number, and they all write to the same stores.
+ */
+const MAX_SESSION_TITLE = 200;
+
 export interface TuiHostOptions {
   /** Working directory the model listing is asked in. Defaults to `dataDir`. */
   readonly cwd?: string;
@@ -159,7 +185,36 @@ export interface TuiHostOptions {
 }
 
 export function createTuiHost(dataDir: string, options: TuiHostOptions = {}): TuiHost {
-  const providers = createDefaultProviderRegistry({});
+  /** For a failure the registry cannot hear about because it happens on the way in. */
+  const reportError =
+    options.onError ??
+    ((error: unknown, context: { readonly runId: string; readonly phase: string }): void => {
+      process.stderr.write(`Run ${context.runId} (${context.phase}): ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+
+  const providers = createDefaultProviderRegistry({
+    claude: {
+      /*
+       * The provider started a turn nobody asked for — register it.
+       *
+       * It does that when background work settles, and a subagent that outlived
+       * its turn can park on a permission prompt the same way. Without this the
+       * adapter has nowhere to report the turn and drops it, which is how a
+       * subagent came to spin for ever on the delegated strip after it had
+       * finished. `runs` is declared below and captured, not called, until a
+       * process is live — which is long after both exist. Same wiring as the
+       * desktop's `engine.ts`, and swallowed for the same reason: this runs
+       * inside the adapter's own event pump.
+       */
+      onContinuation: (run, context) => {
+        try {
+          runs.adopt(run, context);
+        } catch (error) {
+          reportError(error, { runId: run.runId, phase: 'adopt' });
+        }
+      },
+    },
+  });
   const managed = [...new Set(providers.list().flatMap((adapter) => managedEnvKeys(adapter.credentials)))];
 
   const profiles = new ProfileStore({
@@ -207,17 +262,37 @@ export function createTuiHost(dataDir: string, options: TuiHostOptions = {}): Tu
   const onWarning = (message: string, error: unknown): void => {
     process.stderr.write(`${message}: ${error instanceof Error ? error.message : String(error)}\n`);
   };
+  /**
+   * The repositories of skills the desktop keeps cloned, as folders to read.
+   *
+   * Read from the desktop's own `skills.json` and never synced from here: this
+   * process does not write to the desktop's data directory, and a clone is a
+   * write. The copies are whatever the desktop last pulled, which is the same
+   * answer the desktop itself would give a run started this minute.
+   */
+  const syncedSkillDirs = async (): Promise<readonly string[]> => {
+    const raw = await readFile(join(dataDir, 'skills.json'), 'utf8').catch(() => null);
+    if (raw === null) return [];
+    try {
+      const library = parseSkillLibraryDocument(JSON.parse(raw) as unknown);
+      return (library.sources ?? []).map((source) => skillSourceSkillsDir(dataDir, source));
+    } catch {
+      return [];
+    }
+  };
+
   const contentPluginsFor = async (profileId: ProfileId, providerId: ProviderId) => {
     if (providerId !== 'claude' && providerId !== 'codex') return [];
     const configDir = profiles.configDirFor(await profiles.require(profileId));
+    const extraSkillDirs = await syncedSkillDirs();
     if (providerId === 'codex') {
-      await linkSkillsIntoCodexHome({ configDir, onWarning });
+      await linkSkillsIntoCodexHome({ configDir, extraSkillDirs, onWarning });
       return [];
     }
     // One call, because the two sources overlap: a skill the user's own
     // marketplace plugin provides must not also be bridged under Artemis's
     // name. See `resolveContentPlugins`.
-    return resolveContentPlugins({ configDir, dataDir, onWarning });
+    return resolveContentPlugins({ configDir, dataDir, extraSkillDirs, onWarning });
   };
 
   const runs = new RunRegistry({
@@ -371,6 +446,16 @@ export function createTuiHost(dataDir: string, options: TuiHostOptions = {}): Tu
         env: await historyEnvFor(profileId, providerId),
         tag: archived ? ARCHIVED_TAG : null,
       });
+    },
+    renameSession: async (profileId, providerId, sessionId, cwd, title) => {
+      const adapter = providers.get(providerId);
+      if (adapter?.setSessionTitle === undefined) return false;
+      const named = title.trim().slice(0, MAX_SESSION_TITLE);
+      // A name that trims to nothing is not a rename; storing it would blank
+      // the one label the rail has for this conversation.
+      if (named.length === 0) return false;
+      await adapter.setSessionTitle({ sessionId, title: named, cwd, env: await historyEnvFor(profileId, providerId) });
+      return true;
     },
     deleteSession: async (profileId, providerId, sessionId, cwd) => {
       const adapter = providers.get(providerId);

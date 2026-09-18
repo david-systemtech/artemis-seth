@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentEvent, ToolEndStatus } from '@rx-artemis/protocol';
+import { SUGGESTED_TASK_TOOL } from '@rx-artemis/protocol';
 import {
   TranscriptModel,
   isGroupId,
+  isSuggestedTaskCall,
   frameScheduler,
   syncScheduler,
   type AssistantItem,
+  type CommandItem,
   type ToolItem,
 } from './transcript.js';
 
@@ -64,6 +67,35 @@ describe('TranscriptModel', () => {
     const item = model.getItem(ids[0] as string) as AssistantItem;
     expect(item.text).toBe('partial answer');
     expect(item.streaming).toBe(false);
+  });
+
+  it('finalises a streamed block by index after a tool row has settled it', () => {
+    /*
+     * The served-turn shape: the answer streams, the activity report lands as
+     * tool rows (each of which settles every streaming block), and only then
+     * does the whole-block completion arrive. Keyed by its index it finds the
+     * block its deltas built. Sent without one — as the Artemis-server adapter
+     * once did — it could not, opened a second block, and the reader saw the
+     * answer twice.
+     */
+    const model = build();
+    for (const event of stream(
+      { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'Hel' },
+      { type: 'text.delta', messageId: 'm1', blockIndex: 0, text: 'lo.' },
+      { type: 'tool.start', toolCallId: 'c1', name: 'read', input: {} },
+      { type: 'tool.end', toolCallId: 'c1', status: 'ok' },
+      { type: 'text.complete', messageId: 'm1', role: 'assistant', blockIndex: 0, text: 'Hello.' },
+    )) {
+      model.apply(event);
+    }
+    model.flush();
+
+    const answers = model
+      .getListSnapshot()
+      .map((id) => model.getItem(id))
+      .filter((item): item is AssistantItem => item?.kind === 'assistant');
+    expect(answers).toHaveLength(1);
+    expect(answers[0]).toMatchObject({ id: 'a:m1:0', text: 'Hello.', streaming: false });
   });
 
   it('merges tool.start and tool.end into a single item', () => {
@@ -649,6 +681,35 @@ describe('TranscriptModel activity groups', () => {
       expect(model.getRowsSnapshot()).toEqual(['k:m1:0', 'a:m1:1', 'k:m2:0']);
     });
 
+    it('stands a parked ask between two stretches, and gives the second its own row', () => {
+      // The agent thinks, stops to ask, and thinks on once the answer lands.
+      // The card keeps the place it was asked in: the reasoning after it is a
+      // fresh row beneath the card, never more of the fold above it — that
+      // fold would otherwise grow under the reader while the card sat at the
+      // bottom of thinking the agent did after the question was answered.
+      const model = build();
+      for (const event of stream(
+        thought('m1', 0, 'two libraries would do; better ask'),
+        {
+          type: 'permission.request',
+          requestId: 'ask-1',
+          request: { id: 'ask-1', runId: RUN, toolName: 'AskUserQuestion', input: {}, requestedAt: 1 },
+        },
+        { type: 'permission.resolved', requestId: 'ask-1', outcome: 'allowed' },
+        thought('m1', 1, 'luxon it is'),
+      )) {
+        model.apply(event);
+      }
+      model.flush();
+
+      expect(model.getRowsSnapshot()).toEqual(['k:m1:0', 'p:ask-1', 'k:m1:1']);
+      expect(model.getItem('k:m1:0')).toMatchObject({
+        text: 'two libraries would do; better ask',
+        streaming: false,
+      });
+      expect(model.getItem('k:m1:1')).toMatchObject({ text: 'luxon it is', streaming: true });
+    });
+
     it('never merges a redaction into prose, or prose into a redaction', () => {
       const model = build();
       for (const event of stream(
@@ -860,15 +921,16 @@ describe('TranscriptModel artifacts', () => {
       model.apply(event);
     }
 
-    // One marker for both commands, then the tile. Not marker/tile/marker.
-    expect(model.getRowsSnapshot()).toEqual(['g:t:c1', 't:c2']);
+    // The tile where it was made, and one marker for both commands at the
+    // foot. Not marker/tile/marker.
+    expect(model.getRowsSnapshot()).toEqual(['t:c2', 'g:t:c1']);
     const group = model.getGroup('g:t:c1');
     expect(group?.ids).toEqual(['t:c1', 't:c3']);
     // The lifted call is not a member, so the summary does not claim it too.
     expect(group?.counts).toEqual({ command: 2 });
   });
 
-  it('keeps every artifact of a long burst, in order', () => {
+  it('keeps every artifact of a long burst, in order, where it was made', () => {
     const model = withArtifacts();
     for (const event of stream(
       ...call('c1', 'Bash'),
@@ -882,11 +944,74 @@ describe('TranscriptModel artifacts', () => {
       model.apply(event);
     }
 
-    // The reasoning stays in the thread in the order the model wrote it — one
-    // row, since the agent said nothing between the three blocks; the marker and
-    // its tiles land beneath the lot, and the tiles are still in the order they
-    // were made rather than interleaved with the reasoning.
-    expect(model.getRowsSnapshot()).toEqual(['k:m1:0', 'g:t:c1', 't:c2', 't:c3', 't:c4']);
+    // The reasoning and the tiles read in the order the model produced them:
+    // each thought, then the thing it made. A tile stands in the thread, so it
+    // ends the stretch of reasoning the way an answer does — three rows here,
+    // not one merged block with the three tiles parked under it. Only the
+    // command sinks, to a marker at the foot.
+    expect(model.getRowsSnapshot()).toEqual([
+      'k:m1:0',
+      't:c2',
+      'k:m1:1',
+      't:c3',
+      'k:m1:2',
+      't:c4',
+      'g:t:c1',
+    ]);
+    expect(model.getItem('k:m1:1')).toMatchObject({ kind: 'thinking', text: 'now the svg' });
+    expect(model.getGroup('g:t:c1')?.ids).toEqual(['t:c1']);
+  });
+
+  it('stands where it was made, so what the agent says next lands below it', () => {
+    /*
+     * The shape that was reported: a long turn writing document after document,
+     * each announced in a sentence. The tiles used to collect at the foot of
+     * the run, under the marker, so every new sentence arrived *above* the
+     * growing stack — the reader was always scrolling back past the documents
+     * to find the words about them.
+     */
+    const model = withArtifacts();
+    for (const event of stream(
+      { type: 'text.complete', messageId: 'm1', role: 'assistant', text: 'the report first' },
+      ...call('c1', 'Write', { file_path: '/tmp/report.md' }),
+      { type: 'text.complete', messageId: 'm2', role: 'assistant', text: 'now a chart' },
+      ...call('c2', 'Bash'),
+      ...call('c3', 'Write', { file_path: '/tmp/chart.svg' }),
+      { type: 'text.complete', messageId: 'm3', role: 'assistant', text: 'both done' },
+    )) {
+      model.apply(event);
+    }
+
+    // Sentence, tile, sentence, tile, sentence — and the one command at the
+    // foot, where the machinery goes.
+    expect(model.getRowsSnapshot()).toEqual([
+      'a:m1:0',
+      't:c1',
+      'a:m2:0',
+      't:c3',
+      'a:m3:0',
+      'g:t:c2',
+    ]);
+  });
+
+  it('does not move a tile when the calls around it keep coming', () => {
+    // A live run: the marker at the foot grows with every command, and a tile
+    // already on screen has to hold its place above it rather than sink with
+    // the work that follows it.
+    const model = withArtifacts();
+    for (const event of stream(
+      ...call('c1', 'Write', { file_path: '/tmp/a.html' }),
+      ...call('c2', 'Bash'),
+    )) {
+      model.apply(event);
+    }
+    expect(model.getRowsSnapshot()).toEqual(['t:c1', 'g:t:c2']);
+
+    model.apply({ type: 'tool.start', runId: RUN, seq: 4, ts: 1004, toolCallId: 'c3', name: 'Bash', input: {} });
+    model.flush();
+
+    expect(model.getRowsSnapshot()).toEqual(['t:c1', 'g:t:c2']);
+    expect(model.getGroup('g:t:c2')?.ids).toEqual(['t:c2', 't:c3']);
   });
 
   it('produces no marker when the burst was nothing but artifacts', () => {
@@ -920,8 +1045,91 @@ describe('TranscriptModel artifacts', () => {
     model.apply({ type: 'tool.end', runId: RUN, seq: 3, ts: 1003, toolCallId: 'c2', status: 'ok' });
     model.flush();
 
-    // `tool.end` is the verdict, and it has to restructure the rows to show it.
-    expect(model.getRowsSnapshot()).toEqual(['g:t:c1', 't:c2']);
+    // `tool.end` is the verdict, and it has to restructure the rows to show it:
+    // the call leaves the marker and stands where it happened, above it.
+    expect(model.getRowsSnapshot()).toEqual(['t:c2', 'g:t:c1']);
+  });
+
+  /*
+   * The list a surface reads to show every document of a conversation — the
+   * same verdicts the rows are built from, kept as ids so nothing has to be
+   * re-parsed to find them, and stable so a subscriber reading its length is
+   * told about a document and not about a token.
+   */
+  describe('the artifacts snapshot', () => {
+    it('lists the calls that made something, in the order they were made', () => {
+      const model = withArtifacts();
+      for (const event of stream(
+        ...call('c1', 'Bash'),
+        ...call('c2', 'Write', { file_path: '/tmp/a.html' }),
+        { type: 'text.complete', messageId: 'm1', role: 'assistant', text: 'one down' },
+        ...call('c3', 'Write', { file_path: '/tmp/b.md' }),
+      )) {
+        model.apply(event);
+      }
+
+      expect(model.getArtifactsSnapshot()).toEqual(['t:c2', 't:c3']);
+    });
+
+    it('is empty with no test installed, and empty again after a reset', () => {
+      const bare = build();
+      for (const event of stream(...call('c1', 'Write', { file_path: '/tmp/a.html' }))) {
+        bare.apply(event);
+      }
+      expect(bare.getArtifactsSnapshot()).toEqual([]);
+
+      const model = withArtifacts();
+      for (const event of stream(...call('c1', 'Write', { file_path: '/tmp/a.html' }))) {
+        model.apply(event);
+      }
+      expect(model.getArtifactsSnapshot()).toEqual(['t:c1']);
+      model.reset();
+      model.flush();
+      expect(model.getArtifactsSnapshot()).toEqual([]);
+    });
+
+    it('keeps its identity until the set of artifacts moves', () => {
+      const model = withArtifacts();
+      for (const event of stream(...call('c1', 'Write', { file_path: '/tmp/a.html' }))) {
+        model.apply(event);
+      }
+      const before = model.getArtifactsSnapshot();
+      expect(before).toEqual(['t:c1']);
+
+      // A token, a command starting and the command finishing: three flushes,
+      // two of them structural, none of them a new document.
+      model.apply({ type: 'text.delta', runId: RUN, seq: 2, ts: 1002, messageId: 'm1', blockIndex: 0, text: 'hi' });
+      model.apply({ type: 'tool.start', runId: RUN, seq: 3, ts: 1003, toolCallId: 'c2', name: 'Bash', input: {} });
+      model.apply({ type: 'tool.end', runId: RUN, seq: 4, ts: 1004, toolCallId: 'c2', status: 'ok' });
+      model.flush();
+      expect(model.getArtifactsSnapshot()).toBe(before);
+
+      // A write that is still running is not yet a document.
+      model.apply({ type: 'tool.start', runId: RUN, seq: 5, ts: 1005, toolCallId: 'c3', name: 'Write', input: { file_path: '/tmp/b.html' } });
+      model.flush();
+      expect(model.getArtifactsSnapshot()).toBe(before);
+
+      // Its finishing is.
+      model.apply({ type: 'tool.end', runId: RUN, seq: 6, ts: 1006, toolCallId: 'c3', status: 'ok' });
+      model.flush();
+      expect(model.getArtifactsSnapshot()).toEqual(['t:c1', 't:c3']);
+    });
+
+    it('drops what a rewind took with it', () => {
+      const model = withArtifacts();
+      for (const event of stream(
+        ...call('c1', 'Write', { file_path: '/tmp/a.html' }),
+        { type: 'text.complete', messageId: 'u2', role: 'user', text: 'again', replay: true },
+        ...call('c2', 'Write', { file_path: '/tmp/b.html' }),
+      )) {
+        model.apply(event);
+      }
+      expect(model.getArtifactsSnapshot()).toEqual(['t:c1', 't:c2']);
+
+      model.truncateFrom('u:1');
+      model.flush();
+      expect(model.getArtifactsSnapshot()).toEqual(['t:c1']);
+    });
   });
 
   it('folds exactly as before when no test is installed', () => {
@@ -1283,5 +1491,117 @@ describe('a silent run', () => {
     model.apply({ type: 'run.end', reason: 'completed', runId: 'run_2', seq: 0, ts: 2000 } as AgentEvent);
 
     expect(ended(model)).toMatchObject({ kind: 'run-end', silent: true });
+  });
+});
+
+/**
+ * An offer is not machinery.
+ *
+ * A suggested task reaches the model as a tool call like any other, and every
+ * other tool call in a run sinks into the marker at its foot. This one must
+ * not: a question put to the reader, folded behind "Ran 36 commands", is a
+ * question nobody answers. See `isSuggestedTaskCall`.
+ */
+describe('TranscriptModel suggested tasks', () => {
+  const TASK = { title: 'Add tests', tldr: 'No coverage.', prompt: 'Write the tests.' };
+
+  function call(id: string, name: string, input: Record<string, unknown> = {}) {
+    return [
+      { type: 'tool.start', toolCallId: id, name, input },
+      { type: 'tool.end', toolCallId: id, status: 'ok' },
+    ] as Array<Omit<AgentEvent, 'runId' | 'seq' | 'ts'>>;
+  }
+
+  it('stands where it was made while the work around it folds', () => {
+    const model = build();
+    for (const event of stream(
+      ...call('c1', 'Bash'),
+      { type: 'text.complete', messageId: 'm1', role: 'assistant', text: 'Done.' },
+      ...call('c2', SUGGESTED_TASK_TOOL, TASK),
+      ...call('c3', 'Bash'),
+    )) {
+      model.apply(event);
+    }
+
+    // The offer is its own row, directly under the answer it followed — which
+    // is where the reader is looking when they finish reading. The two shell
+    // calls are one marker, at the foot of the run, where the machinery goes.
+    expect(model.getRowsSnapshot()).toEqual(['a:m1:0', 't:c2', 'g:t:c1']);
+  });
+
+  it('is not counted as a document', () => {
+    // Nothing was made. The Documents surface lists things to open, and an
+    // offer is not one of them.
+    const model = build();
+    model.setArtifactTest(() => true);
+    for (const event of stream(...call('c1', SUGGESTED_TASK_TOOL, TASK))) model.apply(event);
+
+    expect(model.getArtifactsSnapshot()).toEqual([]);
+    expect(model.getRowsSnapshot()).toEqual(['t:c1']);
+  });
+
+  it('recognises the call from its name alone, malformed or not', () => {
+    // A call the model got the arguments wrong on is still an offer it made,
+    // and the row that draws it can say so. Folding it back into the marker
+    // would hide the mistake in the one place nobody opens.
+    const model = build();
+    for (const event of stream(...call('c1', SUGGESTED_TASK_TOOL, { title: '' }))) {
+      model.apply(event);
+    }
+
+    expect(isSuggestedTaskCall(model.getItem('t:c1'))).toBe(true);
+    expect(model.getRowsSnapshot()).toEqual(['t:c1']);
+  });
+
+  it('says no to every other tool, including one merely named like it', () => {
+    const model = build();
+    for (const event of stream(...call('c1', 'suggest_task'), ...call('c2', 'Bash'))) {
+      model.apply(event);
+    }
+
+    // The bare name is somebody else's MCP server. The prefixed one is ours,
+    // and the prefix is the whole of the identity.
+    expect(isSuggestedTaskCall(model.getItem('t:c1'))).toBe(false);
+    expect(model.getRowsSnapshot()).toEqual(['g:t:c1']);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Where a command ran.
+ *
+ * `!git status` is executed by the terminal, not looked up in the command
+ * table, and the row that draws it has to be able to say so — otherwise it is
+ * marked as a slash command the app does not have. The event says which; the
+ * item carries it through.
+ */
+describe('a command\'s source', () => {
+  it('reaches the item when the host ran a shell line', () => {
+    const model = build();
+    for (const event of stream({
+      type: 'command.run',
+      source: 'shell',
+      command: { name: 'git', args: 'status', output: 'nothing to commit' },
+    })) {
+      model.apply(event);
+    }
+
+    const item = model.getItem('c:1') as CommandItem;
+    expect(item.kind).toBe('command');
+    expect(item.name).toBe('git');
+    expect(item.args).toBe('status');
+    expect(item.source).toBe('shell');
+    // Not folded into the machinery marker: it is something the user did.
+    expect(model.getRowsSnapshot()).toEqual(['c:1']);
+  });
+
+  it('is left off entirely by a slash command, which is what absent means', () => {
+    const model = build();
+    for (const event of stream({ type: 'command.run', command: { name: 'model', args: 'sonnet' } })) {
+      model.apply(event);
+    }
+
+    expect((model.getItem('c:1') as CommandItem).source).toBeUndefined();
   });
 });

@@ -39,7 +39,10 @@
  *   ARTEMIS_PERMISSION_PARK_MS    how long a permission prompt waits for an
  *                          answer, while a client is attached, before it is
  *                          denied with the standing "nobody is here" message.
- *                          Default 15m.
+ *                          Off by default: a question waits for the person
+ *                          it was asked of, bounded only by the run's own
+ *                          deadline above. Set it for clients that ask for
+ *                          prompts they will never answer.
  *
  * And one for deployments that cannot run this CLI interactively at all:
  *
@@ -151,23 +154,28 @@ async function serve(): Promise<void> {
     );
   }
 
-  const host = createHeadlessHost(dir);
-  await host.ledger.load();
+  // Read fresh per request so a revocation lands without a restart — the CLI
+  // writes server.json, and this re-read is what makes that matter. Cached for
+  // a beat so a busy server is not hitting the disk per request. Built once and
+  // shared: the router authorises against it, and a routine firing looks its
+  // own connection up through the same live view.
+  const readConnections = connectionReader(dir, config.connections);
+  const host = createHeadlessHost(dir, readConnections);
+  await Promise.all([host.ledger.load(), host.routines.load()]);
 
   const server = createArtemisServer({
     port,
     host: bindHost(),
-    // Read fresh per request so a revocation lands without a restart — the
-    // CLI writes server.json, and this re-read is what makes that matter.
-    // Cached for a beat so a busy server is not hitting the disk per request.
-    connections: connectionReader(dir, config.connections),
+    connections: readConnections,
     version: '0.1.0-headless',
     catalogue: host.catalogue,
     runs: host.runSource,
     workspaces: host.workspaces,
     ledger: host.ledger,
     sessions: host.sessionSource,
+    routines: host.routines,
     usage: host.usageSource,
+    commands: host.commandSource,
     feed: host.feed,
     guard: host.guard,
     onRemoteAccess: host.recordAccess,
@@ -175,6 +183,10 @@ async function serve(): Promise<void> {
     // not per deployment, so a build that wired it and a connection that was
     // never granted it produce the same 404 — which is the point.
     profileAdmin: host.profileAdmin,
+    // Likewise per connection, not per deployment: a server with no banks
+    // answers an administrator with an empty list rather than a 501, which is
+    // the truthful answer — the registry is there, and it is empty.
+    memoryBanks: host.memoryBankAdmin,
     ...(signInTimeoutMs() === undefined ? {} : { signInTimeoutMs: signInTimeoutMs() as number }),
     // No `terminals`: this process has no PTY surface — see the file header on
     // what a headless deployment gives up — so the terminal routes answer 501
@@ -186,6 +198,11 @@ async function serve(): Promise<void> {
   });
 
   const bound = await server.listen();
+  // Begin the schedule only once the port is bound — a routine that fires
+  // during a boot that then fails to listen would have run for nothing. The
+  // start pass makes up at most one appointment per routine missed while the
+  // server was down.
+  host.routines.start();
   process.stdout.write(`Artemis server listening on ${bindHost()}:${String(bound)} (data: ${dir})\n`);
 
   let closing = false;

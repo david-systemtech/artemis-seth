@@ -88,6 +88,36 @@
  * default, where the archive is shut, because pinning is a request to keep
  * something in view. See `pinnedSessions` and `pinnedCollapsed` in the store.
  *
+ * ## 0b². Groups sit between the pin shelf and the projects
+ *
+ * Everything above files a row where the *app* decided it goes. That is the
+ * right default and a poor only option, and the case that proves it is an
+ * Artemis Server: every conversation held on one shares a single working
+ * directory, so a month of unrelated work arrives under one heading with no way
+ * to tell any of it apart.
+ *
+ * So a session can also be dragged into a group the user made and named. The
+ * heading is a project heading in every respect that matters — same row height,
+ * same fold, same count at the far end — because it is the same *kind* of
+ * thing, a place rows are filed under; what differs is that a person put it
+ * there, which is why it is also the only heading with a rename and a delete.
+ * Dropping a row onto a project heading is the gesture back out, and it reads
+ * correctly in both directions: you are putting the session back where it would
+ * have been.
+ *
+ * Empty groups keep their heading, unlike every other section here, because the
+ * drop target *is* how the first session gets in. See `sessionGroups.ts`.
+ *
+ * The order of the stack is the user's as well. A group heading can be picked
+ * up and dropped between two others, and it is the *list* that takes that drop
+ * rather than the headings: where a group lands is a question about the whole
+ * stack — the upper half of a group's block means before it, the lower half
+ * after it, anywhere above or below the stack means its nearest end — so it is
+ * answered once, from the row offsets the virtualiser already has
+ * (`groupDropAt`), and drawn as one insertion line on the boundary the group
+ * would really land on. The heading's menu has "Move up" and "Move down" for
+ * the same move without a drag.
+ *
  * ## 0c. The row's menu answers to four letters
  *
  * `R`ename, `P`in, `A`rchive, `D`elete, each drawn as a key cap on the right of
@@ -148,6 +178,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type DragEvent,
   type KeyboardEvent,
   type ReactElement,
   type ReactNode,
@@ -155,10 +186,15 @@ import {
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
+  ArrowDownIcon,
+  ArrowUpIcon,
   ChevronDownIcon,
+  CornerUpLeftIcon,
   FolderIcon,
+  FolderPlusIcon,
   GitBranchIcon,
   InboxIcon,
+  LayersIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
@@ -170,30 +206,45 @@ import type { ProfileId, SessionSummary } from '@rx-artemis/protocol';
 import { useCapability, useProviderCapability } from '../hooks/useCapability';
 import { condenseTitle, formatRelative } from '@rx-artemis/transcript';
 import { lastSegment } from '../lib/paths';
+import { isGroupDrag, readGroupDrag, writeGroupDrag } from '../lib/groupDrag';
 import {
   flattenGroups,
+  groupDropAt,
   groupSessionsByProject,
+  liftSessionGroups,
   orderSessions,
   partitionSessions,
   sessionKey,
+  type GroupDrop,
   type ListRow,
 } from '../lib/sessionGroups';
-import { writeSessionDrag } from '../lib/sessionDrag';
+import {
+  isSessionDrag,
+  readSessionDrag,
+  resolveSessionDrag,
+  writeSessionDrag,
+} from '../lib/sessionDrag';
 import {
   canReachSession,
+  createSessionGroup,
+  deleteSessionGroup,
+  moveSessionToGroup,
   refreshSessions,
   renameSession,
+  renameSessionGroup,
+  reorderSessionGroup,
   resumeSession,
   sessionOrderKey,
   toggleArchivedExpanded,
   togglePinnedCollapsed,
   toggleProjectCollapsed,
   toggleSessionArchived,
+  toggleSessionGroupCollapsed,
   toggleSessionPinned,
   useApp,
 } from '../state/store';
 import { usePane } from '../state/paneContext';
-import { ReasonButton } from './disabled-reason';
+import { IconButton, ReasonButton } from './disabled-reason';
 import { ProfileSwatch, StatusDot } from './primitives';
 import { DeleteSessionDialog } from './DeleteSessionDialog';
 import { ProjectTooltip, SessionTooltip } from './SessionTooltip';
@@ -202,6 +253,9 @@ import {
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from '@/components/ui/context-menu';
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
@@ -244,9 +298,39 @@ export function SessionList(): ReactElement {
   const archivedExpanded = useApp((s) => s.archivedExpanded);
   const pinnedSessions = useApp((s) => s.pinnedSessions);
   const pinnedCollapsed = useApp((s) => s.pinnedCollapsed);
+  const sessionGroups = useApp((s) => s.sessionGroups);
+  const sessionGroupOf = useApp((s) => s.sessionGroupOf);
   const listing = useCapability('listSessions');
 
   const [query, setQuery] = useState('');
+  /*
+   * The group heading whose name is currently being edited, if any.
+   *
+   * Here rather than inside the heading, for the reason the heading cannot
+   * supply: a group is created by a button *above* the list and has to open its
+   * own rename the moment it appears, so the state that says "this one is being
+   * named" has to outlive the row and live where both the button and the
+   * heading can see it. The row-local `editing` on a session row has no such
+   * problem — nothing outside the row ever starts one.
+   *
+   * It also means the virtualiser can scroll a half-typed name out of view and
+   * back without losing it, since the field is recreated from this rather than
+   * from a mounted component's own state.
+   */
+  const [renamingGroup, setRenamingGroup] = useState<string | null>(null);
+
+  /**
+   * Make a group and start naming it, which is one gesture rather than two.
+   *
+   * Both entry points do exactly this — the button on the filter row and the
+   * row menu's "New group…" — so the pair cannot drift into creating groups
+   * that behave differently depending on where they were made.
+   */
+  const newGroup = useCallback((): string => {
+    const id = createSessionGroup();
+    setRenamingGroup(id);
+    return id;
+  }, []);
 
   const profileLabel = useCallback(
     (id: ProfileId): string | undefined => profiles.find((p) => p.id === id)?.label,
@@ -302,14 +386,29 @@ export function SessionList(): ReactElement {
    */
   const rows = useMemo(() => {
     const split = partitionSessions(sessions, { pinned: pinnedKeys, archived: archivedKeys });
+    /*
+     * Then the user's own groups, out of what is left.
+     *
+     * After the two shelves and never before them, which is what gives a pin
+     * precedence over a group: a session that is both shows under Pinned, and
+     * drops back into its group the moment it is unpinned. Ordering it the
+     * other way would hide a pinned row inside a folded group, which is the
+     * one thing a pin exists to prevent.
+     */
+    const lifted = liftSessionGroups(split.active, sessionGroups, sessionGroupOf, {
+      query,
+      profileLabel,
+      orderKey,
+    });
     return flattenGroups(
-      groupSessionsByProject(split.active, { query, profileLabel, orderKey, projectOf }),
+      groupSessionsByProject(lifted.ungrouped, { query, profileLabel, orderKey, projectOf }),
       collapsed,
       {
         pinned: {
           sessions: orderSessions(split.pinned, { query, profileLabel, orderKey }),
           collapsed: pinnedCollapsed,
         },
+        groups: lifted.sections,
         archived: {
           sessions: orderSessions(split.archived, { query, profileLabel, orderKey }),
           collapsed: !archivedExpanded,
@@ -327,6 +426,8 @@ export function SessionList(): ReactElement {
     archivedExpanded,
     pinnedKeys,
     pinnedCollapsed,
+    sessionGroups,
+    sessionGroupOf,
   ]);
 
   /** Unfiltered, so the count does not jump around while typing. */
@@ -335,15 +436,25 @@ export function SessionList(): ReactElement {
   return (
     <div className="flex min-h-0 flex-1 flex-col border-t border-hairline">
       {/*
-       * The filter is the only thing left on this row. A "Sessions" title sat
-       * here, folding the whole list from one control — a caption for a list
-       * whose contents are obvious, over a fold that answered the wrong
-       * question. Folding is per project now, on the group headings, which is
-       * the level anyone actually wants to put away.
+       * The filter and the one control that makes furniture.
+       *
+       * A "Sessions" title sat here once, folding the whole list from one
+       * control — a caption for a list whose contents are obvious, over a fold
+       * that answered the wrong question. Folding is per project now, on the
+       * group headings, which is the level anyone actually wants to put away.
+       *
+       * "New group" shares the row because it is the same *kind* of control as
+       * the filter: neither acts on a session, both change how the list below
+       * reads. It is an icon rather than a labelled button because it is the
+       * rarer of the two by a distance — a handful of groups get made in the
+       * life of an install — and a word here would out-weigh the field beside
+       * it. The row is drawn whether or not the filter is: the button does not
+       * become unavailable because someone's history is short, and the strip of
+       * air above the list was already being reserved for it.
        */}
-      {total > FILTER_THRESHOLD ? (
-        <div className="px-1.5 pt-2 pb-1.5">
-          <div className="relative min-w-0">
+      <div className="flex items-center gap-1 px-1.5 pt-2 pb-1.5">
+        {total > FILTER_THRESHOLD ? (
+          <div className="relative min-w-0 flex-1">
             <SearchIcon
               className="pointer-events-none absolute top-1/2 left-2 size-3 -translate-y-1/2 text-ink-faint"
               aria-hidden="true"
@@ -365,10 +476,21 @@ export function SessionList(): ReactElement {
               className="h-6 rounded-lg border-hairline-strong bg-wash pl-6.5 text-2xs md:text-2xs dark:bg-wash"
             />
           </div>
-        </div>
-      ) : (
-        <div className="pt-1.5" />
-      )}
+        ) : (
+          // Holds the button at the end of the row whether or not the field is
+          // there, so it does not slide sideways the moment a ninth session
+          // brings the filter in.
+          <div className="min-w-0 flex-1" />
+        )}
+        <IconButton
+          label="New group"
+          size="icon-xs"
+          onClick={() => newGroup()}
+          className="shrink-0 text-ink-faint"
+        >
+          <FolderPlusIcon />
+        </IconButton>
+      </div>
 
       <>
         {/*
@@ -414,12 +536,119 @@ export function SessionList(): ReactElement {
         ) : rows.length === 0 ? (
           <NothingHere filtered={total > 0} query={query} />
         ) : (
-          <VirtualRows rows={rows} />
+          <VirtualRows
+            rows={rows}
+            renamingGroup={renamingGroup}
+            onRenameGroup={setRenamingGroup}
+            onNewGroup={newGroup}
+          />
         )}
       </>
     </div>
   );
 }
+
+/* -------------------------------------------------------------------------- */
+/* Headings as drop targets                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Make a heading accept a session dragged from the list.
+ *
+ * Both headings that file rows use this: a group's, which takes the session in,
+ * and a project's, which takes it back out. One hook rather than two sets of
+ * handlers because the difference between "into this group" and "back to its
+ * project" is a single argument — the group id, or `null` — and everything
+ * else about the gesture, including what it refuses, is the same. Two copies
+ * would be two chances for one of them to accept a drag it should decline.
+ *
+ * ## What it accepts, and why the question is about the *type*
+ *
+ * `isSessionDrag` looks at the types on offer rather than at the payload,
+ * because the drag data store is unreadable during `dragover` — see
+ * `sessionDrag.ts`. That is not a limitation worked around here, it is the
+ * reason the payload has a MIME type of its own: a URL from the browser or a
+ * file from Finder must land on a heading and do nothing at all.
+ *
+ * `preventDefault` on `dragover` is what *makes* an element a drop target in
+ * HTML5 drag and drop — without it the browser rejects the drop and plays the
+ * snap-back animation — so calling it only for session drags is exactly how a
+ * heading declines everything else.
+ *
+ * ## The highlight is local state, not a class toggled on the DOM
+ *
+ * The rows are virtualised and re-created as the list scrolls, so a class
+ * written directly onto an element would survive exactly until the row was
+ * recycled and then reappear on whatever took its place. `dragleave` clears it;
+ * so does the drop, because no `dragend` arrives on the *target*.
+ *
+ * ## The payload is resolved against the live list
+ *
+ * `useApp.getState()` rather than a subscription: this runs once, inside an
+ * event, and a heading that re-rendered on every change to the session list
+ * would be paying a subscription for a value it only reads while the pointer is
+ * over it. A row that vanished mid-drag resolves to nothing and the drop is
+ * ignored, which is the honest outcome.
+ */
+function useSessionDropTarget(groupId: string | null): {
+  readonly over: boolean;
+  readonly handlers: {
+    readonly onDragEnter: (event: DragEvent<HTMLElement>) => void;
+    readonly onDragOver: (event: DragEvent<HTMLElement>) => void;
+    readonly onDragLeave: () => void;
+    readonly onDrop: (event: DragEvent<HTMLElement>) => void;
+  };
+} {
+  const [over, setOver] = useState(false);
+
+  const accept = useCallback((event: DragEvent<HTMLElement>): void => {
+    if (!isSessionDrag(event.dataTransfer)) return;
+    event.preventDefault();
+    // Matches the `effectAllowed` the drag source sets: dropping a session onto
+    // a heading *moves* it there, it does not leave a copy behind.
+    event.dataTransfer.dropEffect = 'move';
+    setOver(true);
+  }, []);
+
+  const drop = useCallback(
+    (event: DragEvent<HTMLElement>): void => {
+      setOver(false);
+      const payload = readSessionDrag(event.dataTransfer);
+      if (payload === null) return;
+      event.preventDefault();
+      const session = resolveSessionDrag(payload, useApp.getState().sessions);
+      if (session === undefined) return;
+      moveSessionToGroup(session, groupId);
+    },
+    [groupId],
+  );
+
+  return {
+    over,
+    handlers: {
+      onDragEnter: accept,
+      onDragOver: accept,
+      onDragLeave: () => setOver(false),
+      onDrop: drop,
+    },
+  };
+}
+
+/**
+ * What a heading looks like with a session held over it.
+ *
+ * A ground and an inset ring rather than a line between rows, because the drop
+ * files the session *under* this heading rather than at a position in a list —
+ * there is no insertion point to draw, and an insertion line would promise an
+ * ordering the group does not have (its rows sort by recency, like everywhere
+ * else).
+ *
+ * The exact pair the working area already lights up with when the same drag is
+ * held over a column (see `WorkingArea`), so one gesture has one appearance
+ * wherever it can land. Stated once here so the group heading and the project
+ * heading cannot drift apart either.
+ */
+const DROP_TARGET = 'bg-beam/15 ring-1 ring-beam/50 ring-inset';
 
 /* -------------------------------------------------------------------------- */
 /* Group headings                                                             */
@@ -451,6 +680,19 @@ export function SessionList(): ReactElement {
  * are absolutely positioned inside a spacer, where sticky does not apply, and
  * faking it needs a second pinned copy of the heading plus the bookkeeping to
  * know which one it is. That was in this file once and is not worth its weight.
+ *
+ * ## It is also the way *out* of a group
+ *
+ * Dropping a session onto a project heading removes it from whatever group it
+ * was in. Deliberately any project heading rather than only the row's own: the
+ * session goes back to the project it ran in either way — nothing here can
+ * change a session's directory — so refusing the drop on the wrong heading
+ * would be declining a gesture whose outcome is the one the user wanted. The
+ * highlight says the drop will be taken; where it lands afterwards is a fact
+ * about the session, not about which heading was under the pointer.
+ *
+ * A row that is in no group drops onto a heading and nothing happens, which is
+ * the correct amount of nothing.
  */
 const GroupHeading = memo(function GroupHeading({
   project,
@@ -475,6 +717,10 @@ const GroupHeading = memo(function GroupHeading({
   const cwd = usePane((s) => s.cwd);
   const current = useApp((s) => (s.projectRoots[cwd] ?? cwd) === project);
 
+  // `null` — "no group" — is the whole of what a project heading does with a
+  // dropped session. See the note above.
+  const drop = useSessionDropTarget(null);
+
   const name = projectLabel(project);
 
   /*
@@ -490,7 +736,11 @@ const GroupHeading = memo(function GroupHeading({
       type="button"
       onClick={() => toggleProjectCollapsed(project)}
       aria-expanded={!collapsed}
-      className="flex h-full w-full min-w-0 items-center gap-1 rounded-md px-1.5 text-left transition-colors hover:bg-wash"
+      {...drop.handlers}
+      className={cn(
+        'flex h-full w-full min-w-0 items-center gap-1 rounded-md px-1.5 text-left transition-colors hover:bg-wash',
+        drop.over && DROP_TARGET,
+      )}
     >
       <ChevronDownIcon
         aria-hidden="true"
@@ -596,6 +846,203 @@ const PinnedHeading = memo(function PinnedHeading({
 });
 
 /**
+ * One of the user's own groups: its heading, its fold, its menu, its drop zone.
+ *
+ * Built to the same shape as {@link GroupHeading} because it is the same kind
+ * of thing from the reader's side — a word with a count, folding the rows under
+ * it — and deliberately a separate component because almost nothing else is
+ * shared. It names no directory, marks no current project, folds on a flag
+ * carried on its own record rather than on `collapsedProjects`, and it is the
+ * only heading in this list with a name the user can change and a life they can
+ * end.
+ *
+ * ## Three ways in, because the gesture people reach for differs
+ *
+ * Dragging a row onto it is the direct one, and the one the feature is for.
+ * The row menu's "Move to group" is the same move for anyone who does not drag
+ * — a trackpad drag across a scrolling list is a real barrier, and the menu is
+ * the only route available from the keyboard. Folding is a click on the heading
+ * itself.
+ *
+ * Renaming is opened by double-click as well as from the menu. Double-click on
+ * a label that is already a button is the convention every file manager set,
+ * and the click it is built on top of folds the group — a harmless thing to
+ * have happened on the way to renaming, and it unfolds again on the way back.
+ *
+ * ## The rename field replaces the heading rather than overlaying it
+ *
+ * Exactly what a session row does, for the same reason: an input floating over
+ * a live button leaves the fold handler armed underneath the thing the user is
+ * trying to type in. See {@link RenameField}.
+ *
+ * ## Its place in the stack is the user's, and there are two ways to change it
+ *
+ * The heading can be picked up and dropped between two others, and its menu
+ * has "Move up" and "Move down" for the same move a step at a time — the drag
+ * is not available from a keyboard and is a real effort on a trackpad, which is
+ * the argument "Move to group" already makes for rows. This component is only
+ * the *source* of that drag: it says what is being carried and that it has been
+ * picked up. The list takes the drop (see `VirtualRows`), because where a group
+ * lands is a question about the whole stack and no single heading can answer
+ * it. The two menu items name the neighbours the flattening handed down, so
+ * they move past the group drawn above or below even while a filter is hiding
+ * others, and are disabled at the ends of the stack.
+ */
+const SessionGroupHeading = memo(function SessionGroupHeading({
+  groupId,
+  name,
+  count,
+  collapsed,
+  top,
+  renaming,
+  onRename,
+  previousGroupId,
+  nextGroupId,
+  dragging,
+  onDragStart,
+  onDragEnd,
+}: {
+  readonly groupId: string;
+  readonly name: string;
+  readonly count: number;
+  readonly collapsed: boolean;
+  readonly top: number;
+  /** True while this heading is the one being named. See `renamingGroup`. */
+  readonly renaming: boolean;
+  /** Open the rename field on a group, or close whichever one is open. */
+  readonly onRename: (groupId: string | null) => void;
+  /** The group drawn above this one, or `null` at the top of the stack. */
+  readonly previousGroupId: string | null;
+  /** The group drawn below this one, or `null` at the bottom of the stack. */
+  readonly nextGroupId: string | null;
+  /** True while this heading is the one being carried. */
+  readonly dragging: boolean;
+  /** This heading was picked up. The list remembers which, for the drop. */
+  readonly onDragStart: (groupId: string) => void;
+  /** The drag is over — landed, refused or abandoned. */
+  readonly onDragEnd: () => void;
+}): ReactElement {
+  const drop = useSessionDropTarget(groupId);
+
+  if (renaming) {
+    return (
+      <div style={{ top, height: HEADER_HEIGHT }} className="absolute inset-x-0 px-1.5">
+        <GroupRenameField groupId={groupId} name={name} onDone={() => onRename(null)} />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{ top, height: HEADER_HEIGHT }}
+      className={cn('absolute inset-x-0 px-1.5', dragging && 'opacity-50')}
+      /*
+       * The drag source for putting the groups in a different order, hung on
+       * the positioning wrapper for the reason a session row gives: a `<button
+       * draggable>` is a fight over who owns the pointer, and the wrapper costs
+       * nothing and leaves the fold, the double-click and the menu exactly as
+       * they were.
+       *
+       * `dragend` arrives here whether the drop landed, was refused or was
+       * abandoned with Escape, which makes it the one place the picked-up state
+       * can reliably be put down again.
+       */
+      draggable
+      onDragStart={(event) => {
+        writeGroupDrag(event.dataTransfer, { id: groupId, name });
+        onDragStart(groupId);
+      }}
+      onDragEnd={onDragEnd}
+    >
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <button
+            type="button"
+            onClick={() => toggleSessionGroupCollapsed(groupId)}
+            onDoubleClick={() => onRename(groupId)}
+            aria-expanded={!collapsed}
+            title="A group you made. Drag a session onto it to file it here, or drag the heading to move the group."
+            {...drop.handlers}
+            className={cn(
+              'flex h-full w-full min-w-0 items-center gap-1 rounded-md px-1.5 text-left transition-colors hover:bg-wash',
+              drop.over && DROP_TARGET,
+            )}
+          >
+            <ChevronDownIcon
+              aria-hidden="true"
+              className={cn(
+                'size-2.5 shrink-0 text-ink-faint transition-transform',
+                collapsed && '-rotate-90',
+              )}
+            />
+            {/*
+              Layers rather than a folder, and that is the whole of the visual
+              distinction from a project heading. A folder in this sidebar means
+              a directory on disk — every project heading wears one — and a
+              group is precisely the section that is *not* a place. The accent
+              colour is shared with the folder and the pin, because all three
+              head a section that holds rows.
+            */}
+            <LayersIcon aria-hidden="true" className="size-2.5 shrink-0 text-beam-text" />
+            <span className="chrome-label min-w-0 truncate text-ink-muted">{name}</span>
+            <GroupCount count={count} />
+          </button>
+        </ContextMenuTrigger>
+
+        <ContextMenuContent className="w-48" onKeyDown={pressHotkey}>
+          <MenuAction hotkey="r" onSelect={() => onRename(groupId)}>
+            <PencilIcon aria-hidden="true" />
+            Rename
+          </MenuAction>
+
+          {/*
+           * The drag, a step at a time. Past the neighbour that is *drawn*, so
+           * the move is one the reader can see even with a filter hiding other
+           * groups; disabled rather than hidden at the ends, so the menu keeps
+           * its shape and the letters keep their places.
+           */}
+          <MenuAction
+            hotkey="u"
+            disabled={previousGroupId === null}
+            onSelect={() => {
+              if (previousGroupId !== null) reorderSessionGroup(groupId, previousGroupId, 'before');
+            }}
+          >
+            <ArrowUpIcon aria-hidden="true" />
+            Move up
+          </MenuAction>
+          <MenuAction
+            hotkey="n"
+            disabled={nextGroupId === null}
+            onSelect={() => {
+              if (nextGroupId !== null) reorderSessionGroup(groupId, nextGroupId, 'after');
+            }}
+          >
+            <ArrowDownIcon aria-hidden="true" />
+            Move down
+          </MenuAction>
+
+          <ContextMenuSeparator />
+
+          {/*
+           * Not drawn as destructive and not behind a confirmation, because
+           * nothing is destroyed: the group is a view, the transcripts are
+           * untouched, and every session in it reappears under the project it
+           * ran in. Painting it red like Delete on a session row would teach
+           * that the two acts weigh the same, and the one that really does
+           * destroy a file would lose the only signal it has.
+           */}
+          <MenuAction hotkey="d" onSelect={() => deleteSessionGroup(groupId)}>
+            <Trash2Icon aria-hidden="true" />
+            Delete group
+          </MenuAction>
+        </ContextMenuContent>
+      </ContextMenu>
+    </div>
+  );
+});
+
+/**
  * The Archived section's heading.
  *
  * Built to the same shape as {@link GroupHeading} so the two read as one list
@@ -696,10 +1143,53 @@ function projectLabel(project: string): string | null {
 /* Virtualiser                                                                */
 /* -------------------------------------------------------------------------- */
 
-function VirtualRows({ rows }: { readonly rows: readonly ListRow[] }): ReactElement {
+/**
+ * The window of rows, and the three things it has to hand down.
+ *
+ * `renamingGroup` and `onRenameGroup` pass straight through to the headings:
+ * the state lives above this component because a group is created by a control
+ * outside the list (see `newGroup`), and it is threaded rather than read from
+ * the store because a half-typed name is not application state — putting it
+ * there would re-render every row in a virtualised list on each keystroke.
+ *
+ * `onNewGroup` goes to the *rows*, for the menu item that makes a group and
+ * files the session into it in one step.
+ */
+function VirtualRows({
+  rows,
+  renamingGroup,
+  onRenameGroup,
+  onNewGroup,
+}: {
+  readonly rows: readonly ListRow[];
+  readonly renamingGroup: string | null;
+  readonly onRenameGroup: (groupId: string | null) => void;
+  readonly onNewGroup: () => string;
+}): ReactElement {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewport, setViewport] = useState(0);
+
+  /*
+   * A group heading being carried, and where it would land.
+   *
+   * Component state rather than store state for the reason `renamingGroup` is:
+   * it changes many times a second while a pointer moves, it means nothing once
+   * the gesture is over, and nothing outside this list has any use for it.
+   *
+   * `draggedGroup` exists because a drop target cannot read a drag's payload
+   * until the drop — only its types (see `groupDrag.ts`) — and "would this
+   * change anything?" needs to know which heading is in the air. It is only
+   * ever a refinement: a drag from another window leaves it `null`, the line is
+   * then drawn everywhere, and the drop still reads the real id off the
+   * payload.
+   */
+  const [draggedGroup, setDraggedGroup] = useState<string | null>(null);
+  const [groupDrop, setGroupDrop] = useState<GroupDrop | null>(null);
+  const endGroupDrag = useCallback((): void => {
+    setDraggedGroup(null);
+    setGroupDrop(null);
+  }, []);
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -749,6 +1239,85 @@ function VirtualRows({ rows }: { readonly rows: readonly ListRow[] }): ReactElem
   const first = Math.max(0, indexAt(offsets, scrollTop) - OVERSCAN);
   const last = Math.min(rows.length - 1, indexAt(offsets, scrollTop + height) + OVERSCAN);
 
+  /*
+   * The list is the drop target for a carried group, not the headings.
+   *
+   * Where a group lands is a question about the whole stack, so it is asked
+   * here, once, of the geometry this component already owns: the pointer is
+   * turned into a position in list pixels and `groupDropAt` reads the answer
+   * off the same `offsets` the rows were drawn from. That is what lets the
+   * lower half of an open group mean "after this group" and draw its line under
+   * the group's last row, where the heading would actually go — a heading that
+   * took its own drops could only ever draw a line against itself.
+   *
+   * A session drag never gets here as far as these are concerned: both handlers
+   * decline anything that is not carrying a group, exactly as the headings'
+   * own handlers decline anything that is not carrying a session, so the two
+   * gestures share elements without either answering for the other.
+   */
+  const groupDropFor = (event: DragEvent<HTMLDivElement>): GroupDrop | null => {
+    const element = scrollRef.current;
+    if (!element) return null;
+    const y = event.clientY - element.getBoundingClientRect().top + element.scrollTop;
+    return groupDropAt(rows, offsets, y, draggedGroup);
+  };
+
+  const overGroupDrag = (event: DragEvent<HTMLDivElement>): void => {
+    if (!isGroupDrag(event.dataTransfer)) return;
+    const drop = groupDropFor(event);
+    // Fewer than two groups: nothing to arrange, so nothing to accept.
+    if (drop === null) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    // `dragover` fires for as long as the pointer is held over the list, and
+    // almost every one of them resolves to the place the last one did.
+    setGroupDrop((current) =>
+      current !== null &&
+      current.anchorId === drop.anchorId &&
+      current.edge === drop.edge &&
+      current.lineY === drop.lineY &&
+      current.changes === drop.changes
+        ? current
+        : drop,
+    );
+  };
+
+  const leaveGroupDrag = (event: DragEvent<HTMLDivElement>): void => {
+    /*
+     * `dragleave` bubbles up from every row the pointer crosses; only the one
+     * that really leaves the list takes the line away.
+     *
+     * Asked two ways because the first is not dependable: `relatedTarget` is
+     * where the pointer went, but engines have shipped drag events with it left
+     * `null`, and a line that blinked out at every row boundary until the next
+     * `dragover` would be the result. The pointer still being inside the list's
+     * own rectangle is the answer that needs nothing from the event but its
+     * coordinates.
+     */
+    const into = event.relatedTarget;
+    if (into instanceof Node && event.currentTarget.contains(into)) return;
+    const box = event.currentTarget.getBoundingClientRect();
+    const inside =
+      event.clientX >= box.left &&
+      event.clientX < box.right &&
+      event.clientY >= box.top &&
+      event.clientY < box.bottom;
+    if (inside) return;
+    setGroupDrop(null);
+  };
+
+  const dropGroupDrag = (event: DragEvent<HTMLDivElement>): void => {
+    if (!isGroupDrag(event.dataTransfer)) return;
+    const id = readGroupDrag(event.dataTransfer);
+    const drop = groupDropFor(event);
+    // No `dragend` arrives on a *target*, and the source may have been scrolled
+    // out of the window and unmounted by now, so the drop tidies up as well.
+    endGroupDrag();
+    if (id === null || drop === null) return;
+    event.preventDefault();
+    reorderSessionGroup(id, drop.anchorId, drop.edge);
+  };
+
   const visible: ReactElement[] = [];
   for (let i = first; i <= last; i += 1) {
     const row = rows[i];
@@ -778,6 +1347,28 @@ function VirtualRows({ rows }: { readonly rows: readonly ListRow[] }): ReactElem
       );
       continue;
     }
+    if (row.kind === 'group-header') {
+      visible.push(
+        <SessionGroupHeading
+          key={row.key}
+          groupId={row.groupId}
+          name={row.name}
+          count={row.count}
+          collapsed={row.collapsed}
+          top={top}
+          renaming={renamingGroup === row.groupId}
+          onRename={onRenameGroup}
+          // `null`, not `undefined`, so the props keep one identity at the ends
+          // of the stack — the same bargain `groupId` strikes on a row.
+          previousGroupId={row.previousGroupId ?? null}
+          nextGroupId={row.nextGroupId ?? null}
+          dragging={draggedGroup === row.groupId}
+          onDragStart={setDraggedGroup}
+          onDragEnd={endGroupDrag}
+        />,
+      );
+      continue;
+    }
     // `row.key` is `sessionKey` — an id is unique inside the profile that owns
     // it, not globally, and two profiles surfacing the same id would collide
     // into one React key and silently drop a row.
@@ -788,6 +1379,10 @@ function VirtualRows({ rows }: { readonly rows: readonly ListRow[] }): ReactElem
         session={row.session}
         pinned={row.pinned ?? false}
         archived={row.archived ?? false}
+        // `null`, not `undefined`, so the prop's identity is stable across the
+        // rows that are in no group — see note 3 in the file header.
+        groupId={row.groupId ?? null}
+        onNewGroup={onNewGroup}
       />,
     );
   }
@@ -796,10 +1391,34 @@ function VirtualRows({ rows }: { readonly rows: readonly ListRow[] }): ReactElem
     <div
       ref={scrollRef}
       onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+      onDragEnter={overGroupDrag}
+      onDragOver={overGroupDrag}
+      onDragLeave={leaveGroupDrag}
+      onDrop={dropGroupDrag}
       className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain"
     >
       <div className="relative" style={{ height: total }}>
         {visible}
+        {/*
+          Where the carried group would land: one line, on the boundary between
+          two groups' blocks. A line rather than the ground-and-ring a session
+          drag lights a heading with, and the difference is the point — that
+          drop files a row *under* a heading and has no position to show, this
+          one is nothing but a position. Not drawn where the drop would change
+          nothing, so a heading held over its own place promises no move.
+
+          Kept a pixel inside the top so a line above the very first row is not
+          half clipped by the scroller, and out of the pointer's way so it can
+          never become the element the drag is over.
+        */}
+        {groupDrop !== null && groupDrop.changes ? (
+          <div
+            aria-hidden="true"
+            data-slot="group-drop-line"
+            style={{ top: Math.max(1, groupDrop.lineY) }}
+            className="pointer-events-none absolute inset-x-1.5 z-10 h-0.5 -translate-y-1/2 rounded-full bg-beam"
+          />
+        ) : null}
       </div>
     </div>
   );
@@ -834,11 +1453,17 @@ const Row = memo(function Row({
   top,
   pinned,
   archived,
+  groupId,
+  onNewGroup,
 }: {
   readonly session: SessionSummary;
   readonly top: number;
   readonly pinned: boolean;
   readonly archived: boolean;
+  /** The group this row is filed under, or `null`. See `SessionRow.groupId`. */
+  readonly groupId: string | null;
+  /** Make a group and start naming it. See `newGroup` in {@link SessionList}. */
+  readonly onNewGroup: () => string;
 }): ReactElement {
   /*
    * "Open in *a* column", not "open in the focused one".
@@ -930,6 +1555,23 @@ const Row = memo(function Row({
    * works.
    */
   const orphaned = useApp((s) => !s.profiles.some((p) => canReachSession(session, p.id)));
+
+  /*
+   * The groups this row's menu can offer to move it into.
+   *
+   * A subscription on every row, which is affordable only because the array's
+   * identity is stable: it changes when a group is created, renamed, deleted or
+   * folded, and at no other time — in particular not when a session is moved,
+   * which rewrites the membership record instead. A sidebar with no groups in
+   * it pays one reference comparison per row per store write, which is what
+   * every other selector here costs.
+   *
+   * Read at the row rather than passed down from the list because the menu is
+   * the only consumer: threading it through `VirtualRows` would put the group
+   * list in the props of every row whether or not its menu was ever opened,
+   * and a new array identity there would defeat `memo` on all of them.
+   */
+  const groups = useApp((s) => s.sessionGroups);
 
   /*
    * Two pieces of row-local UI state, and both are deliberately here rather
@@ -1173,6 +1815,70 @@ const Row = memo(function Row({
           </MenuAction>
 
           {/*
+           * Filing, for everyone who is not going to drag.
+           *
+           * The drag is the gesture this feature is built around and it is not
+           * available to every hand or any keyboard, so the same three moves —
+           * into a group, into a *new* group, back out — are all here. A
+           * submenu rather than a flat run of items because the list grows with
+           * the number of groups, and a menu whose length depends on the user's
+           * filing would push Delete somewhere different for every install.
+           *
+           * No hotkey letter: the parent menu's four are the actions that are
+           * always there, and a fifth that opens a submenu would need a second
+           * press with nothing to press it against. `pressHotkey` declines
+           * anything arriving from inside the submenu for the same reason —
+           * see the note there.
+           */}
+          <ContextMenuSub>
+            <ContextMenuSubTrigger>
+              <LayersIcon aria-hidden="true" />
+              Move to group
+            </ContextMenuSubTrigger>
+            <ContextMenuSubContent className="w-44">
+              {groups.map((group) => (
+                <ContextMenuItem
+                  key={group.id}
+                  // The group it is already in is inert rather than absent: a
+                  // list that silently omitted one entry would read as the app
+                  // having lost a group, where a disabled item says "this is
+                  // where it already is".
+                  disabled={group.id === groupId}
+                  onSelect={() => moveSessionToGroup(session, group.id)}
+                >
+                  <LayersIcon aria-hidden="true" />
+                  <span className="min-w-0 truncate">{group.name}</span>
+                </ContextMenuItem>
+              ))}
+
+              {groups.length > 0 ? <ContextMenuSeparator /> : null}
+
+              {/*
+               * Makes the group, files the session into it, and opens the
+               * rename on the new heading — one gesture, because a group made
+               * from here is being made *for* this session, and the name is
+               * the only part still missing.
+               */}
+              <ContextMenuItem
+                onSelect={() => {
+                  moveSessionToGroup(session, onNewGroup());
+                }}
+              >
+                <FolderPlusIcon aria-hidden="true" />
+                New group…
+              </ContextMenuItem>
+
+              {/* Only when there is something to come out of. */}
+              {groupId === null ? null : (
+                <ContextMenuItem onSelect={() => moveSessionToGroup(session, null)}>
+                  <CornerUpLeftIcon aria-hidden="true" />
+                  Remove from group
+                </ContextMenuItem>
+              )}
+            </ContextMenuSubContent>
+          </ContextMenuSub>
+
+          {/*
            * A scheduler's firing is archived by rule, not by entry — see
            * `partitionSessions` — so "Unarchive" on one would remove nothing
            * and change nothing. Disabled with the reason rather than hidden,
@@ -1271,8 +1977,8 @@ const Row = memo(function Row({
  * into an attribute selector below, and `"` or `]` arriving from a keyboard
  * layout nobody tested would be a syntax error thrown at a right-click.
  */
-type Hotkey = 'r' | 'p' | 'a' | 'd';
-const HOTKEYS: ReadonlySet<string> = new Set<Hotkey>(['r', 'p', 'a', 'd']);
+type Hotkey = 'r' | 'p' | 'a' | 'd' | 'u' | 'n';
+const HOTKEYS: ReadonlySet<string> = new Set<Hotkey>(['r', 'p', 'a', 'd', 'u', 'n']);
 
 /**
  * Turn a letter into the click it stands for.
@@ -1293,9 +1999,20 @@ const HOTKEYS: ReadonlySet<string> = new Set<Hotkey>(['r', 'p', 'a', 'd']);
  * Modified presses are left alone. ⌘R is the window reloading and ⌘D is the
  * platform's, and a menu that swallowed them because it happened to be open
  * would be taking keys that were never aimed at it.
+ *
+ * So are presses that arrive from inside a **submenu**. "Move to group" opens a
+ * list of names, and a keydown there bubbles to this handler on the parent
+ * content — so `d` typed while hunting for a group called "docs" would find the
+ * parent's Delete item and open the confirmation for a session the user was in
+ * the middle of filing. The submenu's own items carry no letters, so there is
+ * nothing here for a key from inside one to mean.
  */
 function pressHotkey(event: KeyboardEvent<HTMLDivElement>): void {
   if (event.metaKey || event.ctrlKey || event.altKey) return;
+  const target = event.target;
+  if (target instanceof Element && target.closest('[data-slot="context-menu-sub-content"]')) {
+    return;
+  }
   const key = event.key.toLowerCase();
   if (!HOTKEYS.has(key)) return;
 
@@ -1409,6 +2126,71 @@ function RenameField({
       // The same field shape as the filter above it — see the note there for
       // why the ground is stated rather than inherited.
       className="h-full w-full rounded-lg border-hairline-strong bg-wash px-2 text-xs md:text-xs dark:bg-wash"
+    />
+  );
+}
+
+/**
+ * The same field, in place of a group's heading.
+ *
+ * A near-copy of {@link RenameField} rather than a shared component taking a
+ * commit callback, and the duplication is the smaller cost: the two differ in
+ * what they commit to (a provider's store over IPC versus this desktop's
+ * preferences), in what an empty value means (a session keeps its provider
+ * title; a group declines the rename — see `renameSessionGroup`), in their
+ * accessible names and in their heights. A shared component would take a
+ * callback, a label, a class and a height, which is every line of it
+ * parameterised.
+ *
+ * What is deliberately identical is the *behaviour*: Enter and blur commit,
+ * Escape abandons, the text arrives selected, and arrow keys stay in the field.
+ * Renaming in this app should feel like one thing wherever it is done.
+ */
+function GroupRenameField({
+  groupId,
+  name,
+  onDone,
+}: {
+  readonly groupId: string;
+  readonly name: string;
+  readonly onDone: () => void;
+}): ReactElement {
+  const [value, setValue] = useState(name);
+  /* Guards the double-commit — Enter commits and then blurs. See `RenameField`. */
+  const done = useRef(false);
+
+  const finish = useCallback(
+    (commit: boolean): void => {
+      if (done.current) return;
+      done.current = true;
+      if (commit) renameSessionGroup(groupId, value);
+      onDone();
+    },
+    [groupId, value, onDone],
+  );
+
+  return (
+    <Input
+      autoFocus
+      value={value}
+      onChange={(event) => setValue(event.target.value)}
+      onBlur={() => finish(true)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          finish(true);
+        } else if (event.key === 'Escape') {
+          event.preventDefault();
+          finish(false);
+        }
+        event.stopPropagation();
+      }}
+      onFocus={(event) => event.target.select()}
+      aria-label={`Rename group: ${name}`}
+      spellCheck={false}
+      // A heading's height, not a row's, and the small type that goes with it:
+      // the field stands exactly where the heading was.
+      className="h-full w-full rounded-md border-hairline-strong bg-wash px-1.5 text-2xs md:text-2xs dark:bg-wash"
     />
   );
 }

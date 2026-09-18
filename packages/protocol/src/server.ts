@@ -67,11 +67,13 @@
  * "yes, something is listening" and nothing else.
  */
 
+import { readAttachments, type Attachment } from './attachment.js';
 import type { AuthStatusInfo } from './ipc.js';
 import type { PlanUsage } from './usage.js';
 import type { AgentEvent } from './events.js';
 import type { ProfileId } from './ids.js';
 import type { Capabilities, ProviderId, ProviderKind } from './provider.js';
+import type { RoutineDraft, RoutinePatch, RoutineSnapshot } from './routine.js';
 
 /* -------------------------------------------------------------------------- */
 /* Addresses                                                                  */
@@ -381,6 +383,42 @@ export interface ServerModelsBody {
   readonly models: readonly ServerModel[];
 }
 
+/**
+ * One account's slash commands, as `GET /api/v0/commands` reports them.
+ *
+ * Kept per account beside the union because the union is what a menu wants
+ * and the account is what a person debugging a missing skill wants: a skill
+ * installed under one profile's config directory reaches that account alone,
+ * and a flat list cannot say which.
+ */
+export interface ServerCommandsAccount {
+  readonly profileId: ProfileId;
+  readonly profileSlug: string;
+  readonly profileLabel: string;
+  readonly providerId: ProviderId;
+  /** The names a session on this account would offer, as its provider spells them. */
+  readonly commands: readonly string[];
+}
+
+/**
+ * The body of `GET /api/v0/commands` — what a session on the server would
+ * offer when `/` is typed, asked before there is one.
+ *
+ * `commands` is the union across every account the connection can see, in
+ * first-seen order and without duplicates: what a client asks before it has
+ * picked a route, which is the moment a composer's menu opens. The names are
+ * the *serving machine's*. Its skills and commands reach a served run through
+ * that machine's own content bridge, so a skill installed there arrives as
+ * `artemis-skills:<name>` exactly as it does in a local session — and a client
+ * holding the token learns the names here rather than keeping a copy of every
+ * skill on its own disk.
+ */
+export interface ServerCommandsBody {
+  readonly object: 'artemis.commands';
+  readonly commands: readonly string[];
+  readonly accounts: readonly ServerCommandsAccount[];
+}
+
 /* -------------------------------------------------------------------------- */
 /* Adding an account to a server, from somewhere else                         */
 /* -------------------------------------------------------------------------- */
@@ -616,6 +654,74 @@ export interface ServerCreateProfileRequest {
   readonly provider?: ProviderId;
 }
 
+/* -------------------------------------------------------------------------- */
+/* The serving machine's memory banks, and which of its accounts each reaches  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which of a server's accounts one memory bank reaches.
+ *
+ * The wire shape of core's `BankProfileScope`, restated here because the
+ * protocol package is the one both ends may depend on. `all` covers accounts
+ * added later; a list means exactly those, and an account not on it never
+ * learns the bank exists — the run is not told about it, its checkout is not
+ * attached, and the memory tools will not name it.
+ */
+export type ServerMemoryBankScope =
+  | { readonly kind: 'all' }
+  | { readonly kind: 'profiles'; readonly profileIds: readonly string[] };
+
+/**
+ * One bank in the serving machine's registry.
+ *
+ * `path` is a directory on the *serving* machine, published for the same
+ * reason {@link ServerProfileCreatedBody.configDir} is: a caller holding the
+ * administrative grant is looking at a thing on that machine and needs to be
+ * able to tell two checkouts apart. Nothing here is a credential — the bank's
+ * git credential lives in the host's key manager and never crosses the wire.
+ */
+export interface ServerMemoryBank {
+  readonly slug: string;
+  readonly path: string;
+  readonly role: 'readwrite' | 'readonly';
+  /** The registry's own on/off switch, which scope is orthogonal to. */
+  readonly enabled: boolean;
+  readonly profiles: ServerMemoryBankScope;
+}
+
+/** The body of `GET /api/v0/memory-banks`. */
+export interface ServerMemoryBanksBody {
+  readonly object: 'artemis.memory-banks';
+  readonly banks: readonly ServerMemoryBank[];
+  /**
+   * The accounts a scope may name.
+   *
+   * Carried on the same read as the banks so a client can draw the checklist
+   * from one request: without it, a list of opaque ids is all a scope is, and
+   * the client would have to join it against the catalogue itself.
+   */
+  readonly profiles: readonly ServerMemoryBankAccount[];
+}
+
+/** One account on the serving machine, as the bank scope picker needs it. */
+export interface ServerMemoryBankAccount {
+  readonly id: ProfileId;
+  /** The left half of a model route, which is how a served run is addressed. */
+  readonly slug: string;
+  readonly label: string;
+}
+
+/** The body of `PATCH /api/v0/memory-banks/{slug}`. */
+export interface ServerMemoryBankScopeRequest {
+  readonly profiles: ServerMemoryBankScope;
+}
+
+/** What `PATCH /api/v0/memory-banks/{slug}` answers: the bank as it now stands. */
+export interface ServerMemoryBankBody {
+  readonly object: 'artemis.memory-bank';
+  readonly bank: ServerMemoryBank;
+}
+
 /**
  * One stored server conversation, as `GET /api/v0/sessions` reports it.
  *
@@ -741,6 +847,78 @@ export interface ServerSessionDeletedBody {
 export interface ServerSessionTaggedBody {
   readonly object: 'artemis.session.tagged';
   readonly tagged: boolean;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Routines: appointments that fire in the server                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The server's routines, as `GET /api/v0/routines` reports them.
+ * ============================================================================
+ *
+ * A routine that runs *in the server* fires on schedule with every client
+ * closed — which is the point of it, and the difference from a desktop routine
+ * that fires only while the app is open. These five routes are how a client
+ * makes and manages them:
+ *
+ * ```
+ *   GET    /api/v0/routines                 the ones this connection owns
+ *   POST   /api/v0/routines                 create one, owned by this connection
+ *   PATCH  /api/v0/routines/{id}            edit one this connection owns
+ *   DELETE /api/v0/routines/{id}            delete one this connection owns
+ *   POST   /api/v0/routines/{id}/run-now    fire one now, schedule notwithstanding
+ * ```
+ *
+ * ## Scope is the connection's, exactly as it is for sessions
+ *
+ * Every route is scoped by the same `workspaceKey` the session ledger uses: a
+ * token sees, edits and fires exactly the routines whose scope matches its own
+ * pin, and "not yours" answers like "not there" — a token must not be able to
+ * sound out which routines exist. Create stamps the caller's scope and
+ * connection id; the client never sends either.
+ *
+ * ## The directory and the mode are the server's to decide
+ *
+ * A served firing runs in the connection's own workspace and nowhere else, so
+ * a `cwd` on the draft is ignored — a server routine belongs to a connection
+ * with a fixed directory, and one without is refused. And because a server has
+ * nobody in front of it to answer a permission prompt, a firing opens in
+ * `bypassPermissions` unless the routine names a stricter mode; the client is
+ * expected to leave it at the default.
+ */
+
+/** The routine a client sends to create one. `cwd` is ignored — see the header. */
+export interface ServerRoutineCreateRequest {
+  readonly draft: RoutineDraft;
+}
+
+/** The edit a client sends. Absent fields are left alone. */
+export interface ServerRoutineUpdateRequest {
+  readonly patch: RoutinePatch;
+}
+
+/** The body of `GET /api/v0/routines`. */
+export interface ServerRoutinesBody {
+  readonly object: 'artemis.routines';
+  readonly routines: readonly RoutineSnapshot[];
+}
+
+/**
+ * The body of a single-routine route — create, edit, and run-now alike.
+ *
+ * One shape for all three so a client has one thing to read: the routine as it
+ * now stands, next appointment and firing state included.
+ */
+export interface ServerRoutineBody {
+  readonly object: 'artemis.routine';
+  readonly routine: RoutineSnapshot;
+}
+
+/** Body of `DELETE /api/v0/routines/{id}`. False when there was nothing to remove. */
+export interface ServerRoutineDeletedBody {
+  readonly object: 'artemis.routine.deleted';
+  readonly deleted: boolean;
 }
 
 /** One row of `GET /v1/models`, in OpenAI's shape. */
@@ -1128,6 +1306,28 @@ export interface ServerConnectionInfo {
    */
   readonly manageProfiles: boolean;
   /**
+   * This server reads attachments off the wire.
+   *
+   * A capability line in the same class as {@link manageProfiles}, and present
+   * for the same reason: a client reads it to decide whether to offer a whole
+   * control, and "the field was missing" and "the answer is no" must not be two
+   * things it has to tell apart. A server older than attachments sends neither,
+   * and a client reading `=== true` lands on the safe answer either way.
+   *
+   * It exists because attachments are the one part of a request whose silent
+   * loss cannot be recovered from downstream. Every other setting an old server
+   * drops costs the caller a feature; a dropped screenshot costs them the
+   * question — the agent answers the text alone, confidently, about nothing,
+   * and no signal anywhere says a file was meant to be there. So a client with
+   * something to attach asks this first and refuses the prompt on its own side
+   * rather than sending it.
+   *
+   * Says nothing about whether the *account* being run can see a picture: that
+   * is `ServerProfile.capabilities.imageInput` and `.fileInput`, published per
+   * account, and enforced per run when the route starts one.
+   */
+  readonly acceptsAttachments: boolean;
+  /**
    * Epoch ms this token stops working, when it has one. Absent means never.
    *
    * Told to the client rather than merely enforced, because the difference
@@ -1150,6 +1350,10 @@ export function describeConnection(connection: ServerConnection): ServerConnecti
       : { allow: connection.allow }),
     canRunTurns: workspaceCanRunTurns(connection.workspace),
     manageProfiles: connection.manageProfiles === true,
+    // A property of the build rather than of the token: every connection on a
+    // server that has this line can send attachments, and the per-route and
+    // per-account refusals happen later, where the account is known.
+    acceptsAttachments: true,
     ...(connection.expiresAt === undefined ? {} : { expiresAt: connection.expiresAt }),
   };
 }
@@ -1381,6 +1585,86 @@ export interface ArtemisChatExtensions {
    * so even the widest mode is a convenience, not a capability.
    */
   readonly permissionMode?: string;
+  /**
+   * Standing instructions to append to the run's system prompt.
+   *
+   * Composed on the *client* — the machine that has the prompt library and
+   * knows this machine's memory banks — and carried here so a served run reads
+   * the same conventions a local one would. It is appended on top of the
+   * serving provider's own preset, never a replacement: a caller cannot displace
+   * the coding-agent instructions the provider relies on to use its tools.
+   *
+   * A request, like everything else here. An older server drops the field, so a
+   * newer client degrades to a run with no standing instructions rather than
+   * failing — exactly what a server that never had them does today. Carrying it
+   * grants the caller nothing new: it is the caller's own text, applied to the
+   * caller's own run, and bounded in size where the request is validated.
+   *
+   * Honoured only where the serving account's provider can append to its
+   * preset — `ServerProfile.capabilities.systemPromptAppend`, which the
+   * catalogue publishes per account. Elsewhere (Codex, OpenCode) it is dropped
+   * and named in `artemis.ignored` as `artemis.systemPrompt`, because an
+   * instruction the model never read is worse silent than absent: the client
+   * would believe it was heard.
+   *
+   * Not the place for text about the *client's* machine. The memory-bank
+   * prompt names this machine's banks and this machine's paths, and a served
+   * run executes on the server, which describes its own banks itself; the
+   * desktop keeps that built-in off this field and sends only the user's own
+   * prompts.
+   */
+  readonly systemPrompt?: string;
+  /**
+   * Branch the conversation named by {@link sessionId} into a new session,
+   * leaving the original whole. The reply announces the branch's own id.
+   *
+   * Needs {@link sessionId}: there is nothing to fork otherwise, and the
+   * server refuses the request rather than starting a fresh conversation
+   * that a caller would mistake for a branch. Honoured only where the serving
+   * account's provider can fork — `ServerProfile.capabilities.forkSession` —
+   * and refused elsewhere, never dropped: a fork that was quietly set aside
+   * would append the next turn to the very conversation the caller meant to
+   * leave untouched.
+   */
+  readonly forkSession?: boolean;
+  /**
+   * Cut the conversation named by {@link sessionId} back to just before this
+   * stored message before continuing.
+   *
+   * The id is the serving provider's own, as its stored transcript names it
+   * — read back through `GET /api/v0/sessions/{id}/messages`, which is where a
+   * client learns it. Needs {@link sessionId}, and is refused rather than
+   * dropped where the account cannot rewind (`capabilities.rewind`), for the
+   * same reason as {@link forkSession}: a cut that silently did not happen
+   * leaves the caller continuing a conversation they believe they shortened.
+   * With {@link forkSession} the cut lands in the branch and the original is
+   * left whole.
+   */
+  readonly rewindToMessageId?: string;
+  /**
+   * Files and images the prompt is about.
+   *
+   * The one field here that is **not** a setting for the run: it is part of the
+   * message. "Why is this button misaligned?" without its screenshot is not a
+   * shorter question, it is a question about nothing, and the answer will be
+   * confident and useless — which is why an attachment this server cannot
+   * honour is refused rather than dropped, and why the serving account's
+   * `capabilities.imageInput` and `capabilities.fileInput` decide the refusal
+   * per route rather than the whole server answering for every provider it
+   * fronts.
+   *
+   * Images may instead arrive the OpenAI way, as `image_url` content parts on
+   * the trailing user message, and an off-the-shelf client has no other option.
+   * The two are read into the same list and held to the same ceilings
+   * together — see `mergeAttachments`.
+   *
+   * An Artemis server older than this field drops it, and that drop is the one
+   * this surface cannot make loud from its own side. What it can do is *say so
+   * in advance*: `ServerConnectionInfo.acceptsAttachments` is the flag a client
+   * reads before it sends, and the desktop's served adapter refuses the prompt
+   * locally rather than posting a question whose subject will never arrive.
+   */
+  readonly attachments?: readonly Attachment[];
 }
 
 /**
@@ -1486,6 +1770,10 @@ export const CHAT_EXTENSIONS_FIELD = 'artemis';
  * newer client talking to an older server degrades instead of failing. The
  * *values* are type-checked, because a `thinking: 5` is a caller bug worth
  * surfacing rather than coercing.
+ *
+ * @throws {import('./attachment.js').AttachmentError} for an `attachments`
+ * field this will not accept. The only way out of here that is not a return,
+ * and deliberately so: see the field's own note.
  */
 export function readChatExtensions(body: unknown): ArtemisChatExtensions {
   if (typeof body !== 'object' || body === null) return {};
@@ -1521,8 +1809,36 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
     ...(typeof extensions['permissionMode'] === 'string'
       ? { permissionMode: extensions['permissionMode'] as string }
       : {}),
+    ...(typeof extensions['systemPrompt'] === 'string' && extensions['systemPrompt'].length > 0
+      ? { systemPrompt: extensions['systemPrompt'] as string }
+      : {}),
+    // `true` only: a fork is asked for or it is not, and `false` sent
+    // explicitly means the same as absent.
+    ...(extensions['forkSession'] === true ? { forkSession: true } : {}),
+    ...(typeof extensions['rewindToMessageId'] === 'string' &&
+    extensions['rewindToMessageId'].length > 0
+      ? { rewindToMessageId: extensions['rewindToMessageId'] as string }
+      : {}),
+    // The exception to "unknown keys drop, wrong types drop". Everything else
+    // here is a setting, and a setting the caller spelled wrong is best treated
+    // as one they did not send; an attachment is the *subject* of the message,
+    // and one dropped for being malformed turns the prompt into a question
+    // about nothing. So this throws, and the route answers 400 naming the
+    // field. See `readAttachments`.
+    ...(extensions['attachments'] === undefined
+      ? {}
+      : attachmentsOrNothing(
+          readAttachments(extensions['attachments'], `${CHAT_EXTENSIONS_FIELD}.attachments`),
+        )),
     ...readRemoteOptions(extensions['remote']),
   };
+}
+
+/** Spreadable: the field when there is one, nothing when the list was empty. */
+function attachmentsOrNothing(value: readonly Attachment[] | undefined): {
+  attachments?: readonly Attachment[];
+} {
+  return value === undefined ? {} : { attachments: value };
 }
 
 /**

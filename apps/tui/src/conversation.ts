@@ -17,11 +17,60 @@
  * — and everything the status bar says about "queued" or "wait for this turn"
  * falls out of which path was taken.
  *
+ * The steers that have gone out and not been read yet are kept as a *list*, not
+ * a tally. The provider folds a mid-turn message in at its next tool break, and
+ * that fold is invisible from outside its process: the only thing that can
+ * strike an entry is the `message.delivered` naming the one message that was
+ * read, and a count cannot say *which* one it lost. Keeping the text as well
+ * answers the question a person actually has — what am I waiting on? — and is
+ * what makes {@link Conversation.takeBackQueued} possible at all. The desktop's
+ * `PaneState.queuedSteers` made the same move, for the same reason.
+ *
  * The transcript is `@rx-artemis/transcript`'s model, the same one the desktop
  * renderer draws from, fed the same `AgentEvent`s. The optimistic user row is
  * pushed before the round-trip under the identity the registry will file the
  * prompt as — `${runId}:prompt:${n}` — which is what lets a later replay merge
  * onto it rather than draw it twice; `pushUserMessage`'s own comment says why.
+ *
+ * What the turn *did to the disk* is kept alongside it, in a
+ * {@link ChangeLedger} of this conversation's own. It has to be fed from here
+ * because here is where the events are: the ledger's whole trick is reading a
+ * file on `tool.start`, while the call has been announced and has not run yet,
+ * and nothing downstream of this class sees that moment. One ledger per
+ * conversation and one working directory per ledger — a conversation that
+ * changes directory has nothing to say about the files of the one it left — and
+ * a subagent's edits count, because they land on the same disk as anybody
+ * else's. {@link ConversationState.filesChanged} is the one line of it the
+ * status bar wants, folded on `tool.end` rather than on every delta.
+ *
+ * The state also carries *what the agent is doing right now* — the turn's
+ * start time, a one-line activity, and the tokens it has written since. That
+ * reading belongs here rather than in the status bar because it is a fold over
+ * the event stream, and the stream only passes through this class: the bar
+ * gets a snapshot and a clock of its own. See {@link ConversationActivity}.
+ *
+ * What a turn cost *the plan* is folded here for the same reason, and only
+ * here: a person on a subscription thinks in windows, not in dollars, and the
+ * dollar figure under a turn answers a question they are not asking. The
+ * account's meters move while the turn runs — Claude reports each limit on the
+ * wire, so the `plan.limit` events have brought `#planUsage` up to date by the
+ * time `run.end` lands — and the difference between what a meter read when the
+ * turn began and what it reads when it ended is what that turn actually spent.
+ * The subtraction is only true at that instant, so it is taken then and kept;
+ * see {@link Conversation.planDeltaFor}. A provider that refreshes its numbers
+ * only when asked — Codex — moves no meter mid-run, and the reading is then
+ * absent rather than wrong.
+ *
+ * Going back to an earlier prompt is the one move here that *takes rows away*.
+ * {@link Conversation.armRewind} cuts the transcript at a past prompt and
+ * records that the next `start()` must carry `rewindToMessageId` — the
+ * protocol's own way of saying "resume this session with its history truncated
+ * to just before this message" — with `forkSession` when a branch is the safer
+ * shape. Nothing is sent at that moment: the arm describes the next run, and
+ * the rows it cut are kept until that run has said something, because until
+ * then the rewind can still turn out never to have happened.
+ * {@link Conversation.canRewind} holds the rule for which of the two moves a
+ * provider gets, and `#redraw` the honest limits of putting rows back.
  *
  * Nothing here touches Ink or `process`. The driver is an interface the
  * registry satisfies structurally, so the tests hand in a fake and the
@@ -46,10 +95,21 @@ import type {
   RunId,
   RunInput,
   SessionId,
+  ThinkingDeltaEvent,
+  ToolCallId,
   UsageSnapshot,
 } from '@rx-artemis/protocol';
-import { NO_CAPABILITIES, applyPlanLimit } from '@rx-artemis/protocol';
-import { TranscriptModel, frameScheduler, type Scheduler } from '@rx-artemis/transcript';
+import { NO_CAPABILITIES, applyPlanLimit, planMeterSlots } from '@rx-artemis/protocol';
+import {
+  TranscriptModel,
+  frameScheduler,
+  oneLine,
+  summarizeToolInput,
+  type Scheduler,
+  type TranscriptItem,
+} from '@rx-artemis/transcript';
+
+import { ChangeLedger } from './changes.js';
 
 /** The slice of `RunRegistry` a conversation needs. Satisfied structurally. */
 export interface RunDriver {
@@ -90,6 +150,117 @@ export interface ConversationSettings {
 
 export type ConversationStatus = 'idle' | 'starting' | 'running' | 'awaiting_permission';
 
+/**
+ * When a waiting message is expected to be read.
+ *
+ * `next-tool-break` is the one that happens: the provider accepted a steer and
+ * will fold it in at its next tool boundary. `after-turn` would be a message
+ * *Artemis* is sitting on until the turn ends, and no path here does that —
+ * `send()` refuses a mid-turn message on a provider without `midRunSteering`
+ * rather than parking the text, so the composer keeps the words and nothing is
+ * queued. The kind is named anyway because the strip has to label whatever it
+ * is handed, and a holding queue is the obvious next thing someone adds; a
+ * label invented at that point would have to be invented in the component.
+ */
+export type QueuedDelivery = 'next-tool-break' | 'after-turn';
+
+/** One message sent but not yet read, as the strip draws it. */
+export interface QueuedMessage {
+  /**
+   * The identity the message was sent under — `${runId}:prompt:${n}`, the same
+   * string the optimistic transcript row claims. It is what a
+   * `message.delivered` names when the provider reads this one, so it is the
+   * only thing that can strike the right entry rather than an arbitrary one.
+   */
+  readonly id: string;
+  /** What was typed, whole. The strip truncates; the state does not. */
+  readonly text: string;
+  readonly delivery: QueuedDelivery;
+  /** When it was sent, for a strip that may one day want to age a row. */
+  readonly ts: number;
+}
+
+/**
+ * What the agent is doing this very moment, in words.
+ *
+ * A turn used to be one undifferentiated `working…` from the first token to
+ * the last, which answers neither of the two questions someone actually has
+ * while they wait — *what* is it doing, and *is it still going*. Every other
+ * terminal agent answers the first by promoting something the model already
+ * said: Codex prints the reasoning header, Gemini the thought subject, Claude
+ * Code the tool. So does this. Nothing here is invented or paraphrased — it is
+ * the model's own first line, or the name of the tool it just reached for.
+ *
+ * `since` is when *this* text took the line, not when the turn began, which is
+ * what makes "the same thought for 45 seconds" a thing the bar can notice.
+ */
+export interface ConversationActivity {
+  readonly kind: 'thinking' | 'tool' | 'writing';
+  /** Already one line and already short enough to print. */
+  readonly text: string;
+  /** Host clock when this text took the line. */
+  readonly since: number;
+}
+
+/**
+ * One plan window a turn moved, ready to print: `0.4% of week`.
+ *
+ * The label is the meter's own short name lower-cased, because it is read as
+ * the tail of a dim sentence rather than as a heading — and it is the same
+ * vocabulary the status bar's meters carry ({@link planMeterSlots}), so the
+ * two surfaces cannot disagree about which window a number belongs to.
+ */
+export interface PlanDelta {
+  readonly label: string;
+  /** Points of that window consumed since the turn began, to one decimal. */
+  readonly pct: number;
+}
+
+/** One prompt the person sent, as the go-back list draws it. */
+export interface UserTurn {
+  /** The transcript row, for keying the list and pointing at the row. */
+  readonly id: string;
+  /**
+   * The provider's own id for this message, and `undefined` when there is none
+   * to give.
+   *
+   * `undefined` is not an edge case in a fresh window — it is the ordinary
+   * state of every prompt typed in this one. Neither Claude nor Codex echoes a
+   * live prompt back on the stream (both mappers gate the user row on
+   * `isReplay`, because the front end has already drawn it), so the only name
+   * such a row carries is the registry's own retention id,
+   * `${runId}:prompt:${n}`. That is an Artemis word the provider's stored chain
+   * has never heard, and sending it as `rewindToMessageId` buys the adapter's
+   * "that message is not in this session" refusal and nothing else. So it is
+   * reported as no id at all, and the list greys the row rather than offering a
+   * move that cannot work. Rows read back out of a stored session — the whole
+   * of a resumed conversation — carry the real thing.
+   *
+   * The desktop closes that gap by re-reading the stored session and matching
+   * the row by its position from the end (`resolveRewindAnchor` in
+   * `state/store.ts`). That is a provider read, which this class cannot make;
+   * the same move belongs in whatever wires this list up, if the ids are wanted
+   * for prompts typed in this session.
+   */
+  readonly messageId: string | undefined;
+  /** What was typed, whole. The list cuts it to a line. */
+  readonly text: string;
+  readonly ts: number;
+  /**
+   * The run this prompt was sent under, when the row carries the registry's
+   * retention id — which is the one thing that id is still good for.
+   */
+  readonly runId?: string;
+}
+
+/**
+ * Whether this conversation can go back to an earlier prompt, and which of the
+ * two moves it would be. See {@link Conversation.canRewind}.
+ */
+export type RewindPlan =
+  | { readonly ok: true; readonly fork: boolean }
+  | { readonly ok: false; readonly reason: string };
+
 export interface ConversationState {
   readonly settings: ConversationSettings;
   readonly status: ConversationStatus;
@@ -99,7 +270,18 @@ export interface ConversationState {
   readonly usage?: UsageSnapshot;
   /** Open permission requests, oldest first. The card draws the first. */
   readonly pendingPermissions: readonly PermissionRequest[];
-  /** Steers accepted by the provider but not yet delivered to the model. */
+  /**
+   * Steers accepted by the provider but not yet delivered to the model, oldest
+   * first — which is also the order they will be read in.
+   */
+  readonly queuedMessages: readonly QueuedMessage[];
+  /**
+   * How many of {@link queuedMessages} there are, for the status line.
+   *
+   * Derived from the list rather than counted alongside it: a tally and a list
+   * that can drift apart is the bug this list was built to end, and two
+   * surfaces reading one array cannot disagree about a message.
+   */
   readonly queued: number;
   /**
    * Background work, as the provider last reported it — a replacement list,
@@ -115,6 +297,53 @@ export interface ConversationState {
    * replacement list; known only once a session has started.
    */
   readonly slashCommands: readonly string[];
+  /**
+   * Host clock when the turn now running started, and absent when none is.
+   *
+   * The clock itself is not here — an elapsed *number* in the store would be a
+   * write per second to move one digit, and every subscriber would re-render
+   * for it. What is here is the fixed point a component's own clock subtracts
+   * from, which is the same trade `DelegatedStrip` makes for its rows.
+   */
+  readonly turnStartedAt?: number;
+  /** What the agent is doing right now. Absent until it has said something. */
+  readonly activity?: ConversationActivity;
+  /**
+   * Output tokens this turn, when the provider has reported any mid-turn.
+   *
+   * Separate from {@link usage}, which accumulates across the whole
+   * conversation and answers "what has this cost". This answers "how much has
+   * it written since I pressed Enter", which is the reading that moves while
+   * someone is watching it. Both Claude and Codex emit `delta` usage during a
+   * turn — per assistant message and per token-count report respectively — so
+   * this is real on both; a provider that reports nothing until `run.end`
+   * leaves it undefined for the whole turn, and the bar simply omits it.
+   */
+  readonly turnTokens?: number;
+  /**
+   * A rewind is armed: the screen has been cut back to a past prompt and the
+   * next turn will carry the truncation to the provider.
+   *
+   * For the status line and the composer hint, which are the only places a
+   * person can be told that the next thing they send will land somewhere other
+   * than the end of the conversation. `fork` is which move it turned out to be
+   * — see {@link Conversation.canRewind} — so the hint can name it rather than
+   * guess.
+   */
+  readonly rewindArmed?: { readonly messageId: string; readonly fork: boolean };
+  /**
+   * What this conversation has done to the working directory, in three
+   * numbers: `3 files · +42 -7`.
+   *
+   * The whole of the ledger in a form a status bar can print without walking
+   * a list on every frame, and absent until something has actually been
+   * edited — a bar that says `0 files` spends columns saying nothing happened.
+   * Folded when a tool call *ends*, which is the only moment the totals can
+   * move: a change is recorded when its call succeeds, so no number here can
+   * change between one `tool.end` and the next. The ledger itself
+   * ({@link Conversation.changes}) has the files, the diffs and the undo.
+   */
+  readonly filesChanged?: { readonly files: number; readonly added: number; readonly removed: number };
 }
 
 export type Outcome = { readonly ok: true } | { readonly ok: false; readonly reason: string };
@@ -126,17 +355,171 @@ export interface ConversationOptions {
   readonly capabilitiesFor: (providerId: ProviderId) => Capabilities | undefined;
   readonly scheduler?: Scheduler;
   readonly newRunId?: () => RunId;
+  /** The host clock, injected so a test can pin what "now" was. */
+  readonly now?: () => number;
+  /**
+   * The ledger this conversation records its file edits in, built for the
+   * directory it starts in.
+   *
+   * A factory rather than an instance because the directory is the ledger's
+   * one construction argument and it comes from the settings; injected at all
+   * because {@link ChangeLedger} reads and writes real files, and a test wants
+   * one over a `Map`.
+   */
+  readonly ledger?: (cwd: string) => ChangeLedger;
 }
 
 const describe = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
+/**
+ * How much of a thought or a tool call the line keeps.
+ *
+ * The status line shares its row with the elapsed time, the token count and
+ * the key hints, and it is the half that truncates. Sixty characters is about
+ * a reasoning header — "Investigating the rendering code" — and well short of
+ * a sentence, which is the right place to stop: the transcript above has the
+ * sentence.
+ */
+const ACTIVITY_CHARS = 60;
+
+/**
+ * What marks an id Artemis minted for its own bookkeeping.
+ *
+ * The registry files every prompt under `${runId}:prompt:${n}` so a replay can
+ * merge onto the row the user watched themselves type. A provider's own message
+ * id is a uuid and has no colons in it, which is what makes the two tellable
+ * apart with a substring — the line the desktop's `resolveRewindAnchor` draws,
+ * in the same words.
+ */
+const RETENTION_MARK = ':prompt:';
+
+/** The provider's own id for a user row, or nothing when the row has none. */
+function providerMessageId(messageId: string | undefined): string | undefined {
+  return messageId === undefined || messageId.includes(RETENTION_MARK) ? undefined : messageId;
+}
+
+/** The run a retention id names, for a row whose provider id is not known. */
+function retainedRunId(messageId: string | undefined): string | undefined {
+  if (messageId === undefined) return undefined;
+  const at = messageId.indexOf(RETENTION_MARK);
+  return at <= 0 ? undefined : messageId.slice(0, at);
+}
+
+/**
+ * The run id redrawn rows are stamped with. See `Conversation.#redraw`.
+ *
+ * Their own ids would reopen the sequence check on runs that have long
+ * finished: `checkSequence` reads a repeated `seq` as a hole in the transport
+ * and writes "3 events were dropped in transit" into the very transcript being
+ * repaired. One id of its own, counted densely, says what is true — this is a
+ * redraw, not a feed.
+ */
+const REDRAWN_RUN: RunId = 'rewind:redraw';
+
+/**
+ * The events that mean an armed turn has begun for real.
+ *
+ * The line the rows held against a failed rewind are let go at: once the
+ * provider has said or done anything, it has accepted the truncation — or made
+ * the branch — and what was cut off is a conversation it no longer holds.
+ *
+ * Deliberately not `RunEndItem.silent`, which sounds like the same question and
+ * is not: that flag counts everything drawn since the last run ended, and a
+ * conversation resumed from history has already "produced" four turns before
+ * the first prompt is typed. It would call every refused rewind noisy.
+ */
+const TURN_SPOKE: ReadonlySet<AgentEvent['type']> = new Set([
+  'text.delta',
+  'text.complete',
+  'thinking.delta',
+  'tool.start',
+  'tool.end',
+  'command.run',
+  'permission.request',
+]);
+
+/**
+ * A thinking block's first line, as a heading rather than as markdown.
+ *
+ * Models write their reasoning headers in the syntax they write everything
+ * else in — `**Investigating rendering code**`, `## Checking the mapper` — and
+ * the status line has no markdown renderer and should not grow one for this.
+ * So the marks come off and the words stay. Whatever is left is the model's
+ * own phrasing, never a paraphrase.
+ *
+ * Only the marks that are almost always markup: `*` and a backtick. An
+ * underscore is left where it is, because a header naming `user_service.ts` is
+ * far commoner than one set in italics, and a heading with the underscores
+ * filed out of its filenames would be worse than one with a stray `_`.
+ */
+function heading(line: string): string {
+  const bare = line
+    .replace(/[*`]/g, '')
+    .replace(/^\s*#+\s*/, '')
+    .replace(/^\s*[>-]\s+/, '');
+  return oneLine(bare, ACTIVITY_CHARS);
+}
+
+/**
+ * The smallest movement worth a column, in points of a window.
+ *
+ * Below this a turn prints `0.0% of week`, which spends a column saying that
+ * nothing happened — and on a weekly window most turns are below it. Rounding
+ * to a tenth is the same judgement made twice: a plan is a thing you watch
+ * over days, and the second decimal of it is noise.
+ */
+const PLAN_DELTA_FLOOR = 0.05;
+
+/** Each meter's reading, by window, as a turn's before-and-after is taken. */
+function planMeterReadings(usage: PlanUsage | null): ReadonlyMap<string, number> {
+  const readings = new Map<string, number>();
+  for (const slot of planMeterSlots(usage)) {
+    if (slot.window.utilization !== null) readings.set(slot.id, slot.window.utilization);
+  }
+  return readings;
+}
+
+/**
+ * What the meters moved between the reading a turn opened with and the one it
+ * closed with.
+ *
+ * Forwards only. A 5-hour window rolls over on its own schedule, and a turn
+ * that straddles the roll reads as −40%: true about the meter, false about the
+ * turn, which handed none of the plan back. A window absent from `before` is
+ * skipped for the same reason — a meter the account only started reporting
+ * mid-turn cannot have all of its consumption charged to this one.
+ */
+function planDelta(before: ReadonlyMap<string, number>, after: PlanUsage | null): readonly PlanDelta[] {
+  const deltas: PlanDelta[] = [];
+  for (const slot of planMeterSlots(after)) {
+    const ended = slot.window.utilization;
+    const began = before.get(slot.id);
+    if (ended === null || began === undefined) continue;
+    const moved = ended - began;
+    if (moved < PLAN_DELTA_FLOOR) continue;
+    deltas.push({ label: slot.label.toLowerCase(), pct: Math.round(moved * 10) / 10 });
+  }
+  return deltas;
+}
+
 export class Conversation {
   readonly transcript: TranscriptModel;
+
+  /**
+   * Every file edit of this conversation, and the way back from the last one.
+   *
+   * Public because everything that reads it — `/diff`, `/undo`, the status
+   * bar's line — lives outside this class; fed from inside it, because the
+   * `tool.start` that a pre-image has to be read at passes through here and
+   * nowhere else. See {@link ConversationState.filesChanged} for the summary.
+   */
+  readonly changes: ChangeLedger;
 
   readonly #driver: RunDriver;
   readonly #capabilitiesFor: (providerId: ProviderId) => Capabilities | undefined;
   readonly #newRunId: () => RunId;
+  readonly #now: () => number;
   readonly #listeners = new Set<() => void>();
   readonly #eventListeners = new Set<(event: AgentEvent) => void>();
   readonly #unsubscribe: () => void;
@@ -148,14 +531,83 @@ export class Conversation {
   #sessionId: SessionId | undefined;
   #usage: UsageSnapshot | undefined;
   #pending: PermissionRequest[] = [];
-  #queued = 0;
+  #queued: readonly QueuedMessage[] = [];
   #tasks: readonly BackgroundTask[] = [];
   #planUsage: PlanUsage | null = null;
+  /**
+   * Each meter's reading when the turn now running began, so the end can be
+   * subtracted from it. Absent between turns, and empty for an account that
+   * had reported no windows by the time one started.
+   */
+  #planAtTurnStart: ReadonlyMap<string, number> | undefined;
+  /**
+   * What each finished turn cost the plan, by the run that spent it.
+   *
+   * One small entry per turn that moved a meter, held for as long as the row
+   * that prints it — which is the transcript's own lifetime, and cleared with
+   * it by {@link reset}.
+   */
+  readonly #planDeltas = new Map<RunId, readonly PlanDelta[]>();
+  /** The run a run-end row belongs to, by the clock it carries. See {@link planDeltaForRow}. */
+  readonly #planDeltaRows = new Map<number, RunId>();
   #slashCommands: readonly string[] = [];
   /** A run has reported its own commands, which outrank every seed. */
   #slashCommandsFromRun = false;
+  #turnStartedAt: number | undefined;
+  #activity: ConversationActivity | undefined;
+  #turnTokens: number | undefined;
+  /**
+   * The heading of the last thinking block this turn opened, kept so that a
+   * tool call can hand the line back to it when it finishes. Dropped the
+   * moment the agent starts writing: by then the thought is spent, and
+   * restoring it after the answer has begun would be the line going backwards.
+   */
+  #thinkingText: string | undefined;
+  /**
+   * The thinking block being read for a heading — its identity, the bytes seen
+   * so far, and whether its first line is already known.
+   *
+   * This is the whole of the "keep it cheap" rule. A thinking block arrives as
+   * hundreds of deltas and only its first line is ever printed, so once that
+   * line is settled every further delta costs one boolean: no concatenation,
+   * no scan, no new object, and therefore no new state snapshot either.
+   */
+  #thinkingBlock: { key: string; text: string; settled: boolean } | undefined;
+  /** The tool call currently holding the line, so a sibling's end cannot take it. */
+  #activeToolCallId: ToolCallId | undefined;
   /** The run that most recently ended; background work it started is stopped through it. */
   #lastRunId: RunId | undefined;
+  /** What the next `start()` must carry, once, to wind the session back. */
+  #rewindArmed: { readonly messageId: string; readonly fork: boolean } | undefined;
+  /**
+   * The rows the arm took off the screen, and where they were taken from.
+   *
+   * Kept because an armed rewind is a promise about a run that has not started
+   * yet, and the promise can fail: the start can throw, or the provider can
+   * refuse the truncation and end the run on an error having said nothing. Both
+   * mean nothing was wound back anywhere but here, and the honest screen is the
+   * one from before the cut. Dropped the moment the run proves otherwise by
+   * finishing or by producing anything at all — past that point the provider
+   * really has branched or truncated, and rows put back would be a record of a
+   * conversation it no longer holds.
+   */
+  #rewindDropped: readonly TranscriptItem[] | undefined;
+  /** Where in the list the cut was made, so the rows go back where they were. */
+  #rewindCutAt: number | undefined;
+  /** Provider-started turns on this session that arrived while a turn of ours was open. See `#fromSibling`. */
+  readonly #siblings = new Set<RunId>();
+  /** The ledger's totals, as the snapshot carries them. Absent until an edit lands. */
+  #filesChanged: ConversationState['filesChanged'];
+  /**
+   * Every ledger read this conversation has started, chained.
+   *
+   * The ledger's work is asynchronous — it reads a file — and it is started
+   * from a synchronous event handler, so there is nothing for a caller to hold
+   * on to unless it is kept. One chain rather than a set because the order the
+   * reads finish in is the order they were asked for, and because a chain is
+   * one thing to await. See {@link Conversation.changesSettled}.
+   */
+  #ledgerWork: Promise<void> = Promise.resolve();
   #snapshot: ConversationState;
 
   constructor(options: ConversationOptions) {
@@ -164,7 +616,9 @@ export class Conversation {
     this.#capabilitiesFor = options.capabilitiesFor;
     this.#capabilities = options.capabilitiesFor(options.settings.providerId) ?? NO_CAPABILITIES;
     this.#newRunId = options.newRunId ?? (() => randomUUID() as RunId);
+    this.#now = options.now ?? Date.now;
     this.transcript = new TranscriptModel(options.scheduler ?? frameScheduler);
+    this.changes = options.ledger?.(options.settings.cwd) ?? new ChangeLedger(options.settings.cwd);
     this.#snapshot = this.#buildSnapshot();
     this.#unsubscribe = this.#driver.subscribe((event) => this.#onEvent(event));
   }
@@ -212,6 +666,7 @@ export class Conversation {
     const changesAccount =
       (patch.profileId !== undefined && patch.profileId !== this.#settings.profileId) ||
       (patch.providerId !== undefined && patch.providerId !== this.#settings.providerId);
+    const movesDirectory = patch.cwd !== undefined && patch.cwd !== this.#settings.cwd;
     if (changesAccount && this.isLive) {
       return { ok: false, reason: 'A conversation belongs to the account it started on. Wait for this turn to finish.' };
     }
@@ -219,9 +674,15 @@ export class Conversation {
     if (changesAccount) {
       this.#sessionId = undefined;
       this.#usage = undefined;
+      this.#clearRewind();
+      this.#endTurn();
       this.#capabilities = this.#capabilitiesFor(this.#settings.providerId) ?? NO_CAPABILITIES;
       this.transcript.reset();
     }
+    // The ledger is about one directory. Its paths were resolved against the
+    // old root and its undos would write there, so moving is the end of it —
+    // as is starting again somewhere else on another account.
+    if (changesAccount || movesDirectory) this.#resetChanges();
     this.#notify();
     return { ok: true };
   }
@@ -233,9 +694,15 @@ export class Conversation {
     this.#usage = undefined;
     this.#runId = undefined;
     this.#pending = [];
-    this.#queued = 0;
+    this.#queued = [];
     this.#status = 'idle';
+    this.#clearRewind();
+    this.#endTurn();
     this.transcript.reset();
+    // The rows that would have asked for these are gone with it.
+    this.#planDeltas.clear();
+    this.#planDeltaRows.clear();
+    this.#resetChanges();
     this.#notify();
     return { ok: true };
   }
@@ -272,6 +739,33 @@ export class Conversation {
   }
 
   /**
+   * Take the newest waiting message off the list and hand its text back.
+   *
+   * What this cannot do, and must not pretend to: un-send it. `driver.send` has
+   * already resolved, which means the provider is holding that message and will
+   * read it at its next tool break whatever happens here — and `RunDriver` has
+   * no retract, because the registry has none to expose and no adapter could
+   * honour one invented at this layer. Nor does the transcript row go: the
+   * message really was sent, and a row that vanished would be the screen lying
+   * about it. Even Esc is not a cancel — the CLI's queue survives an interrupt
+   * by design, so interrupting makes the message be read *sooner*.
+   *
+   * So what it is for is the honest half: Artemis stops counting the message as
+   * outstanding, and the words come back into the composer where they can be
+   * edited and sent again as the next turn's prompt. That is the whole of what
+   * the strip's header offers, and the *newest* is the right one to offer —
+   * it is the one still fresh in the typist's head, and the one the provider is
+   * least likely to have reached already.
+   */
+  takeBackQueued(): string | undefined {
+    const newest = this.#queued.at(-1);
+    if (newest === undefined) return undefined;
+    this.#queued = this.#queued.slice(0, -1);
+    this.#notify();
+    return newest.text;
+  }
+
+  /**
    * Replace the screen with a stored conversation and continue it.
    *
    * The events come from the provider's own store, already flagged `replay`,
@@ -282,16 +776,169 @@ export class Conversation {
   loadHistory(sessionId: SessionId, events: readonly AgentEvent[]): Outcome {
     if (this.isLive) return { ok: false, reason: 'Wait for this turn to finish before switching conversations.' };
     this.transcript.reset();
+    // A stored conversation's edits were made by a process that is no longer
+    // running, in a working tree that has moved on since. Nothing in the
+    // replay can be undone, so nothing in it is recorded as undoable.
+    this.#resetChanges();
     for (const event of events) this.transcript.apply(event);
     this.transcript.flush();
     this.#sessionId = sessionId;
     this.#usage = undefined;
     this.#runId = undefined;
     this.#pending = [];
-    this.#queued = 0;
+    this.#queued = [];
     this.#status = 'idle';
+    this.#clearRewind();
+    this.#endTurn();
     this.#notify();
     return { ok: true };
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Going back to an earlier prompt                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Every prompt in this conversation, oldest first.
+   *
+   * The list the go-back picker is built from, and deliberately unfiltered: a
+   * row whose {@link UserTurn.messageId} is `undefined` is one the provider
+   * cannot be pointed at, and leaving it out would be a list with holes in it
+   * that a person could not account for. Greying it says the same thing and
+   * keeps the conversation legible.
+   */
+  userTurns(): readonly UserTurn[] {
+    this.transcript.flush();
+    const turns: UserTurn[] = [];
+    for (const id of this.transcript.getListSnapshot()) {
+      const item = this.transcript.getItem(id);
+      if (item?.kind !== 'user') continue;
+      const runId = retainedRunId(item.messageId);
+      turns.push({
+        id: item.id,
+        messageId: providerMessageId(item.messageId),
+        text: item.text,
+        ts: item.ts,
+        ...(runId === undefined ? {} : { runId }),
+      });
+    }
+    return turns;
+  }
+
+  /**
+   * Can this conversation go back to an earlier prompt, and would it fork?
+   *
+   * With a target it answers for that prompt; without one it answers for the
+   * newest, which is the cheapest move and the one a standing hint should
+   * describe. Every refusal is in words the status line can print.
+   *
+   * ## The fork rule
+   *
+   * Both moves are the same request — `rewindToMessageId` on the next run —
+   * and `forkSession` only decides where the truncated history gets written:
+   * into a branch, leaving the original session whole, or over the session
+   * itself. Which one is preferred follows from what the protocol says can be
+   * refused. Without a fork, providers "may refuse for all but the most recent
+   * turn", and the Claude adapter shows exactly why: `resolveRewindPoint` can
+   * only declare the CLI's drops-a-turn acknowledgement when the discarded
+   * range is one turn, and a deeper cut "takes its chances with the provider's
+   * own guard". A branch has nothing to guard — the original file is not
+   * touched. So a fork is taken whenever the provider has one and the target is
+   * not the newest prompt, and the in-place rewind is kept for the case it is
+   * safe in: going back one turn, where keeping the session id is worth
+   * something and the session list does not grow a branch nobody asked for.
+   *
+   * ## Why `forkSession` alone is a refusal
+   *
+   * It is not a third way of going back. The truncation is the part `rewind`
+   * gates, and an adapter without it ignores `rewindToMessageId` — so a fork
+   * would branch from the *end* of the conversation, and the screen would be
+   * cut back to an old prompt while the model still held every turn after it.
+   * The answer would come back confident and wrong, which is the same failure
+   * `send()` refuses an image for rather than quietly dropping it. Codex and
+   * OpenCode are in this position today (`forkSession: true, rewind: false`);
+   * the fix is in those adapters, not in this gate.
+   */
+  canRewind(messageId?: string): RewindPlan {
+    const label = this.#settings.providerLabel;
+    if (!this.#capabilities.rewind) {
+      return {
+        ok: false,
+        reason: this.#capabilities.forkSession
+          ? `${label} can branch a conversation but not wind one back to an earlier prompt.`
+          : `${label} cannot go back to an earlier prompt.`,
+      };
+    }
+    if (this.#sessionId === undefined) {
+      return { ok: false, reason: 'There is no stored conversation to go back through yet.' };
+    }
+    if (this.isLive) {
+      return { ok: false, reason: 'Wait for this turn to finish, or press Esc to interrupt it.' };
+    }
+    return { ok: true, fork: this.#forkToReach(messageId) };
+  }
+
+  /**
+   * Point the next turn at an earlier prompt, and cut the screen back to it.
+   *
+   * Nothing is sent here. What this records is what the next `start()` must
+   * carry — `rewindToMessageId`, and `forkSession` when {@link canRewind} chose
+   * a branch — and what it changes is the screen, so the conversation reads as
+   * already wound back while the prompt is being retyped. The rows it removed
+   * are kept: see `#rewindDropped` for how long, and {@link disarmRewind} for
+   * the ordinary way they come back.
+   *
+   * Arming twice cuts further back. The second cut is above the first, so its
+   * rows go in front of the ones already held and a restore is still one replay
+   * of one tail.
+   */
+  armRewind(messageId: string): Outcome {
+    // Against a current list: the fork rule reads the newest prompt off it, and
+    // a row pushed on this frame has not reached the snapshot yet.
+    this.transcript.flush();
+    const plan = this.canRewind(messageId);
+    if (!plan.ok) return plan;
+
+    const ids = this.transcript.getListSnapshot();
+    let cutAt = -1;
+    for (let index = 0; index < ids.length; index += 1) {
+      const id = ids[index];
+      const item = id === undefined ? undefined : this.transcript.getItem(id);
+      if (item?.kind === 'user' && providerMessageId(item.messageId) === messageId) {
+        cutAt = index;
+        break;
+      }
+    }
+    const cutId = cutAt < 0 ? undefined : ids[cutAt];
+    if (cutId === undefined) return { ok: false, reason: 'That prompt is not in this conversation.' };
+
+    const dropped: TranscriptItem[] = [];
+    for (const id of ids.slice(cutAt)) {
+      const item = this.transcript.getItem(id);
+      if (item !== undefined) dropped.push(item);
+    }
+    this.transcript.truncateFrom(cutId);
+    this.transcript.flush();
+
+    this.#rewindArmed = { messageId, fork: plan.fork };
+    this.#rewindDropped = [...dropped, ...(this.#rewindDropped ?? [])];
+    this.#rewindCutAt = cutAt;
+    this.#notify();
+    return { ok: true };
+  }
+
+  /**
+   * Change your mind: the arm goes and the rows come back.
+   *
+   * Only while *armed*, which is the window in which nothing has been asked of
+   * the provider. Once the turn has gone out the arm is spent, and this is a
+   * no-op rather than a way to redraw rows over a rewind that is happening.
+   */
+  disarmRewind(): void {
+    if (this.#rewindArmed === undefined) return;
+    this.#rewindArmed = undefined;
+    this.#putRowsBack();
+    this.#notify();
   }
 
   /**
@@ -314,6 +961,39 @@ export class Conversation {
     this.#planUsage = usage;
     this.#notify();
   }
+
+  /**
+   * What one finished turn took out of the plan, window by window, or
+   * `undefined` where nothing moved far enough to say so.
+   *
+   * Recorded rather than derived, because it cannot be recovered afterwards:
+   * the meters keep moving, the 5-hour window rolls, and the next poll replaces
+   * the snapshot wholesale. Absent for a provider that reports its limits only
+   * when asked, and absent for a turn that began before any reading was held —
+   * in both cases there is no "before" to subtract, which is a different thing
+   * from a turn that cost nothing and is reported the same way, as silence.
+   */
+  planDeltaFor(runId: RunId): readonly PlanDelta[] | undefined {
+    return this.#planDeltas.get(runId);
+  }
+
+  /**
+   * The same reading, found from the run-end row that prints it.
+   *
+   * A `RunEndItem` carries no run id — the transcript files it under a counted
+   * `e:N` and has no field to hang one off — so the row is matched on the one
+   * thing it does carry that the turn's ending also stamped: `ts`, the instant
+   * `run.end` arrived. Two turns of one conversation cannot end in the same
+   * millisecond, and a row put back by a rewind redraw keeps its original
+   * clock, so it keeps its reading with it.
+   *
+   * An arrow, not a method, because it is handed to the transcript's rows as a
+   * prop and a new function per render would redraw every row on the screen.
+   */
+  planDeltaForRow = (row: { readonly ts: number }): readonly PlanDelta[] | undefined => {
+    const runId = this.#planDeltaRows.get(row.ts);
+    return runId === undefined ? undefined : this.#planDeltas.get(runId);
+  };
 
   /** Stop a background task, of this run or the one that just ended. */
   async stopTask(taskId: string): Promise<Outcome> {
@@ -377,6 +1057,107 @@ export class Conversation {
   }
 
   /* ---------------------------------------------------------------------- */
+  /* What changed on disk                                                    */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Resolves once every ledger read started so far has finished.
+   *
+   * The ledger reads and hashes files, and it is fed from an event handler
+   * that cannot wait for it — so between the `tool.end` on the wire and the
+   * change appearing in {@link changes} there is a gap of one disk read. This
+   * is how to be on the far side of it: `/diff` and `/undo` typed the instant a
+   * turn ends should see the turn's last edit, and a test that emits two events
+   * and asserts about the ledger has no other way to know when to look.
+   */
+  changesSettled(): Promise<void> {
+    return this.#ledgerWork;
+  }
+
+  /**
+   * Re-read the ledger's totals into the state.
+   *
+   * The event stream does this for itself on every `tool.end`. It is public for
+   * the one thing that moves the totals without an event behind it: `/undo`,
+   * which takes a change back through {@link changes} directly, and after which
+   * a status line still reading `3 files` would be a count of files one of
+   * which has been put back.
+   */
+  refreshChanges(): void {
+    if (this.#foldChanges()) this.#notify();
+  }
+
+  /**
+   * Show the ledger every tool call, before anything else has an opinion.
+   *
+   * Called before the event switch, and so before its `agentId` early return: a
+   * subagent's `Edit` writes to the same disk as the main agent's, and the
+   * `/diff` that leaves out the three files a delegated agent rewrote is
+   * worse than no `/diff` at all. The reads are started and not waited for —
+   * `onToolStart` files its snapshot promise before it yields, so an end that
+   * arrives first still finds it — and the totals are folded when the end has
+   * been recorded, which is the only moment they can have moved.
+   */
+  #ledgerHears(event: AgentEvent): void {
+    if (event.type === 'tool.start') {
+      this.#track(
+        this.changes.onToolStart({
+          id: event.toolCallId,
+          name: event.name,
+          input: event.input,
+          ts: event.ts,
+        }),
+      );
+      return;
+    }
+    if (event.type !== 'tool.end') return;
+    this.#track(
+      this.changes.onToolEnd({ id: event.toolCallId, status: event.status }).then(() => {
+        this.refreshChanges();
+      }),
+    );
+  }
+
+  /** Keep the chain going whatever one read did. See `#ledgerWork`. */
+  #track(work: Promise<void>): void {
+    this.#ledgerWork = this.#ledgerWork.then(() => work).catch(() => undefined);
+  }
+
+  /** A different conversation, or the same one somewhere else. */
+  #resetChanges(): void {
+    this.changes.reset(this.#settings.cwd);
+    this.#filesChanged = undefined;
+  }
+
+  /**
+   * Fold the ledger into three numbers, and say whether they moved.
+   *
+   * The object is kept when it would be the same object, because the snapshot
+   * is compared by reference and a fresh one per `tool.end` would be a render
+   * of the whole app for every tool call that touched nothing.
+   */
+  #foldChanges(): boolean {
+    const files = this.changes.files();
+    const current = this.#filesChanged;
+    if (files.length === 0) {
+      if (current === undefined) return false;
+      this.#filesChanged = undefined;
+      return true;
+    }
+    let added = 0;
+    let removed = 0;
+    for (const file of files) {
+      added += file.added;
+      removed += file.removed;
+    }
+    if (current !== undefined && current.files === files.length && current.added === added && current.removed === removed) {
+      return false;
+    }
+    this.#filesChanged = { files: files.length, added, removed };
+    return true;
+  }
+
+  /* ---------------------------------------------------------------------- */
   /* The two paths                                                           */
   /* ---------------------------------------------------------------------- */
 
@@ -391,10 +1172,17 @@ export class Conversation {
       this.transcript.claimUserMessage(rowId, messageId);
     }
 
+    // Taken here, and taken once: the arm describes the *next* start, and a
+    // turn after it must not ask for a truncation the provider has already
+    // made. A failure below puts the rows back; it does not re-arm.
+    const rewind = this.#rewindArmed;
+    this.#rewindArmed = undefined;
+
     this.#runId = runId;
     this.#status = 'starting';
     this.#pending = [];
-    this.#queued = 0;
+    this.#queued = [];
+    this.#beginTurn();
     this.#notify();
 
     const settings = this.#settings;
@@ -410,6 +1198,15 @@ export class Conversation {
       ...(settings.fastMode === true ? { fastMode: true } : {}),
       ...(settings.ultracode === true ? { ultracode: true } : {}),
       ...(this.#sessionId === undefined ? {} : { resumeSessionId: this.#sessionId }),
+      // The armed rewind, and only alongside the session it truncates —
+      // `rewindToMessageId` is ignored without `resumeSessionId`, and an arm
+      // that outlived its session would be a request about nothing.
+      ...(rewind === undefined || this.#sessionId === undefined
+        ? {}
+        : {
+            rewindToMessageId: rewind.messageId,
+            ...(rewind.fork ? { forkSession: true } : {}),
+          }),
       // Sent only when the provider really has the mode: an adapter rejects an
       // unknown one rather than downgrading it, and a stored preference must
       // not become an error on a provider with fewer modes.
@@ -427,10 +1224,17 @@ export class Conversation {
       return { ok: true };
     } catch (error) {
       const reason = describe(error);
+      // The rewind never left the building: nothing was truncated anywhere but
+      // on this screen, so the conversation goes back as it was. The prompt row
+      // is lifted with it and put down again at the end, still pending, where
+      // the attempt actually happened — a history filed underneath its own
+      // failure would read as the turns having come after it.
+      if (rewind !== undefined) this.#putRowsBack();
       this.transcript.note('error', reason);
       if (this.#runId === runId) {
         this.#runId = undefined;
         this.#status = 'idle';
+        this.#endTurn();
       }
       this.#notify();
       return { ok: false, reason };
@@ -440,14 +1244,23 @@ export class Conversation {
   async #steer(runId: RunId, prompt: string, attachments: readonly Attachment[] = []): Promise<Outcome> {
     const handle = this.#driver.get(runId);
     const n = (handle?.promptCount ?? 1) + 1;
-    const rowId = this.transcript.pushUserMessage(prompt, attachments.length > 0 ? attachments : undefined, `${runId}:prompt:${n}`);
+    const messageId = `${runId}:prompt:${n}`;
+    const rowId = this.transcript.pushUserMessage(prompt, attachments.length > 0 ? attachments : undefined, messageId);
     try {
       const outcome =
         attachments.length > 0
           ? await this.#driver.send(runId, prompt, attachments)
           : await this.#driver.send(runId, prompt);
       this.transcript.confirmUserMessage(rowId);
-      if (!outcome.deliveredImmediately) this.#queued += 1;
+      // Queued under the id the registry filed it as — the same one the row
+      // above claimed, and the one a `message.delivered` will name. The
+      // provider has taken it; nothing has seen it read it.
+      if (!outcome.deliveredImmediately) {
+        this.#queued = [
+          ...this.#queued,
+          { id: messageId, text: prompt, delivery: 'next-tool-break', ts: Date.now() },
+        ];
+      }
       this.#notify();
       return { ok: true };
     } catch (error) {
@@ -462,15 +1275,282 @@ export class Conversation {
   }
 
   /* ---------------------------------------------------------------------- */
+  /* Winding back                                                            */
+  /* ---------------------------------------------------------------------- */
+
+  /** The fork rule, applied to one target. See {@link canRewind}. */
+  #forkToReach(messageId: string | undefined): boolean {
+    if (!this.#capabilities.forkSession) return false;
+    // No target is the newest prompt, which is the one cut a provider is not
+    // expected to refuse — so nothing has to be branched around.
+    if (messageId === undefined) return false;
+    return this.#newestPrompt() !== messageId;
+  }
+
+  /**
+   * The provider's id for the last settled prompt of the conversation.
+   *
+   * Of the *conversation*, not of the screen. Rows an arm has already taken off
+   * are still in the provider's session file — nothing has been sent yet — and
+   * they are exactly what a second, deeper arm has to be judged against: a cut
+   * that reads as "one turn back" on a screen already wound back is two turns
+   * back in the file, which is the case the provider may refuse.
+   */
+  #newestPrompt(): string | undefined {
+    const held = this.#rewindDropped ?? [];
+    for (let index = held.length - 1; index >= 0; index -= 1) {
+      const item = held[index];
+      if (item?.kind === 'user' && !item.pending) return providerMessageId(item.messageId);
+    }
+    const ids = this.transcript.getListSnapshot();
+    for (let index = ids.length - 1; index >= 0; index -= 1) {
+      const id = ids[index];
+      const item = id === undefined ? undefined : this.transcript.getItem(id);
+      if (item?.kind === 'user' && !item.pending) return providerMessageId(item.messageId);
+    }
+    return undefined;
+  }
+
+  /**
+   * Put the cut rows back, with whatever has landed since on top of them.
+   *
+   * Three callers, one shape: the user changed their mind, the start threw, or
+   * the run ended on an error without saying a word. In all three the rows
+   * below the cut are what the conversation actually is, and anything drawn
+   * after the cut — the prompt that failed, the card of the run that failed —
+   * happened *after* those rows and belongs below them. So the tail is lifted,
+   * the held rows go down, and the tail goes back on top.
+   */
+  #putRowsBack(): void {
+    const dropped = this.#rewindDropped;
+    const cutAt = this.#rewindCutAt;
+    this.#forgetRewindCopy();
+    if (dropped === undefined || cutAt === undefined) return;
+
+    this.transcript.flush();
+    const ids = this.transcript.getListSnapshot();
+    const after: TranscriptItem[] = [];
+    for (const id of ids.slice(cutAt)) {
+      const item = this.transcript.getItem(id);
+      if (item !== undefined) after.push(item);
+    }
+    const first = ids[cutAt];
+    if (first !== undefined) this.transcript.truncateFrom(first);
+    this.#redraw(dropped);
+    this.#redraw(after);
+    this.transcript.flush();
+  }
+
+  /** The copy is no longer owed to anyone. */
+  #forgetRewindCopy(): void {
+    this.#rewindDropped = undefined;
+    this.#rewindCutAt = undefined;
+  }
+
+  /** Arm and copy both go, with no redraw: the screen is being replaced. */
+  #clearRewind(): void {
+    this.#rewindArmed = undefined;
+    this.#forgetRewindCopy();
+  }
+
+  /**
+   * Draw rows the model no longer holds, as the events that would have made
+   * them.
+   *
+   * `TranscriptModel` is written to through its event door, and `truncateFrom`
+   * is the only door out; there is no re-insert, and there should not be one
+   * for this. So putting rows back means replaying them — each item as the
+   * event it came from, in the order it stood in. Everything a reader looks at
+   * survives the round trip: the words, the tool calls and their results, the
+   * permission record, the original timestamps, and the row ids of anything
+   * named by the provider (a tool call, an assistant block) so a re-delivery
+   * still lands on the right row.
+   *
+   * What does not survive is worth naming, because this is best effort and
+   * saying so is the only honest version of it:
+   *
+   *  - Streaming state. A reasoning block has no completion event — the
+   *    protocol says so deliberately — so the last restored one reads as still
+   *    open until the next tool call or turn settles it.
+   *  - Counted ids. A user row, a notice, a command and a run-end card are
+   *    minted fresh, so anything holding one of those ids across a restore
+   *    (a selection, a scroll anchor) is pointing at nothing.
+   *  - Facts computed *about* a run. The `silent` flag on a restored run-end
+   *    card is recomputed from what has been drawn since, not remembered.
+   *
+   * None of it changes what the conversation says, which is the property this
+   * has to have: the rows come back because the rewind did not happen, and the
+   * reader has to be able to trust what they are reading.
+   */
+  #redraw(items: readonly TranscriptItem[]): void {
+    let seq = 0;
+    const stamp = (ts: number): { runId: RunId; seq: number; ts: number } => ({
+      runId: REDRAWN_RUN,
+      seq: seq++,
+      ts,
+    });
+
+    for (const item of items) {
+      switch (item.kind) {
+        case 'user': {
+          // A replayed row goes back through the event door, which is the only
+          // one that keeps its replay mark and its clock; a locally-typed one
+          // goes back through the door it came in at, which is the only one
+          // that carries its attachments and its pending state.
+          if (item.replay === true && item.messageId !== undefined) {
+            this.transcript.apply({
+              ...stamp(item.ts),
+              type: 'text.complete',
+              role: 'user',
+              messageId: item.messageId,
+              text: item.text,
+              replay: true,
+            });
+            break;
+          }
+          const id = this.transcript.pushUserMessage(item.text, item.attachments, item.messageId);
+          if (!item.pending) this.transcript.confirmUserMessage(id);
+          break;
+        }
+        case 'assistant':
+          this.transcript.apply({
+            ...stamp(item.ts),
+            type: 'text.complete',
+            role: 'assistant',
+            messageId: item.messageId,
+            blockIndex: item.blockIndex,
+            text: item.text,
+            stopReason: item.stopReason,
+            replay: item.replay,
+            synthetic: item.synthetic,
+            agentId: item.agentId,
+          });
+          break;
+        case 'thinking':
+          this.transcript.apply({
+            ...stamp(item.ts),
+            type: 'thinking.delta',
+            messageId: item.messageId,
+            blockIndex: item.blockIndex,
+            text: item.text,
+            redacted: item.redacted,
+            agentId: item.agentId,
+          });
+          break;
+        case 'tool':
+          this.transcript.apply({
+            ...stamp(item.ts),
+            type: 'tool.start',
+            toolCallId: item.toolCallId,
+            name: item.name,
+            input: item.input,
+            title: item.title,
+            agentId: item.agentId,
+            parentToolCallId: item.parentToolCallId,
+          });
+          if (item.status !== 'running') {
+            this.transcript.apply({
+              ...stamp(item.ts),
+              type: 'tool.end',
+              toolCallId: item.toolCallId,
+              name: item.name,
+              status: item.status,
+              result: item.result,
+              resultText: item.resultText,
+              error: item.error,
+              durationMs: item.durationMs,
+              agentId: item.agentId,
+              parentToolCallId: item.parentToolCallId,
+            });
+          }
+          break;
+        case 'permission':
+          this.transcript.apply({
+            ...stamp(item.ts),
+            type: 'permission.request',
+            requestId: item.requestId,
+            request: item.request,
+          });
+          if (item.state !== 'pending') {
+            this.transcript.resolvePermission(item.requestId, item.state, item.note, item.answers);
+          }
+          break;
+        case 'notice':
+          this.transcript.note(item.level, item.text, item.detail);
+          break;
+        case 'command':
+          this.transcript.apply({
+            ...stamp(item.ts),
+            type: 'command.run',
+            command: {
+              name: item.name,
+              args: item.args,
+              output: item.output,
+              failed: item.failed,
+            },
+            // Which table the name came from. Without it a restored `!git
+            // status` comes back wearing a slash, which reads as a command
+            // the app has and does not.
+            source: item.source,
+          });
+          break;
+        case 'run-end':
+          this.transcript.apply({
+            ...stamp(item.ts),
+            type: 'run.end',
+            reason: item.reason,
+            error: item.error,
+            usage: item.usage,
+            durationMs: item.durationMs,
+            numTurns: item.numTurns,
+            result: item.result,
+          });
+          break;
+        default: {
+          // Exhaustiveness without a throw: a transcript that learns a new row
+          // should not be able to take the terminal down on a restore.
+          const unhandled: never = item;
+          void unhandled;
+          break;
+        }
+      }
+    }
+  }
+
+  /* ---------------------------------------------------------------------- */
   /* Events                                                                  */
   /* ---------------------------------------------------------------------- */
 
   #onEvent(event: AgentEvent): void {
-    if (event.runId !== this.#runId) return;
+    if (event.runId !== this.#runId && !this.#adopt(event)) {
+      if (!this.#fromSibling(event)) return;
+      this.#onSiblingEvent(event);
+      return;
+    }
     this.transcript.apply(event);
+    this.#ledgerHears(event);
+
+    // The turn has spoken, so the rewind held against it is settled — but only
+    // once the arm has gone out. While it is still armed nothing has been asked
+    // of the provider, so nothing it says (a settle turn of its own, say) can
+    // decide the fate of a cut it has not heard about. See {@link TURN_SPOKE}.
+    if (this.#rewindArmed === undefined && this.#rewindDropped !== undefined && TURN_SPOKE.has(event.type)) {
+      this.#forgetRewindCopy();
+    }
 
     switch (event.type) {
       case 'session.started':
+        /*
+         * Whatever the provider says this session is, including a new one.
+         *
+         * A forked start answers with the *branch's* id and `forked: true`,
+         * `resumedFrom` naming the conversation it came off. Taking the id at
+         * its word is what moves this conversation onto the branch: the rail
+         * shows the branch, the next turn resumes the branch, and the original
+         * is left exactly as it was — which is the whole point of having forked.
+         * No special case is needed for it, and one would be a way to get it
+         * wrong.
+         */
         this.#sessionId = event.sessionId;
         if (this.#status === 'starting') this.#status = 'running';
         // What the provider actually started in, which may differ from what
@@ -496,10 +1576,43 @@ export class Conversation {
         if (this.#status === 'awaiting_permission' && this.#pending.length === 0) this.#status = 'running';
         break;
       case 'message.delivered':
-        this.#queued = Math.max(0, this.#queued - 1);
+        this.#deliver(event.messageId);
+        break;
+      case 'thinking.delta':
+        this.#onThinking(event);
+        break;
+      case 'text.delta':
+        // Text is the answer being written, whatever came before it. The
+        // thought that led here is spent — see `#thinkingText`.
+        if (event.agentId === undefined && event.text.length > 0) {
+          this.#thinkingBlock = undefined;
+          this.#thinkingText = undefined;
+          this.#setActivity('writing', 'writing');
+        }
+        break;
+      case 'tool.start': {
+        if (event.agentId !== undefined) break;
+        const target = summarizeToolInput(event.input);
+        this.#activeToolCallId = event.toolCallId;
+        this.#setActivity(
+          'tool',
+          oneLine(target.length > 0 ? `${event.name} ${target}` : event.name, ACTIVITY_CHARS),
+        );
+        break;
+      }
+      case 'tool.end':
+        // Only the call that is actually on the line may take itself off it:
+        // tools run in parallel, and the first of three to finish must not
+        // blank a line describing one of the other two.
+        if (event.agentId === undefined && event.toolCallId === this.#activeToolCallId) {
+          this.#activeToolCallId = undefined;
+          if (this.#thinkingText === undefined) this.#activity = undefined;
+          else this.#setActivity('thinking', this.#thinkingText);
+        }
         break;
       case 'usage':
         this.#foldUsage(event.usage);
+        this.#foldTurnTokens(event.usage);
         break;
       case 'background.tasks':
         this.#tasks = event.tasks;
@@ -514,16 +1627,51 @@ export class Conversation {
       case 'run.end': {
         if (event.sessionId !== undefined) this.#sessionId = event.sessionId;
         if (event.usage !== undefined) this.#foldUsage(event.usage);
+        /*
+         * A rewind that never happened.
+         *
+         * A copy still held here is a turn that said nothing — anything the
+         * provider says lets it go on the way in — so an error ending is the
+         * refused truncation: the adapter throws before the model is reached.
+         * That is the one ending after which the rows are still true. Any other
+         * one means the session was wound back or branched, and the copy is let
+         * go rather than used to redraw a conversation the provider no longer
+         * holds. Best effort, and this is the edge of it.
+         */
+        if (this.#rewindArmed === undefined && this.#rewindDropped !== undefined) {
+          if (event.reason === 'error') this.#putRowsBack();
+          else this.#forgetRewindCopy();
+        }
         const ended = this.#runId;
+        // Before `#endTurn` lets go of the reading the turn opened with, and
+        // while `#planUsage` still holds what the last `plan.limit` folded in.
+        if (ended !== undefined) this.#recordPlanDelta(ended, event.ts);
         this.#lastRunId = ended;
         this.#runId = undefined;
         this.#status = 'idle';
         this.#pending = [];
-        this.#queued = 0;
-        // Released now rather than left for the registry's retention: a run
-        // belongs to the one conversation that started it, and nothing else
-        // in this process will ever re-attach to it.
-        if (ended !== undefined) void this.#driver.dispose(ended).catch(() => undefined);
+        this.#queued = [];
+        this.#endTurn();
+        /*
+         * And nothing else. The run is *not* disposed here, and that omission
+         * is load-bearing.
+         *
+         * `dispose()` is the one call that overrules a provider's retention of
+         * its process — `ClaudeRun.release` exists, as a deliberate no-op, to
+         * stop the registry reaching for it at every turn boundary. Reaching
+         * for it here killed the CLI the instant a turn ended, taking with it
+         * every subagent the turn had left running in the background: the
+         * `Agent` tool backgrounds by default, so "delegate this and carry on"
+         * is the ordinary case, not an exotic one. The next turn then spawned a
+         * fresh process whose ledger had never heard of the work, and reported
+         * the conversation's own subagents as `stopped`, `0 tools`, `0 tokens`.
+         *
+         * The registry retires a finished run without help: the pump's
+         * `finally` calls `#finalize`, which releases rather than disposes, and
+         * the process then decides for itself whether it still holds work worth
+         * staying open for. That decision is the whole of the feature; this
+         * used to overrule it one line after it was made.
+         */
         break;
       }
       default:
@@ -532,6 +1680,200 @@ export class Conversation {
 
     this.#notify();
     for (const listener of this.#eventListeners) listener(event);
+  }
+
+  /**
+   * Take on a turn the provider started by itself, when it is this conversation's.
+   *
+   * The CLI speaks unprompted: told that background work settled it answers,
+   * and a subagent that outlived its turn can park on a permission prompt. Those
+   * turns are real runs, adopted by the registry (`host.ts`) under an id nothing
+   * here minted — and routing is by run id, so without this every one of them
+   * was dropped. What that looked like from the chair: the delegated strip
+   * spinning on a subagent that had finished, and the agent's own sentence
+   * about the result never arriving.
+   *
+   * The run's first event is the one that names the conversation, and the
+   * session id is the whole test: this session, and not another conversation's
+   * run on the same registry. Only while idle — a turn this conversation is
+   * already running keeps its stream, as the desktop's pane does.
+   */
+  #adopt(event: AgentEvent): boolean {
+    if (event.type !== 'session.started') return false;
+    if (this.#runId !== undefined || this.#sessionId === undefined || event.sessionId !== this.#sessionId) return false;
+    this.#runId = event.runId;
+    this.#status = 'running';
+    this.#pending = [];
+    this.#queued = [];
+    // A provider-started turn is still a turn someone is waiting through, and
+    // its clock starts where we first heard of it — which is the only moment
+    // available, since nothing here asked for it.
+    this.#beginTurn();
+    return true;
+  }
+
+  /**
+   * Is this an event of a sibling — a provider-started turn on this session
+   * that could not be adopted because a turn of ours was already open?
+   *
+   * The one window {@link #adopt} cannot cover: the next prompt is typed, the
+   * CLI takes its settle turn first, and two runs of one session are alive at
+   * once while `#runId` can hold only the prompt's. The sibling's first event
+   * names the session, which is enough to remember it by; everything after is
+   * matched on the id.
+   */
+  #fromSibling(event: AgentEvent): boolean {
+    if (this.#siblings.has(event.runId)) return true;
+    if (event.type !== 'session.started' || this.#sessionId === undefined || event.sessionId !== this.#sessionId) return false;
+    this.#siblings.add(event.runId);
+    return true;
+  }
+
+  /**
+   * What a sibling's turn is allowed to change: the transcript, and the rows.
+   *
+   * Not the run lifecycle — status, permissions, the queue all describe the
+   * prompt's own turn — and not its end: a sibling finishing says nothing
+   * about ours. The CLI runs the two in series, so what the sibling says lands
+   * before the prompt's answer, which is the order it actually happened in.
+   */
+  #onSiblingEvent(event: AgentEvent): void {
+    this.transcript.apply(event);
+    // Its edits are on the same disk as ours, and it is this conversation's
+    // session that they were made for. Whose run id they carry decides
+    // nothing about which files changed.
+    this.#ledgerHears(event);
+    if (event.type === 'background.tasks') this.#tasks = event.tasks;
+    if (event.type === 'run.end') this.#siblings.delete(event.runId);
+    this.#notify();
+    for (const listener of this.#eventListeners) listener(event);
+  }
+
+  /**
+   * Strike the waiting message a `message.delivered` names.
+   *
+   * By id where one matches: the event carries the identity the message was sent
+   * under, so this is the one case where the *right* entry can be removed rather
+   * than a plausible one — and a provider that reads a later message first (it
+   * decides the order, not us) is then reported correctly.
+   *
+   * Otherwise the oldest goes, and there is a real case for it: the id is
+   * `promptCount + 1`, and an adopted run — one the provider started, which
+   * {@link #adopt} takes on — reports no `promptCount` at all, so the steer
+   * claims `:prompt:2` while the registry, whose own count is still at zero,
+   * files it as `:prompt:1`. The delivery then names an id this list does not
+   * hold. Dropping it would leave the strip showing a message the agent is
+   * plainly acting on, which is the failure the list was built to end;
+   * deliveries arrive in the order the provider reads them, so oldest-first is
+   * wrong only about *which* row goes, never about how many.
+   */
+  #deliver(messageId: string): void {
+    if (this.#queued.length === 0) return;
+    const named = this.#queued.findIndex((message) => message.id === messageId);
+    const gone = named === -1 ? 0 : named;
+    this.#queued = this.#queued.filter((_, index) => index !== gone);
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* What it is doing, and for how long                                      */
+  /* ---------------------------------------------------------------------- */
+
+  /** A turn is starting: the clock runs and everything the last one said goes. */
+  #beginTurn(): void {
+    this.#endTurn();
+    this.#turnStartedAt = this.#now();
+    this.#planAtTurnStart = planMeterReadings(this.#planUsage);
+  }
+
+  /** The turn is over: nothing is happening, so the line must not claim it is. */
+  #endTurn(): void {
+    this.#turnStartedAt = undefined;
+    this.#planAtTurnStart = undefined;
+    this.#activity = undefined;
+    this.#turnTokens = undefined;
+    this.#thinkingText = undefined;
+    this.#thinkingBlock = undefined;
+    this.#activeToolCallId = undefined;
+  }
+
+  /** Take the subtraction while it is still true. See {@link planDeltaFor}. */
+  #recordPlanDelta(runId: RunId, at: number): void {
+    const before = this.#planAtTurnStart;
+    if (before === undefined) return;
+    const deltas = planDelta(before, this.#planUsage);
+    if (deltas.length === 0) return;
+    this.#planDeltas.set(runId, deltas);
+    this.#planDeltaRows.set(at, runId);
+  }
+
+  /**
+   * Put something on the line, and *only* when it is different.
+   *
+   * The reference has to survive an unchanged tick, because a fresh object per
+   * delta would be a fresh state snapshot per delta, which is a re-render per
+   * token of every subscriber of this store. It also keeps `since` honest: the
+   * clock behind "the same thought for 45 seconds" must not be restarted by
+   * the next token of that same thought.
+   */
+  #setActivity(kind: ConversationActivity['kind'], text: string): void {
+    const current = this.#activity;
+    if (current !== undefined && current.kind === kind && current.text === text) return;
+    this.#activity = { kind, text, since: this.#now() };
+  }
+
+  /**
+   * Read a heading out of a thinking block, once, and then stop reading it.
+   *
+   * Only the *first line* is ever wanted, so the block is accumulated only
+   * until that line is known — either a newline arrives, or enough characters
+   * have that the line would be clipped at {@link ACTIVITY_CHARS} anyway and
+   * cannot change what is printed. Either way the answer settles once and the
+   * rest of the block costs nothing. That is also what makes the printed text
+   * stable: a partial first line grown a token at a time would rewrite the
+   * status line on every frame with a word and a half of a header.
+   *
+   * A subagent's reasoning is skipped. `DelegatedStrip` already draws each
+   * delegated agent on its own row, and letting a fan-out of three write to
+   * the main line would make it flicker between three unrelated thoughts while
+   * saying nothing about the agent that is actually being waited on.
+   */
+  #onThinking(event: ThinkingDeltaEvent): void {
+    if (event.agentId !== undefined) return;
+    const key = `${event.messageId}:${String(event.blockIndex)}`;
+    let block = this.#thinkingBlock;
+    if (block === undefined || block.key !== key) {
+      block = { key, text: '', settled: false };
+      this.#thinkingBlock = block;
+    } else if (block.settled) {
+      return;
+    }
+
+    // Leading blank lines are not a heading: a block that opens with one would
+    // otherwise settle on an empty string and never say anything again.
+    block.text = (block.text + event.text).replace(/^\s+/, '');
+    const stop = block.text.indexOf('\n');
+    if (stop === -1 && block.text.length < ACTIVITY_CHARS) return;
+
+    block.settled = true;
+    const text = heading(stop === -1 ? block.text : block.text.slice(0, stop));
+    if (text.length === 0) return;
+    this.#thinkingText = text;
+    this.#setActivity('thinking', text);
+  }
+
+  /**
+   * Output tokens this turn.
+   *
+   * `scope` says how: `delta` events add up, and `cumulative`/`final` are
+   * already the whole of the run — and a run *is* a turn here, which is the
+   * one rule this file is built around, so a cumulative figure needs no
+   * subtraction to become a turn's figure. Ignored when no turn is running,
+   * since a late `usage` belongs to the turn that has already been cleared.
+   */
+  #foldTurnTokens(usage: UsageSnapshot): void {
+    if (this.#turnStartedAt === undefined) return;
+    const output = usage.tokens.outputTokens;
+    this.#turnTokens = usage.scope === 'delta' ? (this.#turnTokens ?? 0) + output : output;
   }
 
   /** `delta` adds to the running total; `cumulative` and `final` replace it. */
@@ -570,15 +1912,64 @@ export class Conversation {
       ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
       ...(this.#usage === undefined ? {} : { usage: this.#usage }),
       pendingPermissions: this.#pending,
-      queued: this.#queued,
+      queuedMessages: this.#queued,
+      queued: this.#queued.length,
       tasks: this.#tasks,
       planUsage: this.#planUsage,
       slashCommands: this.#slashCommands,
+      ...(this.#turnStartedAt === undefined ? {} : { turnStartedAt: this.#turnStartedAt }),
+      ...(this.#activity === undefined ? {} : { activity: this.#activity }),
+      // Zero is not a reading. A provider that has reported usage whose output
+      // count is still nothing has told us nothing worth a column.
+      ...(this.#turnTokens === undefined || this.#turnTokens <= 0
+        ? {}
+        : { turnTokens: this.#turnTokens }),
+      ...(this.#rewindArmed === undefined ? {} : { rewindArmed: this.#rewindArmed }),
+      ...(this.#filesChanged === undefined ? {} : { filesChanged: this.#filesChanged }),
     };
   }
 
+  /**
+   * Publish, unless nothing observable moved.
+   *
+   * Every event that belongs to this conversation lands here, including each
+   * one of the hundreds of text and thinking deltas in a turn — and before
+   * this comparison each of those replaced the snapshot with an object that
+   * was new but not different, which is a render of the whole app per token.
+   * The transcript never had that problem: its model coalesces into one flush
+   * per frame (`frameScheduler`) and notifies only what changed. This is the
+   * same discipline for the other half of the screen, and it is what lets the
+   * activity line be computed on every delta without costing anything — a
+   * thought whose heading has already settled produces an identical snapshot
+   * and no notification at all, so the status line moves when the transcript
+   * does rather than once per token.
+   *
+   * Field-by-field and by reference, which is sound because every one of these
+   * is replaced wholesale when it changes; `queued` is omitted because it is
+   * derived from `queuedMessages`.
+   */
   #notify(): void {
-    this.#snapshot = this.#buildSnapshot();
+    const next = this.#buildSnapshot();
+    const previous = this.#snapshot;
+    const same =
+      next.settings === previous.settings &&
+      next.status === previous.status &&
+      next.capabilities === previous.capabilities &&
+      next.runId === previous.runId &&
+      next.sessionId === previous.sessionId &&
+      next.usage === previous.usage &&
+      next.pendingPermissions === previous.pendingPermissions &&
+      next.queuedMessages === previous.queuedMessages &&
+      next.tasks === previous.tasks &&
+      next.planUsage === previous.planUsage &&
+      next.slashCommands === previous.slashCommands &&
+      next.turnStartedAt === previous.turnStartedAt &&
+      next.activity === previous.activity &&
+      next.turnTokens === previous.turnTokens &&
+      next.rewindArmed === previous.rewindArmed &&
+      next.filesChanged === previous.filesChanged;
+    if (same) return;
+    this.#snapshot = next;
     for (const listener of this.#listeners) listener();
   }
 }

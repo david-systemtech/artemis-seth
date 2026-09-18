@@ -30,15 +30,20 @@ import type {
   ProviderDescriptor,
   ProviderModelOption,
   RunEndReason,
+  SkillInfo,
+  SkillLibraryDocument,
+  SkillsListResponse,
   RunHandle,
   RunSuggestion,
   Routine,
+  RoutineSnapshot,
   RoutinesState,
   SecretConnection,
   SecretConnectionState,
   SecretProviderDescriptor,
   SecretVerifyResult,
   ServerProfile,
+  ServerMemoryBank,
   ServerSignInStatus,
   ServerState,
   SharedConfigEntryState,
@@ -50,6 +55,7 @@ import type {
   TerminalInfo,
   Unsubscribe,
   WindowState,
+  WorkspaceDescribeResponse,
 } from '@rx-artemis/protocol';
 import {
   ARTEMIS_RELEASES_URL,
@@ -62,6 +68,9 @@ import {
   SHARED_ENTRIES,
   normalizeProfileColor,
   parseAgentPromptsDocument,
+  parseSkillLibraryDocument,
+  withoutSkillSource,
+  withSkillSource,
   type BrowserEvent,
   type BrowserInfo,
   type BrowserState,
@@ -149,10 +158,12 @@ const CLAUDE_CAPS: Capabilities = {
   rewind: true,
   usageReporting: true,
   costReporting: true,
+  contextReporting: true,
   planUsageReporting: true,
   systemPromptAppend: true,
   imageInput: true,
   fileInput: true,
+  taskSuggestions: true,
 };
 
 /** A deliberately weaker provider, so capability gating is visible in dev. */
@@ -172,6 +183,7 @@ const CODEX_CAPS: Capabilities = {
   rewind: false,
   usageReporting: true,
   costReporting: false,
+  contextReporting: true,
   // True, as the real adapter declares: Codex answers `account/rateLimits/read`
   // like Claude answers its own. What differs is the *shape* of the answer —
   // see `mockCodexPlanUsage`.
@@ -188,6 +200,10 @@ const CODEX_CAPS: Capabilities = {
   // would be no way to see it without editing this file.
   imageInput: false,
   fileInput: false,
+  // False, as the real adapter declares: nothing in Codex's app-server protocol
+  // takes a host-defined tool, so there is nowhere to put `suggest_task`. This
+  // is the flag that keeps chips out of a Codex conversation entirely.
+  taskSuggestions: false,
 };
 
 /**
@@ -377,6 +393,25 @@ let mockRemoteAccounts: readonly ServerProfile[] = [
   { ...mockServerProfile('remote-work', 'work'), live: true },
 ];
 let mockSignIn: ServerSignInStatus | null = null;
+/**
+ * Banks that pretend to live on the server this profile points at.
+ *
+ * One of each scope, because the pane's two branches — the "every account"
+ * tick and the checklist under it — are both worth seeing in dev without
+ * having to click one into existence.
+ */
+let mockServerBanks: readonly ServerMemoryBank[] = [
+  { slug: 'cortex', path: '/data/banks/cortex', role: 'readwrite', enabled: true, profiles: { kind: 'all' } },
+  {
+    slug: 'client-notes',
+    path: '/data/banks/client-notes',
+    role: 'readonly',
+    enabled: true,
+    profiles: { kind: 'profiles', profileIds: ['remote-work'] },
+  },
+];
+/** Routines that pretend to live on a server this profile points at. */
+let mockServerRoutines: readonly RoutineSnapshot[] = [];
 
 /**
  * One poll, one step — the shape the real flow has.
@@ -403,12 +438,24 @@ function advanceMockSignIn(current: ServerSignInStatus | null): ServerSignInStat
 /**
  * The banks "on this machine": agents write to the real ones; here, retire
  * deletes. Two banks so the multi-bank rendering — read-only badge, default
- * marker, per-bank switches — is the state dev meets by default.
+ * marker, per-bank switches — is the state dev meets by default, and one of
+ * each format, attached two different ways, so the format badge and the
+ * profile picker both have something to draw without anyone arranging it.
  */
 let mockMasterEnabled = true;
 let mockBanks: MemoryBankInfo[] = [
   {
     slug: 'team-memory',
+    name: 'Team memory',
+    description:
+      'What the team has learned about its own systems. Use for anything about the harness, its deployments or its conventions.',
+    format: 'manifest',
+    profiles: { kind: 'all' },
+    // One refused entry, so the problems disclosure and the memory card's
+    // "not installed" rendering are both reachable in dev.
+    problems: [
+      'memories/demo-org/harness/half-written.md: metadata.type must be one of decision, feedback, reference, workflow',
+    ],
     path: '/Users/demo/Documents/team-memory',
     remote: 'https://github.com/demo-team/team-memory.git',
     role: 'readwrite',
@@ -416,10 +463,14 @@ let mockBanks: MemoryBankInfo[] = [
     isDefault: true,
     exists: true,
     source: 'cerebro@52a0a32',
-    memories: 3,
+    memories: 4,
     mirrored: 0,
-    validationErrors: 0,
+    validationErrors: 1,
     projects: 27,
+    // Carries its own `bin/cerebro`, so the "Wire for stock Claude Code" offer
+    // is live on this card and refused-with-a-reason on the other one — both
+    // states reachable in dev without arranging anything.
+    embedsCli: true,
     // Held as a reference rather than as a token, so the pane's "from a key
     // manager" rendering is what dev meets by default — including the degraded
     // sentence, which is the state a real machine reaches only when its vault
@@ -427,7 +478,14 @@ let mockBanks: MemoryBankInfo[] = [
     credential: { kind: 'ref' },
   },
   {
+    // No manifest and no name of its own, so the card prints the slug once —
+    // the case a legacy cerebro bank is in until someone describes it.
     slug: 'client-docs',
+    name: 'client-docs',
+    description: null,
+    format: 'legacy-projects',
+    profiles: { kind: 'profiles', profileIds: ['demo-personal'] },
+    problems: [],
     path: '/Users/demo/Documents/client-docs',
     remote: null,
     role: 'readonly',
@@ -439,9 +497,20 @@ let mockBanks: MemoryBankInfo[] = [
     mirrored: 0,
     validationErrors: 0,
     projects: 4,
+    embedsCli: false,
     credential: { kind: 'none' },
   },
 ];
+
+/**
+ * Which banks are wired into "stock Claude Code" on this fake machine.
+ *
+ * Its own list rather than a derivation of `enabled`, because that is exactly
+ * the distinction the row exists to draw: a bank can be on for Artemis and
+ * unwired for the other harness, and a mock that conflated them would render a
+ * state the real pane never shows.
+ */
+let mockWiredBanks: string[] = ['team-memory'];
 
 /* -------------------------------------------------------------------------- */
 /* Key managers                                                               */
@@ -626,6 +695,7 @@ function rememberMockVerify(id: string, result: SecretVerifyResult): void {
 let mockBankMemories: MemoryBankMemory[] = [
   {
     name: 'team-memory-bank',
+    title: 'Team memory bank',
     type: 'reference',
     description: "What the team memory bank is, and how agents keep it current",
     body: "The team memory bank is shared by every developer on the Artemis harness — and agents, not developers, maintain it.",
@@ -633,11 +703,14 @@ let mockBankMemories: MemoryBankMemory[] = [
     author: 'demo@example.com',
     org: null,
     project: null,
+    scope: {},
+    problems: [],
     readonly: false,
     file: 'memories/team-memory-bank.md',
   },
   {
     name: 'writing-team-memories',
+    title: 'Writing team memories',
     type: 'feedback',
     description: 'House style for team memories: atomic, durable, absolute dates, team-relevant, no secrets',
     body: 'A team memory is one fact per file, written so a teammate (or their agent) who lacks your context can act on it.',
@@ -645,13 +718,34 @@ let mockBankMemories: MemoryBankMemory[] = [
     author: 'demo@example.com',
     org: 'demo-org',
     project: 'harness',
+    scope: { org: 'demo-org', project: 'harness' },
+    problems: [],
     readonly: false,
     file: 'memories/demo-org/harness/writing-team-memories.md',
+  },
+  // The refused entry the bank's `problems` line counts. Browsable, so the
+  // person who can fix it can see what is wrong — which is the whole reason
+  // an entry with problems is listed at all.
+  {
+    name: 'half-written',
+    title: 'Half written',
+    type: 'note',
+    description: 'Something an agent started and did not finish',
+    body: 'No metadata.type, so the reader will not install it.',
+    added: null,
+    author: null,
+    org: 'demo-org',
+    project: 'harness',
+    scope: { org: 'demo-org', project: 'harness' },
+    problems: ['metadata.type must be one of decision, feedback, reference, workflow'],
+    readonly: false,
+    file: 'memories/demo-org/harness/half-written.md',
   },
   // A mirror-tree memory, so dev meets the grouped, read-only rendering —
   // badge on, retire hidden — without arranging a real mirror.
   {
     name: 'artemis-agent-harness',
+    title: 'Artemis agent harness',
     type: 'reference',
     description: 'Artemis is our in-house Claude agent harness; where its profiles, projects, and memory live on disk',
     body: 'Artemis is the team’s in-house agent harness, an Electron app wrapping the Claude Agent SDK.',
@@ -659,10 +753,78 @@ let mockBankMemories: MemoryBankMemory[] = [
     author: 'demo@example.com',
     org: 'demo-org',
     project: 'sessions',
+    scope: { org: 'demo-org', project: 'sessions' },
+    problems: [],
     readonly: true,
     file: 'memory/sessions/artemis-agent-harness.md',
   },
 ];
+
+/**
+ * The dev mock's skills: one of each shape the Skills pane has to draw — chosen
+ * by the model or typed, typed only, an account's own, and one nobody
+ * described — with one already always-on so the populated state is what a
+ * developer meets first.
+ */
+const MOCK_SKILLS: readonly SkillInfo[] = [
+  {
+    name: 'code-review',
+    description: 'Review a diff for correctness bugs before it is proposed.',
+    origin: { kind: 'machine' },
+    dir: '/Users/demo/.agents/skills/code-review',
+    modelInvocable: true,
+    userInvocable: true,
+    bodyChars: 5_200,
+  },
+  {
+    name: 'release',
+    description: 'Cut a release: gates, tag, and the notes that go with it.',
+    origin: { kind: 'profile', profileIds: ['demo-personal' as ProfileId] },
+    dir: '/Users/demo/.claude/skills/release',
+    modelInvocable: false,
+    userInvocable: true,
+    bodyChars: 2_100,
+  },
+  {
+    name: 'scratch',
+    description: '',
+    origin: { kind: 'machine' },
+    dir: '/Users/demo/.agents/skills/scratch',
+    modelInvocable: true,
+    userInvocable: true,
+    bodyChars: 340,
+  },
+  {
+    name: 'unslop',
+    description: 'Remove AI writing patterns from prose. Use for docs, READMEs and anything that should sound human.',
+    origin: { kind: 'machine' },
+    dir: '/Users/demo/.agents/skills/unslop',
+    modelInvocable: true,
+    userInvocable: true,
+    bodyChars: 3_900,
+  },
+];
+
+let mockSkillLibrary: SkillLibraryDocument = parseSkillLibraryDocument({
+  version: 1,
+  alwaysOn: [{ name: 'unslop', scope: { kind: 'all' } }],
+  sources: [{ url: 'https://github.com/demo/agent-skills.git', subdir: 'skills' }],
+});
+
+/** The whole skills state, with every mock source drawn as cloned and current. */
+function mockSkillsState(): SkillsListResponse {
+  return {
+    skills: MOCK_SKILLS,
+    document: mockSkillLibrary,
+    sources: (mockSkillLibrary.sources ?? []).map((source) => ({
+      source,
+      cloned: true,
+      head: 'a1b2c3d',
+      syncedAt: Date.now() - 12 * 60_000,
+      skillCount: 2,
+    })),
+  };
+}
 
 /**
  * The prompt library, in memory.
@@ -689,6 +851,53 @@ let mockAgentPrompts: AgentPromptsDocument = parseAgentPromptsDocument({
     },
   ],
 });
+
+/**
+ * The mock's answer for what a directory is, shared by the two channels that
+ * need it: naming one, and splitting a worktree off it.
+ *
+ * A module-level function rather than a closure inside the bridge, because the
+ * second caller is a sibling entry in the same frozen object and cannot reach
+ * the first.
+ */
+function mockWorkspace(path: string): WorkspaceDescribeResponse {
+  const segments = path.split('/').filter(Boolean);
+  const name = segments.at(-1) ?? path;
+  const temporary = segments[0] === 'tmp' ? { temporary: true } : {};
+  if (path.includes('/scratch/')) return { path, name, ...temporary };
+
+  const linked = segments.indexOf('worktrees');
+  if (linked >= 0) {
+    // The worktree's root is the directory *below* `worktrees/`, so a cwd
+    // deeper inside one still reports the checkout it belongs to.
+    const repoRoot = `/${segments.slice(0, linked + 2).join('/')}`;
+    const repoName = repoRoot.split('/').at(-1) ?? name;
+    /*
+     * And the project is whatever the worktree was split off from — the real
+     * thing reads that out of the `gitdir:` pointer, which the mock has no file
+     * to read. Everything above `worktrees/`, with a `.claude` container
+     * dropped, is the layout an agent's worktree actually has
+     * (`<repo>/.claude/worktrees/<branch>`) and is enough to exercise the
+     * sidebar grouping a worktree under its repository.
+     */
+    const above = segments.slice(0, linked);
+    if (above.at(-1) === '.claude') above.pop();
+    const projectRoot = above.length > 0 ? `/${above.join('/')}` : repoRoot;
+    return { path, name, repoRoot, repoName, projectRoot, worktree: true, ...temporary };
+  }
+
+  const depth = segments.indexOf('monorepo');
+  const repoRoot = depth < 0 ? path : `/${segments.slice(0, depth + 1).join('/')}`;
+  return {
+    path,
+    name,
+    repoRoot,
+    repoName: repoRoot.split('/').at(-1) ?? name,
+    // Not a worktree, so the project is the repository itself.
+    projectRoot: repoRoot,
+    ...temporary,
+  };
+}
 
 export function createMockBridge(): ArtemisBridge {
   /** Profiles a `refresh` has been run for — what fills the real cache. */
@@ -1629,43 +1838,21 @@ export function createMockBridge(): ArtemisBridge {
        *                   spelling that is recognisable on sight.
        *  - everything else — the ordinary clone, cwd at the root.
        */
-      describe: async ({ path }) => {
-        const segments = path.split('/').filter(Boolean);
-        const name = segments.at(-1) ?? path;
-        const temporary = segments[0] === 'tmp' ? { temporary: true } : {};
-        if (path.includes('/scratch/')) return ok({ path, name, ...temporary });
+      describe: async ({ path }) => ok(mockWorkspace(path)),
 
-        const linked = segments.indexOf('worktrees');
-        if (linked >= 0) {
-          // The worktree's root is the directory *below* `worktrees/`, so a cwd
-          // deeper inside one still reports the checkout it belongs to.
-          const repoRoot = `/${segments.slice(0, linked + 2).join('/')}`;
-          const repoName = repoRoot.split('/').at(-1) ?? name;
-          /*
-           * And the project is whatever the worktree was split off from — the
-           * real thing reads that out of the `gitdir:` pointer, which the mock
-           * has no file to read. Everything above `worktrees/`, with a `.claude`
-           * container dropped, is the layout an agent's worktree actually has
-           * (`<repo>/.claude/worktrees/<branch>`) and is enough to exercise the
-           * sidebar grouping a worktree under its repository.
-           */
-          const above = segments.slice(0, linked);
-          if (above.at(-1) === '.claude') above.pop();
-          const projectRoot = above.length > 0 ? `/${above.join('/')}` : repoRoot;
-          return ok({ path, name, repoRoot, repoName, projectRoot, worktree: true, ...temporary });
-        }
-
-        const depth = segments.indexOf('monorepo');
-        const repoRoot = depth < 0 ? path : `/${segments.slice(0, depth + 1).join('/')}`;
-        return ok({
-          path,
-          name,
-          repoRoot,
-          repoName: repoRoot.split('/').at(-1) ?? name,
-          // Not a worktree, so the project is the repository itself.
-          projectRoot: repoRoot,
-          ...temporary,
-        });
+      /*
+       * No git to run, so the mock answers with the path the real one would
+       * have produced — `<repo>/.worktrees/<branch>` — which makes a suggested
+       * task's "Start with worktree" reachable in dev right through to the new
+       * column opening in the right directory. The one thing it cannot fake
+       * usefully is failure: a mock that refused on a timer would make the
+       * option unpredictable, and the real failures (no git on the PATH, a
+       * repository with no commits) are reachable in the app.
+       */
+      createWorktree: async ({ path, branch }) => {
+        const described = mockWorkspace(path);
+        const root = described.projectRoot ?? described.repoRoot ?? path;
+        return ok({ path: `${root}/.worktrees/${branch}`, branch });
       },
     },
 
@@ -1721,14 +1908,18 @@ export function createMockBridge(): ArtemisBridge {
             {
               name: 'demo-personal',
               label: 'Demo — personal',
-              hook: true,
-              banks: Object.fromEntries(mockBanks.map((bank) => [bank.slug, bank.enabled])),
+              hook: mockWiredBanks.length > 0,
+              banks: Object.fromEntries(
+                mockBanks.map((bank) => [bank.slug, mockWiredBanks.includes(bank.slug)]),
+              ),
             },
             {
+              // Wired on one profile and not the other, which is the partial
+              // state the row has a sentence for.
               name: 'demo-work',
               label: 'Demo — work',
               hook: false,
-              banks: Object.fromEntries(mockBanks.map((bank) => [bank.slug, bank.enabled])),
+              banks: Object.fromEntries(mockBanks.map((bank) => [bank.slug, false])),
             },
           ],
         }),
@@ -1794,6 +1985,14 @@ export function createMockBridge(): ArtemisBridge {
           ...mockBanks,
           {
             slug: request.slug,
+            name: request.slug,
+            description: null,
+            // A created bank starts from the BANK.md Artemis writes it; a
+            // joined or adopted one is whatever was already there, and the
+            // mock has no directory to look in, so it guesses the same.
+            format: 'manifest',
+            profiles: { kind: 'all' },
+            problems: [],
             path: request.path ?? `/Users/demo/Documents/${request.slug}`,
             remote: request.remote ?? null,
             role: request.role,
@@ -1805,6 +2004,9 @@ export function createMockBridge(): ArtemisBridge {
             mirrored: 0,
             validationErrors: 0,
             projects: 0,
+            // A bank Artemis just made carries no CLI: Artemis writes a
+            // BANK.md and a memories/ folder, and nothing else.
+            embedsCli: false,
           },
         ];
         mockMasterEnabled = true;
@@ -1827,8 +2029,46 @@ export function createMockBridge(): ArtemisBridge {
             : `'${request.slug}' is off — its profile block is out, and syncs skip it.`,
         });
       },
+      setProfiles: async (request) => {
+        mockBanks = mockBanks.map((bank) =>
+          bank.slug === request.slug ? { ...bank, profiles: request.profiles } : bank,
+        );
+        return ok({
+          message:
+            request.profiles.kind === 'all'
+              ? `'${request.slug}' is attached to every profile, including accounts added later.`
+              : `'${request.slug}' is attached to ${request.profiles.profileIds.length} profile(s). Installed into their projects; removed from the rest.`,
+        });
+      },
+      /*
+       * The other harness's wiring, which the real channel does by spawning
+       * the bank's own CLI. Refused here the way main refuses it, so the
+       * card's disabled state and its receipt are both reachable in dev.
+       */
+      wireClaudeCode: async (request) => {
+        const bank = mockBanks.find((entry) => entry.slug === request.slug);
+        if (bank?.embedsCli !== true) {
+          return {
+            ok: false,
+            error: {
+              code: 'invalid_request',
+              message: `'${request.slug}' embeds no cerebro CLI, so it cannot be wired into stock Claude Code; Artemis’s own runs are unaffected.`,
+              retryable: false,
+            },
+          };
+        }
+        mockWiredBanks = request.enabled
+          ? [...new Set([...mockWiredBanks, request.slug])]
+          : mockWiredBanks.filter((slug) => slug !== request.slug);
+        return ok({
+          message: request.enabled
+            ? `Wired '${request.slug}' into stock Claude Code: a managed block in each profile's CLAUDE.md, the /cerebro command, and a session-start sync hook.`
+            : `Unwired '${request.slug}' from stock Claude Code (managed block, /cerebro command, session-start hook).`,
+        });
+      },
       forget: async (request) => {
         mockBanks = mockBanks.filter((bank) => bank.slug !== request.slug);
+        mockWiredBanks = mockWiredBanks.filter((slug) => slug !== request.slug);
         return ok({ message: `Unwired '${request.slug}' from every profile. Forgot '${request.slug}'.` });
       },
       setMasterEnabled: async (request) => {
@@ -1969,6 +2209,23 @@ export function createMockBridge(): ArtemisBridge {
         mockAgentPrompts = parseAgentPromptsDocument(request.document);
         return ok({ document: mockAgentPrompts });
       },
+    },
+
+    skills: {
+      list: async () => ok(mockSkillsState()),
+      save: async (request) => {
+        mockSkillLibrary = parseSkillLibraryDocument({ ...request.document, sources: mockSkillLibrary.sources });
+        return ok({ document: mockSkillLibrary });
+      },
+      addSource: async (request) => {
+        mockSkillLibrary = withSkillSource(mockSkillLibrary, request.url, request.subdir);
+        return ok(mockSkillsState());
+      },
+      removeSource: async (request) => {
+        mockSkillLibrary = withoutSkillSource(mockSkillLibrary, request.id);
+        return ok(mockSkillsState());
+      },
+      syncSources: async () => ok(mockSkillsState()),
     },
 
     /*
@@ -2447,6 +2704,94 @@ export function createMockBridge(): ArtemisBridge {
       },
     },
 
+    /** The server's banks, and which of its accounts each one reaches. */
+    serverMemoryBanks: {
+      list: async () =>
+        ok({
+          manageProfiles: true,
+          available: true,
+          banks: mockServerBanks,
+          accounts: mockRemoteAccounts.map((account) => ({
+            id: account.id,
+            slug: account.slug,
+            label: account.label,
+          })),
+        }),
+      setProfiles: async ({ slug, profiles }) => {
+        mockServerBanks = mockServerBanks.map((bank) =>
+          bank.slug === slug ? { ...bank, profiles } : bank,
+        );
+        const changed = mockServerBanks.find((bank) => bank.slug === slug);
+        return changed === undefined
+          ? ({ ok: false, error: { code: 'invalid_request', message: 'No such bank.' } } as never)
+          : ok({ bank: changed });
+      },
+    },
+
+    /*
+     * Routines on a remote server. A small in-memory set per session, enough
+     * for the routines pane to show, add and remove server routines in dev
+     * without a real server behind the profile.
+     */
+    serverRoutines: {
+      list: async () => ok({ routines: mockServerRoutines }),
+      create: async ({ draft }) => {
+        const routine: RoutineSnapshot = {
+          id: `server-routine-${String(mockServerRoutines.length + 1)}`,
+          name: draft.name,
+          instructions: draft.instructions,
+          cwd: '/srv/work',
+          profileId: draft.profileId,
+          providerId: draft.providerId,
+          ...(draft.model === undefined ? {} : { model: draft.model }),
+          ...(draft.effort === undefined ? {} : { effort: draft.effort }),
+          ...(draft.permissionMode === undefined ? {} : { permissionMode: draft.permissionMode }),
+          schedule: draft.schedule,
+          paused: draft.paused === true,
+          createdAt: Date.now(),
+          scope: 'dir:/srv/work',
+          connectionId: 'mock-connection',
+          running: false,
+          history: [],
+        };
+        mockServerRoutines = [routine, ...mockServerRoutines];
+        return ok({ routine });
+      },
+      update: async ({ routineId, patch }) => {
+        let updated: RoutineSnapshot | undefined;
+        mockServerRoutines = mockServerRoutines.map((routine) => {
+          if (routine.id !== routineId) return routine;
+          updated = {
+            ...routine,
+            ...(patch.name === undefined ? {} : { name: patch.name }),
+            ...(patch.instructions === undefined ? {} : { instructions: patch.instructions }),
+            ...(patch.model === undefined
+              ? {}
+              : patch.model === ''
+                ? { model: undefined }
+                : { model: patch.model }),
+            ...(patch.schedule === undefined ? {} : { schedule: patch.schedule }),
+            ...(patch.paused === undefined ? {} : { paused: patch.paused }),
+          };
+          return updated;
+        });
+        return updated === undefined
+          ? ({ ok: false, error: { code: 'invalid_request', message: 'No such routine.' } } as never)
+          : ok({ routine: updated });
+      },
+      delete: async ({ routineId }) => {
+        const had = mockServerRoutines.some((routine) => routine.id === routineId);
+        mockServerRoutines = mockServerRoutines.filter((routine) => routine.id !== routineId);
+        return ok({ removed: had });
+      },
+      runNow: async ({ routineId }) => {
+        const routine = mockServerRoutines.find((entry) => entry.id === routineId);
+        return routine === undefined
+          ? ({ ok: false, error: { code: 'invalid_request', message: 'No such routine.' } } as never)
+          : ok({ routine });
+      },
+    },
+
     usagePlan: {
       /*
        * Empty until that profile has actually been fetched.
@@ -2765,7 +3110,10 @@ export function createMockBridge(): ArtemisBridge {
             id: `routine-${mockRoutines.length + 1}`,
             name: draft.name,
             instructions: draft.instructions,
-            cwd: draft.cwd,
+            // A local routine always has a directory; the field only became
+            // optional on the wire for a server routine, which this mock's
+            // local-routines surface never produces.
+            cwd: draft.cwd ?? '',
             profileId: draft.profileId,
             providerId: draft.providerId,
             ...(draft.model === undefined ? {} : { model: draft.model }),

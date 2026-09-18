@@ -80,3 +80,331 @@ describe('PreferencesStore', () => {
     expect(new PreferencesStore(dir).get()).toEqual({});
   });
 });
+
+/*
+ * Pinned conversations.
+ *
+ * A pin is a promise about what the rail looks like next time: keep this one at
+ * the top. So the only interesting questions are whether it survives the
+ * launch that made it, whether toggling twice is the same as never having
+ * toggled, and whether a list holding ids of conversations nobody can find any
+ * more is still a list this can be asked about.
+ */
+describe('PreferencesStore pins', () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = join(await mkdtemp(join(tmpdir(), 'artemis-tui-pins-')), 'nested');
+  });
+  afterEach(async () => {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  });
+
+  it('reads pins back, in the order they were made', async () => {
+    const store = new PreferencesStore(dir);
+    expect(store.isPinned('s-1')).toBe(false);
+    expect(store.togglePin('s-1')).toBe(true);
+    expect(store.togglePin('s-2')).toBe(true);
+    await store.flush();
+
+    const reopened = new PreferencesStore(dir);
+    expect(reopened.isPinned('s-1')).toBe(true);
+    expect(reopened.isPinned('s-2')).toBe(true);
+    expect(reopened.isPinned('s-3')).toBe(false);
+    expect(reopened.get().pinned).toEqual(['s-1', 's-2']);
+    expect([...reopened.pinnedSet()]).toEqual(['s-1', 's-2']);
+  });
+
+  it('toggles back off, leaving every other pin where it was', async () => {
+    const store = new PreferencesStore(dir);
+    store.togglePin('s-1');
+    store.togglePin('s-2');
+    expect(store.togglePin('s-1')).toBe(false);
+    await store.flush();
+
+    const reopened = new PreferencesStore(dir);
+    expect(reopened.isPinned('s-1')).toBe(false);
+    expect(reopened.isPinned('s-2')).toBe(true);
+    expect(reopened.get().pinned).toEqual(['s-2']);
+  });
+
+  it('keeps pins through the other settings, and the other settings through a pin', async () => {
+    // One file, and a save of either half must not be a save over the other.
+    const store = new PreferencesStore(dir);
+    store.saveModelFor('prof_work', { model: 'opus' });
+    store.save({ profileId: 'prof_work', permissionMode: 'plan' });
+    store.togglePin('s-1');
+    store.save({ permissionMode: 'acceptEdits' });
+    await store.flush();
+
+    const reopened = new PreferencesStore(dir);
+    expect(reopened.isPinned('s-1')).toBe(true);
+    expect(reopened.modelFor('prof_work')).toEqual({ model: 'opus' });
+    expect(reopened.get()).toMatchObject({ profileId: 'prof_work', permissionMode: 'acceptEdits' });
+  });
+
+  it('answers about an id it has never heard of, and holds on to ones nobody can find', async () => {
+    // A pinned session can be deleted, or belong to an account that is logged
+    // out. Neither is something this file can check, and dropping the id would
+    // silently unpin a conversation that comes back tomorrow.
+    const { mkdir } = await import('node:fs/promises');
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, 'preferences.json'),
+      JSON.stringify({ version: 1, preferences: { pinned: ['s-gone', 's-here'] } }),
+      'utf8',
+    );
+
+    const store = new PreferencesStore(dir);
+    expect(store.isPinned('s-gone')).toBe(true);
+    expect(store.isPinned('never-existed')).toBe(false);
+    store.togglePin('s-here');
+    await store.flush();
+    expect(new PreferencesStore(dir).get().pinned).toEqual(['s-gone']);
+  });
+
+  it('opens on nothing pinned when the file says something else entirely', async () => {
+    // Hand-edited, or written by a version that meant something different by
+    // the word. A launch is never something a preferences file gets to fail.
+    const store = new PreferencesStore(dir);
+    store.save({ pinned: 'yes' as unknown as readonly string[] });
+    expect(store.isPinned('s-1')).toBe(false);
+    expect([...store.pinnedSet()]).toEqual([]);
+    expect(store.togglePin('s-1')).toBe(true);
+    expect([...store.pinnedSet()]).toEqual(['s-1']);
+    await store.flush();
+  });
+
+  it('hands back the same set until the pins change', async () => {
+    // The rail asks once per draw and then asks of every row; rebuilding the
+    // set for each of those would be a scan per row.
+    const store = new PreferencesStore(dir);
+    store.togglePin('s-1');
+    const set = store.pinnedSet();
+    expect(store.pinnedSet()).toBe(set);
+    store.togglePin('s-2');
+    expect(store.pinnedSet()).not.toBe(set);
+    expect([...store.pinnedSet()]).toEqual(['s-1', 's-2']);
+    await store.flush();
+  });
+});
+
+/*
+ * Unsent drafts.
+ *
+ * A message someone is part-way through writing is work, and switching
+ * conversations or quitting used to lose it. So it is written down against the
+ * conversation it was typed in — and the questions worth pinning are the three
+ * that make it feel like the text never went anywhere: it comes back under its
+ * own conversation and nobody else's, it survives the launch that lost it, and
+ * the list it lives in cannot grow without limit.
+ */
+describe('PreferencesStore drafts', () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = join(await mkdtemp(join(tmpdir(), 'artemis-tui-drafts-')), 'nested');
+  });
+  afterEach(async () => {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  });
+
+  it('hands a draft back to the conversation it was typed in', async () => {
+    const store = new PreferencesStore(dir);
+    expect(store.draftFor('s-1')).toBeUndefined();
+    store.setDraft('s-1', 'why does the rail flicker');
+    store.setDraft('s-2', 'rewrite the header');
+    await store.flush();
+
+    const reopened = new PreferencesStore(dir);
+    expect(reopened.draftFor('s-1')).toBe('why does the rail flicker');
+    expect(reopened.draftFor('s-2')).toBe('rewrite the header');
+    expect(reopened.draftFor('s-3')).toBeUndefined();
+  });
+
+  it('replaces a conversation’s draft rather than keeping both', async () => {
+    const store = new PreferencesStore(dir);
+    store.setDraft('s-1', 'first thought');
+    store.setDraft('s-1', 'second thought');
+    expect(store.draftFor('s-1')).toBe('second thought');
+    expect(store.get().drafts).toEqual([{ sessionId: 's-1', text: 'second thought' }]);
+    await store.flush();
+  });
+
+  it('forgets a draft that has been emptied, whitespace included', async () => {
+    // "Nothing typed" is where every conversation starts; a row saying so is a
+    // row spending one of the twenty on no information at all.
+    const store = new PreferencesStore(dir);
+    store.setDraft('s-1', 'something');
+    store.setDraft('s-1', '   \n ');
+    expect(store.draftFor('s-1')).toBeUndefined();
+    expect(store.get().drafts).toEqual([]);
+    await store.flush();
+  });
+
+  it('keeps the twenty most recently typed at, and drops the oldest', async () => {
+    const store = new PreferencesStore(dir);
+    for (let n = 0; n < 25; n += 1) store.setDraft(`s-${String(n)}`, `draft ${String(n)}`);
+    expect(store.get().drafts).toHaveLength(20);
+    expect(store.draftFor('s-4')).toBeUndefined();
+    expect(store.draftFor('s-5')).toBe('draft 5');
+    expect(store.draftFor('s-24')).toBe('draft 24');
+
+    // Typing at an old conversation again moves it to the back of the queue,
+    // so the next twenty writes are what push it out rather than its age.
+    store.setDraft('s-5', 'still here');
+    for (let n = 25; n < 44; n += 1) store.setDraft(`s-${String(n)}`, `draft ${String(n)}`);
+    expect(store.draftFor('s-5')).toBe('still here');
+    await store.flush();
+  });
+
+  it('keeps drafts through the other settings, and opens on none when the file says something else', async () => {
+    const store = new PreferencesStore(dir);
+    store.save({ profileId: 'prof_work' });
+    store.setDraft('s-1', 'a draft');
+    store.togglePin('s-1');
+    await store.flush();
+
+    const reopened = new PreferencesStore(dir);
+    expect(reopened.draftFor('s-1')).toBe('a draft');
+    expect(reopened.isPinned('s-1')).toBe(true);
+    expect(reopened.get().profileId).toBe('prof_work');
+
+    const { mkdir } = await import('node:fs/promises');
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, 'preferences.json'),
+      JSON.stringify({ version: 1, preferences: { drafts: [{ sessionId: 's-1' }, 'nonsense', { sessionId: 's-2', text: 'kept' }] } }),
+      'utf8',
+    );
+    const salvaged = new PreferencesStore(dir);
+    expect(salvaged.draftFor('s-1')).toBeUndefined();
+    expect(salvaged.draftFor('s-2')).toBe('kept');
+  });
+});
+
+/*
+ * The check a directory runs after an edit.
+ *
+ * This is a setting about a project rather than about an account or a
+ * conversation, which makes the interesting questions the ones about the key:
+ * the same directory spelled two ways is one setting, clearing it is as easy as
+ * setting it, and a map that is rewritten whole on every save cannot grow
+ * without limit.
+ */
+describe('PreferencesStore after-edit checks', () => {
+  let dir: string;
+  const work = sep === '\\' ? 'C:\\work\\artemis' : '/work/artemis';
+  const other = sep === '\\' ? 'C:\\work\\notes' : '/work/notes';
+  /*
+   * Every store opened here is flushed before its directory goes: a write
+   * still in flight when the directory is removed is a race a Windows runner
+   * loses with ENOTEMPTY, and the removal itself retries for the same reason.
+   */
+  const stores: PreferencesStore[] = [];
+  const opened = (): PreferencesStore => {
+    const store = new PreferencesStore(dir);
+    stores.push(store);
+    return store;
+  };
+  beforeEach(async () => {
+    dir = join(await mkdtemp(join(tmpdir(), 'artemis-tui-checks-')), 'nested');
+  });
+  afterEach(async () => {
+    await Promise.all(stores.splice(0).map((store) => store.flush()));
+    await rm(join(dir, '..'), { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
+
+  it('reads a directory’s command back, and answers nothing for one nobody has set', async () => {
+    const store = opened();
+    expect(store.afterEditFor(work)).toBeUndefined();
+    store.setAfterEdit(work, 'pnpm -s test');
+    store.setAfterEdit(other, 'cargo clippy');
+    await store.flush();
+
+    const reopened = opened();
+    expect(reopened.afterEditFor(work)).toBe('pnpm -s test');
+    expect(reopened.afterEditFor(other)).toBe('cargo clippy');
+    expect(reopened.afterEditFor(sep === '\\' ? 'C:\\elsewhere' : '/elsewhere')).toBeUndefined();
+  });
+
+  it('is one setting however the directory was spelled', () => {
+    // The path somebody typed at `/check` and the one the app is running in
+    // must not be two settings that disagree.
+    const store = opened();
+    store.setAfterEdit(`${work}${sep}`, 'pnpm test');
+    expect(store.afterEditFor(work)).toBe('pnpm test');
+    expect(store.afterEditFor(join(work, 'src', '..'))).toBe('pnpm test');
+    expect(Object.keys(store.get().afterEdit ?? {})).toEqual([work]);
+  });
+
+  it('clears the command on nothing, and on a command of spaces', async () => {
+    const store = opened();
+    store.setAfterEdit(work, 'pnpm test');
+    store.setAfterEdit(other, 'cargo clippy');
+    store.setAfterEdit(work, undefined);
+    expect(store.afterEditFor(work)).toBeUndefined();
+    // And the other directory's is where it was.
+    expect(store.afterEditFor(other)).toBe('cargo clippy');
+
+    store.setAfterEdit(other, '  \n ');
+    expect(store.afterEditFor(other)).toBeUndefined();
+    expect(store.get().afterEdit).toEqual({});
+    await store.flush();
+    expect(opened().afterEditFor(work)).toBeUndefined();
+  });
+
+  it('trims the command it was given, so a pasted line is the command', () => {
+    const store = opened();
+    store.setAfterEdit(work, '  pnpm -s typecheck  ');
+    expect(store.afterEditFor(work)).toBe('pnpm -s typecheck');
+  });
+
+  it('keeps the fifty most recently set, and a directory set again goes to the back', async () => {
+    const store = opened();
+    for (let n = 0; n < 55; n += 1) store.setAfterEdit(`${work}-${String(n)}`, `check ${String(n)}`);
+    expect(Object.keys(store.get().afterEdit ?? {})).toHaveLength(50);
+    expect(store.afterEditFor(`${work}-4`)).toBeUndefined();
+    expect(store.afterEditFor(`${work}-5`)).toBe('check 5');
+    expect(store.afterEditFor(`${work}-54`)).toBe('check 54');
+
+    // Setting an old directory again moves it to the back of the map, so the
+    // next fifty writes are what push it out rather than its age.
+    store.setAfterEdit(`${work}-5`, 'still here');
+    for (let n = 55; n < 104; n += 1) store.setAfterEdit(`${work}-${String(n)}`, `check ${String(n)}`);
+    expect(store.afterEditFor(`${work}-5`)).toBe('still here');
+    await store.flush();
+  });
+
+  it('keeps the check through the other settings, and opens on none when the file says something else', async () => {
+    const store = opened();
+    store.save({ profileId: 'prof_work' });
+    store.setAfterEdit(work, 'pnpm test');
+    store.togglePin('s-1');
+    store.setDraft('s-1', 'a draft');
+    await store.flush();
+
+    const reopened = opened();
+    expect(reopened.afterEditFor(work)).toBe('pnpm test');
+    expect(reopened.isPinned('s-1')).toBe(true);
+    expect(reopened.draftFor('s-1')).toBe('a draft');
+    expect(reopened.get().profileId).toBe('prof_work');
+
+    const { mkdir } = await import('node:fs/promises');
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, 'preferences.json'),
+      JSON.stringify({ version: 1, preferences: { afterEdit: { [work]: 7, [other]: 'cargo test' } } }),
+      'utf8',
+    );
+    const salvaged = opened();
+    expect(salvaged.afterEditFor(work)).toBeUndefined();
+    expect(salvaged.afterEditFor(other)).toBe('cargo test');
+
+    await writeFile(join(dir, 'preferences.json'), JSON.stringify({ version: 1, preferences: { afterEdit: 'pnpm test' } }), 'utf8');
+    const nonsense = opened();
+    expect(nonsense.afterEditFor(work)).toBeUndefined();
+    // And it can still be set from there, over whatever the file held.
+    nonsense.setAfterEdit(work, 'pnpm test');
+    expect(nonsense.afterEditFor(work)).toBe('pnpm test');
+    await nonsense.flush();
+  });
+});

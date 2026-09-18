@@ -3,6 +3,10 @@ import { describe, expect, it } from 'vitest';
 import { ValidationError } from './errors.js';
 import {
   validateAgentPromptsSave,
+  validateSkillsSave,
+  validateSkillsSourceAdd,
+  validateSkillsSourceRemove,
+  validateSkillsSourceSync,
   validatePreviewOpen,
   validateProfilesCreate,
   validateProfilesSuggestDir,
@@ -15,8 +19,11 @@ import {
   validateSessionsListAll,
   validateMemoryBankAdd,
   validateMemoryBankSetEnabled,
+  validateMemoryBankSetProfiles,
+  validateMemoryBankWireClaudeCode,
   validateMemoryBanksSetMasterEnabled,
   validateMemoryBanksVerifyRemote,
+  validateServerMemoryBanksSetProfiles,
   validateSecretsConnectionDelete,
   validateSecretsConnectionSave,
   validateSecretsConnectionVerify,
@@ -32,6 +39,7 @@ import {
   validateTerminalWrite,
   validateUpdatesCheck,
   validateWindowRequest,
+  validateWorkspaceCreateWorktree,
 } from './validate.js';
 
 /**
@@ -1064,6 +1072,196 @@ describe('validateMemoryBankSetEnabled', () => {
   });
 });
 
+/**
+ * The profile scope: which accounts a bank reaches.
+ *
+ * The consequences run in three directions — which runs are briefed about the
+ * bank, whose projects it is installed into, and which runs may read its
+ * directory — so the shape is checked rather than trusted, and a list that
+ * repeats an id is understood rather than refused.
+ */
+describe('validateMemoryBankSetProfiles', () => {
+  it('takes the two scopes the protocol names', () => {
+    expect(validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'all' } })).toEqual({
+      slug: 'cortex',
+      profiles: { kind: 'all' },
+    });
+    expect(
+      validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: ['work'] } }),
+    ).toEqual({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: ['work'] } });
+  });
+
+  it('reads an empty list as a bank that reaches nobody, not as `all`', () => {
+    // The dangerous default. A scope that fell back to `all` would put a bank
+    // the user has just detached from every profile in front of every run.
+    expect(
+      validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: [] } }),
+    ).toEqual({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: [] } });
+    expect(
+      validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'profiles' } }),
+    ).toEqual({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: [] } });
+  });
+
+  it('deduplicates rather than refusing a list that names a profile twice', () => {
+    expect(
+      validateMemoryBankSetProfiles({
+        slug: 'cortex',
+        profiles: { kind: 'profiles', profileIds: ['work', 'work', 'home'] },
+      }),
+    ).toEqual({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: ['work', 'home'] } });
+  });
+
+  it('refuses a scope that is not one of the two, and a slug outside the grammar', () => {
+    expect(() => validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'some' } })).toThrow(
+      ValidationError,
+    );
+    expect(() => validateMemoryBankSetProfiles({ slug: 'cortex' })).toThrow(ValidationError);
+    expect(() => validateMemoryBankSetProfiles({ slug: '../etc', profiles: { kind: 'all' } })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('caps the list, and refuses an id that is not a string or is too long', () => {
+    const many = Array.from({ length: 51 }, (_unused, index) => `p${String(index)}`);
+    expect(() =>
+      validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: many } }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateMemoryBankSetProfiles({ slug: 'cortex', profiles: { kind: 'profiles', profileIds: [42] } }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateMemoryBankSetProfiles({
+        slug: 'cortex',
+        profiles: { kind: 'profiles', profileIds: ['x'.repeat(65)] },
+      }),
+    ).toThrow(ValidationError);
+  });
+});
+
+/**
+ * The same scope, one machine further away.
+ *
+ * Its own validator rather than a shared one, because the ids in it are the
+ * *server's* account ids and not this machine's: one function taking either
+ * would be the single place where two registries could be confused. So the
+ * shape rules are checked here in full rather than assumed from the twin
+ * above, and the extra field — which server — is required.
+ */
+describe('validateServerMemoryBanksSetProfiles', () => {
+  it('takes the two scopes, and names which server', () => {
+    expect(
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: 'cortex',
+        profiles: { kind: 'all' },
+      }),
+    ).toEqual({ profileId: 'prof_server', slug: 'cortex', profiles: { kind: 'all' } });
+    expect(
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: 'cortex',
+        // The server's own ids, which are that server's business and are
+        // checked as strings rather than against this machine's grammar.
+        profiles: { kind: 'profiles', profileIds: ['remote-work', 'remote-work', 'remote-home'] },
+      }),
+    ).toEqual({
+      profileId: 'prof_server',
+      slug: 'cortex',
+      profiles: { kind: 'profiles', profileIds: ['remote-work', 'remote-home'] },
+    });
+  });
+
+  it('reads an empty list as a bank that reaches nobody, not as `all`', () => {
+    expect(
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: 'cortex',
+        profiles: { kind: 'profiles' },
+      }),
+    ).toEqual({
+      profileId: 'prof_server',
+      slug: 'cortex',
+      profiles: { kind: 'profiles', profileIds: [] },
+    });
+  });
+
+  it('refuses a request with no server, a bad scope, or a slug outside the grammar', () => {
+    expect(() =>
+      validateServerMemoryBanksSetProfiles({ slug: 'cortex', profiles: { kind: 'all' } }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: 'cortex',
+        profiles: { kind: 'some' },
+      }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: '../etc',
+        profiles: { kind: 'all' },
+      }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateServerMemoryBanksSetProfiles({
+        profileId: 'prof_server',
+        slug: 'cortex',
+        profiles: { kind: 'profiles', profileIds: [42] },
+      }),
+    ).toThrow(ValidationError);
+  });
+});
+
+/**
+ * Wiring a bank into stock Claude Code.
+ *
+ * The same shape as the on/off switch and a sharper version of its reason:
+ * what this writes is another program's configuration — a managed block in
+ * every profile's `CLAUDE.md`, a slash command, a session-start hook — so a
+ * guessed direction either edits files nobody asked to have edited or leaves
+ * behind wiring somebody asked to have removed.
+ */
+describe('validateMemoryBankWireClaudeCode', () => {
+  it('takes the state it is given, both ways', () => {
+    expect(validateMemoryBankWireClaudeCode({ slug: 'cortex', enabled: true })).toEqual({
+      slug: 'cortex',
+      enabled: true,
+    });
+    expect(validateMemoryBankWireClaudeCode({ slug: 'cortex', enabled: false })).toEqual({
+      slug: 'cortex',
+      enabled: false,
+    });
+  });
+
+  it('refuses silence and truthy stand-ins', () => {
+    expect(() => validateMemoryBankWireClaudeCode({ slug: 'cortex' })).toThrow(ValidationError);
+    expect(() => validateMemoryBankWireClaudeCode({ slug: 'cortex', enabled: 'true' })).toThrow(
+      ValidationError,
+    );
+    expect(() => validateMemoryBankWireClaudeCode({ slug: 'cortex', enabled: 1 })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('refuses a slug outside the banks` own grammar', () => {
+    // The slug reaches a spawn's argument list and namespaces a managed block
+    // in a file Artemis does not own, so the grammar is the whole gate.
+    expect(() => validateMemoryBankWireClaudeCode({ slug: '../etc', enabled: true })).toThrow(
+      ValidationError,
+    );
+    expect(() => validateMemoryBankWireClaudeCode({ slug: 'No Caps', enabled: true })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('rebuilds the request, so nothing extra reaches main', () => {
+    expect(
+      validateMemoryBankWireClaudeCode({ slug: 'cortex', enabled: true, cli: '/bin/sh' }),
+    ).toEqual({ slug: 'cortex', enabled: true });
+  });
+});
+
 describe('validateMemoryBanksSetMasterEnabled', () => {
   it('takes the state it is given, and refuses silence and stand-ins', () => {
     expect(validateMemoryBanksSetMasterEnabled({ enabled: false })).toEqual({ enabled: false });
@@ -1311,6 +1509,108 @@ describe('validateAgentPromptsSave', () => {
     expect(() => validateAgentPromptsSave(row({ overridden: 'true', markdown: 'forged' }))).toThrow(
       ValidationError,
     );
+  });
+});
+
+/**
+ * The always-on choices, at the boundary.
+ *
+ * What an always-on skill *says* is read by main from a folder main found, so
+ * the property worth pinning is that nothing on this channel can name a place:
+ * a name is a folder's name and never a path, and the document is rebuilt from
+ * the fields the contract names rather than passed through.
+ */
+describe('validateSkillsSave', () => {
+  const save = (alwaysOn: unknown) => validateSkillsSave({ document: { alwaysOn } });
+
+  it('rebuilds the document from names and scopes, and nothing else', () => {
+    const saved = save([
+      { name: 'unslop', scope: { kind: 'all' }, dir: '/etc', body: 'forged' },
+      { name: 'tdd', scope: { kind: 'profiles', profileIds: ['p1'] } },
+    ]);
+
+    expect(saved).toEqual({
+      document: {
+        version: 1,
+        alwaysOn: [
+          { name: 'unslop', scope: { kind: 'all' } },
+          { name: 'tdd', scope: { kind: 'profiles', profileIds: ['p1'] } },
+        ],
+      },
+    });
+  });
+
+  it('refuses a name that is a path, in either spelling', () => {
+    for (const name of ['../../etc/passwd', 'skills/unslop', 'C:\\Users\\me\\skill', '..', '.']) {
+      expect(() => save([{ name, scope: { kind: 'all' } }]), name).toThrow(ValidationError);
+    }
+  });
+
+  it('refuses a document that is not a list of entries', () => {
+    expect(() => save('unslop')).toThrow(ValidationError);
+    expect(() => save([{ scope: { kind: 'all' } }])).toThrow(ValidationError);
+    expect(() => save([{ name: 'unslop', scope: { kind: 'some' } }])).toThrow(ValidationError);
+    expect(() => validateSkillsSave({})).toThrow(ValidationError);
+  });
+
+  it('accepts an empty list, which is every skill switched off', () => {
+    expect(save([]).document.alwaysOn).toEqual([]);
+  });
+
+  it('keeps a name exactly as it was sent, because it is a folder’s name', () => {
+    // The store and the pane match by equality; a name tidied here would split
+    // one skill into a row that reads "off" and a phantom that reads "missing".
+    expect(save([{ name: ' notes ', scope: { kind: 'all' } }]).document.alwaysOn[0]?.name).toBe(' notes ');
+  });
+
+  it('carries no sources, whatever the renderer sent with the switches', () => {
+    // A source is a URL main will clone. It has a channel and a validator of
+    // its own, and cannot ride in on a save about switches.
+    const saved = validateSkillsSave({
+      document: { alwaysOn: [], sources: [{ id: 'x', url: 'ext::sh -c boom', subdir: 'skills' }] },
+    });
+
+    expect('sources' in saved.document).toBe(false);
+  });
+});
+
+/**
+ * A repository to subscribe to: the one string on this surface that becomes an
+ * argument to a program. The rule is the protocol's and is tested there; what
+ * is pinned here is that the boundary applies it, and answers with its words.
+ */
+describe('the skill source validators', () => {
+  it('accepts a forge URL, trims it, and defaults the folder', () => {
+    expect(validateSkillsSourceAdd({ url: '  https://github.com/david-systemtech/agent-skills.git ' })).toEqual({
+      url: 'https://github.com/david-systemtech/agent-skills.git',
+      subdir: 'skills',
+    });
+    expect(validateSkillsSourceAdd({ url: 'git@github.com:a/b.git', subdir: 'packs/skills' }).subdir).toBe('packs/skills');
+  });
+
+  it('refuses what git must never be handed, in the rule’s own words', () => {
+    for (const url of ['ext::sh -c boom', '--upload-pack=x', 'file:///etc', '/home/me/skills']) {
+      expect(() => validateSkillsSourceAdd({ url }), url).toThrow(ValidationError);
+    }
+    expect(() => validateSkillsSourceAdd({ url: 'https://me:token-value@github.com/a/b.git' })).toThrow(
+      /git credentials/,
+    );
+    expect(() => validateSkillsSourceAdd({ url: 'https://github.com/a/b.git', subdir: '../outside' })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('holds a source id to the alphabet ids are written in, since it names a folder main deletes', () => {
+    expect(validateSkillsSourceRemove({ id: 'github-com-a-b-0a1b2c3d' })).toEqual({ id: 'github-com-a-b-0a1b2c3d' });
+    for (const id of ['../x', 'a/b', 'A-B', '', 'a--b', '-a']) {
+      expect(() => validateSkillsSourceRemove({ id }), id).toThrow(ValidationError);
+    }
+  });
+
+  it('pulls everything when no source is named', () => {
+    expect(validateSkillsSourceSync({})).toEqual({});
+    expect(validateSkillsSourceSync({ id: 'github-com-a-b-0a1b2c3d' })).toEqual({ id: 'github-com-a-b-0a1b2c3d' });
+    expect(() => validateSkillsSourceSync({ id: '../x' })).toThrow(ValidationError);
   });
 });
 
@@ -1604,5 +1904,89 @@ describe('validateMemoryBankAdd with a secret reference', () => {
         auth: { ref },
       }).auth,
     ).toEqual({ ref });
+  });
+});
+
+describe('validateAgentPromptsSave: built-ins the user removed', () => {
+  const row = { id: 'p1', name: 'House style', markdown: 'x', enabled: true, scope: { kind: 'all' } };
+
+  it('carries a dismissal that names a prompt this build ships', () => {
+    const { document } = validateAgentPromptsSave({
+      document: { version: 1, prompts: [row], dismissedBuiltIns: ['builtin:cerebro'] },
+    });
+    expect(document.dismissedBuiltIns).toEqual(['builtin:cerebro']);
+  });
+
+  it('writes no field when there is nothing to say', () => {
+    for (const dismissed of [undefined, null, []]) {
+      const { document } = validateAgentPromptsSave({
+        document: { version: 1, prompts: [row], dismissedBuiltIns: dismissed },
+      });
+      expect(document).not.toHaveProperty('dismissedBuiltIns');
+    }
+  });
+
+  it('refuses a dismissal that names nothing this build ships, and a non-array', () => {
+    expect(() =>
+      validateAgentPromptsSave({
+        document: { version: 1, prompts: [row], dismissedBuiltIns: ['builtin:nope'] },
+      }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateAgentPromptsSave({
+        document: { version: 1, prompts: [row], dismissedBuiltIns: 'builtin:cerebro' },
+      }),
+    ).toThrow(ValidationError);
+  });
+});
+
+
+/**
+ * The branch a worktree is created on.
+ *
+ * This is the one string the renderer sends that becomes both a directory under
+ * the user's checkout and a ref inside their `.git`. `suggestedTaskBranch`
+ * already reduces a task title to a safe name, and that is not the point: this
+ * channel is reachable by anything running in the renderer, so the shape is
+ * checked here rather than trusted to the one caller that composes it.
+ */
+describe('validateWorkspaceCreateWorktree', () => {
+  const ROOT = '/code/kronos';
+
+  it('accepts a slug of the shape the composer produces', () => {
+    expect(validateWorkspaceCreateWorktree({ path: ROOT, branch: 'task/add-tests-2' })).toEqual({
+      path: ROOT,
+      branch: 'task/add-tests-2',
+    });
+  });
+
+  it.each([
+    ['traversal', '../../../etc'],
+    ['an absolute path', '/etc/passwd'],
+    ['a leading slash segment', '/task/x'],
+    ['a trailing slash', 'task/'],
+    ['a backslash', String.raw`task\..\..\x`],
+    ['a space', 'task/add tests'],
+    ['a capital', 'Task/Add-Tests'],
+    ['a dot, which git also refuses next to another', 'task/add..tests'],
+    ['nothing at all', ''],
+  ])('refuses %s', (_why, branch) => {
+    expect(() => validateWorkspaceCreateWorktree({ path: ROOT, branch })).toThrow(ValidationError);
+  });
+
+  it('refuses a relative directory, like every other path on this surface', () => {
+    expect(() => validateWorkspaceCreateWorktree({ path: 'kronos', branch: 'task/x' })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('drops fields nobody asked for', () => {
+    const request = validateWorkspaceCreateWorktree({
+      path: ROOT,
+      branch: 'task/x',
+      force: true,
+      cwd: '/somewhere/else',
+    });
+    expect(request).toEqual({ path: ROOT, branch: 'task/x' });
   });
 });

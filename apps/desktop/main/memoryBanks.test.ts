@@ -1,166 +1,227 @@
 /**
- * The pure half of `memoryBanks.ts` — parsing the CLI's `--json` output and
- * its registry file into the protocol's shapes. Fixtures mirror real output
- * from `bin/cerebro` 0.6.0 (the first multi-bank version), including the
- * cases the numbers hide: profiles that symlink one shared projects store,
- * project entries stamped with a `bank` versus legacy unstamped ones, and the
- * pre-multi-bank `{"bank": path}` registry.
+ * The pure half of `memoryBanks.ts`: the decisions, without the disk or the
+ * spawns around them.
+ *
+ * What is here changed shape when core learned to read banks itself. There is
+ * no CLI output to parse any more — a bank's condition is built from what
+ * `readBankAt` found in the directory, which is why the fixtures below are
+ * *directories*, written into a temp dir and read the way the app reads them.
+ * The CLI's registry parser stays, because the CLI's file is still mirrored on
+ * every write and a machine may still have one written by hand.
  *
  * The same convention covers the spawn's pure halves, added when the module
  * learned to run on Windows and to reach a private remote: which interpreter
- * to drive the CLI with, what every spawn is told, and what one
+ * to drive the legacy CLI with, what every spawn is told, and what one
  * `git ls-remote` means. Those are decisions rather than I/O, and the fixtures
  * for the last one are stderr the hosts in reach actually produce — the whole
  * value of the feature is that four indistinguishable-looking failures are
  * told apart.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  detectForge,
+  EphemeralMemoryBankSecrets,
+  readBankAt,
+  REGISTRY_V2_FILE,
+  type BankRecord,
+  type Forge,
+  type SecretRef,
+} from '@rx-artemis/core';
+import type { MemoryBankCheck } from '@rx-artemis/protocol';
+
+import {
   acceptsAsPython3,
+  bankInfoFrom,
   baseCliEnv,
   categorizeLsRemote,
   configureMemoryBanks,
+  forgeCredentialFor,
+  hasBankBlock,
+  hasSessionStartSyncHook,
   isMasterEnabled,
   needsPythonInterpreter,
-  parseBanksStatus,
-  parseDoctor,
   parseGitOrigin,
-  parseMemories,
   parseRegistry,
+  pullDue,
   PYTHON_CANDIDATES,
+  readMemoryBanksPreflight,
+  readMemoryBanksStatus,
   selectPython,
+  syncDue,
+  wireMemoryBankClaudeCode,
   withoutSecrets,
   type LsRemoteResult,
   type PythonProbe,
 } from './memoryBanks';
 
-const STATUS_FIXTURE = JSON.stringify({
-  repo: '/Users/demo/Documents/cerebro',
-  source: 'cerebro@52a0a32',
-  remote: 'https://github.com/Rx-Ventures/cerebro.git',
-  artemis_root: '/Users/demo/Library/Application Support/Artemis',
-  bank: { memories: 3, errors: 0, warnings: 0 },
-  banks: [
-    {
+/* -------------------------------------------------------------------------- */
+/* A bank's condition, from the bank                                          */
+/* -------------------------------------------------------------------------- */
+
+const RECORD: BankRecord = {
+  slug: 'cerebro',
+  path: '',
+  role: 'readwrite',
+  enabled: true,
+  profiles: { kind: 'all' },
+};
+
+/**
+ * A legacy-flat bank on disk: one memory that validates and one file that
+ * cannot be read as one. Both halves matter — the pane counts the second and
+ * shows the reason, which is how the person who can fix it finds out.
+ */
+function writeLegacyFlatBank(): string {
+  const root = mkdtempSync(join(tmpdir(), 'artemis-bank-'));
+  mkdirSync(join(root, 'memories'), { recursive: true });
+  writeFileSync(
+    join(root, 'memories', 'deploy-approval-flow.md'),
+    [
+      '---',
+      'name: deploy-approval-flow',
+      'description: When deploying to production',
+      'metadata:',
+      '  type: reference',
+      '  added: 2026-08-14',
+      '  author: demo@example.com',
+      '---',
+      '',
+      'Deploys need approval in #deploys first.',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  writeFileSync(join(root, 'memories', 'broken.md'), 'no frontmatter at all\n', 'utf8');
+  return root;
+}
+
+describe('bankInfoFrom', () => {
+  const facts = {
+    isDefault: true,
+    remote: null,
+    source: 'artemis@1a2b3c4',
+    projects: 2,
+    embedsCli: false,
+  };
+
+  it('describes a legacy bank read off disk, problems and all', () => {
+    const path = writeLegacyFlatBank();
+    const record = { ...RECORD, path };
+    const info = bankInfoFrom(record, readBankAt(path, { slug: record.slug }), facts);
+
+    expect(info).toMatchObject({
       slug: 'cerebro',
-      path: '/Users/demo/Documents/cerebro',
-      role: 'readwrite',
-      enabled: true,
-      default: true,
+      // A legacy bank says nothing about itself, so the slug is its name.
+      name: 'cerebro',
+      description: null,
+      format: 'legacy-flat',
       exists: true,
-      source: 'cerebro@52a0a32',
-      remote: 'https://github.com/Rx-Ventures/cerebro.git',
-      bank: { memories: 3, errors: 0, warnings: 0 },
-    },
-    {
-      slug: 'client-docs',
-      path: '/Users/demo/Documents/client-docs',
-      role: 'readonly',
-      enabled: false,
-      default: false,
-      exists: true,
-      source: 'cerebro@1a2b3c4',
-      remote: null,
-      bank: { memories: 5, own: 2, mirrored: 3, errors: 1, warnings: 0 },
-    },
-  ],
-  profiles: [
-    {
-      name: 'storrence-dev',
-      label: 'storrence.dev',
-      enabled: true,
-      hook: true,
-      banks: { cerebro: true, 'client-docs': false },
-      projects: [
-        // Legacy entries carry no `bank` stamp and belong to the legacy slug…
-        { key: '-Users-demo-Documents-app', memories: 3, source: 'cerebro@52a0a32' },
-        { key: '-Users-demo-Documents-api', memories: 3, source: 'cerebro@52a0a32' },
-        // …stamped entries belong to theirs.
-        { key: '-Users-demo-Documents-app', bank: 'client-docs', memories: 5, source: 'cerebro@1a2b3c4' },
-      ],
-      shared_with: null,
-    },
-    {
-      name: 'work',
-      label: 'Work – Team',
-      enabled: true,
-      hook: false,
-      banks: { cerebro: true, 'client-docs': false },
-      projects: [],
-      shared_with: 'storrence-dev',
-    },
-  ],
+      memories: 2,
+      validationErrors: 1,
+      // The field the old CLI filled from its mirror trees; core has no such
+      // notion, and the protocol's number is honestly zero.
+      mirrored: 0,
+      projects: 2,
+      isDefault: true,
+      profiles: { kind: 'all' },
+    });
+    // One file, several reasons — each its own line, each naming the file, so
+    // the pane can show them without knowing which bank format produced them.
+    expect(info.problems.length).toBeGreaterThan(0);
+    expect(info.problems.every((problem) => problem.startsWith('memories/broken.md: '))).toBe(true);
+    expect(info.problems.join(' ')).toMatch(/no frontmatter/);
+  });
+
+  it('reads a manifest bank`s own name and description', () => {
+    const path = writeLegacyFlatBank();
+    writeFileSync(
+      join(path, 'BANK.md'),
+      ['---', 'name: cortex', 'description: The homelab and its machines.', '---', '', 'Body.', ''].join('\n'),
+      'utf8',
+    );
+    const record = { ...RECORD, path, slug: 'cortex' };
+    const info = bankInfoFrom(record, readBankAt(path, { slug: record.slug }), facts);
+    expect(info.format).toBe('manifest');
+    expect(info.name).toBe('cortex');
+    expect(info.description).toBe('The homelab and its machines.');
+  });
+
+  it('describes a path that is no longer a bank without losing the record', () => {
+    // The registry still names it, so the pane can offer to forget it. What it
+    // must not do is claim the bank is there.
+    const record = { ...RECORD, path: join(tmpdir(), 'artemis-not-a-bank') };
+    const info = bankInfoFrom(record, null, { ...facts, source: null, projects: 0 });
+    expect(info).toMatchObject({
+      exists: false,
+      format: null,
+      memories: 0,
+      validationErrors: 0,
+      problems: [],
+      path: record.path,
+      slug: 'cerebro',
+      name: 'cerebro',
+    });
+  });
+
+  it('caps the problems it reports, because the count is already exact', () => {
+    const path = mkdtempSync(join(tmpdir(), 'artemis-bank-'));
+    mkdirSync(join(path, 'memories'), { recursive: true });
+    for (let i = 0; i < 20; i += 1) {
+      writeFileSync(join(path, 'memories', `broken-${String(i)}.md`), 'nothing\n', 'utf8');
+    }
+    const info = bankInfoFrom({ ...RECORD, path }, readBankAt(path, { slug: 'cerebro' }), facts);
+    expect(info.validationErrors).toBe(20);
+    expect(info.problems).toHaveLength(12);
+  });
 });
 
-describe('parseBanksStatus', () => {
-  it('rebuilds the protocol shape from real status output', () => {
-    const status = parseBanksStatus(STATUS_FIXTURE, true, true);
-    expect(status.cliAvailable).toBe(true);
-    expect(status.masterEnabled).toBe(true);
-    expect(status.banks).toHaveLength(2);
+/* -------------------------------------------------------------------------- */
+/* What a profile carries, for stock Claude Code's sake                       */
+/* -------------------------------------------------------------------------- */
 
-    const [cerebro, docs] = status.banks;
-    expect(cerebro).toEqual({
-      slug: 'cerebro',
-      path: '/Users/demo/Documents/cerebro',
-      remote: 'https://github.com/Rx-Ventures/cerebro.git',
-      role: 'readwrite',
-      enabled: true,
-      isDefault: true,
-      exists: true,
-      source: 'cerebro@52a0a32',
-      memories: 3,
-      // A health block that predates mirror trees reads as zero mirrored —
-      // the classic bank's truthful answer, not a parse failure.
-      mirrored: 0,
-      validationErrors: 0,
-      projects: 2,
-    });
-    expect(docs).toMatchObject({
-      slug: 'client-docs',
-      role: 'readonly',
-      enabled: false,
-      isDefault: false,
-      remote: null,
-      memories: 5,
-      mirrored: 3,
-      validationErrors: 1,
-      projects: 1,
+describe('hasSessionStartSyncHook', () => {
+  const settings = (command: string): string =>
+    JSON.stringify({
+      hooks: {
+        SessionStart: [{ matcher: 'startup', hooks: [{ type: 'command', command }] }],
+      },
     });
 
-    expect(status.profiles).toHaveLength(2);
-    expect(status.profiles[0]).toEqual({
-      name: 'storrence-dev',
-      label: 'storrence.dev',
-      hook: true,
-      banks: { cerebro: true, 'client-docs': false },
-    });
+  it('recognises the hook however the CLI happened to be spelled', () => {
+    // A shim on PATH, a bank's own copy, and the Windows spawn — all one hook.
+    expect(hasSessionStartSyncHook(settings('cerebro sync --quiet'))).toBe(true);
+    expect(hasSessionStartSyncHook(settings('/home/me/Documents/cortex/bin/cerebro sync --quiet'))).toBe(true);
+    expect(hasSessionStartSyncHook(settings('py -3 C:\\banks\\cortex\\bin\\cerebro sync'))).toBe(true);
   });
 
-  it('masterEnabled is the caller`s fact, not the CLI`s', () => {
-    expect(parseBanksStatus(STATUS_FIXTURE, false, true).masterEnabled).toBe(false);
+  it('is false for another SessionStart hook, and for a cerebro that does not sync', () => {
+    expect(hasSessionStartSyncHook(settings('echo hello'))).toBe(false);
+    expect(hasSessionStartSyncHook(settings('cerebro doctor'))).toBe(false);
   });
 
-  it('drops a bank whose slug is not in the banks` own grammar', () => {
-    const status = parseBanksStatus(
-      JSON.stringify({
-        banks: [{ slug: '../escape', path: '/x', role: 'readwrite', enabled: true }],
-        profiles: [],
-      }),
-      true,
-      true,
-    );
-    expect(status.banks).toHaveLength(0);
+  it('is false for a settings file with no hooks, and for one that will not parse', () => {
+    expect(hasSessionStartSyncHook('{}')).toBe(false);
+    expect(hasSessionStartSyncHook(JSON.stringify({ hooks: { PreToolUse: [] } }))).toBe(false);
+    expect(hasSessionStartSyncHook('')).toBe(false);
+    expect(hasSessionStartSyncHook('{ "hooks": ')).toBe(false);
+  });
+});
+
+describe('hasBankBlock', () => {
+  it('finds the legacy slug`s unprefixed marker and a named bank`s', () => {
+    expect(hasBankBlock('# Notes\n\n<!-- cerebro:begin -->\n- one\n<!-- cerebro:end -->\n', 'cerebro')).toBe(true);
+    expect(hasBankBlock('<!-- cerebro:brandsolidate:begin -->\n', 'brandsolidate')).toBe(true);
   });
 
-  it('refuses output that is not JSON, in its own words', () => {
-    expect(() => parseBanksStatus('warning: something\n{', true, true)).toThrow(/not JSON/);
+  it('does not mistake one bank`s block for another`s', () => {
+    expect(hasBankBlock('<!-- cerebro:brandsolidate:begin -->\n', 'cortex')).toBe(false);
+    expect(hasBankBlock('# Nothing here\n', 'cerebro')).toBe(false);
   });
 });
 
@@ -206,94 +267,6 @@ describe('parseRegistry', () => {
   });
 });
 
-const LIST_FIXTURE = JSON.stringify([
-  {
-    name: 'deploy-approval-flow',
-    description: 'When deploying to production',
-    metadata: { type: 'project', added: '2026-08-14', author: 'demo@example.com' },
-    body: 'Deploys need approval in #deploys first.',
-    file: 'memories/deploy-approval-flow.md',
-    org: null,
-    project: null,
-    tree: 'memories',
-    readonly: false,
-    errors: [],
-    warnings: [],
-  },
-  // A mirror-tree memory: grouped under org/project and read-only.
-  {
-    name: 'unraid-server',
-    description: 'The Unraid box and how to reach it',
-    metadata: { type: 'reference' },
-    body: 'Tailscale IP, GraphQL API, key in the vault.',
-    file: 'memory/claude/unraid-server.md',
-    org: 'personal',
-    project: 'claude',
-    tree: 'memory',
-    readonly: true,
-    errors: [],
-    warnings: [],
-  },
-  // A file the bank could not parse: name-less, carried for the error count.
-  { file: 'memories/broken.md', errors: ['no frontmatter'] },
-]);
-
-describe('parseMemories', () => {
-  it('maps parseable entries and drops the name-less', () => {
-    const memories = parseMemories(LIST_FIXTURE);
-    expect(memories).toHaveLength(2);
-    expect(memories[0]).toEqual({
-      name: 'deploy-approval-flow',
-      type: 'project',
-      description: 'When deploying to production',
-      body: 'Deploys need approval in #deploys first.',
-      added: '2026-08-14',
-      author: 'demo@example.com',
-      org: null,
-      project: null,
-      readonly: false,
-      file: 'memories/deploy-approval-flow.md',
-    });
-    expect(memories[1]).toMatchObject({
-      name: 'unraid-server',
-      org: 'personal',
-      project: 'claude',
-      readonly: true,
-      file: 'memory/claude/unraid-server.md',
-      added: null,
-      author: null,
-    });
-  });
-
-  it('refuses a non-array, in its own words', () => {
-    expect(() => parseMemories('{}')).toThrow(/not an array/);
-  });
-});
-
-describe('parseDoctor', () => {
-  it('rebuilds checks and drops unknown states', () => {
-    const preflight = parseDoctor(
-      JSON.stringify({
-        ready: false,
-        checks: [
-          { id: 'git', label: 'git', state: 'ok', detail: 'git version 2.55.0', remedy: null },
-          { id: 'weird', label: 'Future', state: 'exploded', detail: 'x', remedy: null },
-          {
-            id: 'git-identity',
-            label: 'git identity',
-            state: 'fail',
-            detail: 'unset',
-            remedy: 'git config --global …',
-          },
-        ],
-      }),
-    );
-    expect(preflight.ready).toBe(false);
-    expect(preflight.checks.map((check) => check.id)).toEqual(['git', 'git-identity']);
-    expect(preflight.checks[1]?.remedy).toBe('git config --global …');
-  });
-});
-
 describe('the master switch', () => {
   it('reads as off until configured, and off when the file is absent', () => {
     configureMemoryBanks(mkdtempSync(join(tmpdir(), 'artemis-banks-')));
@@ -330,18 +303,200 @@ describe('the master switch', () => {
  * itself Python actually one.
  */
 describe('needsPythonInterpreter', () => {
-  it('is true for the shipped CLI on Windows and false everywhere else', () => {
-    expect(needsPythonInterpreter('C:/App/resources/cerebro', 'win32')).toBe(true);
-    expect(needsPythonInterpreter('/Applications/Artemis.app/resources/cerebro', 'darwin')).toBe(false);
-    expect(needsPythonInterpreter('/usr/share/artemis/cerebro', 'linux')).toBe(false);
+  it('is true for a bank`s embedded script on Windows and false everywhere else', () => {
+    expect(needsPythonInterpreter('C:/banks/team/bin/cerebro', 'win32')).toBe(true);
+    expect(needsPythonInterpreter('/Users/me/Documents/cortex/bin/cerebro', 'darwin')).toBe(false);
+    expect(needsPythonInterpreter('/home/me/cortex/bin/cerebro', 'linux')).toBe(false);
   });
 
   it('leaves a real executable alone, so a bank may embed one', () => {
-    // Resolution also finds a bank's *own* copy of the CLI, and a bank is free
-    // to ship something Windows can start by itself.
+    // The only CLI that is ever resolved is a bank's *own* copy, and a bank is
+    // free to ship something Windows can start by itself.
     expect(needsPythonInterpreter('C:/banks/team/bin/cerebro.exe', 'win32')).toBe(false);
     expect(needsPythonInterpreter('C:/banks/team/bin/cerebro.cmd', 'win32')).toBe(false);
     expect(needsPythonInterpreter('C:/banks/team/bin/cerebro.BAT', 'win32')).toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Which CLI, if any — and what depends on the answer                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A bank on disk, optionally carrying its own `bin/cerebro`.
+ *
+ * The CLI is written as a plain file rather than a runnable one: nothing here
+ * spawns it. What is under test is *resolution* — which is a question about
+ * whether the file is there, and about the fallbacks that no longer exist.
+ */
+function writeBank(embedsCli: boolean): string {
+  const root = mkdtempSync(join(tmpdir(), 'artemis-cli-bank-'));
+  mkdirSync(join(root, 'memories'), { recursive: true });
+  if (embedsCli) {
+    mkdirSync(join(root, 'bin'), { recursive: true });
+    writeFileSync(join(root, 'bin', 'cerebro'), '#!/usr/bin/env python3\n', 'utf8');
+  }
+  return root;
+}
+
+/**
+ * A data directory whose registry lists these banks — and a scratch
+ * `XDG_CONFIG_HOME`, so the CLI's real registry on the developing machine is
+ * neither read into the answer nor written to.
+ */
+function machineWithBanks(banks: readonly { slug: string; path: string }[]): string {
+  const dataDir = mkdtempSync(join(tmpdir(), 'artemis-cli-data-'));
+  process.env['XDG_CONFIG_HOME'] = join(dataDir, 'xdg');
+  writeFileSync(
+    join(dataDir, REGISTRY_V2_FILE),
+    JSON.stringify({
+      version: 2,
+      banks: banks.map((bank) => ({
+        ...bank,
+        role: 'readwrite',
+        enabled: true,
+        profiles: { kind: 'all' },
+      })),
+      default: banks[0]?.slug ?? null,
+    }),
+  );
+  return dataDir;
+}
+
+/**
+ * Resolution, after the vendored copy left the build.
+ *
+ * The rule is now one sentence — a bank is driven by its own `bin/cerebro` or
+ * by nothing — and the tests that matter are the ones about what was *removed*:
+ * there is no copy shipped beside the app, no borrowing the default bank's,
+ * and no legacy root to fall back through. A machine whose banks carry none has
+ * no CLI at all, and that is an ordinary state rather than a fault.
+ */
+describe('the CLI a bank is driven with', () => {
+  afterEach(() => {
+    delete process.env['XDG_CONFIG_HOME'];
+    delete process.env['ARTEMIS_VENDORED_CEREBRO'];
+  });
+
+  it('reports the bank that embeds one, per bank', async () => {
+    const withCli = writeBank(true);
+    const without = writeBank(false);
+    configureMemoryBanks(
+      machineWithBanks([
+        { slug: 'cortex', path: withCli },
+        { slug: 'notes', path: without },
+      ]),
+    );
+
+    const status = await readMemoryBanksStatus();
+    expect(status.banks.map((bank) => [bank.slug, bank.embedsCli])).toEqual([
+      ['cortex', true],
+      ['notes', false],
+    ]);
+    // The machine-wide answer is "any of them", and it is about one thing only:
+    // whether stock Claude Code can be wired to anything here.
+    expect(status.cliAvailable).toBe(true);
+  });
+
+  it('does not borrow another bank`s copy for a bank that has none', async () => {
+    // The removed fallback. `cortex` is the default bank and carries a CLI;
+    // `notes` still answers `false`, because its block is namespaced by its own
+    // slug and another repository's script is not a substitute.
+    configureMemoryBanks(
+      machineWithBanks([
+        { slug: 'cortex', path: writeBank(true) },
+        { slug: 'notes', path: writeBank(false) },
+      ]),
+    );
+    const status = await readMemoryBanksStatus();
+    expect(status.banks.find((bank) => bank.slug === 'notes')?.embedsCli).toBe(false);
+  });
+
+  it('has no vendored copy to fall back to, however it is pointed at one', async () => {
+    // Artemis used to ship a CLI and let `ARTEMIS_VENDORED_CEREBRO` move it.
+    // Neither exists: a machine whose banks embed none has no CLI, full stop.
+    process.env['ARTEMIS_VENDORED_CEREBRO'] = join(tmpdir(), 'anything');
+    configureMemoryBanks(machineWithBanks([{ slug: 'notes', path: writeBank(false) }]));
+
+    const status = await readMemoryBanksStatus();
+    expect(status.cliAvailable).toBe(false);
+    expect(status.banks[0]?.embedsCli).toBe(false);
+  });
+});
+
+/**
+ * The preflight's `cli` row, which stopped being about Artemis.
+ *
+ * It used to mean "can this machine drive a bank at all", and a `warn` there
+ * read as a degraded install. Everything Artemis does with a bank is core's
+ * now, so the row answers a narrower question — can anything here be wired
+ * into stock Claude Code — and says so in the words a person needs to not go
+ * looking for a fault.
+ */
+describe('readMemoryBanksPreflight: the cli check', () => {
+  afterEach(() => {
+    delete process.env['XDG_CONFIG_HOME'];
+  });
+
+  const cliCheck = async (): Promise<MemoryBankCheck> => {
+    const check = (await readMemoryBanksPreflight()).checks.find((entry) => entry.id === 'cli');
+    if (check === undefined) throw new Error('the preflight no longer reports a cli check');
+    return check;
+  };
+
+  it('is ok when a registered bank embeds one', async () => {
+    configureMemoryBanks(machineWithBanks([{ slug: 'cortex', path: writeBank(true) }]));
+    expect((await cliCheck()).state).toBe('ok');
+  });
+
+  it('warns — and says everything else works — when none does', async () => {
+    configureMemoryBanks(machineWithBanks([{ slug: 'notes', path: writeBank(false) }]));
+    const check = await cliCheck();
+    expect(check.state).toBe('warn');
+    expect(check.detail).toBe(
+      'no bank embeds the cerebro CLI; stock Claude Code wiring is unavailable, everything else works',
+    );
+  });
+
+  it('never fails on it, so a machine with no CLI is still ready', async () => {
+    // The whole point of the demotion: the row is about the other harness, and
+    // `ready` is about whether this one can carry a bank.
+    configureMemoryBanks(machineWithBanks([{ slug: 'notes', path: writeBank(false) }]));
+    const preflight = await readMemoryBanksPreflight();
+    expect(preflight.checks.find((check) => check.id === 'cli')?.state).not.toBe('fail');
+  });
+});
+
+/**
+ * Wiring, refused.
+ *
+ * The success path spawns a Python script inside a git checkout and is not
+ * something a unit test should arrange. What is worth pinning is the refusal,
+ * because it is the one the removal of the vendored copy created: a bank with
+ * no `bin/cerebro` cannot be wired by anything, and the sentence has to name
+ * the bank and say that Artemis is unaffected — otherwise it reads as Artemis
+ * being broken.
+ */
+describe('wireMemoryBankClaudeCode', () => {
+  afterEach(() => {
+    delete process.env['XDG_CONFIG_HOME'];
+  });
+
+  it('refuses a bank that embeds no CLI, by name', async () => {
+    configureMemoryBanks(machineWithBanks([{ slug: 'notes', path: writeBank(false) }]));
+    await expect(wireMemoryBankClaudeCode({ slug: 'notes', enabled: true })).rejects.toThrow(
+      /'notes' embeds no cerebro CLI/,
+    );
+    await expect(wireMemoryBankClaudeCode({ slug: 'notes', enabled: false })).rejects.toThrow(
+      /Artemis’s own runs are unaffected/,
+    );
+  });
+
+  it('refuses a slug this machine does not have', async () => {
+    configureMemoryBanks(machineWithBanks([{ slug: 'notes', path: writeBank(false) }]));
+    await expect(wireMemoryBankClaudeCode({ slug: 'gone', enabled: true })).rejects.toThrow(
+      /No memory bank called 'gone'/,
+    );
   });
 });
 
@@ -580,5 +735,157 @@ describe('parseGitOrigin', () => {
   it('is null for a repository with no origin, and for anything unreadable', () => {
     expect(parseGitOrigin('[core]\n\tbare = false\n')).toBeNull();
     expect(parseGitOrigin('')).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* What a landing authenticates with                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The credential core asks this process for when it lands a memory.
+ *
+ * Core opens the pull request and merges it over the forge's API, and holds no
+ * credential of its own: it names a *forge* and this module answers with what
+ * Artemis holds for that host, or with `null` so core can fall back to
+ * `git credential fill`. Three answers matter and they are the three below —
+ * the bank on that host, a bank somewhere else, and a bank whose token lives
+ * in a key manager that will not give it up.
+ */
+describe('forgeCredentialFor', () => {
+  /** A bank checkout with nothing in it but an origin. */
+  function bankWithOrigin(remote: string): string {
+    const root = mkdtempSync(join(tmpdir(), 'artemis-forge-bank-'));
+    mkdirSync(join(root, 'memories'), { recursive: true });
+    mkdirSync(join(root, '.git'), { recursive: true });
+    writeFileSync(join(root, '.git', 'config'), `[remote "origin"]\n\turl = ${remote}\n`, 'utf8');
+    return root;
+  }
+
+  /**
+   * A data directory whose registry lists one bank — and a scratch
+   * `XDG_CONFIG_HOME`, so the CLI's real registry on the developing machine is
+   * neither read into the answer nor written to.
+   */
+  function machineWith(slug: string, bankPath: string): string {
+    const dataDir = mkdtempSync(join(tmpdir(), 'artemis-forge-data-'));
+    process.env['XDG_CONFIG_HOME'] = join(dataDir, 'xdg');
+    writeFileSync(
+      join(dataDir, REGISTRY_V2_FILE),
+      JSON.stringify({
+        version: 2,
+        banks: [{ slug, path: bankPath, role: 'readwrite', enabled: true, profiles: { kind: 'all' } }],
+        default: slug,
+      }),
+    );
+    return dataDir;
+  }
+
+  const forgeFor = (remote: string): Forge => {
+    const forge = detectForge(remote);
+    if (forge === null) throw new Error(`not a forge: ${remote}`);
+    return forge;
+  };
+
+  const REF: SecretRef = {
+    provider: 'openbao',
+    connectionId: 'conn-1',
+    mount: 'kv',
+    path: 'banks/cortex',
+    key: 'git_token',
+  };
+
+  afterEach(() => {
+    delete process.env['XDG_CONFIG_HOME'];
+  });
+
+  it('answers with the token held for a bank whose origin is on that host', async () => {
+    const bank = bankWithOrigin('https://forge.example/team/cortex.git');
+    const secrets = new EphemeralMemoryBankSecrets();
+    await secrets.write('cortex', { kind: 'token', token: 'forge-token', username: 'david' });
+    configureMemoryBanks(machineWith('cortex', bank), secrets);
+
+    expect(await forgeCredentialFor(forgeFor('https://forge.example/team/cortex.git'))).toEqual({
+      username: 'david',
+      token: 'forge-token',
+    });
+    // The *host* is what is matched, not the repository: a second bank on the
+    // same Forgejo lands with the first one's token rather than needing its own.
+    expect(await forgeCredentialFor(forgeFor('https://forge.example/other/notes.git'))).toEqual({
+      username: 'david',
+      token: 'forge-token',
+    });
+  });
+
+  it('answers null for a forge no bank on this machine is on', async () => {
+    const bank = bankWithOrigin('https://forge.example/team/cortex.git');
+    const secrets = new EphemeralMemoryBankSecrets();
+    await secrets.write('cortex', { kind: 'token', token: 'forge-token', username: 'david' });
+    configureMemoryBanks(machineWith('cortex', bank), secrets);
+
+    // `null` rather than the token: core falls back to `git credential fill`,
+    // and a token for one host must never be presented to another.
+    expect(await forgeCredentialFor(forgeFor('https://github.com/team/cortex.git'))).toBeNull();
+  });
+
+  it('answers null when the bank’s reference cannot be resolved, and records why', async () => {
+    const bank = bankWithOrigin('https://forge.example/team/cortex.git');
+    const secrets = new EphemeralMemoryBankSecrets();
+    await secrets.write('cortex', { kind: 'ref', ref: REF, username: 'david' });
+    const dataDir = machineWith('cortex', bank);
+    configureMemoryBanks(dataDir, secrets, () => Promise.reject(new Error('vault is sealed')));
+
+    expect(await forgeCredentialFor(forgeFor('https://forge.example/team/cortex.git'))).toBeNull();
+
+    // And the sentence survives, for the pane — the three ways a key manager
+    // refuses look identical from the outside otherwise.
+    const status = await readMemoryBanksStatus();
+    expect(status.banks[0]?.credential).toMatchObject({ kind: 'ref', problem: 'vault is sealed' });
+  });
+});
+
+describe('syncDue: the per-directory throttle', () => {
+  const MINUTE = 60_000;
+
+  it('lets the first sync through, and the same directory again after a minute', () => {
+    expect(syncDue({ lastSyncAt: 0 }, '/w/app', 1)).toBe(true);
+    expect(syncDue({ lastSyncAt: 1000, lastSyncCwd: '/w/app' }, '/w/app', 1000 + MINUTE)).toBe(true);
+  });
+
+  it('skips a burst of runs in the directory it just synced', () => {
+    expect(syncDue({ lastSyncAt: 1000, lastSyncCwd: '/w/app' }, '/w/app', 1000 + MINUTE / 2)).toBe(false);
+    // A caller that names no directory is the old behaviour: throttled by time alone.
+    expect(syncDue({ lastSyncAt: 1000, lastSyncCwd: '/w/app' }, undefined, 1000 + MINUTE / 2)).toBe(false);
+  });
+
+  it('goes through for a directory the last sync did not know about', () => {
+    /*
+     * The case the time-only throttle swallowed: a second project opened
+     * within a minute of the first started without its bank installed, and
+     * stayed that way until a bank commit happened to trigger the
+     * every-project install.
+     */
+    expect(syncDue({ lastSyncAt: 1000, lastSyncCwd: '/w/app' }, '/w/other', 1000 + 5)).toBe(true);
+    expect(syncDue({ lastSyncAt: 1000 }, '/w/app', 1000 + 5)).toBe(true);
+  });
+});
+
+describe('pullDue: the per-bank network throttle', () => {
+  const MINUTE = 60_000;
+
+  it('lets a bank that has never pulled through', () => {
+    expect(pullDue(undefined, 0)).toBe(true);
+  });
+
+  it('holds a bank that pulled within the last quarter of an hour', () => {
+    expect(pullDue(1000, 1000 + 5 * MINUTE)).toBe(false);
+    expect(pullDue(1000, 1000 + 14 * MINUTE)).toBe(false);
+  });
+
+  it('lets it through again at fifteen minutes', () => {
+    // The install half still runs on every pass; this throttle is only about
+    // asking the forge, which a bank people commit to a few times a day does
+    // not benefit from being asked more often than this.
+    expect(pullDue(1000, 1000 + 15 * MINUTE)).toBe(true);
   });
 });

@@ -56,6 +56,7 @@ import type {
   RunId,
   RunInput,
   SessionId,
+  ToolServerConfig,
   Unsubscribe,
 } from '@rx-artemis/protocol';
 import { isFileAttachment, isImageAttachment } from '@rx-artemis/protocol';
@@ -120,6 +121,15 @@ export interface RunResolution {
    * on. Absolute paths, so they are resolved here and never sent by a renderer.
    */
   readonly plugins?: readonly LocalPlugin[];
+  /**
+   * Tool servers this run may reach, read from the profile.
+   *
+   * Resolved here for the same reason `plugins` is: an entry can name a command
+   * to spawn, and a renderer that could send one could have any binary on the
+   * machine started under the agent's environment. What crosses the IPC
+   * boundary is the profile id; what comes back is what that profile recorded.
+   */
+  readonly toolServers?: readonly ToolServerConfig[];
   /** Cancels the run from the outside — window close, app shutdown. */
   readonly abortSignal?: AbortSignal;
 }
@@ -168,7 +178,22 @@ function snapshot(entry: RunEntry): RunHandle {
   // Same read-time stamping as `lastSeq`, for the same reason: the count moves
   // per send while the stored handle is replaced only on transitions. See
   // `RunHandle.promptCount` on what an adopting window does with it.
-  return entry.prompts > 0 ? { ...stamped, promptCount: entry.prompts } : stamped;
+  const counted = entry.prompts > 0 ? { ...stamped, promptCount: entry.prompts } : stamped;
+  /*
+   * The seam, when the run learned it after it started.
+   *
+   * `start` records the one it measured. A run that could only be told later —
+   * a turn the provider opened by itself and counted once it announced itself,
+   * a served run told by its server — carries the number on the `Run`, and no
+   * transition rebuilds the stored handle for it. Read here so everyone who
+   * asks after the fact gets it: the window re-attaching after a reload, the
+   * client joining a served continuation. Never over one the registry took
+   * itself, which was measured at the one instant it was exact.
+   */
+  const seam = entry.run.historyOffset;
+  return counted.historyOffset === undefined && seam !== undefined
+    ? { ...counted, historyOffset: seam }
+    : counted;
 }
 
 /** Receives every event of the runs it is subscribed to. */
@@ -632,7 +657,14 @@ export class RunRegistry {
        * reload; a run must never fail to start because history could not be
        * measured.
        */
-      if (input.resumeSessionId !== undefined && adapter.countSessionMessages !== undefined) {
+      // Not for a run joining a turn in progress: the count now would include
+      // that turn's own messages, and the seam it wants is the one the serving
+      // side measured when the turn began — see `Run.historyOffset`.
+      if (
+        input.resumeSessionId !== undefined &&
+        input.attachToLive !== true &&
+        adapter.countSessionMessages !== undefined
+      ) {
         try {
           historyOffset = await adapter.countSessionMessages({
             sessionId: input.resumeSessionId,
@@ -646,6 +678,7 @@ export class RunRegistry {
 
       const resolved: ResolvedRunInput = { ...input, ...resolution, runId };
       run = await adapter.createRun(resolved);
+      if (run.historyOffset !== undefined) historyOffset = run.historyOffset;
     } catch (error) {
       throw asRunError(error, 'transport', `Could not start a ${input.providerId} run`);
     } finally {
@@ -695,12 +728,15 @@ export class RunRegistry {
    * — capabilities, the conversation, whose account and which directory — is
    * already fixed on the run or the process that opened it.
    *
-   * No `historyOffset`. The seam it measures is "how much of the session file
-   * predates this run", and there is no honest answer here: by the time a turn
-   * announces itself the provider has already written part of it. Absent means
-   * "this cannot be counted", which is a case the renderer already handles by
-   * showing no earlier history rather than a duplicated turn — and the pane this
-   * lands in is normally the one that has the conversation on screen already.
+   * No `historyOffset` at adoption. The seam it measures is "how much of the
+   * session file predates this run", and the registry cannot take it here: by
+   * the time a turn announces itself the provider has already filed the message
+   * that opened it. An adapter that can tell where its own output begins counts
+   * the seam itself once the turn is open and reports it on the run, and
+   * {@link snapshot} carries it from there. Until it does, absent means "this
+   * cannot be counted": a renderer that already has the conversation on screen
+   * keeps it, and one rebuilding from nothing shows the turn alone rather than
+   * a conversation twice.
    *
    * @throws {RunError} `cancelled` when the registry is shutting down.
    * @throws {RunError} `invalid_request` when the run id is already known.
@@ -1428,6 +1464,20 @@ function assertRunnable(input: RunInput, adapter: ProviderAdapter): void {
   }
   if (input.rewindToMessageId !== undefined && input.resumeSessionId !== undefined && !caps.rewind) {
     throw new RunError('invalid_request', `Provider "${adapter.id}" cannot rewind sessions`);
+  }
+  if (input.attachToLive === true) {
+    if (input.resumeSessionId === undefined) {
+      throw new RunError(
+        'invalid_request',
+        'Attaching to a run already going needs the session it is serving (resumeSessionId)',
+      );
+    }
+    if (caps.attachLive !== true) {
+      throw new RunError(
+        'invalid_request',
+        `Provider "${adapter.id}" cannot attach to a run already going`,
+      );
+    }
   }
   // Refused rather than dropped, like every other unsupported setting here.
   // The composer will not let a user attach to a provider that cannot take

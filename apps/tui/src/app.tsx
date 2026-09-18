@@ -4,7 +4,7 @@
  * ```
  * ┌ header ── logo · tagline ─────────────────────────── directory ────┐
  * │ conversations│ transcript viewport (bottom-anchored, scrolls)       │
- * │  ▾ folder    │                                                     │
+ * │  ▾ folder    │ ⠹ Explore  auth call sites    1m 12s · Grep · 24k   │
  * │    session   │ permission card / picker / agent view, when open    │
  * │  ▸ folder    │ ╭ composer ─────────────────────────────────────╮   │
  * │              │ ╰────────────────────────────────────────────────╯   │
@@ -14,11 +14,60 @@
  * ```
  *
  * Who has the keys is decided in exactly one place, here. A modal or a
- * permission card, when open, has them; otherwise focus is either the
- * composer or the sidebar (Tab toggles). Every child takes an `isActive` prop
- * and touches nothing when it is false, so two components never answer the
- * same keystroke. Esc, Ctrl+C and the scrolling arrows are handled globally
- * only when no modal owns them.
+ * permission card, when open, has them; otherwise focus is the composer, the
+ * sidebar, the delegated strip or the conversation itself, and Tab walks the
+ * ring — `nextFocus` in `keymap.ts`, which skips the two stops that come and
+ * go: the rail is dropped on a narrow terminal and the strip exists only while
+ * something is running. Every child takes an `isActive` prop and touches
+ * nothing when it is false, so two components never answer the same keystroke.
+ * Esc, Ctrl+C and the scrolling arrows are handled globally only when no modal
+ * owns them.
+ *
+ * The conversation is the newest stop and the only one whose keys are *per
+ * row*. A cursor walks the rows the viewport is drawing — the ids come back
+ * from the viewport, because only it knows which rows exist and in what order
+ * — and each row says for itself what it answers to: `rowVerbs.ts` offers `o`,
+ * `r`, `y`, `d`, `Enter` and `x` exactly when it can also produce what each of
+ * them acts on, and the line under the composer prints the same list. So the
+ * hint and the handler are one decision, and a key cannot go on being
+ * advertised on a row that stopped offering it.
+ *
+ * The rail can be typed at, which moves three of its keys. A printable
+ * character with the focus in the rail is a query, so `a`, `d` and `p` — the
+ * archive, delete and pin they used to be — become letters somebody is
+ * spelling a title with, and the actions move to Ctrl+A, Ctrl+D and Ctrl+P for
+ * as long as a query is on screen. That is the only place in this file where
+ * one key means two things depending on state, and it is why the rail's own
+ * legend has two forms: the rule is unlearnable unless the screen says it.
+ *
+ * Two keys are *shared* with the composer rather than taken from it, because
+ * Ink has no stop-propagation and both handlers see every press: Esc, which
+ * the composer's reverse search owns while it is open, and Tab, which the slash
+ * menu, the `@` popup, the `;;` popup and the holes a snippet left behind own
+ * whenever one of them is there. Both are asked about — `isCapturing()`,
+ * `hasPopup()` — rather than guessed at, and the Tab question is asked before
+ * the Shift branch so that Shift+Tab stands down too: it walks a template's
+ * slots backwards, and stepping the permission mode instead would be a key with
+ * two owners in the one state that has a use for it. `?` runs the other way:
+ * the composer answers it at an empty box, and this file only supplies what it
+ * opens, because a `?` acted on here would have been typed into the box on the
+ * same keystroke.
+ *
+ * Shift+Tab steps the permission mode on through the provider's own list —
+ * the one `/mode` draws, in its order — and steps over bypass until bypass
+ * has been agreed to once. Ctrl+O replaces the layout entirely with the
+ * pager, the one view in which nothing is folded. Esc twice at an empty box
+ * opens the prompts already sent and goes back to one of them, which is the
+ * only move in here that takes rows off the screen.
+ *
+ * Three of the composer's keys need something only this file has, so they
+ * arrive as props and the composer stays a box of text. Ctrl+G hands the whole
+ * terminal to `$EDITOR` and takes it back, which is Ink's instance and nobody
+ * else's — see `editExternally`. `!` turns the box into a shell prompt and its
+ * lines are run by `shell.ts`, landing either as a command row in the
+ * transcript or, for `!!`, as a message the agent is asked about. Ctrl+V's
+ * images come back through `onSubmit`'s third argument and become attachments
+ * beside the `@paths`.
  *
  * Slash commands are parsed before anything is sent. The switchers and
  * viewers are pickers over data the host already knows how to fetch:
@@ -29,20 +78,118 @@
  *    end a conversation, confirmed first.
  *  - `/model`   — the account's own model list, then an effort picker if the
  *    model has levels, then a speed picker if it offers fast mode or ultracode.
+ *    Each row carries what this account's plan says about that model — refused,
+ *    under pressure, or nothing at all — which is `modelFacts.ts`'s join and
+ *    not a second opinion about any of it. A refused row keeps its place with
+ *    the reason in words and cannot be chosen; the only row with no facts is
+ *    `Provider default`, because no model has been named on it.
  *  - `/mode`    — the provider's permission modes, no more. Bypass is red and
  *    asks twice.
  *  - `/resume`  — the account's stored conversations in this directory. The
  *    sidebar shows every project's, worktrees folded into their repository as
  *    the desktop does, and opens one on Enter — moving the working directory
  *    to wherever it ran.
- *  - `/tasks`   — background work as the provider last listed it. A delegated
- *    agent's row opens what it did; a live row offers to stop it.
+ *  - `/tasks`   — background work as the provider last listed it, settled rows
+ *    included. A delegated agent's row opens what it did; a live row offers to
+ *    stop it. What is *running* needs no command: the strip over the composer
+ *    draws it while it runs and disappears when the last of it settles — and
+ *    Tab reaches it, so Enter opens an agent and `x` stops a task without the
+ *    command and the modal it puts over the conversation.
  *  - `/usage`   — every plan window, fetched now; the line under the composer
  *    keeps the 5-hour, the week and Fable's bucket, as the desktop's rings do.
  *  - `/attach`  — a path, read now, sent with the next message.
  *
  * The settings a picker changes are the *next* turn's; the line under the
  * composer shows what the provider actually reported for the current one.
+ *
+ * The rest of the commands are about what came out of the conversation and
+ * what went into the files. Their thinking is in `exportTranscript.ts`,
+ * `clipboard.ts` and `changes.ts`; what is here is the wiring and the words:
+ *
+ *  - `/copy`    — the last reply, or one of its fenced blocks, as source.
+ *    "Copied" and "sent to the terminal" are different promises and the flash
+ *    keeps them apart: over SSH the bytes go to the emulator by OSC 52, which
+ *    no terminal acknowledges.
+ *  - `/export`  — the whole conversation as markdown, written through a temp
+ *    file and a rename so a half-written export cannot be opened and believed.
+ *    Its title is the conversation's own name, which only the rail knows.
+ *  - `/diff`    — two questions, one list. `git` answers what is different
+ *    from the last commit, whoever changed it; the ledger answers what *this
+ *    conversation* did, which is the one that can be answered in a directory
+ *    that is not a repository. Either opens into `TextView`, and git's answer
+ *    goes through the person's own diff tool first when they have one — as a
+ *    filter, never as a pager, which is the distinction `externalTools.ts` is
+ *    built around.
+ *  - `/undo`    — the last file change, taken back, and refused rather than
+ *    guessed at whenever the file has moved since.
+ *  - `/pin`     — held at the top of its folder, remembered in the
+ *    preferences against the session id, which is what a conversation *is*.
+ *  - `/title`   — a name, written into the provider's own store through the
+ *    same door the automatic namer uses. A provider without that field says so.
+ *
+ * Two more read the conversation back rather than change it. `/timeline` is
+ * every turn as one line — when, what was asked, how long, what it cost, which
+ * files it touched — and Enter on a row opens the pager at that turn, which is
+ * the way back into an afternoon's work that scrolling is not. `timeline.ts`
+ * is the reduction; what is here is the list and where Enter lands.
+ *
+ * `/snip` is the one command about what has not been said yet. `snippets.ts`
+ * owns the file, the template language and the arithmetic of an expansion, and
+ * the composer owns the `;;` trigger and the slots Tab walks; what is here is
+ * the four things a command can do that a trigger cannot — the list, for the
+ * snippet somebody wrote in March and cannot name, and `save`, `rm` and
+ * `--examples`. The expansion itself goes through the composer's handle either
+ * way, because what comes back from one is a buffer, a cursor and a list of
+ * holes, and only the box has anywhere to put the last two.
+ *
+ * One more key belongs to neither the conversation nor the pool but to the
+ * *account*. When the provider stops serving this one — a window rejected, or
+ * near enough to it that the next turn may not finish — the left half of the
+ * status line turns yellow and becomes an offer, and Alt+H or `/handoff` opens
+ * it: the accounts that could take this conversation, each with its live plan
+ * readings, the ones that could not with the sentence saying why, and a row
+ * that stays put. Nothing moves until a row is chosen; there is no countdown
+ * and no setting that would make one. That is ADR 0003, and the reasoning is
+ * in `failover.ts` along with everything that decides which window counts as
+ * spent and which account counts as able. An account sharing the provider's
+ * session store opens this very conversation; one that cannot read it is
+ * offered a new conversation with a hand-over already in the composer.
+ *
+ * What somebody is part-way through typing follows the conversation it was
+ * typed in, rather than the screen. Switching parks the draft against the
+ * conversation being left and puts the target's back in the box; a conversation
+ * the provider has filed keeps it between launches, in `preferences.ts`, which
+ * is where the things that are the user's own live.
+ *
+ * Last, the window itself. The title, the taskbar light and the bell are the
+ * only channel to somebody who has tabbed away — and with several
+ * conversations parked and working, that is most of the time. `terminal.ts`
+ * owns the bytes, `attention.ts` the reduction, and the effects under "The
+ * window, from outside" the policy.
+ *
+ * Which terminal this actually is gets asked once more, at the viewport: a
+ * picture somebody attached is drawn where the terminal can draw one and is a
+ * chip with its size everywhere else. `render/images.ts` answers that from the
+ * environment and never by asking the terminal, so it is a constant for the
+ * session, and it is read here because this is the file that knows what Artemis
+ * was started in — the viewport only hands it down.
+ *
+ * Two of those channels point inwards rather than out, and they are under
+ * "Who needs you, and what you missed". Ctrl+] goes to the next conversation
+ * with a claim on you — stuck on a permission first, then finished since you
+ * last had it on screen — and the status line carries the same count, because
+ * a rail glyph only works on somebody who thought to look. And a keystroke
+ * that ends three minutes of stillness is a return rather than a press, so it
+ * brings one longer-lived flash with it saying what changed while nobody was
+ * here. Both are `pool.ts` and `attention.ts` deciding; this file times them.
+ *
+ * The tour is the right answer for one conversation and the wrong one for
+ * four: each press replaces the screen with a transcript nobody came to read.
+ * So when more than one is stuck on a permission the same key opens the card
+ * of asks instead — every one of them on a line, `y` and `n` answerable where
+ * they are parked, Enter to go to the one worth reading. `/asks` opens it for
+ * a single one as well, which is the difference between a key you press
+ * because you are lost and a command you type because you want the list.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
@@ -63,36 +210,90 @@ import {
   type SessionId,
   type SessionSummary,
 } from '@rx-artemis/protocol';
-import { formatDuration, formatRelative, formatUntil, oneLine } from '@rx-artemis/transcript';
+import { formatDuration, formatRelative, formatUntil, isGroupId, oneLine, type TranscriptItem } from '@rx-artemis/transcript';
 import { isArchived } from '@rx-artemis/protocol';
 
 import { browseRowLabel, browseRows, browseStart, recentDirectories, shortenPath } from './directories.js';
-import { prunePool, railActivityFor } from './pool.js';
+import { needsYou, prunePool, railActivityFor, type Needing } from './pool.js';
 
-import { readAttachment } from './attachments.js';
+import { AfterEdit, AFTER_EDIT_TIMEOUT_MS, type AfterEditResult } from './afterEdit.js';
+import { attachmentFromBytes, readAttachment } from './attachments.js';
+import { awayRecap, noticeFor, titleStateOf, type RecapSubject, type RunEnded } from './attention.js';
 import { CATALOGUE_KEY, commandsKey, modelsKey, usageKey } from './cache.js';
+import { fileLines, gitDiff, type ChangedFile } from './changes.js';
 import { checkForUpdate, currentVersion, installRoot } from './update.js';
-import { COMMANDS, parseCommand, type Command } from './commands.js';
+import { copyText } from './clipboard.js';
+import { parseCommand, type Command } from './commands.js';
 import { Conversation, type ConversationSettings } from './conversation.js';
+import { codeBlocksOf, exportFilename, lastAssistantText, transcriptToMarkdown } from './exportTranscript.js';
+import {
+  bestFailoverCandidate,
+  failoverCandidates,
+  failoverLine,
+  failoverReason,
+  failoverTitle,
+  handoverBrief,
+  type FailoverCandidate,
+} from './failover.js';
+import { editInExternalEditor, splitCommand, type ExternalEditResult } from './externalEditor.js';
+import { externalDiffTool, pipeThrough } from './externalTools.js';
+import { listFiles, type Frecency } from './fileIndex.js';
+import type { HistoryScope } from './history.js';
 import type { Launched } from './launch.js';
+import { modelRowFacts } from './modelFacts.js';
 import type { ModelListing } from './host.js';
+import { renderDiff } from './render/diff.js';
+import { imageProtocol } from './render/images.js';
+import { EXAMPLE_SNIPPETS, toSnippetName } from './snippets.js';
+import {
+  rowCommand,
+  rowDiff,
+  rowTarget,
+  rowVerbHint,
+  rowVerbs,
+  rowYankText,
+  type Row,
+  type RowTarget,
+  type RowVerbKind,
+} from './rowVerbs.js';
+import { runShell } from './shell.js';
+import { suggestionsOf, SUGGESTION_DIGITS, type Suggestion } from './suggestions.js';
+import { timelineLines, timelineSummary, turnsOf } from './timeline.js';
+import { AttentionTimer, notify, progressState, setTitle, titleFor } from './terminal.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
 import { ACCENT } from './theme.js';
-import { Composer } from './components/Composer.js';
+import { nextFocus, stepCursor, type Focus } from './keymap.js';
+import { AsksCard, type Ask } from './components/AsksCard.js';
+import { Composer, type ComposerHandle, type FileIndex, type PastedImage } from './components/Composer.js';
+import { DelegatedStrip, delegatedRows, type DelegatedRow } from './components/Delegated.js';
 import { Header } from './components/Header.js';
+import { Help, helpLines } from './components/Help.js';
+import { Pager } from './components/Pager.js';
 import { PermissionCard } from './components/PermissionCard.js';
-import { Picker, type PickerItem } from './components/Picker.js';
+import { Picker, isTypable, type PickerAction, type PickerItem } from './components/Picker.js';
+import { Prompt } from './components/Prompt.js';
+import { QueuedStrip } from './components/QueuedStrip.js';
+import { SessionPreview } from './components/SessionPreview.js';
 import { Sidebar, railRows, type RailRow } from './components/Sidebar.js';
-import { basename } from 'node:path';
+import { TodoStrip } from './components/TodoStrip.js';
+import { basename, isAbsolute, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
-import { readdir, stat } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { readdir, rename, stat, writeFile } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import { describeWorkspace } from '@rx-artemis/core';
 import { StatusBar } from './components/StatusBar.js';
+import { TextView } from './components/TextView.js';
 import { ReplayRows, TranscriptViewport } from './components/Transcript.js';
 
 export interface AppProps {
   readonly launched: Launched;
+  /**
+   * Which files `@` offers first: what was picked before, and how long ago.
+   * Read and written here, loaded and saved by `main.tsx`, and absent from
+   * `--print`, which completes nothing.
+   */
+  readonly files?: Frecency;
 }
 
 interface PickerModal {
@@ -103,11 +304,49 @@ interface PickerModal {
   readonly hint?: string;
   readonly onSelect: (item: PickerItem) => void;
   /**
+   * What Esc does besides taking the picker down, for a list that changed
+   * something on the way in. Without it Esc simply closes.
+   */
+  readonly onCancel?: () => void;
+  /**
    * Which opening this is. A picker that opened on a cached answer is
    * refreshed in place when the fresh one lands — but only if it is still
    * the picker on screen, which the token is how the refresh can tell.
    */
   readonly token?: number;
+  /*
+   * What a list can do *to* a row without leaving it. All four are the
+   * picker's own keys — see `components/Picker.tsx` — and are carried here
+   * rather than answered here, because a modal is a description of a list and
+   * this file is the one place that knows what archiving a conversation means.
+   * A picker that passes none of them advertises none of them.
+   */
+  /** Let the list be typed at. Costs it `j` and `k`, which become letters. */
+  readonly filterable?: boolean;
+  /** Space. */
+  readonly onPreview?: (item: PickerItem) => void;
+  /** Ctrl+R. */
+  readonly onRename?: (item: PickerItem) => void;
+  /** Ctrl+A, Ctrl+P, and whatever else a caller wants a chord for. */
+  readonly onSecondary?: readonly PickerAction[];
+}
+
+/**
+ * One line, asked for: what Ctrl+R opens over the conversation list.
+ *
+ * A modal rather than the composer, because the composer is holding a message
+ * somebody is part-way through writing and a name is not that message. See
+ * `components/Prompt.tsx`, which is the box; what is here is what the answer
+ * is for.
+ */
+interface PromptModal {
+  readonly kind: 'prompt';
+  readonly title: string;
+  readonly initial: string;
+  /** The line as it was typed, the empty one included. */
+  readonly onSubmit: (text: string) => void;
+  /** Esc. Never carries a value, because nothing was agreed to. */
+  readonly onCancel: () => void;
 }
 
 interface LoadingModal {
@@ -121,11 +360,83 @@ interface ReplayModal {
   readonly events: readonly AgentEvent[];
 }
 
-type Modal = PickerModal | LoadingModal | ReplayModal;
-type Focus = 'composer' | 'sidebar';
+/**
+ * The whole conversation, unfolded.
+ *
+ * It carries almost nothing: the pager reads the same transcript this file is
+ * already holding. Mounted *instead of* the layout rather than inside it,
+ * because it draws the terminal — see `components/Pager.tsx` — and because
+ * everything behind a full-screen reader should be unmounted rather than
+ * merely quiet.
+ */
+interface PagerModal {
+  readonly kind: 'pager';
+  /**
+   * The row to open on, instead of the end: the turn somebody picked out of
+   * `/timeline`. A turn's id *is* a row id — the ledger keys each turn by the
+   * user row it opens at — so nothing is translated on the way through.
+   */
+  readonly initialRowId?: string;
+}
+
+/**
+ * Everyone who is waiting on a permission, in one list.
+ *
+ * No payload at all, and deliberately: the asks are rebuilt from the pool on
+ * every render, so a conversation that answers its own question while the card
+ * is up loses its row on the next frame. A list captured when the key was
+ * pressed would go on offering `y` for a request that had already been
+ * withdrawn. See `components/AsksCard.tsx`.
+ */
+interface AsksModal {
+  readonly kind: 'asks';
+}
+
+/** The key map, drawn over the conversation. `keymap.ts` is what it says. */
+interface HelpModal {
+  readonly kind: 'help';
+}
+
+/**
+ * A wall of text with a way through it: what `/diff` opens into.
+ *
+ * The lines are built once, at the width the pane had when the command ran,
+ * because `renderDiff` cuts to a width and the alternative is re-rendering
+ * every diff on every resize for a view somebody is reading rather than
+ * living in. A resize while it is open therefore truncates rather than
+ * reflows, and closing and reopening is exact again.
+ */
+interface TextModal {
+  readonly kind: 'text';
+  readonly title: string;
+  readonly lines: readonly string[];
+}
+
+type Modal = PickerModal | PromptModal | LoadingModal | ReplayModal | PagerModal | AsksModal | HelpModal | TextModal;
 
 /** The row that leaves the recents list for the filesystem. Not a path, so it cannot be one. */
 const BROWSE_KEY = '\u0000browse';
+
+/**
+ * `/diff`'s first row: git's answer rather than one of the ledger's files.
+ * A leading NUL for the same reason `BROWSE_KEY` has one — the rows beside it
+ * are indices, and this must not be able to collide with one.
+ */
+const WORKING_TREE_KEY = '\u0000working-tree';
+
+/**
+ * The hand-off list's three kinds of row.
+ *
+ * One account can appear twice in it — as "move the conversation there" and,
+ * when it cannot read the transcript, as "start fresh there" — so a row key
+ * cannot simply be the profile id. These prefixes are what tell the two apart
+ * on the way back out. `stay here` takes the leading NUL `BROWSE_KEY` has, for
+ * the same reason: it is not an account and must not be able to collide with
+ * one.
+ */
+const FAILOVER_MOVE = 'move:';
+const FAILOVER_SEED = 'seed:';
+const FAILOVER_STAY_KEY = '\u0000stay';
 
 const MODE_LABEL: Readonly<Record<PermissionMode, string>> = {
   default: 'Ask',
@@ -146,6 +457,14 @@ const MODE_DETAIL: Readonly<Record<PermissionMode, string>> = {
 };
 
 const QUIT_WINDOW_MS = 2_000;
+/**
+ * How long the first Esc waits for the second.
+ *
+ * Long enough for two deliberate presses and short enough that an Esc pressed
+ * to stop something, and another half a second later to make sure, is not read
+ * as a request to go back through the conversation.
+ */
+const ESC_ESC_WINDOW_MS = 600;
 /** A plan-usage read is a CLI call; one a minute is the desktop's own tolerance. */
 const PLAN_USAGE_MIN_INTERVAL_MS = 60_000;
 /** A cached plan reading older than this is not shown while the fresh one is read: the windows will have moved. */
@@ -154,6 +473,23 @@ const USAGE_SEED_MAX_AGE_MS = 24 * 60 * 60_000;
 const MODELS_WARM_MAX_AGE_MS = 24 * 60 * 60_000;
 /** The key legend, for a picker whose hint has something else to say first. */
 const PICKER_KEYS = '↑↓ · Enter · Esc';
+/**
+ * Rows a list keeps while a preview is open beneath it.
+ *
+ * The two share the slot between the transcript and the composer, and what
+ * falls off the bottom of an Ink column is whatever is last in it — which here
+ * is the composer and the line under it. So the list is what gives way: it is
+ * the thing that already scrolls, and the preview is the thing that was just
+ * asked for. Eight rather than the picker's own twelve, which is still most of
+ * a directory's conversations.
+ */
+const PICKER_ROWS_WITH_PREVIEW = 8;
+/**
+ * What the preview and the furniture round it need out of the pane: ten lines
+ * for the box, five for the list's title, query and legend, and six for the
+ * composer, the status line and the strips above them.
+ */
+const PREVIEW_SLOT_ROWS = 21;
 /**
  * Below this many columns the rail is dropped; the pickers cover the same
  * ground. The conversation needs about ninety columns to read as prose, and
@@ -165,13 +501,105 @@ const SIDEBAR_WIDTH = 32;
 const TALL_HEADER_MIN_ROWS = 24;
 /** Lines one arrow press scrolls — a wheel tick arrives as a few of these. */
 const SCROLL_STEP = 2;
+/**
+ * The run a `!` command's transcript row belongs to: none of them.
+ *
+ * `apply` counts sequence numbers per run to notice events dropped in transit.
+ * A row written here has nothing to do with the provider's stream, so it gets a
+ * run of its own and never disturbs that count.
+ */
+const SHELL_RUN_ID = 'local-shell';
+
+/**
+ * The same trick for the commands this file answers itself.
+ *
+ * `/export` and `/undo` leave a row behind — what was written, what was put
+ * back — and neither came off the provider's stream either. A run id apart
+ * from the shell's, because the two are different sources and a `$` row and a
+ * `/` row sharing a numbering would be one accident away from being sorted
+ * together.
+ */
+const LOCAL_RUN_ID = 'local-command';
+
+/**
+ * The columns a {@link TextModal}'s lines are built to: the pane, less its own
+ * padding, the reader's border and the reader's padding.
+ */
+const TEXT_VIEW_CHROME = 6;
+
+/** How long the taskbar light stays red after a failed turn before it goes out. */
+const PROGRESS_ERROR_MS = 5_000;
+
+/**
+ * How long the keyboard has to be still before coming back to it is a return.
+ *
+ * Three minutes is well past a pause for thought and well short of a lunch, so
+ * the line it triggers lands on somebody who has genuinely lost the thread
+ * rather than on somebody who stopped to read the screen. It is longer than
+ * either bell's delay on purpose: a notification is worth sending at six
+ * seconds because it goes somewhere else, and a line in the terminal is only
+ * worth drawing once you have stopped watching the terminal.
+ */
+const AWAY_MS = 3 * 60_000;
+
+/**
+ * How long the welcome-back line holds the status bar.
+ *
+ * Four times an ordinary flash. The usual one answers a key that was just
+ * pressed and the eye is already on the place it appears; this one is news
+ * about something else, arriving on a keystroke that was aimed at something
+ * else, and it has a sentence to be read rather than two words to be
+ * recognised.
+ */
+const RECAP_FLASH_MS = 8_000;
+
+/**
+ * Ctrl+] as the two kinds of terminal report it.
+ *
+ * One that speaks the kitty keyboard protocol sends the bracket with a Ctrl
+ * flag on it. Every other terminal sends the C0 byte the chord has meant since
+ * ASCII, and Ink — which folds Ctrl+A..Z back into letters and nothing else —
+ * hands that over as a one-character string with no modifier set at all. Both
+ * are the same press, and a key map that only knew one of them would work on
+ * about half the terminals people use.
+ */
+const NEXT_NEEDY_BYTE = '\u001d';
+const isNextNeedy = (input: string, key: { readonly ctrl: boolean }): boolean =>
+  input === NEXT_NEEDY_BYTE || (key.ctrl && input === ']');
 
 const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-export function App({ launched }: AppProps): React.JSX.Element {
-  const { host, descriptors, cache, preferences } = launched;
-  const { exit } = useApp();
+/**
+ * A command's arguments as their first word and everything after it.
+ *
+ * The remainder is kept *verbatim* past the whitespace that separated them,
+ * because `/snip save fix-tests` is followed by a template and a template's
+ * line breaks are part of it. Splitting on whitespace and rejoining would save
+ * a paragraph as one long line. `['', '']` for nothing at all.
+ */
+const firstWord = (args: string): readonly [string, string] => {
+  const match = /^(\S+)\s*([\s\S]*)$/.exec(args);
+  return match === null ? ['', ''] : [match[1] ?? '', match[2] ?? ''];
+};
+
+/** `3 lines`, for a row of `/copy`'s list. */
+const countOfLines = (text: string): string => {
+  const lines = text.split('\n').length;
+  return `${String(lines)} line${lines === 1 ? '' : 's'}`;
+};
+
+export function App({ launched, files }: AppProps): React.JSX.Element {
+  const { host, descriptors, cache, preferences, history, snippets } = launched;
+  const { exit, suspendTerminal } = useApp();
   const { columns, rows } = useTerminalSize();
+  /*
+   * How wide the conversation's own pane is: the terminal, less the rail when
+   * there is one. Worked out here rather than down in the layout because
+   * three things that are not layout need it — the rows `/help` prints, and
+   * the width the transcript and a replayed agent decide a diff gutter on.
+   */
+  const showSidebar = columns >= SIDEBAR_MIN_COLUMNS;
+  const mainWidth = showSidebar ? columns - SIDEBAR_WIDTH : columns;
 
   /**
    * A conversation, ready to be shown.
@@ -229,6 +657,80 @@ export function App({ launched }: AppProps): React.JSX.Element {
   const poolRef = useRef(pool);
   poolRef.current = pool;
 
+  /*
+   * What this file remembers about each pooled conversation.
+   *
+   * Three facts a `Conversation` has no reason to keep and this file cannot
+   * work out twice: when it was last on the screen, how its last turn ended,
+   * and when it stopped to ask. They are what Ctrl+] and the welcome-back
+   * line are built from — see "Who needs you, and what you missed".
+   *
+   * Refs, because none of them changes what is on the frame they are written
+   * in: every one is written from a subscription the conversation's own store
+   * is already going to re-render for, and a `useState` here would be a
+   * second render for a number nothing drew yet.
+   *
+   * Keyed by a name minted here rather than by the session id. A conversation
+   * nothing has been sent in has no session and can still be the one that
+   * needs you; and a session id arrives some seconds after the object does, so
+   * a key that appears late is a key that loses whatever was written under the
+   * old one. The `WeakMap` is what makes the name stable for as long as the
+   * object is and no longer.
+   */
+  const conversationKeys = useRef(new WeakMap<Conversation, string>());
+  const keysMinted = useRef(0);
+  const keyFor = useCallback((alive: Conversation): string => {
+    const known = conversationKeys.current.get(alive);
+    if (known !== undefined) return known;
+    const minted = `c${String(keysMinted.current++)}`;
+    conversationKeys.current.set(alive, minted);
+    return minted;
+  }, []);
+
+  /**
+   * When each conversation was last looked at.
+   *
+   * Written as one leaves the screen, because that is the last moment it was
+   * being looked at. The one *on* the screen is a special case handled where
+   * the map is read rather than written: it is being looked at now, whatever
+   * was last recorded, and a turn that finished in front of somebody must not
+   * queue itself up as something they have not seen.
+   */
+  const seenAt = useRef(new Map<string, number>());
+  /** How each conversation's last turn ended, for the welcome-back line. */
+  const runEnds = useRef(new Map<string, RunEnded>());
+  /** When each stopped to ask. Stale, harmlessly, once the question is answered. */
+  const askedAt = useRef(new Map<string, number>());
+
+  /*
+   * The composer's own handle, which is how anything here reaches into the box
+   * — and, at the keys, how Esc is asked after rather than taken. See
+   * `Composer`. It is declared this far up because {@link switchTo} needs it:
+   * the draft in the box belongs to the conversation being left.
+   */
+  const composerRef = useRef<ComposerHandle>(null);
+
+  /**
+   * What was in each pooled conversation's composer when it left the screen.
+   *
+   * A `WeakMap` on the conversation rather than a map keyed by session id, for
+   * the reason `conversationKeys` is: a conversation nothing has been sent in
+   * has no session id and is exactly the one somebody is most likely to be
+   * part-way through typing in. The store beside it — `preferences.ts`, keyed
+   * by session id — is what carries a draft between launches, and only a
+   * conversation the provider has filed can have a row there.
+   */
+  const drafts = useRef(new WeakMap<Conversation, string>());
+
+  /**
+   * Every conversation stopped on a permission, as of the last render.
+   *
+   * Filled in beside the memo that builds it, far below; declared here because
+   * both the key and `/asks` are answered above that, and because a list read
+   * at the moment of the keystroke is the only honest one — see the memo.
+   */
+  const asksNow = useRef<readonly Ask[]>([]);
+
   useEffect(
     () => () => {
       for (const alive of poolRef.current) alive.dispose();
@@ -236,18 +738,53 @@ export function App({ launched }: AppProps): React.JSX.Element {
     [],
   );
 
-  const switchTo = useCallback((next: Conversation) => {
-    if (next === conversationRef.current) return;
-    // Decided by `prunePool`, disposed here: the rule is pure and tested, and
-    // a state updater with side effects is a thing React may run twice.
-    const { kept, dropped } = prunePool(poolRef.current, next, (parked) => parked.isLive);
-    for (const gone of dropped) gone.dispose();
-    poolRef.current = kept;
-    setPool(kept);
-    conversationRef.current = next;
-    setConversation(next);
-    setScroll(0);
-  }, []);
+  const switchTo = useCallback(
+    (next: Conversation) => {
+      if (next === conversationRef.current) return;
+      const leaving = conversationRef.current;
+      // The moment it stopped being looked at, which is what "finished since
+      // you last looked at it" is measured against.
+      seenAt.current.set(keyFor(leaving), Date.now());
+      /*
+       * The draft goes with the conversation it was typed in.
+       *
+       * A half-written message is about *this* conversation, so leaving it in
+       * the box while the transcript behind it changes is the one arrangement
+       * that is certainly wrong — it reads as the app losing track of which
+       * question you were asking. Parked here and restored below; written to
+       * the preferences as well whenever there is a session id to file it
+       * under, which is what makes it survive a quit.
+       */
+      const draft = composerRef.current?.getText() ?? '';
+      drafts.current.set(leaving, draft);
+      const leavingSession = leaving.getState().sessionId;
+      if (leavingSession !== undefined) preferences.setDraft(leavingSession, draft);
+      // Decided by `prunePool`, disposed here: the rule is pure and tested, and
+      // a state updater with side effects is a thing React may run twice.
+      const { kept, dropped } = prunePool(poolRef.current, next, (parked) => parked.isLive);
+      for (const gone of dropped) gone.dispose();
+      poolRef.current = kept;
+      setPool(kept);
+      conversationRef.current = next;
+      setConversation(next);
+      setScroll(0);
+      // The cursor and the unfolded rows name rows of the transcript being
+      // left, and mean nothing in the one arriving.
+      setCursorId(null);
+      setExpanded(new Set());
+      // The same is true of a failed check: it is about the edits of a turn in
+      // the conversation being left, and Enter here now means what it means in
+      // the one arriving. What the checks *remember* is not cleared — that is
+      // "the same failure twice in a row", which is about the person and not
+      // about which transcript is on the screen.
+      setCheckOffer(null);
+      const arrivingSession = next.getState().sessionId;
+      composerRef.current?.setText(
+        drafts.current.get(next) ?? (arrivingSession === undefined ? undefined : preferences.draftFor(arrivingSession)) ?? '',
+      );
+    },
+    [keyFor, preferences],
+  );
 
   const state = useSyncExternalStore(conversation.subscribe, conversation.getState);
 
@@ -296,6 +833,30 @@ export function App({ launched }: AppProps): React.JSX.Element {
   const [update, setUpdate] = useState<string | undefined>(undefined);
   const [focus, setFocus] = useState<Focus>('composer');
   const [scroll, setScroll] = useState(0);
+  /** The agent's checklist, opened into its rows with Ctrl+T; one line otherwise. */
+  const [todoExpanded, setTodoExpanded] = useState(false);
+  /**
+   * The row the transcript's cursor is on, by id; `null` for nowhere yet.
+   *
+   * Held here rather than in the viewport because this file is the one that
+   * reads the keys, and because the verbs a row answers are carried out with
+   * things only this file has — a terminal to lend out, a clipboard, a
+   * composer to write into. The viewport is handed the id back and draws the
+   * caret; see {@link cursorRows} for the other half of the arrangement.
+   */
+  const [cursorId, setCursorId] = useState<string | null>(null);
+  /**
+   * The rows the viewport is drawing, in the order it draws them.
+   *
+   * It has to come from there: the model's list is ordered by when a row was
+   * filed and holds far more than the window draws, so stepping the cursor is
+   * an index into what is *on the screen* and nothing here can work that out.
+   * Reported only when the list changes, which is why holding it as state
+   * costs a render rather than a hundred a second.
+   */
+  const [cursorRows, setCursorRows] = useState<readonly string[]>([]);
+  /** Rows unfolded one at a time by Enter, in an otherwise folded viewport. */
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   /** How far back the viewport can go, as it last measured itself. */
   const scrollExtent = useRef({ maxOffset: 0, viewportLines: 0 });
   const onScrollExtent = useCallback((extent: { readonly maxOffset: number; readonly viewportLines: number }) => {
@@ -308,8 +869,46 @@ export function App({ launched }: AppProps): React.JSX.Element {
   }, []);
   const [pendingAttachments, setPendingAttachments] = useState<readonly { name: string; attachment: Attachment }[]>([]);
   const quitArmed = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** The first Esc of a possible Esc, Esc; see {@link ESC_ESC_WINDOW_MS}. */
+  const escArmed = useRef<ReturnType<typeof setTimeout> | null>(null);
   const planFetchedAt = useRef(0);
   const pickerToken = useRef(0);
+  /**
+   * Whether bypass has been agreed to, once, in this session.
+   *
+   * Shift+Tab steps over `bypassPermissions` until it has: a key that can be
+   * hit by accident must not be able to turn every prompt off, and the
+   * picker's two-step is where that decision belongs. Once it has been taken
+   * the cycle includes bypass — leaving it out for the rest of the session
+   * would mean the one mode you have to go to the picker to *leave* by
+   * keyboard, which is a worse trap than the one being avoided.
+   */
+  const bypassConfirmed = useRef(false);
+
+  /*
+   * The project's own checks, and the one failure that is on offer.
+   * ------------------------------------------------------------------------
+   *
+   * `afterEdit.ts` decides everything about *what is true* — whether a turn is
+   * one to check after, how long a command may run, what the agent is told, and
+   * whether a failure has been seen before. What is here is the three things it
+   * deliberately leaves out: which row the transcript gets, what the status line
+   * says, and which key sends the failure on.
+   *
+   * One instance for the process, in a ref like `attention` and for the same
+   * reason: the only thing it remembers is the last failure it offered, and that
+   * is a fact about the person sitting here rather than about a conversation.
+   *
+   * The offer is state and not a ref, because the status line's own words are
+   * what advertise the key — so a frame that has an offer and a frame that does
+   * not are two different frames. It is cleared in four places, each of which is
+   * a moment the failure has stopped being the thing in front of you: the next
+   * submission, an Esc, the start of another turn, and a switch to another
+   * conversation.
+   */
+  const checks = useRef<AfterEdit | null>(null);
+  checks.current ??= new AfterEdit();
+  const [checkOffer, setCheckOffer] = useState<AfterEditResult | null>(null);
 
   const pendingRequest = state.pendingPermissions[0];
   const workspace = basename(state.settings.cwd) || state.settings.cwd;
@@ -323,9 +922,21 @@ export function App({ launched }: AppProps): React.JSX.Element {
     [transcript],
   );
 
-  const showFlash = useCallback((text: string) => {
+  /**
+   * Which flash is on the line, so an older one's timer cannot take a newer
+   * one off. Two of them now have very different lives — the welcome-back
+   * line lasts four times as long as "pinned" — and without this the short one
+   * pressed a moment later would clear the long one when *its* two seconds
+   * were up, which reads as a message that flickered rather than one that was
+   * replaced.
+   */
+  const flashToken = useRef(0);
+  const showFlash = useCallback((text: string, ms = QUIT_WINDOW_MS) => {
+    const mine = ++flashToken.current;
     setFlash(text);
-    setTimeout(() => setFlash(undefined), QUIT_WINDOW_MS).unref?.();
+    setTimeout(() => {
+      if (flashToken.current === mine) setFlash(undefined);
+    }, ms).unref?.();
   }, []);
 
   // A new row arriving while scrolled back is the one moment "follow" would
@@ -333,6 +944,20 @@ export function App({ launched }: AppProps): React.JSX.Element {
   // person where they were.
   useEffect(() => {
     if (live) setScroll(0);
+  }, [live]);
+
+  /*
+   * A turn starting takes the failed check off the table.
+   *
+   * Whatever the agent has been asked to do next, it is not "here is what your
+   * last edits broke" — and Enter is the key that sends that, so leaving the
+   * offer up through a turn would leave one keystroke pointing at something
+   * stale. Watched on the status rather than on an event because there is no
+   * `run.start`: a run announces its end and nothing else, and a turn beginning
+   * is exactly this flag turning over.
+   */
+  useEffect(() => {
+    if (live) setCheckOffer(null);
   }, [live]);
 
   /* ---------------------------------------------------------------------- */
@@ -343,6 +968,41 @@ export function App({ launched }: AppProps): React.JSX.Element {
   const [accounts, setAccounts] = useState<readonly ProfileMetadata[]>([]);
   const [railLoading, setRailLoading] = useState(true);
   const [railIndex, setRailIndex] = useState(0);
+  /**
+   * What is being typed at the rail; empty when nothing is.
+   *
+   * One string rather than a mode flag and a string, because a rail of two
+   * hundred conversations is searched rather than walked and there is nothing
+   * to enter or leave: any printable key with the focus in the rail starts a
+   * query, and Esc ends one. `/` is the exception only in that it does not type
+   * itself, so `/foo` and `foo` reach the same place.
+   */
+  const [railQuery, setRailQuery] = useState('');
+  /**
+   * The query, and the cursor put back on the first row of what it found.
+   *
+   * The two go together every single time — a cursor left at row forty of a
+   * list that has just become three rows long is a selection nobody can see —
+   * so they are one function rather than two calls somebody has to remember to
+   * make in the same breath.
+   */
+  const setRailFilter = useCallback((next: string | ((current: string) => string)) => {
+    setRailQuery(next);
+    setRailIndex(0);
+  }, []);
+  /**
+   * The conversation Space is showing, unopened.
+   *
+   * Drawn in the same slot the pickers use — under the picker, when one is
+   * open — rather than inside the rail, and for the rail's own reason: the rail
+   * is thirty-two columns wide and a preview is a title, a branch, a model, a
+   * folder and four lines of the opening prompt. Cut to thirty columns none of
+   * that is worth reading, and a box that grew the rail to fit it would push
+   * the conversation sideways every time the cursor passed a row. The slot over
+   * the composer has the width, and it means Space shows the same box wherever
+   * it is pressed. See `components/SessionPreview.tsx`.
+   */
+  const [preview, setPreview] = useState<SessionSummary | null>(null);
   // Folders unfolded in the rail, keyed by project root. The current one is
   // always open.
   const [openFolders, setOpenFolders] = useState<ReadonlySet<string>>(() => new Set());
@@ -451,9 +1111,123 @@ export function App({ launched }: AppProps): React.JSX.Element {
         : accounts.find((profile) => profile.id === session.profileId)?.label ?? 'another account',
     [accounts, state.settings.profileId],
   );
+  /**
+   * The conversations held at the top of their folder.
+   *
+   * The store memoises the set on the identity of the array it was built from,
+   * so `pinnedSet()` is free to call on every draw — but that also means
+   * nothing here re-renders when a pin is toggled, since the call site never
+   * changes. `pinTick` is the nudge: `/pin` bumps it, this re-derives, and the
+   * rail and the sidebar both see the new set. See `preferences.ts`.
+   */
+  const [pinTick, setPinTick] = useState(0);
+  const pinned = useMemo(
+    () => preferences.pinnedSet(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [preferences, pinTick],
+  );
   const rail: readonly RailRow[] = useMemo(
-    () => railRows(sessions, openFolders, projectOf, accountOf, expandedFolders),
-    [sessions, openFolders, projectOf, accountOf, expandedFolders],
+    () => railRows(sessions, openFolders, projectOf, accountOf, expandedFolders, { pinned, query: railQuery }),
+    [sessions, openFolders, projectOf, accountOf, expandedFolders, pinned, railQuery],
+  );
+
+  /**
+   * Pin a conversation, or unpin it, whichever it is.
+   *
+   * The whole of `/pin`'s doing, taken apart from `/pin`'s knowing *which*: the
+   * rail's `p` and the conversation list's Ctrl+P both name a row that is not
+   * the conversation on screen, and a second copy of "write it down, re-derive,
+   * say which way it went" is a second chance for the three to drift.
+   */
+  const togglePinFor = useCallback(
+    (sessionId: string) => {
+      const nowPinned = preferences.togglePin(sessionId);
+      setPinTick((tick) => tick + 1);
+      showFlash(nowPinned ? 'pinned' : 'unpinned');
+    },
+    [preferences, showFlash],
+  );
+
+  /**
+   * Put a conversation away, or take it back out.
+   *
+   * A tag written into the provider's own store — the same one the desktop
+   * writes — so a row archived here is archived there. Nothing is destroyed
+   * and the conversation is still resumable from the archive folder, which is
+   * what makes this the safe half of the pair and why it asks nothing before
+   * doing it.
+   *
+   * Up here, above the pickers, because it is no longer the rail's alone: the
+   * conversation list offers the same thing on Ctrl+A, and a list that archived
+   * by a different route than the rail's would be two answers to one question.
+   */
+  const archiveRailSession = useCallback(
+    async (session: SessionSummary) => {
+      const archived = isArchived(session);
+      if (host.capabilitiesFor(session.providerId)?.tagSession !== true) {
+        setNotice(`${state.settings.providerLabel} cannot archive a conversation.`);
+        return;
+      }
+      try {
+        const done = await host.archiveSession(session.profileId, session.providerId, session.id, session.cwd, !archived);
+        if (!done) {
+          setNotice('That conversation could not be archived; it may already be gone.');
+          return;
+        }
+        say('info', `${archived ? 'Restored' : 'Archived'} ${oneLine(session.title, 60)}.`);
+        await refreshRail();
+      } catch (error) {
+        say('error', `Could not archive that conversation: ${describeError(error)}`);
+      }
+    },
+    [host, state.settings.providerLabel, say, refreshRail],
+  );
+
+  /**
+   * Name a stored conversation, whichever one it is.
+   *
+   * Written into the provider's own store, through the same door the automatic
+   * namer uses and the desktop's rename menu item uses: a typed title and a
+   * generated one are the same fact about a session, and a second store kept
+   * here would be a fact about one installation — invisible to the desktop,
+   * absent on another machine. A provider whose store has no such field says
+   * so and nothing is written; see `Capabilities.renameSession`.
+   *
+   * It takes an id rather than reading the conversation on screen, because
+   * `/title` is no longer the only way in: Ctrl+R over a row of the
+   * conversation list names *that* row, which is very often not this one.
+   */
+  const renameStoredSession = useCallback(
+    async (sessionId: SessionId, name: string): Promise<void> => {
+      if (name.length === 0) {
+        showFlash('a name cannot be empty');
+        return;
+      }
+      if (host.capabilitiesFor(state.settings.providerId)?.renameSession !== true) {
+        showFlash('this provider does not let a conversation be renamed');
+        return;
+      }
+      try {
+        const done = await host.renameSession(
+          state.settings.profileId,
+          state.settings.providerId,
+          sessionId,
+          state.settings.cwd,
+          name,
+        );
+        if (!done) {
+          showFlash('this provider does not let a conversation be renamed');
+          return;
+        }
+        showFlash(`named ${oneLine(name, 48)}`);
+        // The rail is where the name is read back from, and it is what
+        // `/export` takes its title and its filename from.
+        await refreshRail();
+      } catch (error) {
+        say('error', `Could not rename this conversation: ${describeError(error)}`);
+      }
+    },
+    [host, state.settings.profileId, state.settings.providerId, state.settings.cwd, showFlash, say, refreshRail],
   );
 
   /* ---------------------------------------------------------------------- */
@@ -563,8 +1337,177 @@ export function App({ launched }: AppProps): React.JSX.Element {
   }, [state.status, state.sessionId, refreshPlanUsage]);
 
   /* ---------------------------------------------------------------------- */
+  /* Somewhere else to put the work                                          */
+  /* ---------------------------------------------------------------------- */
+
+  /*
+   * When this account's plan stops serving, the line under the composer turns
+   * into an offer and Alt+H opens the list it belongs to. ADR 0003 is the
+   * whole design: a hand off is a chosen act, so nothing here moves anything —
+   * `failover.ts` works out whether there is something worth offering and who
+   * could take it, this file draws it and answers the key, and the move
+   * happens only on a row somebody selected.
+   *
+   * Two axes, as the ADR has it. An account that shares the provider's
+   * `projects/` store can open this very conversation (`owners.ts`: several
+   * profiles reach one transcript, and `SessionSummary.alsoInProfiles` is
+   * where the adapter says which) — that is the live transfer, and it is the
+   * same move the rail already makes when you open somebody else's row. An
+   * account that cannot reach the store is offered a *fresh* conversation with
+   * a hand-over in the box instead, which is the ADR's "degrades to a
+   * continuity note" with the note written by this app rather than by the
+   * agent. Asking the agent for one is a turn of its own and is not this.
+   */
+
+  /** The catalogue the offer's rows are drawn from; the remembered one until a fresh one lands. */
+  const [catalogueRows, setCatalogueRows] = useState<readonly ServerProfile[]>(
+    () => cache.get<readonly ServerProfile[]>(CATALOGUE_KEY)?.value ?? [],
+  );
+  /**
+   * What the *other* accounts' plans read.
+   *
+   * The ordinary poll only ever asks about the account in use, which is right
+   * — every other reading costs a subprocess for a number nobody is looking
+   * at. But an offer to move work to an account is a claim about that
+   * account's room right now, and answering it from a reading taken at launch
+   * would be the stale recommendation `PLAN_USAGE_MAX_AGE_MS` exists to
+   * refuse. So the sweep happens exactly once, at the moment the offer becomes
+   * true, which is the one moment the subprocesses are worth spending.
+   */
+  const [otherUsage, setOtherUsage] = useState<ReadonlyMap<string, PlanUsage | null>>(() => new Map());
+  const failoverProbe = useRef({ at: 0, running: false });
+
+  /**
+   * Whether an account's config directory reaches this conversation.
+   *
+   * Answered from the rail's own listing rather than by asking again: the
+   * adapter already reports every profile that reaches a transcript on the
+   * summary itself, and `[profileId, ...alsoInProfiles]` is documented as the
+   * full set. A conversation the rail has not listed yet is `false` here and
+   * re-asked when the picker opens — see {@link openFailoverPicker}.
+   */
+  const reachesThisConversation = useCallback(
+    (profileId: string): boolean => {
+      const id = state.sessionId;
+      // Nothing has been sent, so there is no transcript for an account to be
+      // out of reach of. Every account can take the work; what the list offers
+      // in that case is a fresh start rather than a move, which is the same
+      // thing when there is nothing to continue.
+      if (id === undefined) return true;
+      const row = sessions.find((session) => session.id === id);
+      if (row === undefined) return false;
+      return row.profileId === profileId || (row.alsoInProfiles ?? []).includes(profileId);
+    },
+    [sessions, state.sessionId],
+  );
+
+  /*
+   * Recomputed on every render rather than memoized, and deliberately: the
+   * answer depends on the clock — a reading ages out of usefulness, a window
+   * resets — so a cache keyed on the inputs would go on offering a hand off
+   * after the thing that justified it had passed. It is a handful of scans
+   * over a handful of windows, and it is only asked while nothing is running.
+   */
+  const failoverWhy = live ? null : failoverReason(state.planUsage);
+  /* A boolean rather than the reason itself, because the reason is a fresh
+     object every render and the sweep below wants to run when the *answer*
+     turns over, not when the object does. */
+  const failoverOffered = failoverWhy !== null;
+  const failoverBest =
+    failoverWhy === null
+      ? null
+      : bestFailoverCandidate(
+          failoverCandidates(catalogueRows, accounts, otherUsage, state.settings.profileId, reachesThisConversation),
+        );
+
+  useEffect(() => {
+    if (!failoverOffered) return;
+    const probe = failoverProbe.current;
+    if (probe.running || Date.now() - probe.at < PLAN_USAGE_MIN_INTERVAL_MS) return;
+    probe.running = true;
+    void (async () => {
+      // The remembered readings first, so the rows carry numbers while the
+      // probes run — the same stale-while-revalidate every other slow answer
+      // in here is shown behind. See `cache.ts`.
+      const remembered = new Map<string, PlanUsage | null>();
+      for (const account of accounts) {
+        const reading = cache.get<PlanUsage>(usageKey(account.id));
+        if (reading !== undefined) remembered.set(account.id, reading.value);
+      }
+      if (remembered.size > 0) setOtherUsage(remembered);
+      try {
+        const catalogue = await host.catalogue.read();
+        cache.set(CATALOGUE_KEY, catalogue);
+        setCatalogueRows(catalogue);
+      } catch {
+        // The remembered rows stand; every one of them still says what it is.
+      }
+      const readings = await Promise.all(
+        accounts.map(async (account) => {
+          try {
+            const usage = await host.fetchPlanUsage(account.id, account.providerId);
+            if (usage !== null && usage.available) cache.set(usageKey(account.id), usage);
+            return [account.id, usage] as const;
+          } catch {
+            // No reading is not a number of its own: the row says "stale
+            // reading" and is not offered, which is the honest answer.
+            return [account.id, null] as const;
+          }
+        }),
+      );
+      setOtherUsage(new Map(readings));
+    })().finally(() => {
+      probe.running = false;
+      probe.at = Date.now();
+    });
+  }, [failoverOffered, accounts, host, cache]);
+
+  /* ---------------------------------------------------------------------- */
   /* Resume                                                                  */
   /* ---------------------------------------------------------------------- */
+
+  /**
+   * Read a stored conversation out of an account's store and put it on screen.
+   *
+   * The half of {@link loadSession} that actually opens something, split out
+   * because one caller must skip the checks in front of it: a hand off opens
+   * the conversation that is *already* on screen, under a different account,
+   * and `loadSession` is right to refuse that as a no-op for everybody else.
+   *
+   * `opening` is a line written into the new conversation's transcript before
+   * it is shown, which is the only place a note about *why* this conversation
+   * has just changed accounts can go — the old conversation is about to be
+   * pruned, and a note on it would be a note nobody sees again.
+   */
+  const openUnder = useCallback(
+    async (
+      sessionId: SessionId,
+      title: string,
+      settings: ConversationSettings,
+      opening?: { readonly level: 'info' | 'warn'; readonly text: string; readonly detail?: string },
+    ): Promise<boolean> => {
+      setModal({ kind: 'loading', title: `Opening ${oneLine(title, 60)}…` });
+      try {
+        const events = await host.sessionMessages(settings.profileId, settings.providerId, sessionId, settings.cwd);
+        setModal(null);
+        const next = makeConversation(settings);
+        const outcome = next.loadHistory(sessionId, events);
+        if (!outcome.ok) {
+          next.dispose();
+          setNotice(outcome.reason);
+          return false;
+        }
+        if (opening !== undefined) next.transcript.note(opening.level, opening.text, opening.detail);
+        switchTo(next);
+        return true;
+      } catch (error) {
+        setModal(null);
+        say('error', `Could not open that conversation: ${describeError(error)}`);
+        return false;
+      }
+    },
+    [host, makeConversation, switchTo, say],
+  );
 
   /**
    * Show a stored conversation, reading it in if it is not already alive.
@@ -588,26 +1531,21 @@ export function App({ launched }: AppProps): React.JSX.Element {
         switchTo(parked);
         return;
       }
-      const settings = into ?? current.getState().settings;
-      setModal({ kind: 'loading', title: `Opening ${oneLine(title, 60)}…` });
-      try {
-        const events = await host.sessionMessages(settings.profileId, settings.providerId, sessionId, settings.cwd);
-        setModal(null);
-        const next = makeConversation(settings);
-        const outcome = next.loadHistory(sessionId, events);
-        if (!outcome.ok) {
-          next.dispose();
-          setNotice(outcome.reason);
-          return;
-        }
-        switchTo(next);
-      } catch (error) {
-        setModal(null);
-        say('error', `Could not open that conversation: ${describeError(error)}`);
-      }
+      await openUnder(sessionId, title, into ?? current.getState().settings);
     },
-    [host, pool, makeConversation, switchTo, say],
+    [pool, switchTo, openUnder],
   );
+
+  /**
+   * The conversation list, opened again.
+   *
+   * A ref because the list has to be able to reopen itself — naming a row
+   * replaces it with the one-line box, and what comes back afterwards has to be
+   * a list re-read from the store rather than the stale one that was on screen
+   * — and a `useCallback` cannot name itself in its own body. Assigned just
+   * below, on every render, so it is always the current closure.
+   */
+  const resumeAgain = useRef<() => void>(() => undefined);
 
   const openResumePicker = useCallback(
     async (latest = false) => {
@@ -634,14 +1572,84 @@ export function App({ launched }: AppProps): React.JSX.Element {
             .join(' · '),
           ...(session.id === state.sessionId ? { note: 'this conversation' } : {}),
         }));
+        const found = (key: string): SessionSummary | undefined => list.find((candidate) => candidate.id === key);
         setModal({
           kind: 'picker',
           title: `Conversations in ${workspace}`,
           items,
           ...(state.sessionId === undefined ? {} : { initialKey: state.sessionId }),
+          /*
+           * The one picker in here that is genuinely long — every stored
+           * conversation in this directory, growing for as long as the
+           * directory is worked in — so it is the one that is typed at rather
+           * than walked. The rail's keys, on the rail's rows, in the surface
+           * that is open when the rail is not on screen.
+           */
+          filterable: true,
+          onPreview: (item) => {
+            const session = found(item.key);
+            // Pressing Space twice on a row puts the box away, which is the
+            // only way out of it that does not also close the list.
+            if (session !== undefined) setPreview((shown) => (shown?.id === session.id ? null : session));
+          },
+          onRename: (item) => {
+            const session = found(item.key);
+            if (session === undefined) return;
+            setModal({
+              kind: 'prompt',
+              title: 'Name this conversation',
+              initial: session.title,
+              /*
+               * The list is re-read rather than patched, and both ways out do
+               * it: a row still showing the old title after a rename would be
+               * the screen disagreeing with the store, and Esc out of the name
+               * should leave the list exactly where it was found. Waited on
+               * first, because a list re-read before the write landed would
+               * come back with the name that was just replaced.
+               */
+              onSubmit: (name) => {
+                const named = name.trim();
+                if (named.length === 0) {
+                  resumeAgain.current();
+                  return;
+                }
+                setModal({ kind: 'loading', title: `Naming it "${oneLine(named, 40)}"…` });
+                void renameStoredSession(session.id, named).then(() => {
+                  resumeAgain.current();
+                });
+              },
+              onCancel: () => {
+                resumeAgain.current();
+              },
+            });
+          },
+          onSecondary: [
+            {
+              key: 'ctrl+a',
+              label: 'archive',
+              run: (item) => {
+                const session = found(item.key);
+                if (session === undefined) return;
+                setModal(null);
+                setPreview(null);
+                void archiveRailSession(session);
+              },
+            },
+            {
+              key: 'ctrl+p',
+              label: 'pin',
+              run: (item) => {
+                if (found(item.key) !== undefined) togglePinFor(item.key);
+              },
+            },
+          ],
+          onCancel: () => {
+            setPreview(null);
+          },
           onSelect: (item) => {
-            const session = list.find((candidate) => candidate.id === item.key);
+            const session = found(item.key);
             setModal(null);
+            setPreview(null);
             if (session === undefined || session.id === state.sessionId) return;
             void loadSession(session.id, session.title);
           },
@@ -651,8 +1659,11 @@ export function App({ launched }: AppProps): React.JSX.Element {
         say('error', `Could not list conversations: ${describeError(error)}`);
       }
     },
-    [host, state.settings, state.sessionId, workspace, say, loadSession],
+    [host, state.settings, state.sessionId, workspace, say, loadSession, renameStoredSession, archiveRailSession, togglePinFor],
   );
+  resumeAgain.current = () => {
+    void openResumePicker();
+  };
 
   // `artemis -c` / `--resume <id>`: act once the screen exists.
   const resumedOnLaunch = useRef(false);
@@ -848,12 +1859,36 @@ export function App({ launched }: AppProps): React.JSX.Element {
     const token = ++pickerToken.current;
     const present = (listing: ModelListing): Omit<PickerModal, 'kind'> => {
       const items: PickerItem[] = [
+        /*
+         * No facts on this row, and it is the one row that must not have any:
+         * it is a decision to let the CLI choose, so there is no model to ask
+         * the plan about, and a row saying `fable 92%` under "whatever the CLI
+         * would pick" would be a claim about a model nobody has named.
+         */
         { key: '', label: 'Provider default', detail: 'whatever the CLI would pick' },
-        ...listing.models.map((model) => ({
-          key: model.id,
-          label: model.label,
-          detail: model.displayName !== undefined && model.displayName !== model.label ? model.displayName : model.note,
-        })),
+        ...listing.models.map((model) => {
+          /*
+           * What this account's plan has to say about this model — exhausted,
+           * under pressure, or nothing at all. `modelFacts.ts` does the join
+           * and borrows every judgement in it from somewhere that has already
+           * made one, so the picker and the meter under the composer cannot
+           * come to disagree about the same window.
+           *
+           * The catalogue's own text is the fallback rather than the
+           * replacement: a plan with nothing metered leaves `detail` empty and
+           * the row reads exactly as it did before any of this existed.
+           */
+          const facts = modelRowFacts(model, state.planUsage);
+          const catalogue = model.displayName !== undefined && model.displayName !== model.label ? model.displayName : model.note;
+          return {
+            key: model.id,
+            label: model.label,
+            detail: facts.detail === '' ? catalogue : facts.detail,
+            disabled: facts.disabled,
+            ...(facts.reason === undefined ? {} : { reason: facts.reason }),
+            ...(facts.note === undefined ? {} : { note: facts.note }),
+          };
+        }),
       ];
       return {
         title: listing.live ? 'Models' : 'Models (built-in list — the account did not confirm it)',
@@ -861,6 +1896,11 @@ export function App({ launched }: AppProps): React.JSX.Element {
         initialKey: state.settings.model ?? '',
         token,
         onSelect: (item) => {
+          // A row the provider is refusing on this account is shown with the
+          // reason and is not choosable. The picker already declines to select
+          // one; this is the second half of the same rule, because a refresh
+          // can disable the row under a cursor that was already on it.
+          if (item.disabled === true) return;
           setModal(null);
           if (item.key === '') {
             conversation.updateSettings({ model: undefined, modelLabel: undefined, effort: undefined, fastMode: undefined, ultracode: undefined });
@@ -890,7 +1930,7 @@ export function App({ launched }: AppProps): React.JSX.Element {
         );
       }
     }
-  }, [cache, readModels, state.settings.profileId, state.settings.model, openPicker, conversation, openEffortPicker, say]);
+  }, [cache, readModels, state.settings.profileId, state.settings.model, state.planUsage, openPicker, conversation, openEffortPicker, say]);
 
   const applyMode = useCallback(
     (mode: PermissionMode) => {
@@ -915,13 +1955,48 @@ export function App({ launched }: AppProps): React.JSX.Element {
         setModal(null);
         const mode = item.key as PermissionMode;
         if (mode === 'bypassPermissions') {
-          confirm('Approve every tool call without asking?', 'Yes — bypass all permission prompts', true, () => applyMode(mode));
+          confirm('Approve every tool call without asking?', 'Yes — bypass all permission prompts', true, () => {
+            bypassConfirmed.current = true;
+            applyMode(mode);
+          });
         } else {
           applyMode(mode);
         }
       },
     });
   }, [openPicker, state.capabilities.permissionModes, state.settings.providerLabel, state.settings.permissionMode, confirm, applyMode]);
+
+  /**
+   * Shift+Tab: the next mode the provider has, wrapping round.
+   *
+   * The same list the picker builds, in the same order, applied by the same
+   * function — the key is another door to `/mode`, not a second opinion about
+   * what a mode change is. What it does not do is walk into
+   * `bypassPermissions`: that one is reached by agreeing to it, and only once
+   * that has happened does the cycle include it. See `bypassConfirmed`.
+   *
+   * The flash is the whole feedback the keystroke needs. A mode stepped past
+   * on the way to another is still a mode the transcript records — `applyMode`
+   * writes the line — because what the agent was allowed to do when is part of
+   * what happened.
+   */
+  const cycleMode = useCallback(() => {
+    const available = PERMISSION_MODES.filter(
+      (mode) =>
+        state.capabilities.permissionModes.includes(mode) && (mode !== 'bypassPermissions' || bypassConfirmed.current),
+    );
+    if (available.length < 2) {
+      showFlash(`${state.settings.providerLabel} has one permission mode; /mode says which.`);
+      return;
+    }
+    // A mode the cycle skips — bypass, before it has been agreed to — is not
+    // in the list, so `indexOf` is -1 and the step lands on the first: Shift+Tab
+    // always leads *out* of it, whatever it cannot lead into.
+    const next = available[(available.indexOf(state.settings.permissionMode) + 1) % available.length];
+    if (next === undefined || next === state.settings.permissionMode) return;
+    applyMode(next);
+    showFlash(`permission mode: ${MODE_LABEL[next]}`);
+  }, [state.capabilities.permissionModes, state.settings.permissionMode, state.settings.providerLabel, applyMode, showFlash]);
 
   /* ---------------------------------------------------------------------- */
   /* Tasks and usage                                                         */
@@ -935,29 +2010,47 @@ export function App({ launched }: AppProps): React.JSX.Element {
     return parts.join(' · ');
   };
 
-  const openTaskTranscript = useCallback(
-    async (task: BackgroundTask) => {
+  /**
+   * What one delegated agent did, read out of the provider's own store.
+   *
+   * Keyed on the agent rather than on a task, because the two are not always
+   * the same thing. A `Task`/`Agent` call is filed under exactly the id the
+   * task list carries, so for those they coincide; a workflow's agents each
+   * write their own transcript under an id nested in the workflow's progress,
+   * and those are reachable only from the delegated strip's unfolded rows. One
+   * function for both, so `/tasks` and the strip cannot come to disagree about
+   * what opening an agent means.
+   */
+  const openAgentTranscript = useCallback(
+    async (agentId: string, described: string) => {
       const sessionId = state.sessionId;
       if (sessionId === undefined) {
         setNotice('No session to read the agent from yet.');
         return;
       }
-      setModal({ kind: 'loading', title: `Reading what "${oneLine(task.description, 50)}" did…` });
+      setModal({ kind: 'loading', title: `Reading what "${oneLine(described, 50)}" did…` });
       try {
         const events = await host.subagentMessages(
           state.settings.profileId,
           state.settings.providerId,
           sessionId,
-          task.id,
+          agentId,
           state.settings.cwd,
         );
-        setModal({ kind: 'replay', title: oneLine(task.description, 90), events });
+        setModal({ kind: 'replay', title: oneLine(described, 90), events });
       } catch (error) {
         setModal(null);
         say('error', `Could not read that agent's transcript: ${describeError(error)}`);
       }
     },
     [host, state.sessionId, state.settings, say],
+  );
+
+  const openTaskTranscript = useCallback(
+    async (task: BackgroundTask) => {
+      await openAgentTranscript(task.id, task.description);
+    },
+    [openAgentTranscript],
   );
 
   const openTasksPicker = useCallback(() => {
@@ -1014,6 +2107,456 @@ export function App({ launched }: AppProps): React.JSX.Element {
     });
     say('info', `Plan${usage.subscriptionType !== undefined ? ` · ${usage.subscriptionType}` : ''}`, lines.join('\n'));
   }, [refreshPlanUsage, conversation, say, state.settings.providerLabel]);
+
+  /* ---------------------------------------------------------------------- */
+  /* Taking it out, and taking it back                                       */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * This conversation's row in the rail, when the store has one for it.
+   *
+   * The only place the terminal learns what a conversation is *called*: a
+   * title is the provider's, written beside the transcript, and the rail is
+   * already reading every account's list. A conversation that has not been
+   * saved yet — nothing sent, or sent and not yet listed — has no row and no
+   * name, which is a fact the callers below say out loud rather than paper
+   * over with the folder's name.
+   */
+  const currentSession = useMemo(
+    () => (state.sessionId === undefined ? undefined : sessions.find((session) => session.id === state.sessionId)),
+    [sessions, state.sessionId],
+  );
+
+  /**
+   * A row for something this terminal did rather than something the model did.
+   *
+   * The same row `!` writes and the same row a provider's own slash command
+   * gets, because it is the same kind of thing: the host did it, and nothing
+   * was sampled. See {@link LOCAL_RUN_ID} for why it is not on the provider's
+   * numbering.
+   */
+  const recordCommand = useCallback(
+    (name: string, args: string | undefined, output: string, failed = false) => {
+      transcript.apply({
+        type: 'command.run',
+        runId: LOCAL_RUN_ID,
+        seq: 0,
+        ts: Date.now(),
+        command: {
+          name,
+          ...(args === undefined || args.length === 0 ? {} : { args }),
+          ...(output.length === 0 ? {} : { output }),
+          ...(failed ? { failed: true } : {}),
+        },
+      });
+    },
+    [transcript],
+  );
+
+  /**
+   * Run this directory's checks, and put what happened where it can be acted on.
+   *
+   * Three surfaces for one command, each answering a different question, which is
+   * why `afterEdit.ts` hands back a result and draws none of it.
+   *
+   *  - **The flash** answers "is something still running", so it stays up for as
+   *    long as the checks may. `AfterEdit` kills them at two minutes and says so;
+   *    a flash that expired first would leave the terminal looking idle while a
+   *    test suite was still going, which is the reading that gets a feature
+   *    switched off.
+   *  - **The row** answers "what did it say", and it is a `$` row rather than a
+   *    `/` one because that is what it is: a shell command this process ran, with
+   *    no model asked and nothing sampled. The ending line goes back on the end
+   *    of the output — `AfterEdit` lifted it out for the flash's sake, and the
+   *    row is meant to hold what the compiler wrote *and* how it finished.
+   *  - **The offer** answers "is this worth interrupting somebody for", and that
+   *    is `isNewFailure`'s to decide. It is asked of every result and not only of
+   *    the failures, because a pass is what ends a run of identical ones and that
+   *    is recorded there.
+   *
+   * The transcript is captured rather than looked up, so a check that outlives a
+   * switch still files its row in the conversation whose turn it was. The offer
+   * is the one thing held back in that case: Enter would send it wherever the
+   * person went instead.
+   */
+  const runChecks = useCallback(
+    async (command: string, cwd: string): Promise<void> => {
+      const engine = checks.current;
+      if (engine === null) return;
+      const owner = conversation;
+      showFlash(`checks: ${oneLine(command, 48)}`, AFTER_EDIT_TIMEOUT_MS);
+      const result = await engine.run(command, cwd);
+      // Split the way `runShellLine` splits a typed line: the first word is the
+      // name the row draws, the rest are its arguments.
+      const cut = command.search(/\s/u);
+      const args = cut === -1 ? undefined : command.slice(cut).trim();
+      const said = [result.output, result.exitLine ?? ''].filter((part) => part.length > 0).join('\n');
+      transcript.apply({
+        type: 'command.run',
+        // Not the provider's numbering, for {@link SHELL_RUN_ID}'s reason.
+        runId: SHELL_RUN_ID,
+        seq: 0,
+        ts: Date.now(),
+        command: {
+          name: cut === -1 ? command : command.slice(0, cut),
+          ...(args === undefined || args.length === 0 ? {} : { args }),
+          ...(said.length === 0 ? {} : { output: said }),
+          ...(result.ok ? {} : { failed: true }),
+        },
+        source: 'shell',
+      });
+      // A failure's summary names the key that sends it, and a key advertised
+      // for two seconds is not advertised; a pass has nothing to act on and
+      // keeps the ordinary window.
+      showFlash(engine.summarize(result), result.ok ? undefined : RECAP_FLASH_MS);
+      const worthOffering = engine.isNewFailure(result);
+      if (result.ok) setCheckOffer(null);
+      // Not cleared when the failure is a repeat: either it is the offer that is
+      // already standing, or it is one somebody has already sent, and both are
+      // cases where the right number of offers is the number there is now.
+      else if (worthOffering && conversationRef.current === owner) setCheckOffer(result);
+    },
+    [conversation, showFlash, transcript],
+  );
+
+  /*
+   * The turn that has just ended, and whether it is one to check after.
+   *
+   * A listener of its own rather than a line in either of the two further down:
+   * the failed-run one is about a light on the taskbar and the pooled one is
+   * about every conversation at once, while this is about the one on the screen
+   * and has to wait on a disk read before it can answer at all.
+   *
+   * Filtered to this conversation's *own* run, the way the pooled listener is: a
+   * conversation forwards its siblings' events too, and a delegated agent
+   * finishing is not the end of anybody's turn.
+   *
+   * The ledger is waited on first. It is fed from a handler that cannot wait for
+   * a read, so the count this is decided on would otherwise be missing the very
+   * last edit of the turn — the one most likely to be what broke something. What
+   * comes back is read off the live state and not off the render's snapshot,
+   * which is a frame old by then.
+   */
+  useEffect(() => {
+    let ownRun = conversation.getState().runId;
+    return conversation.subscribeEvents((event) => {
+      ownRun = conversation.getState().runId ?? ownRun;
+      if (event.type !== 'run.end' || event.runId !== ownRun) return;
+      // Asked here as well as in `shouldRun`, which would answer the same: the
+      // ledger read below is a wait, and there is nothing to learn from it about
+      // a turn whose reason has already ruled it out.
+      if (event.reason !== 'completed') return;
+      void (async () => {
+        await conversation.changesSettled();
+        const settled = conversation.getState();
+        // This conversation's directory, which is fixed for as long as it exists
+        // — a `/cwd` is a new conversation and not this one moved — so reading it
+        // here keeps `state` out of this effect's dependencies and out of its
+        // resubscriptions.
+        const cwd = settled.settings.cwd;
+        const command = preferences.afterEditFor(cwd);
+        const engine = checks.current;
+        // A narrowing, not a decision: whether nothing being set is a reason not
+        // to run is one of the three things `shouldRun` answers.
+        if (engine === null || command === undefined) return;
+        if (!engine.shouldRun({ editedFiles: settled.filesChanged?.files ?? 0, reason: event.reason, command })) return;
+        await runChecks(command, cwd);
+      })();
+    });
+  }, [conversation, preferences, runChecks]);
+
+  /**
+   * Put text on the clipboard and say which of the two routes it took.
+   *
+   * "Copied" and "sent to the terminal" are different promises and the flash
+   * keeps them apart: OSC 52 hands the bytes to whatever emulator the person
+   * is sitting in front of, through however many hops of SSH, and no terminal
+   * acknowledges it. See `clipboard.ts`.
+   */
+  const putOnClipboard = useCallback(
+    async (text: string) => {
+      const method = await copyText(text);
+      showFlash(method === 'native' ? 'copied' : method === 'osc52' ? 'sent to the terminal' : 'no way to copy here');
+    },
+    [showFlash],
+  );
+
+  /**
+   * `/copy` — the last reply, or one piece of it.
+   *
+   * Source rather than the rendering on screen: the point of copying a reply
+   * is to paste it somewhere that renders it again, and what the terminal drew
+   * is ANSI escapes and hard-wrapped lines. A reply with fenced blocks opens a
+   * list first, because the thing people mean most of the time is the command
+   * in the middle of the explanation rather than the explanation.
+   */
+  const copyLastReply = useCallback(() => {
+    const text = lastAssistantText(transcript);
+    if (text === null) {
+      showFlash('nothing to copy');
+      return;
+    }
+    const blocks = codeBlocksOf(text);
+    if (blocks.length === 0) {
+      void putOnClipboard(text);
+      return;
+    }
+    openPicker({
+      title: 'Copy',
+      items: [
+        { key: 'all', label: 'the whole reply', detail: countOfLines(text) },
+        ...blocks.map((block, index) => {
+          const opening = block.code.split('\n').find((line) => line.trim().length > 0) ?? '';
+          return {
+            key: String(index),
+            // The language and the first line that has anything on it: between
+            // them they identify a block without the person having to count
+            // fences back through the reply.
+            label: [block.lang, oneLine(opening, 60)].filter((part) => part.length > 0).join(' · ') || 'an empty block',
+            detail: countOfLines(block.code),
+          };
+        }),
+      ],
+      onSelect: (item) => {
+        setModal(null);
+        if (item.key === 'all') {
+          void putOnClipboard(text);
+          return;
+        }
+        const block = blocks[Number(item.key)];
+        if (block !== undefined) void putOnClipboard(block.code);
+      },
+    });
+  }, [transcript, showFlash, putOnClipboard, openPicker]);
+
+  /**
+   * `/export` — the whole conversation as a markdown file.
+   *
+   * Written beside itself and renamed into place, as `preferences.ts` writes:
+   * a rename is atomic on every filesystem this runs on, and the failure it
+   * rules out — a half-written export that someone opens and believes — is the
+   * one failure a saved file must not have.
+   *
+   * The name is the caller's when they gave one, relative to where the
+   * conversation is working rather than to wherever this process happens to
+   * have been started. Otherwise it is `exportFilename`'s, which carries the
+   * conversation's own name and the time, because exporting twice in an
+   * afternoon is the normal case.
+   */
+  const exportConversation = useCallback(
+    (args: string) => {
+      const title = currentSession?.title;
+      const startedAt = currentSession?.createdAt;
+      const markdown = transcriptToMarkdown(transcript, {
+        ...(title === undefined ? {} : { title }),
+        ...(startedAt === undefined ? {} : { startedAt }),
+      });
+      if (markdown.trim().length === 0) {
+        showFlash('nothing to export');
+        return;
+      }
+      const named = args.length > 0 ? args : exportFilename(title);
+      const path = isAbsolute(named) ? named : resolvePath(state.settings.cwd, named);
+      void (async () => {
+        try {
+          const temp = `${path}.${String(process.pid)}.tmp`;
+          await writeFile(temp, markdown, 'utf8');
+          await rename(temp, path);
+        } catch (error) {
+          showFlash('could not write that file');
+          say('error', `Could not write ${path}: ${describeError(error)}`);
+          return;
+        }
+        showFlash(shortenPath(path, homedir()));
+        recordCommand('export', args.length > 0 ? args : undefined, path);
+      })();
+    },
+    [currentSession, transcript, state.settings.cwd, showFlash, say, recordCommand],
+  );
+
+  /**
+   * One file's edits, oldest first, as the transcript draws them.
+   *
+   * Newest last on purpose: a file read top to bottom should end on the edit
+   * that left it as it is now, and the ledger hands its changes back newest
+   * first because that is the order `/undo` wants them in.
+   */
+  const diffOfFile = useCallback(
+    (file: ChangedFile, columns: number): readonly string[] =>
+      conversation.changes
+        .changes()
+        .filter((change) => change.path === file.path)
+        .reverse()
+        .flatMap((change, index) => [
+          ...(index === 0 ? [] : ['']),
+          // No cap: this is the view someone opened *because* the transcript
+          // capped it. The gutter is on for the same reason — there is room,
+          // and a line number is how a diff is talked about.
+          ...renderDiff(change.edit, Number.POSITIVE_INFINITY, { columns, numbers: 'on' }),
+        ]),
+    [conversation],
+  );
+
+  /**
+   * `/diff` — what changed, from two directions.
+   *
+   * The ledger answers "what has this conversation done", which is the
+   * question during a turn; `git` answers "what is different from the last
+   * commit, whoever changed it", which is the question before committing.
+   * Both are offered because neither is a superset: the ledger sees edits in a
+   * directory that is not a repository at all, and git sees the work the
+   * person did themselves.
+   *
+   * Waited on first. The ledger is fed from an event handler that cannot wait
+   * for a disk read, so a `/diff` typed the instant a turn ends would
+   * otherwise be missing that turn's last edit — see `changesSettled`.
+   *
+   * ## The working tree goes through the user's own diff tool
+   *
+   * Somebody who has spent an afternoon on their `delta` theme should see that
+   * theme here. `git` has already answered with unified text, which is exactly
+   * what `delta`, `diff-so-fancy` and `bat` read on standard input, so the tool
+   * is a *filter*: the text goes in, the ANSI comes back, and `TextView`
+   * scrolls it with the terminal still Ink's — see `externalTools.ts` on why
+   * that is a different thing from handing the terminal to a pager. The width
+   * is the box's rather than the terminal's, or `delta` would lay the diff out
+   * for columns the reader does not have.
+   *
+   * Nothing is lost when it goes wrong. `null` means the person has no such
+   * tool and has always seen Artemis's own rendering; a tool that fails says so
+   * on the status line and the rendering is the same one. What is *not* done is
+   * running it over the per-file rows: those come from the ledger as `FileEdit`
+   * rows — already diffed, numbered against both files and collapsed in the
+   * middle — and rebuilding unified text with honest hunk headers out of a
+   * capped row list is a new diff, not a pipe. They keep `renderDiff`.
+   */
+  const openDiff = useCallback(() => {
+    void (async () => {
+      await conversation.changesSettled();
+      const files = conversation.changes.files();
+      const columns = Math.max(20, mainWidth - TEXT_VIEW_CHROME);
+
+      const workingTree = async (): Promise<void> => {
+        setModal({ kind: 'loading', title: 'Working tree — asking git…' });
+        const result = await gitDiff(conversation.getState().settings.cwd);
+        if (!result.ok) {
+          setModal(null);
+          showFlash(result.reason);
+          return;
+        }
+        if (result.text.trim().length === 0) {
+          setModal(null);
+          showFlash('nothing changed');
+          return;
+        }
+        const title = `Working tree · ${workspace}`;
+        const tool = externalDiffTool({ columns });
+        if (tool !== null) {
+          setModal({ kind: 'loading', title: `Working tree — through ${tool.label}…` });
+          const piped = await pipeThrough(tool.argv, result.text);
+          if (piped.ok) {
+            setModal({ kind: 'text', title: `${title} · via ${tool.label}`, lines: piped.text.split('\n') });
+            return;
+          }
+          showFlash(piped.reason);
+        }
+        setModal({ kind: 'text', title, lines: result.text.split('\n') });
+      };
+
+      // Nothing recorded means there is only one row to offer, and a picker of
+      // one row is a keystroke asking to be skipped.
+      if (files.length === 0) {
+        await workingTree();
+        return;
+      }
+
+      const labels = fileLines(files, columns);
+      openPicker({
+        title: 'What changed',
+        items: [
+          { key: WORKING_TREE_KEY, label: 'working tree', detail: 'everything different from the last commit' },
+          ...files.map((file, index) => ({ key: String(index), label: labels[index] ?? file.label })),
+        ],
+        hint: '↑↓ move · Enter opens the diff · Esc back',
+        onSelect: (item) => {
+          setModal(null);
+          if (item.key === WORKING_TREE_KEY) {
+            void workingTree();
+            return;
+          }
+          const file = files[Number(item.key)];
+          if (file === undefined) return;
+          setModal({ kind: 'text', title: file.label, lines: diffOfFile(file, columns) });
+        },
+      });
+    })();
+  }, [conversation, mainWidth, workspace, openPicker, showFlash, diffOfFile]);
+
+  /**
+   * `/undo` — the last file change, taken back.
+   *
+   * The whole of the rule is the ledger's: it refuses unless the file still
+   * looks exactly as it did when the call finished, so a later edit, a save
+   * from an editor or a formatter all mean "cannot undo" rather than a write
+   * over work nobody asked to lose. What is here is the waiting, the re-read
+   * of the totals — the one thing that moves them without an event behind it —
+   * and saying which of the three happened.
+   */
+  const undoLastChange = useCallback(() => {
+    void (async () => {
+      await conversation.changesSettled();
+      const result = await conversation.changes.undo();
+      conversation.refreshChanges();
+      if (!result.ok) {
+        showFlash(`cannot undo: ${result.reason}`);
+        recordCommand('undo', undefined, `cannot undo: ${result.reason}`, true);
+        return;
+      }
+      const said = `${result.action} ${result.path}`;
+      showFlash(said);
+      recordCommand('undo', undefined, said);
+    })();
+  }, [conversation, showFlash, recordCommand]);
+
+  /**
+   * `/pin` — hold this conversation at the top of its folder.
+   *
+   * A judgement about a conversation rather than about an account, so it is
+   * remembered in the preferences and not in the cache, and it is the session
+   * id that is written down: a title is the provider's to change and a path is
+   * the directory's, while the id is what the conversation *is*.
+   */
+  const togglePin = useCallback(() => {
+    const sessionId = state.sessionId;
+    if (sessionId === undefined) {
+      showFlash('nothing to pin yet');
+      return;
+    }
+    togglePinFor(sessionId);
+  }, [state.sessionId, showFlash, togglePinFor]);
+
+  /**
+   * `/title` — name *this* conversation.
+   *
+   * Which one, and the words for having none yet; the writing is
+   * {@link renameStoredSession}'s, because Ctrl+R over the conversation list
+   * does the same thing to a row that is usually not this one.
+   */
+  const renameConversation = useCallback(
+    (name: string) => {
+      const sessionId = state.sessionId;
+      if (sessionId === undefined) {
+        showFlash('nothing to name yet');
+        return;
+      }
+      if (name.length === 0) {
+        showFlash('/title <name> names this conversation');
+        return;
+      }
+      void renameStoredSession(sessionId, name);
+    },
+    [state.sessionId, showFlash, renameStoredSession],
+  );
 
   /* ---------------------------------------------------------------------- */
   /* Commands and messages                                                   */
@@ -1191,14 +2734,293 @@ export function App({ launched }: AppProps): React.JSX.Element {
     });
   }, [sessions, state.settings.cwd, moveToDirectory, openBrowser]);
 
+  /**
+   * `/timeline` — every turn as one line, and a way back into any of them.
+   *
+   * The ledger's own question, asked of a conversation that has got long: what
+   * has this actually cost, and where was the turn where it went wrong. Both
+   * are answered by the same list — `timeline.ts` reduces the transcript to
+   * turns and formats them, the title carries the totals, and Enter opens the
+   * pager at the turn rather than scrolling somebody towards it.
+   *
+   * Typed at, because the reason to open it is usually that the conversation is
+   * too long to scroll, and a list that is too long to scroll is the same
+   * problem one surface further out. The rows are built at `mainWidth - 4`: the
+   * pane, less the picker's own padding and its cursor gutter.
+   *
+   * The cursor opens on the *last* turn, which is where the transcript already
+   * is — arriving at the top of a forty-turn ledger would be forty presses from
+   * the thing that just happened. `note` is what the turn touched, because a
+   * turn is remembered by its files long after its prompt has blurred, and the
+   * error when there was one, which is the row somebody is looking for.
+   */
+  const openTimelinePicker = useCallback(() => {
+    const turns = turnsOf(transcript);
+    if (turns.length === 0) {
+      showFlash('no turns yet');
+      return;
+    }
+    const lines = timelineLines(turns, mainWidth - 4);
+    const last = turns[turns.length - 1];
+    openPicker({
+      title: `Timeline — ${timelineSummary(turns)}`,
+      items: lines.map((line, index) => {
+        const turn = turns[index];
+        const touched = (turn?.files ?? []).map((path) => basename(path)).join(', ');
+        const note = [touched, turn?.error].filter((part): part is string => part !== undefined && part.length > 0).join(' · ');
+        return {
+          key: line.id,
+          label: line.text,
+          detail: line.detail,
+          ...(note.length === 0 ? {} : { note }),
+        };
+      }),
+      filterable: true,
+      ...(last === undefined ? {} : { initialKey: last.userItemId }),
+      hint: `Enter opens the whole conversation at that turn · ${PICKER_KEYS}`,
+      onSelect: (item) => {
+        setModal({ kind: 'pager', initialRowId: item.key });
+      },
+    });
+  }, [transcript, mainWidth, openPicker, showFlash]);
+
+  /**
+   * `/asks` — the card, for however many are waiting.
+   *
+   * The command opens it for one, which the key does not: Ctrl+] pressed with a
+   * single conversation waiting means "take me there", and putting a card of one
+   * row in front of that would be a keystroke asking a question with one answer.
+   * Somebody who *types* `/asks` has asked for the list.
+   */
+  const openAsksCard = useCallback(() => {
+    if (asksNow.current.length === 0) {
+      showFlash('nothing needs you');
+      return;
+    }
+    setModal({ kind: 'asks' });
+  }, [showFlash]);
+
+  /* ---------------------------------------------------------------------- */
+  /* Snippets                                                                */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * `/snip` with no name — the saved templates, as a list.
+   *
+   * The command's other form needs the name, which is fine for the three
+   * somebody wrote this morning and no use at all for the one they wrote in
+   * March. So the bare command is the list, typed at for the reason `/timeline`
+   * is: the reason to open it is that you have more of them than you remember.
+   *
+   * Enter goes through the composer's handle rather than writing the text
+   * itself. What comes back from an expansion is a buffer, a cursor and a list
+   * of holes for Tab to walk, and only the box has anywhere to put the last
+   * two — see {@link ComposerHandle.expandSnippet}.
+   */
+  const openSnippetPicker = useCallback(() => {
+    const saved = snippets.list();
+    if (saved.length === 0) {
+      showFlash('no snippets yet · /snip save <name> <text>, or /snip --examples');
+      return;
+    }
+    openPicker({
+      title: 'Snippets',
+      // The body as one line, which is how a name is recognised again: nobody
+      // remembers what `explain` says, and the first few words are enough.
+      items: saved.map((snippet) => ({ key: snippet.name, label: snippet.name, detail: oneLine(snippet.body, Math.max(20, mainWidth - 24)) })),
+      filterable: true,
+      hint: `Enter expands it into the composer · ${PICKER_KEYS}`,
+      onSelect: (item) => {
+        setModal(null);
+        composerRef.current?.expandSnippet(item.key, []);
+      },
+    });
+  }, [snippets, mainWidth, openPicker, showFlash]);
+
+  /**
+   * `/snip` — expand one, list them, or keep the list.
+   *
+   * ```
+   * /snip                     the list; Enter expands the row
+   * /snip fix-tests pnpm -w   expand it, its words filling the slots
+   * /snip save fix-tests …    write one, under the name it can be typed as
+   * /snip rm fix-tests        forget it
+   * /snip --examples          copy in three to edit
+   * ```
+   *
+   * The three subcommands outrank a snippet of the same name, which is the only
+   * ambiguity here and the one every tool resolves this way. A snippet called
+   * `save` is reachable from the list and from `;;save`, which is where anybody
+   * who managed to save one under that name is going to look for it.
+   *
+   * Saving takes the rest of the line *verbatim* rather than its words
+   * rejoined: a template's line breaks are part of the template, and `$0` on a
+   * line of its own is the common shape. Which means the name is the *first*
+   * word and only the first word — everything after it is the body, so there is
+   * nowhere for a name with a space in it to live — and it goes through
+   * `toSnippetName` on the way in: `Fix_Tests!` is `fix-tests`, because saving
+   * is the one moment somebody types a name rather than picks one and refusing
+   * a capital letter there is pedantry. What is stored is still one lower-case
+   * word, so the trigger stays one token.
+   */
+  const runSnip = useCallback(
+    (args: string) => {
+      const [word, rest] = firstWord(args);
+
+      if (word === '') {
+        openSnippetPicker();
+        return;
+      }
+
+      if (word === '--examples') {
+        for (const example of EXAMPLE_SNIPPETS) snippets.set(example.name, example.body);
+        showFlash(`${String(EXAMPLE_SNIPPETS.length)} examples saved · /snip lists them`);
+        return;
+      }
+
+      if (word === 'save') {
+        const [typedName, body] = firstWord(rest);
+        if (body.trim().length === 0) {
+          setNotice('/snip save <name> <the template> — with the text to save after the name.');
+          return;
+        }
+        const name = toSnippetName(typedName);
+        if (name === null) {
+          setNotice(`"${typedName}" leaves nothing that can be a snippet name; letters, digits and dashes survive.`);
+          return;
+        }
+        const replaced = snippets.get(name) !== undefined;
+        snippets.set(name, body);
+        showFlash(`${replaced ? 'replaced' : 'saved'} ;;${name}`);
+        return;
+      }
+
+      if (word === 'rm') {
+        const [typedName] = firstWord(rest);
+        // Through the same door saving used, so that `rm Fix_Tests` forgets
+        // exactly what `save Fix_Tests …` wrote, rather than reporting that
+        // there is no snippet by a name nobody could have stored.
+        const name = toSnippetName(typedName);
+        if (name === null) {
+          setNotice('/snip rm <name> — which snippet to forget.');
+          return;
+        }
+        if (!snippets.remove(name)) {
+          setNotice(`No snippet called ${name}.`);
+          return;
+        }
+        showFlash(`removed ;;${name}`);
+        return;
+      }
+
+      /*
+       * A name, and the words after it filling its slots in order — the last
+       * slot taking whatever is left, which is why `/snip explain the whole
+       * launch path` explains the phrase rather than the word "the".
+       */
+      const words = rest.split(/\s+/).filter((part) => part.length > 0);
+      if (composerRef.current?.expandSnippet(word, words) !== true) {
+        setNotice(`No snippet called ${word}. /snip lists them; /snip save ${word} <text> writes one.`);
+      }
+    },
+    [snippets, openSnippetPicker, showFlash],
+  );
+
+  /**
+   * The hand-off list, opened from a command that is answered before it.
+   *
+   * A ref for `resumeAgain`'s reason turned round: `openFailoverPicker` is
+   * built out of half a dozen things that only exist further down this file,
+   * and `/handoff` is parsed up here. One indirection rather than either a list
+   * of hooks moved for the sake of an ordering or two ways into one picker.
+   */
+  const handOffAgain = useRef<() => void>(() => undefined);
+
+  /**
+   * `/check` — read back this folder's checks, set them, switch them off, or run
+   * them now.
+   *
+   * Per directory and not per conversation, because it is a fact about a project:
+   * `pnpm -w test` is the answer for this checkout however many conversations are
+   * open in it, and somebody who set it last week is owed it today. The store is
+   * `preferences.ts`, keyed by the resolved path.
+   *
+   * The command is taken exactly as it was typed, pipes and `&&` and all: it goes
+   * to a shell, so anything a shell understands is a legal answer and a terminal
+   * that tried to validate it would only be wrong about somebody's `just`
+   * recipe.
+   *
+   * Everything but the bare readout forgets the last failure first. All three are
+   * moments where "the same failure twice in a row" has stopped being true
+   * without a check having passed — the command changed, it was switched off, or
+   * it was asked for by hand — and asking by hand is asking for the answer, not
+   * for silence because the answer has not changed since last time.
+   */
+  const runCheckCommand = useCallback(
+    (args: string) => {
+      const cwd = state.settings.cwd;
+      const engine = checks.current;
+      if (args.length === 0) {
+        const current = preferences.afterEditFor(cwd);
+        setNotice(current === undefined ? 'no check set for this folder' : `checks after edits: ${current}`);
+        return;
+      }
+      if (args === 'off') {
+        preferences.setAfterEdit(cwd, undefined);
+        engine?.forget();
+        // The offer is about a check that no longer runs here.
+        setCheckOffer(null);
+        showFlash('no checks after edits');
+        return;
+      }
+      if (args === 'now') {
+        const current = preferences.afterEditFor(cwd);
+        engine?.forget();
+        if (current === undefined) {
+          setNotice('no check set for this folder · /check <command> sets one');
+          return;
+        }
+        // Regardless of `shouldRun`, which is the rule for what is worth doing
+        // unasked. This was asked for, so an untouched turn is not a reason.
+        void runChecks(current, cwd);
+        return;
+      }
+      preferences.setAfterEdit(cwd, args);
+      engine?.forget();
+      showFlash(`checks after edits: ${args}`);
+    },
+    [state.settings.cwd, preferences, showFlash, runChecks],
+  );
+
   const runCommand = useCallback(
     (command: Command) => {
       switch (command.name) {
-        case 'help':
-          say('info', 'Commands', COMMANDS.map((spec) => `${spec.usage.padEnd(16)} ${spec.summary}`).join('\n'));
+        case 'help': {
+          /*
+           * The whole map, grouped, rather than the slash commands alone. The
+           * overlay and this print the same rows from the same function, so
+           * what `/help` says and what `?` draws cannot drift apart — which is
+           * the divergence `keymap.ts` exists to end. The commands are still
+           * here; they are the last group, as they are in the map.
+           */
+          const lines = helpLines(mainWidth);
+          const width = lines.reduce((widest, line) => Math.max(widest, line.key.length), 0);
+          const printed: string[] = [];
+          for (const line of lines) {
+            if (line.group !== undefined) printed.push(printed.length === 0 ? line.group : `\n${line.group}`);
+            printed.push(`  ${line.key.padEnd(width)}  ${line.does}${line.planned === true ? ' (soon)' : ''}`);
+          }
+          say('info', 'Keys', printed.join('\n'));
           return;
+        }
         case 'cwd':
+          // Another folder is another project with checks of its own, so what
+          // failed last is no longer a thing that could fail again in a row.
+          checks.current?.forget();
           openDirectoryPicker();
+          return;
+        case 'check':
+          runCheckCommand(command.args);
           return;
         case 'quit':
           exit();
@@ -1225,7 +3047,10 @@ export function App({ launched }: AppProps): React.JSX.Element {
             } else if (!state.capabilities.permissionModes.includes(wanted)) {
               setNotice(`${state.settings.providerLabel} does not have a "${wanted}" mode.`);
             } else if (wanted === 'bypassPermissions') {
-              confirm('Approve every tool call without asking?', 'Yes — bypass all permission prompts', true, () => applyMode(wanted));
+              confirm('Approve every tool call without asking?', 'Yes — bypass all permission prompts', true, () => {
+                bypassConfirmed.current = true;
+                applyMode(wanted);
+              });
             } else {
               applyMode(wanted);
             }
@@ -1241,11 +3066,43 @@ export function App({ launched }: AppProps): React.JSX.Element {
         case 'attach':
           void attach(command.args);
           return;
+        case 'copy':
+          copyLastReply();
+          return;
+        case 'export':
+          exportConversation(command.args);
+          return;
+        case 'diff':
+          openDiff();
+          return;
+        case 'undo':
+          undoLastChange();
+          return;
+        case 'pin':
+          togglePin();
+          return;
+        case 'title':
+          renameConversation(command.args);
+          return;
         case 'tasks':
           openTasksPicker();
           return;
         case 'usage':
           void showUsage();
+          return;
+        case 'asks':
+          openAsksCard();
+          return;
+        case 'timeline':
+          openTimelinePicker();
+          return;
+        case 'snip':
+          runSnip(command.args);
+          return;
+        case 'handoff':
+          // The same list Alt+H opens, because there is one hand-off and two
+          // ways to ask for it. See `openFailoverPicker`.
+          handOffAgain.current();
           return;
         default:
           return;
@@ -1253,6 +3110,7 @@ export function App({ launched }: AppProps): React.JSX.Element {
     },
     [
       say,
+      mainWidth,
       state.settings,
       state.capabilities.permissionModes,
       exit,
@@ -1264,74 +3122,831 @@ export function App({ launched }: AppProps): React.JSX.Element {
       openResumePicker,
       loadSession,
       attach,
+      copyLastReply,
+      exportConversation,
+      openDiff,
+      undoLastChange,
+      togglePin,
+      renameConversation,
       openTasksPicker,
       showUsage,
+      openAsksCard,
+      openTimelinePicker,
+      runSnip,
+      runCheckCommand,
       confirm,
       applyMode,
     ],
   );
 
   const submit = useCallback(
-    (text: string) => {
+    (text: string, mentions: readonly string[] = [], images: readonly PastedImage[] = []) => {
       setNotice(undefined);
+      /*
+       * Whatever is being sent, the failed check is no longer the thing Enter
+       * means — including when it is the hand-over itself, which is sent once
+       * and would otherwise be one keystroke from being sent twice. Cleared here
+       * rather than at the key so that every door into the composer's Enter goes
+       * through one line: a message, a steer, a slash command, a snippet.
+       */
+      setCheckOffer(null);
       const command = parseCommand(text);
       if (command !== null) {
         runCommand(command);
         return;
       }
-      const attachments = pendingAttachments.map((entry) => entry.attachment);
+      /*
+       * An image pasted into the box with Ctrl+V. There is no file for it —
+       * the bytes came off the clipboard — so `attachments.ts` builds the same
+       * `Attachment` from what is in hand. A provider that cannot take images
+       * gets none, and says so rather than dropping one silently; the `[Image
+       * #1]` left in the text is still where it was meant.
+       */
+      const pasted = state.capabilities.imageInput
+        ? images.flatMap((image) => {
+            const attachment = attachmentFromBytes(image.name, image.mediaType, image.bytes);
+            return attachment === null ? [] : [attachment];
+          })
+        : [];
+      const attachments = [...pendingAttachments.map((entry) => entry.attachment), ...pasted];
       setPendingAttachments([]);
       setScroll(0);
-      void conversation.send(text, attachments).then((outcome) => {
+      if (pasted.length < images.length) {
+        setNotice(
+          state.capabilities.imageInput
+            ? 'A pasted image was too large to send.'
+            : `${state.settings.providerLabel} cannot take images.`,
+        );
+      }
+      /*
+       * Remembered here and not in `Conversation`, because what is remembered
+       * is what a person typed: this is every submission that leaves the
+       * composer as a message or a steer, and none of the slash commands the
+       * terminal answers itself — those returned above, and `/model` is not a
+       * prompt anybody wants Up to hand back. It is written down before the
+       * provider is asked, so a message the run refuses is still one keystroke
+       * from being retyped. Blank text and an immediate repeat are dropped by
+       * `history.ts`, which is where that rule belongs.
+       */
+      history.append({
+        text,
+        cwd: state.settings.cwd,
+        ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),
+      });
+      /*
+       * An `@path` is a file the message is about, so it travels as one — read
+       * with `/attach`'s own reader and sent beside whatever was already
+       * queued. The `@path` stays in the text, because that is what tells the
+       * agent which file was meant where; the attachment is what saves it a
+       * round trip to read it. Anything the reader will not take — a
+       * directory, a path deleted since the index was listed, a kind this
+       * provider cannot accept — is simply not attached, and the words remain
+       * exactly as they were typed.
+       */
+      void (async () => {
+        const read = await Promise.all(mentions.map((path) => readAttachment(path, state.settings.cwd)));
+        const named = read.flatMap((result) => {
+          if (!result.ok) return [];
+          const accepts = result.attachment.kind === 'image' ? state.capabilities.imageInput : state.capabilities.fileInput;
+          return accepts ? [result.attachment] : [];
+        });
+        const outcome = await conversation.send(text, [...attachments, ...named]);
         if (!outcome.ok) {
           setNotice(outcome.reason);
           // Not lost: a refused message keeps its attachments for the retry.
           if (attachments.length > 0) setPendingAttachments(pendingAttachments);
         }
-      });
+      })();
     },
-    [conversation, runCommand, pendingAttachments],
+    [
+      conversation,
+      runCommand,
+      pendingAttachments,
+      history,
+      state.capabilities,
+      state.settings.cwd,
+      state.settings.providerLabel,
+      state.sessionId,
+    ],
   );
+
+  /* ---------------------------------------------------------------------- */
+  /* The terminal, lent out                                                  */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Hand the whole terminal to `$EDITOR`, and take it back.
+   *
+   * Two programs cannot own one terminal: `vim` wants the alternate screen,
+   * raw mode and standard input, and Ink is holding all three. Ink 7 knows
+   * this and does the entire dance behind `useApp().suspendTerminal` — it
+   * flushes whatever render is pending, erases its own frame, turns off the
+   * kitty protocol it may have negotiated, writes `\x1b[?1049l` to leave the
+   * alternate screen, and drops raw mode and bracketed paste; on the way back
+   * it re-enters the alternate screen, re-enables the protocol, retakes raw
+   * mode, throws away the frame it diffs against and forces a full redraw. Ink
+   * restores all of it even when the callback throws, which is the reason to
+   * use it rather than to write the escapes out here: a half-suspended
+   * terminal is a dead prompt, and there is no key left to fix it with.
+   *
+   * What it cannot do is prove anything about a real terminal from a test —
+   * the whole sequence is writes to a TTY and reads from one. See the report:
+   * the escape sequences and the order are Ink's, verified by reading it; what
+   * `$EDITOR` looks like on the way in and out has to be tried by hand.
+   */
+  const editExternally = useCallback(
+    async (text: string): Promise<string | undefined> => {
+      let result: ExternalEditResult | undefined;
+      try {
+        await suspendTerminal(async () => {
+          result = await editInExternalEditor(text);
+        });
+      } catch (error) {
+        setNotice(`Could not hand over the terminal: ${describeError(error)}`);
+        return undefined;
+      }
+      if (result === undefined) return undefined;
+      if (!result.ok) {
+        setNotice(`Could not edit the message: ${result.reason}`);
+        return undefined;
+      }
+      return result.text;
+    },
+    [suspendTerminal],
+  );
+
+  /**
+   * `o` on a row: the file it touched, opened where it touched it.
+   *
+   * The same handover as Ctrl+G and for the same reason — two programs cannot
+   * own one terminal — but not the same call. `editInExternalEditor` is about
+   * a draft: it writes a temp file, waits, reads it back, and throws the text
+   * away on a non-zero exit. Here there is no text to carry either way. The
+   * file is the user's own, on disk, and what they do to it is between them and
+   * their editor; this only has to put them in front of it and take the screen
+   * back afterwards.
+   *
+   * `+<line>` is the argument vi, vim, nano, emacs and `less` have all agreed
+   * on for "start here", so it is the one worth spending. An editor that does
+   * not know it — VS Code wants `--goto file:line` — opens the file anyway and
+   * ignores an argument it reads as a filename it cannot find, which is a
+   * cursor in the wrong place rather than a key that does nothing.
+   */
+  const openInEditorAt = useCallback(
+    async (target: RowTarget): Promise<void> => {
+      const configured = (process.env['VISUAL'] ?? '').trim() || (process.env['EDITOR'] ?? '').trim();
+      if (configured.length === 0) {
+        showFlash('neither VISUAL nor EDITOR is set');
+        return;
+      }
+      const argv = splitCommand(configured);
+      const file = argv[0];
+      if (file === undefined || file.length === 0) {
+        showFlash('the editor command is empty');
+        return;
+      }
+      const args = [...argv.slice(1), `+${String(target.line ?? 1)}`, target.path];
+      let failed: string | undefined;
+      try {
+        await suspendTerminal(async () => {
+          failed = await new Promise<string | undefined>((settle) => {
+            let done = false;
+            const finish = (reason?: string): void => {
+              if (done) return;
+              done = true;
+              settle(reason);
+            };
+            try {
+              const child = spawn(file, args, { stdio: 'inherit' });
+              // A failed spawn emits `error` and then `exit` with a null code,
+              // so the first of the two to speak is the answer.
+              child.on('error', (error: Error) => finish(`could not run ${file}: ${error.message}`));
+              // Any exit status at all: `:cq` means "forget it" for a draft
+              // being read back, and there is nothing here to forget.
+              child.on('exit', () => finish());
+            } catch (error) {
+              finish(`could not run ${file}: ${describeError(error)}`);
+            }
+          });
+        });
+      } catch (error) {
+        setNotice(`Could not hand over the terminal: ${describeError(error)}`);
+        return;
+      }
+      if (failed !== undefined) showFlash(failed);
+    },
+    [suspendTerminal, showFlash],
+  );
+
+  /**
+   * A line typed at the composer's `$`.
+   *
+   * The rules of running it are `shell.ts`'s; what is here is the two things
+   * that can be done with the answer. `!cmd` puts it in the transcript as a
+   * command row — the same row a provider's own slash command gets, because
+   * this is the same kind of thing: the host did it, and no model was asked.
+   * `!!cmd` hands it to the agent as a message instead, fenced, with the
+   * command named above it, which is the short way to ask "why does this say
+   * that" about something that just happened.
+   *
+   * The line is written to the prompt history with its `!` in front, which is
+   * the whole of what makes ↑ at the `$` a shell history: one file, and a
+   * prefix that says which list an entry belongs to.
+   */
+  const runShellLine = useCallback(
+    (command: string, options: { readonly send: boolean }) => {
+      const cwd = state.settings.cwd;
+      history.append({
+        text: `!${options.send ? '!' : ''}${command}`,
+        cwd,
+        ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),
+      });
+      setFlash(`running: ${oneLine(command, 48)}`);
+      setScroll(0);
+      void (async () => {
+        const result = await runShell(command, cwd);
+        setFlash(undefined);
+        if (options.send) {
+          submit(`Ran \`${command}\`:\n\`\`\`\n${result.output}\n\`\`\``);
+          return;
+        }
+        const cut = command.search(/\s/u);
+        const args = cut === -1 ? undefined : command.slice(cut).trim();
+        transcript.apply({
+          type: 'command.run',
+          // Not a run: the seq counter belongs to the provider's stream, and a
+          // run id of its own is what keeps this out of that numbering.
+          runId: SHELL_RUN_ID,
+          seq: 0,
+          ts: Date.now(),
+          command: {
+            name: cut === -1 ? command : command.slice(0, cut),
+            ...(args === undefined || args.length === 0 ? {} : { args }),
+            ...(result.output.length === 0 ? {} : { output: result.output }),
+            ...(result.failed ? { failed: true } : {}),
+          },
+          // Which table the name came from. Nothing looked `git` up in a
+          // command list and there is no `/git`, so the row wears a `$`
+          // rather than a slash — and keeps it through a redraw.
+          source: 'shell',
+        });
+      })();
+    },
+    [history, state.settings.cwd, state.sessionId, submit, transcript],
+  );
+
+  /* ---------------------------------------------------------------------- */
+  /* The window, from outside                                                */
+  /* ---------------------------------------------------------------------- */
+
+  /*
+   * Artemis is the one agent terminal where several conversations work at
+   * once, which makes the window's own chrome the only channel it has to
+   * someone who has tabbed away. `terminal.ts` is all of the bytes and none of
+   * the policy; this is the policy.
+   *
+   * Three signals, three different questions:
+   *
+   *  - The **title** answers "what is Artemis doing", across the whole pool
+   *    rather than for whichever conversation happens to be on screen — the
+   *    person reading a taskbar button cannot see which one that is. The
+   *    reduction is `titleStateOf`, which is pure and tested; this is the
+   *    effect that writes its answer out.
+   *  - The **taskbar light** answers "is this window still busy", and belongs
+   *    to the conversation in front of you: it is the window's own progress,
+   *    and a parked conversation's turn is reported by the rail.
+   *  - The **bell** answers "do I need to come back", and waits until nobody
+   *    is looking. `AttentionTimer` is that rule — every keystroke pushes both
+   *    kinds back out, so a notification never fires at someone mid-sentence.
+   */
+
+  /** One timer for the process, built on first render and never replaced. */
+  const attention = useRef<AttentionTimer | null>(null);
+  attention.current ??= new AttentionTimer();
+  useEffect(
+    () => () => {
+      attention.current?.disarmAll();
+    },
+    [],
+  );
+
+  /**
+   * What this conversation is called, and a mirror of it for the callbacks.
+   *
+   * The title effect wants the value it rendered with; a notification wants
+   * the value at the moment it fires, which may be a minute later and by then
+   * may be a name the rail had not read when the bell was armed.
+   */
+  const conversationTitle = currentSession?.title;
+  const conversationName = useRef<string | undefined>(undefined);
+  conversationName.current = conversationTitle;
+
+  const chrome = useMemo(
+    () => titleStateOf(pool.map((alive) => alive.getState())),
+    // The same two signals the rail's activity map watches: `parkedTick` says
+    // a parked conversation moved, `state` that the one on screen did.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [pool, parkedTick, state],
+  );
+
+  useEffect(() => {
+    // The folder is the subject when the conversation has no name yet, which
+    // `titleFor` arranges: `◇ ready · (artemis)` would be a hole where a name
+    // should be.
+    setTitle(
+      titleFor({
+        state: chrome.state,
+        ...(conversationTitle === undefined ? {} : { title: conversationTitle }),
+        folder: workspace,
+        needing: chrome.needing,
+      }),
+    );
+  }, [chrome.state, chrome.needing, conversationTitle, workspace]);
+
+  /**
+   * When the last turn failed, so the light is not cleared out from under its
+   * own red. `progressState('done')` and `'clear'` are the same sequence, and
+   * the status going idle arrives on the heels of the `run.end` that failed.
+   */
+  const failedAt = useRef(0);
+  /**
+   * Which state of the light a pending clear belongs to.
+   *
+   * A turn started inside the five seconds takes the bar back to working, and
+   * the timer that was going to clear the red must not then clear *that* — a
+   * pulse that stops halfway through a turn is a worse lie than a red bar that
+   * outstays its welcome.
+   */
+  const progressGeneration = useRef(0);
+
+  useEffect(() => {
+    const off = conversation.subscribeEvents((event) => {
+      if (event.type !== 'run.end' || event.reason !== 'error') return;
+      failedAt.current = Date.now();
+      const generation = ++progressGeneration.current;
+      progressState('error');
+      const clearing = setTimeout(() => {
+        if (progressGeneration.current === generation) progressState('clear');
+      }, PROGRESS_ERROR_MS);
+      clearing.unref?.();
+    });
+    return off;
+  }, [conversation]);
+
+  useEffect(() => {
+    if (live) {
+      progressGeneration.current += 1;
+      progressState('working');
+      return;
+    }
+    // The `run.end` that failed has already lit the bar red, and the status
+    // going idle arrives on its heels; `done` and `clear` are the same
+    // sequence, so letting this through would take the red straight back off.
+    if (Date.now() - failedAt.current < PROGRESS_ERROR_MS) return;
+    progressState('done');
+  }, [live]);
+
+  /**
+   * The first conversation anywhere in the pool that has stopped to ask.
+   *
+   * Anywhere, because the whole reason a parked conversation is worth a bell
+   * is that its question is invisible: the rail shows a glyph, and the rail is
+   * not what the person is looking at.
+   */
+  const waiting = useMemo(() => {
+    for (const alive of pool) {
+      const asking = alive.getState();
+      const request = asking.pendingPermissions[0];
+      if (request === undefined) continue;
+      const named = asking.sessionId === undefined ? undefined : sessions.find((row) => row.id === asking.sessionId)?.title;
+      return { title: named, tool: request.toolName };
+    }
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pool, parkedTick, state, sessions]);
+
+  /*
+   * Read at the moment the bell rings rather than captured when it was armed:
+   * six seconds is long enough for the rail to have learned the conversation's
+   * name, and a notification that says which one is asking is the whole value
+   * of the notification.
+   */
+  const waitingNow = useRef(waiting);
+  waitingNow.current = waiting;
+  const someoneWaiting = waiting !== undefined;
+
+  useEffect(() => {
+    const timer = attention.current;
+    if (timer === null) return;
+    if (!someoneWaiting) {
+      timer.disarm('needs-you');
+      return;
+    }
+    timer.arm('needs-you', () => {
+      const asking = waitingNow.current;
+      notify(
+        noticeFor('needs-you', {
+          ...(asking?.title === undefined ? {} : { conversation: asking.title }),
+          ...(asking?.tool === undefined ? {} : { tool: asking.tool }),
+        }),
+      );
+    });
+  }, [someoneWaiting]);
+
+  /**
+   * Whether the conversation on screen was running the last time this looked.
+   *
+   * A finished turn is a *transition* and not a state: a conversation resumed
+   * from the store is idle without having just finished anything, and
+   * switching from a live conversation to a parked idle one is not the end of
+   * a turn either. So the conversation is remembered beside the flag, and only
+   * the same one going from live to idle arms the bell.
+   */
+  const lastTurn = useRef<{ readonly conversation: Conversation; readonly live: boolean } | null>(null);
+  useEffect(() => {
+    const timer = attention.current;
+    const previous = lastTurn.current;
+    lastTurn.current = { conversation, live };
+    if (timer === null) return;
+    if (live) {
+      // A new turn is the answer to the last one; nothing is owed about it.
+      timer.disarm('finished');
+      return;
+    }
+    if (previous === null || previous.conversation !== conversation || !previous.live) return;
+    timer.arm('finished', () => {
+      const said = lastAssistantText(conversation.transcript);
+      notify(
+        noticeFor('finished', {
+          ...(conversationName.current === undefined ? {} : { conversation: conversationName.current }),
+          ...(said === null ? {} : { reply: said }),
+        }),
+      );
+    });
+  }, [conversation, live]);
+
+  /* ---------------------------------------------------------------------- */
+  /* Who needs you, and what you missed                                      */
+  /* ---------------------------------------------------------------------- */
+
+  /*
+   * The pool's other half of the bargain.
+   *
+   * Several conversations working at once buys you parallelism and hands you
+   * a new problem with it: the thing that wants you is, by construction, not
+   * the thing you are looking at. The rail answers "which one" with a glyph
+   * per row, and a glyph only works on somebody who thought to look. These
+   * two do the looking for them.
+   *
+   *  - **Ctrl+]** goes to the next conversation with a claim on you — every
+   *    one that is stuck on a permission first, then every one whose turn
+   *    ended since you last had it on screen. `needsYou` is that ordering,
+   *    pure and tested; the same list is the count the status line draws, so
+   *    the number beside the composer and the conversation the key opens can
+   *    never disagree.
+   *  - **The welcome-back line** is for the other direction: not "where
+   *    should I go" but "what did I miss", on the keystroke that ends three
+   *    minutes of stillness. `awayRecap` writes it.
+   *
+   * Both are built from `runEnds` and `askedAt` above, which this is where
+   * they are filled in. One subscription per pooled conversation, taken off
+   * the event stream rather than off the state, because a run's length and
+   * its cost are on `run.end` and nowhere else — `ConversationState` keeps
+   * what is true *now*, and both of these are facts about a turn that is
+   * over.
+   */
+  useEffect(() => {
+    // A conversation dropped by `prunePool` is never coming back as the same
+    // object, so what was written under its key is dead weight. Pruned here
+    // rather than in `switchTo` so that one rule — "the pool is what exists" —
+    // governs all three maps.
+    const alive = new Set(pool.map((parked) => keyFor(parked)));
+    for (const remembered of [seenAt.current, runEnds.current, askedAt.current]) {
+      for (const key of [...remembered.keys()]) if (!alive.has(key)) remembered.delete(key);
+    }
+    const offs = pool.map((parked) => {
+      const key = keyFor(parked);
+      /*
+       * Which run is this conversation's own turn.
+       *
+       * A conversation forwards its *siblings'* events as well — work the
+       * provider started beside the turn, which lands in the same transcript —
+       * and a sibling's `run.end` is not the end of anybody's turn. The state
+       * says which run is the conversation's while one is in flight and clears
+       * it as that run ends, so it is remembered from the events that came
+       * before rather than asked for at the one moment it is gone.
+       */
+      let ownRun = parked.getState().runId;
+      return parked.subscribeEvents((event) => {
+        ownRun = parked.getState().runId ?? ownRun;
+        if (event.type === 'permission.request') {
+          askedAt.current.set(key, Date.now());
+          return;
+        }
+        if (event.type !== 'run.end' || event.runId !== ownRun) return;
+        runEnds.current.set(key, {
+          // The host's clock and not the provider's: this is compared against
+          // the moment of a keystroke, which only this process saw.
+          at: Date.now(),
+          durationMs: event.durationMs,
+          costUsd: event.usage?.costUsd,
+          failed: event.reason === 'error',
+        });
+      });
+    });
+    return () => {
+      for (const off of offs) off();
+    };
+  }, [pool, keyFor]);
+
+  /**
+   * Where each conversation sits in the rail, by session id.
+   *
+   * Ctrl+] walks the pool in the order the eye is about to travel rather than
+   * in the order conversations happened to be opened, which is what makes
+   * repeated presses feel like going down a list instead of being thrown
+   * about one. A conversation the rail has no row for — nothing sent in it
+   * yet, or a filter is hiding it — sorts to the end rather than out: the
+   * order decides which one is *next*, never which ones count.
+   */
+  const railOrder = useMemo(() => {
+    const at = new Map<string, number>();
+    rail.forEach((row, index) => {
+      if (row.kind === 'session') at.set(row.session.id, index);
+    });
+    return at;
+  }, [rail]);
+
+  /** Every conversation with a claim on you, in the order Ctrl+] will visit them. */
+  const needing = useMemo(() => {
+    const ranked = [...pool].sort(
+      (a, b) =>
+        (railOrder.get(a.getState().sessionId ?? '') ?? Number.MAX_SAFE_INTEGER) -
+        (railOrder.get(b.getState().sessionId ?? '') ?? Number.MAX_SAFE_INTEGER),
+    );
+    const looked = new Map(seenAt.current);
+    // The one on the screen is being looked at now, whatever the map last
+    // recorded about it. Written here rather than by an effect because an
+    // effect runs after the render that would already have counted it.
+    looked.set(keyFor(conversation), Date.now());
+    return needsYou(
+      ranked.map((parked) => {
+        const parkedState = parked.getState();
+        return {
+          key: keyFor(parked),
+          status: parkedState.status,
+          pendingPermissions: parkedState.pendingPermissions,
+          finishedAt: runEnds.current.get(keyFor(parked))?.at,
+        };
+      }),
+      looked,
+    );
+    // The same two signals the rail's activity map watches — `parkedTick` for
+    // a parked conversation, `state` for the one on screen — plus the rail's
+    // own order.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pool, parkedTick, state, conversation, railOrder, keyFor]);
+
+  /** Read at the moment the key is pressed, not when the handler was built. */
+  const needingNow = useRef<readonly Needing[]>(needing);
+  needingNow.current = needing;
+
+  /**
+   * Every conversation stopped on a permission, as a row of the card.
+   *
+   * Rebuilt on every render rather than held, which is the arrangement
+   * `AsksCard` asks for: a request answered from anywhere — the full card
+   * behind this one, another window, the agent withdrawing it — has to be able
+   * to take its row off the list, and a list captured at the keystroke could
+   * not. The card keeps its own note of what *it* has answered, because that
+   * round trip is a few frames long and a row that lingered could be allowed
+   * twice.
+   *
+   * In the rail's order, like {@link needing} and for the same reason: two
+   * surfaces about the same set of conversations should walk them in the order
+   * the eye does. The conversation on screen is in the list and says so — the
+   * count on the status line includes it, and a card headed "3 conversations
+   * are waiting on you" that lists two is a card whose count you stop
+   * trusting.
+   */
+  const asks = useMemo<readonly Ask[]>(() => {
+    const ranked = [...pool].sort(
+      (a, b) =>
+        (railOrder.get(a.getState().sessionId ?? '') ?? Number.MAX_SAFE_INTEGER) -
+        (railOrder.get(b.getState().sessionId ?? '') ?? Number.MAX_SAFE_INTEGER),
+    );
+    return ranked.flatMap((parked) => {
+      const parkedState = parked.getState();
+      const request = parkedState.pendingPermissions[0];
+      if (request === undefined) return [];
+      const named = parkedState.sessionId === undefined ? undefined : sessions.find((row) => row.id === parkedState.sessionId)?.title;
+      return [
+        {
+          key: keyFor(parked),
+          // The folder when the provider has not filed it under a name yet,
+          // which is what the rail shows for such a row too.
+          title: named ?? (basename(parkedState.settings.cwd) || parkedState.settings.cwd),
+          request,
+          decide: (decision) => {
+            void parked.respondToPermission(request.id, decision);
+          },
+          open: () => {
+            switchTo(parked);
+          },
+          ...(parked === conversation ? { current: true } : {}),
+        } satisfies Ask,
+      ];
+    });
+    // The same two signals the rail's activity map watches — `parkedTick` for
+    // a parked conversation, `state` for the one on screen.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pool, parkedTick, state, conversation, sessions, railOrder, keyFor, switchTo]);
+
+  // Read at the moment the key is pressed, as `needing` is; the ref itself is
+  // declared with the others, above, because `/asks` is answered before this.
+  asksNow.current = asks;
+
+  /**
+   * Ctrl+]: go to whoever is waiting.
+   *
+   * The step is always to the one *after* the current conversation in the
+   * queue, so a second press walks on instead of staying put — and since
+   * arriving somewhere counts as looking at it, the "finished" half of the
+   * queue drains as you go while the stuck half stays until the questions are
+   * answered, which is exactly the difference between the two.
+   *
+   * A conversation with no claim of its own is not in the queue at all, so the
+   * search comes back empty-handed and the step lands on the first — the
+   * common case, since the reason to press this is that the screen is showing
+   * something that does *not* need you.
+   */
+  const goToNeedy = useCallback(() => {
+    const queue = needingNow.current;
+    if (queue.length === 0) {
+      showFlash('nothing needs you');
+      return;
+    }
+    const here = keyFor(conversationRef.current);
+    const at = queue.findIndex((row) => row.key === here);
+    const next = queue[(at + 1) % queue.length];
+    const target = next === undefined ? undefined : poolRef.current.find((parked) => keyFor(parked) === next.key);
+    // The one thing that needs you is the one you are on: the card is already
+    // on the screen, and moving nowhere without a word reads as a dead key.
+    if (target === undefined || target === conversationRef.current) {
+      showFlash('nothing else needs you');
+      return;
+    }
+    switchTo(target);
+  }, [keyFor, showFlash, switchTo]);
+
+  /**
+   * The pool as the welcome-back line needs to read it.
+   *
+   * Built at the keystroke rather than kept in a memo: it is wanted once every
+   * few minutes at most, and the names come from the rail's own list, which
+   * moves for reasons that have nothing to do with this.
+   */
+  const recapSubjects = useCallback(
+    (): readonly RecapSubject[] =>
+      poolRef.current.map((parked) => {
+        const parkedState = parked.getState();
+        const key = keyFor(parked);
+        return {
+          title: parkedState.sessionId === undefined ? undefined : sessions.find((row) => row.id === parkedState.sessionId)?.title,
+          status: parkedState.status,
+          pendingPermissions: parkedState.pendingPermissions,
+          lastRun: runEnds.current.get(key),
+          askedAt: askedAt.current.get(key),
+        };
+      }),
+    [keyFor, sessions],
+  );
+
+  /* ---------------------------------------------------------------------- */
+  /* The delegated strip, pointed at                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /** Which row of the strip the cursor is on. The strip clamps it; see below. */
+  const [delegatedSelected, setDelegatedSelected] = useState(0);
+  /** Task ids whose workflow agents are unfolded, which `→` and `←` change. */
+  const [delegatedExpanded, setDelegatedExpanded] = useState<ReadonlySet<string>>(() => new Set());
+  /**
+   * The row under the cursor, as the strip reported it.
+   *
+   * Taken from the strip rather than worked out again here, which is what its
+   * header asks for and the reason it hands one back: the rows are read out of
+   * the tasks on every render and unfolding changes how many there are, so a
+   * second reading in this file would be a second answer to "what does Enter
+   * open" — and the two would part company on the first tick of the clock.
+   */
+  const [delegatedRow, setDelegatedRow] = useState<DelegatedRow | undefined>(undefined);
+  /**
+   * How many rows the strip has, which is all this file needs of them.
+   *
+   * Tab must not stop at a strip with nothing in it and ↑↓ must not walk past
+   * the end, and both are questions about the count. `delegatedRows` is asked,
+   * rather than the tasks counted again, for {@link delegatedRow}'s reason. The
+   * clock it is given is only spent on the text of rows nothing here reads.
+   */
+  const delegatedCount = useMemo(
+    () => delegatedRows(state.tasks, Date.now(), mainWidth, { expanded: delegatedExpanded }).rows.length,
+    [state.tasks, mainWidth, delegatedExpanded],
+  );
+
+  /*
+   * A strip that has emptied is a strip nobody can see, and the cursor in it
+   * answers keys that now have no rows to act on. The focus comes home.
+   */
+  useEffect(() => {
+    if (delegatedCount === 0 && focus === 'delegated') setFocus('composer');
+  }, [delegatedCount, focus]);
 
   /* ---------------------------------------------------------------------- */
   /* Keys                                                                    */
   /* ---------------------------------------------------------------------- */
 
-  const showSidebar = columns >= SIDEBAR_MIN_COLUMNS;
   const modalOpen = modal !== null || pendingRequest !== undefined;
   const sidebarActive = focus === 'sidebar' && showSidebar && !modalOpen;
+  const delegatedActive = focus === 'delegated' && delegatedCount > 0 && !modalOpen;
   const composerActive = focus === 'composer' && !modalOpen;
 
-  /**
-   * Put a conversation away, or take it back out.
-   *
-   * A tag written into the provider's own store — the same one the desktop
-   * writes — so a row archived here is archived there. Nothing is destroyed
-   * and the conversation is still resumable from the archive folder, which is
-   * what makes this the safe half of the pair and why it asks nothing before
-   * doing it.
+  /*
+   * No count to gate on, unlike the two above: the transcript is always drawn,
+   * and a conversation with nothing in it is a stop whose arrows find no row
+   * and whose Esc leads back to the composer — which is a dead end somebody can
+   * see rather than one Tab quietly skipped.
    */
-  const archiveRailSession = useCallback(
-    async (session: SessionSummary) => {
-      const archived = isArchived(session);
-      if (host.capabilitiesFor(session.providerId)?.tagSession !== true) {
-        setNotice(`${state.settings.providerLabel} cannot archive a conversation.`);
-        return;
-      }
-      try {
-        const done = await host.archiveSession(session.profileId, session.providerId, session.id, session.cwd, !archived);
-        if (!done) {
-          setNotice('That conversation could not be archived; it may already be gone.');
-          return;
-        }
-        say('info', `${archived ? 'Restored' : 'Archived'} ${oneLine(session.title, 60)}.`);
-        await refreshRail();
-      } catch (error) {
-        say('error', `Could not archive that conversation: ${describeError(error)}`);
-      }
+  const transcriptActive = focus === 'transcript' && !modalOpen;
+
+  /**
+   * The row an id names, whichever of the two kinds it is.
+   *
+   * A group is a run's finished calls folded into one row and lives in its own
+   * table; `isGroupId` is the model's own way of telling the two apart. Read
+   * afresh wherever it is wanted rather than held, because a row's status moves
+   * under the cursor — a call finishes, a group stops running — and what `x`
+   * may do to a row is a question about the row *now*.
+   */
+  const rowAt = useCallback(
+    (id: string | null): Row | undefined => {
+      if (id === null) return undefined;
+      return isGroupId(id) ? transcript.getGroup(id) : transcript.getItem(id);
     },
-    [host, state.settings.providerLabel, say, refreshRail],
+    [transcript],
   );
+
+  /** A group's calls, which live in the model rather than on the group. */
+  const membersOf = useCallback(
+    (id: string): readonly TranscriptItem[] =>
+      (transcript.getGroup(id)?.ids ?? [])
+        .map((memberId) => transcript.getItem(memberId))
+        .filter((member): member is TranscriptItem => member !== undefined),
+    [transcript],
+  );
+
+  /** The row the hint under the composer is about; nothing, with focus away. */
+  const cursorRow = transcriptActive ? rowAt(cursorId) : undefined;
+
+  /*
+   * Which prompts ↑ offers, and what Ctrl+R cycles through: this folder first,
+   * because "what did I type" nearly always means "here", then everything, and
+   * this conversation last — it is the narrowest, and the one someone asks for
+   * deliberately rather than by default. `recent` falls through the list until
+   * something has entries, so a folder nobody has typed in is not an ↑ that
+   * does nothing.
+   */
+  const historyScopes = useMemo<readonly HistoryScope[]>(
+    () => [
+      { kind: 'folder', cwd: state.settings.cwd },
+      { kind: 'all' },
+      ...(state.sessionId === undefined ? [] : [{ kind: 'session', sessionId: state.sessionId } as const]),
+    ],
+    [state.settings.cwd, state.sessionId],
+  );
+
+  /**
+   * What `@` completes against: the files under the working directory, and
+   * what was picked before.
+   *
+   * Memoised on the directory, so moving — `/cwd`, or opening a session that
+   * ran somewhere else — hands the composer a different index and the listing
+   * is taken again. The promise is the cache: a second `@` joins the first
+   * listing rather than starting another, and a directory nobody names a file
+   * in is never listed at all, because the composer only asks once there is an
+   * `@` in the box.
+   */
+  const fileIndex = useMemo<FileIndex | undefined>(() => {
+    if (files === undefined) return undefined;
+    const where = state.settings.cwd;
+    let listing: Promise<readonly string[]> | undefined;
+    return {
+      list: () => {
+        listing ??= listFiles(where);
+        return listing;
+      },
+      frecency: files,
+    };
+  }, [files, state.settings.cwd]);
 
   /**
    * Destroy a conversation, after asking.
@@ -1372,6 +3987,10 @@ export function App({ launched }: AppProps): React.JSX.Element {
   const chooseRailRow = useCallback(
     (row: RailRow) => {
       setFocus('composer');
+      // The box Space opened is about the row that was under the cursor, and
+      // the cursor has just been acted on. The query is left alone: Esc is what
+      // takes a filter off, and Enter is not Esc.
+      setPreview(null);
       switch (row.kind) {
         case 'new':
           startNew();
@@ -1436,7 +4055,465 @@ export function App({ launched }: AppProps): React.JSX.Element {
     [startNew, openDirectoryPicker, state.sessionId, state.settings.cwd, state.settings.profileId, accounts, descriptors, conversation, loadSession],
   );
 
+  /**
+   * The settings this conversation would run under on another account.
+   *
+   * The model and its knobs are dropped rather than carried across, the same
+   * way `switchAccount` and the rail's cross-account open drop them: a model
+   * id is the other account's vocabulary, and an effort level set for a model
+   * this one may not have is a setting that would be refused on the first
+   * turn. What is kept is everything the account has no opinion about — the
+   * directory, the permission mode.
+   */
+  const settingsOn = useCallback(
+    (profile: ProfileMetadata): ConversationSettings => ({
+      ...state.settings,
+      profileId: profile.id,
+      providerId: profile.providerId,
+      profileLabel: profile.label,
+      providerLabel: descriptors.get(profile.providerId)?.label ?? profile.providerId,
+      model: undefined,
+      modelLabel: undefined,
+      effort: undefined,
+      fastMode: undefined,
+      ultracode: undefined,
+    }),
+    [state.settings, descriptors],
+  );
+
+  /**
+   * Move this conversation, whole, onto another account.
+   *
+   * The live transfer, and it is the rail's own move with the row picked for
+   * you: a profile that reaches this transcript can read it out of the shared
+   * store and go on from where it stopped. `openUnder` rather than
+   * `loadSession` because the session being opened is the one already on
+   * screen, which `loadSession` correctly treats as nothing to do.
+   *
+   * The interrupt is first and is usually a no-op — the offer is only made
+   * while nothing is running — but Alt+H is answerable at any time, and a
+   * turn left running on the account being left would go on spending the
+   * quota that caused the move.
+   */
+  const handOffTo = useCallback(
+    async (candidate: FailoverCandidate): Promise<void> => {
+      const profile = accounts.find((account) => account.id === candidate.id);
+      const sessionId = state.sessionId;
+      if (profile === undefined || sessionId === undefined) {
+        setNotice('That conversation cannot be moved: it has not been stored yet.');
+        return;
+      }
+      if (conversation.isLive) await conversation.interrupt();
+      const title = sessions.find((session) => session.id === sessionId)?.title ?? workspace;
+      // The conversation being built for it seeds its own plan reading; the
+      // one being left must not hand the next account its gauge.
+      planFetchedAt.current = 0;
+      await openUnder(sessionId, title, settingsOn(profile), {
+        level: 'info',
+        text: `Continued on ${profile.label}`,
+        // Neutral about *which* limit and how close it was: the status line
+        // said that, and the row people find later wants the fact that the
+        // account changed and why, not the percentage it changed at.
+        detail: `Handed over from ${state.settings.profileLabel}, whose plan was running out. This conversation now runs as ${profile.label} (${descriptors.get(profile.providerId)?.label ?? profile.providerId}).`,
+      });
+    },
+    [accounts, state.sessionId, state.settings.profileLabel, conversation, sessions, workspace, openUnder, settingsOn, descriptors],
+  );
+
+  /**
+   * Start again on an account that cannot read this conversation.
+   *
+   * ADR 0003's degraded case. A session id only resolves under a config
+   * directory holding its transcript, so at a provider boundary there is no
+   * live move to make — and the answer is not to stop, it is to carry the
+   * *briefing* instead of the history. The note says plainly that nothing
+   * travelled, because an agent that silently knows nothing about the last
+   * hour is worse than one that says so; the composer gets the hand-over to
+   * send, edit or throw away, so the first act on the new account is still a
+   * chosen one.
+   *
+   * With nothing sent yet there is nothing to carry and nothing to apologise
+   * for, so it is an ordinary account switch and says what `switchAccount`
+   * says. A briefing written from an empty transcript would be a line of
+   * boilerplate dropped over whatever somebody was part-way through typing.
+   */
+  const startFreshOn = useCallback(
+    (candidate: FailoverCandidate): void => {
+      const profile = accounts.find((account) => account.id === candidate.id);
+      if (profile === undefined) {
+        setNotice('That account is no longer configured.');
+        return;
+      }
+      const turns = conversation.userTurns();
+      const carried = turns.length > 0 || lastAssistantText(transcript) !== null;
+      const settings = settingsOn(profile);
+      planFetchedAt.current = 0;
+      const next = makeConversation(settings);
+      if (carried) {
+        next.transcript.note(
+          'warn',
+          `Started fresh on ${profile.label} (${settings.providerLabel}).`,
+          'That account cannot read this one’s transcript, so none of the conversation came with it. What is in the composer is a hand-over written from the last turn — send it, change it, or write your own.',
+        );
+      } else {
+        next.transcript.note('info', `Now running as ${profile.label} (${settings.providerLabel}). New conversation.`);
+      }
+      switchTo(next);
+      if (carried) {
+        composerRef.current?.setText(
+          handoverBrief({
+            lastPrompt: turns[turns.length - 1]?.text ?? null,
+            lastReply: lastAssistantText(transcript),
+          }),
+        );
+      }
+    },
+    [accounts, conversation, transcript, settingsOn, makeConversation, switchTo],
+  );
+
+  /**
+   * The offer: what happened, who could take it, and what each row would do.
+   *
+   * Opened by Alt+H, or by `/handoff` on a terminal that swallows Alt, and by
+   * nothing else — no timer, no setting, no countdown. ADR 0003 rejected the
+   * standing auto-move outright, and the
+   * reason is worth keeping in view here: the ranking that would justify one
+   * does not exist yet (`bindingWindow` is workload-blind, `drain-v1` is
+   * unimplemented), and a conversation moved on its own to an account that
+   * immediately stalls spends the user's trust along with their quota. So this
+   * shows the facts and asks.
+   *
+   * Every account is a row, including the ones that cannot be chosen, each
+   * with the one sentence that says why — the profile picker's rule and the
+   * desktop's. An account that cannot read this conversation gets a second row
+   * under it offering the seeded start instead, because "no" and "not that
+   * way" are different answers and only one of them is a dead end.
+   *
+   * Reachability is asked once, when the list opens. The rail's own listing
+   * usually knows already — the adapter reports every profile that reaches a
+   * transcript — and when it does not, the rows say `checking…` while the
+   * question is put to the provider and fill in when it answers.
+   */
+  const openFailoverPicker = useCallback(() => {
+    const now = Date.now();
+    const why = failoverReason(state.planUsage, now);
+    if (why === null) {
+      showFlash('the plan has room; nothing to hand off');
+      return;
+    }
+    const sessionId = state.sessionId;
+    const token = ++pickerToken.current;
+    const stay: PickerItem = {
+      key: FAILOVER_STAY_KEY,
+      label: 'stay here',
+      detail:
+        why.kind === 'rejected'
+          ? 'and wait for the window to come back'
+          : 'and spend the rest of the window here',
+    };
+
+    const present = (reaches: ((profileId: string) => boolean) | null): Omit<PickerModal, 'kind'> => {
+      const title = failoverTitle(why, now);
+      if (reaches === null) {
+        return {
+          title,
+          items: [
+            ...catalogueRows
+              .filter((row) => row.id !== state.settings.profileId)
+              .map((row) => ({ key: `${FAILOVER_MOVE}${row.id}`, label: row.label, disabled: true, reason: 'checking…' })),
+            stay,
+          ],
+          initialKey: FAILOVER_STAY_KEY,
+          token,
+          hint: `asking which accounts can read this conversation… · ${PICKER_KEYS}`,
+          onSelect: () => {
+            setModal(null);
+          },
+        };
+      }
+      const candidates = failoverCandidates(catalogueRows, accounts, otherUsage, state.settings.profileId, reaches, now);
+      // With nothing sent there is no conversation to continue, so every row is
+      // a fresh start and says so rather than promising a move of nothing.
+      const continuing = sessionId !== undefined;
+      const items: PickerItem[] = [];
+      for (const candidate of candidates) {
+        items.push({
+          key: `${continuing ? FAILOVER_MOVE : FAILOVER_SEED}${candidate.id}`,
+          label: continuing ? candidate.label : `start fresh on ${candidate.label}`,
+          detail: [candidate.providerLabel, candidate.pressure]
+            .filter((part): part is string => part !== undefined)
+            .join(' · '),
+          ...(candidate.block === null ? {} : { disabled: true, reason: candidate.block }),
+        });
+        if (candidate.block === 'cannot reach this conversation') {
+          items.push({
+            key: `${FAILOVER_SEED}${candidate.id}`,
+            label: `start fresh on ${candidate.label}`,
+            detail: 'a new conversation, with a hand-over in the box to send or edit',
+          });
+        }
+      }
+      items.push(stay);
+      return {
+        title,
+        items,
+        // The safe row, so an Enter pressed before the list has been read
+        // changes nothing. The same rule `confirm` is built on.
+        initialKey: FAILOVER_STAY_KEY,
+        token,
+        onSelect: (item) => {
+          setModal(null);
+          const id = item.key.slice(item.key.indexOf(':') + 1);
+          const chosen = candidates.find((candidate) => candidate.id === id);
+          if (chosen === undefined) return;
+          if (item.key.startsWith(FAILOVER_MOVE)) void handOffTo(chosen);
+          else if (item.key.startsWith(FAILOVER_SEED)) startFreshOn(chosen);
+        },
+      };
+    };
+
+    const listed = sessionId !== undefined && sessions.some((session) => session.id === sessionId);
+    if (listed || sessionId === undefined) {
+      openPicker(present(reachesThisConversation));
+      return;
+    }
+    openPicker(present(null));
+    void host
+      .listSessionsAcross(accounts.map((account) => ({ id: account.id, providerId: account.providerId })))
+      .then(
+        (list) => {
+          const row = list.find((session) => session.id === sessionId);
+          const reach = new Set(row === undefined ? [] : [row.profileId, ...(row.alsoInProfiles ?? [])]);
+          const fresh = present((profileId) => reach.has(profileId));
+          setModal((current) =>
+            current?.kind === 'picker' && current.token === token ? { ...current, ...fresh, hint: undefined } : current,
+          );
+        },
+        () => {
+          // Unanswered is not "unreachable": every row keeps its place and the
+          // hint says the question went unanswered rather than implying no.
+          setModal((current) =>
+            current?.kind === 'picker' && current.token === token
+              ? { ...current, hint: `could not ask which accounts can read this · ${PICKER_KEYS}` }
+              : current,
+          );
+        },
+      );
+  }, [
+    state.planUsage,
+    state.sessionId,
+    state.settings.profileId,
+    catalogueRows,
+    accounts,
+    otherUsage,
+    sessions,
+    host,
+    reachesThisConversation,
+    openPicker,
+    showFlash,
+    handOffTo,
+    startFreshOn,
+  ]);
+  handOffAgain.current = openFailoverPicker;
+
+  /**
+   * Go back to an earlier prompt: the list, and what picking one does.
+   *
+   * Newest first, because "that came out wrong" is why anybody opens this.
+   * Every prompt is listed, the ones that cannot be gone back to included —
+   * a list with holes in it is a list nobody can account for — and those say
+   * why rather than offering a move that would be refused. Nothing is sent
+   * here: picking arms the rewind, cuts the screen back to that prompt and
+   * puts the words in the box, and the next Enter is what carries the
+   * truncation to the provider. See {@link Conversation.armRewind}.
+   *
+   * A prompt typed in *this* window has no provider id to point at — neither
+   * Claude nor Codex echoes a live prompt back on the stream — so its row is
+   * greyed with the reason rather than offered. Resolving those by re-reading
+   * the stored session and matching the row by its position from the end is
+   * what the desktop does, on use rather than up front (see the comment over
+   * `UserRow` in `apps/desktop/renderer/src/components/Transcript.tsx`, and
+   * `resolveRewindPoint` in `packages/core/src/adapters/history.ts`). That is
+   * a provider read, and it is the follow-up to this: nothing here makes one
+   * behind a keystroke.
+   */
+  const openRewindPicker = useCallback(() => {
+    const plan = conversation.canRewind();
+    if (!plan.ok) {
+      showFlash(plan.reason);
+      return;
+    }
+    const turns = [...conversation.userTurns()].reverse();
+    if (turns.length === 0) {
+      showFlash('Nothing has been sent in this conversation yet.');
+      return;
+    }
+    const items: PickerItem[] = turns.map((turn) => {
+      const forThis = turn.messageId === undefined ? undefined : conversation.canRewind(turn.messageId);
+      const hint =
+        forThis === undefined
+          ? 'typed this session'
+          : forThis.ok
+            ? forThis.fork
+              ? 'branch here'
+              : 'rewind here'
+            : forThis.reason;
+      return {
+        key: turn.id,
+        label: oneLine(turn.text, 70),
+        detail: `${formatRelative(turn.ts)} · ${hint}`,
+        ...(forThis?.ok === true ? {} : { disabled: true, reason: hint }),
+      };
+    });
+    openPicker({
+      title: 'Go back to an earlier prompt',
+      items,
+      hint: `the screen is cut back now; nothing is sent until you press Enter · ${PICKER_KEYS}`,
+      // Cancelling puts back whatever an earlier arm took away. Nothing is
+      // armed on the way in, so this is a no-op except for the second
+      // opening — arming twice cuts further back, and Esc out of the second
+      // list should leave the conversation as the first one left it.
+      onCancel: () => {
+        conversation.disarmRewind();
+      },
+      onSelect: (item) => {
+        setModal(null);
+        const turn = turns.find((candidate) => candidate.id === item.key);
+        if (turn?.messageId === undefined) return;
+        const armed = conversation.armRewind(turn.messageId);
+        if (!armed.ok) {
+          setNotice(armed.reason);
+          return;
+        }
+        // The prompt comes back to be edited, which is the whole point of
+        // going back to it. `setText` goes in through the editor's own undo,
+        // so whatever was in the box is one Ctrl+_ away.
+        composerRef.current?.setText(turn.text);
+        setFocus('composer');
+        setScroll(0);
+      },
+    });
+  }, [conversation, openPicker, showFlash]);
+
+  /* ---------------------------------------------------------------------- */
+  /* The follow-ups the agent offered                                        */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * What is on offer, and whether the digits are bound to it.
+   *
+   * Read out of the transcript on every change to its list rather than kept
+   * anywhere. `suggestions.ts` stores nothing, files nothing and is told nothing
+   * — an offer *is* the tool call that made it — which is why a reopened
+   * conversation's chips come back without a line of code to restore them, and
+   * why this is a memo over the id list rather than a subscription of its own.
+   *
+   * One boolean for the keys and for the chips both. The number a reader sees and
+   * the digit the app binds are meant to be one calculation; two booleans would
+   * be two, and a chip advertising a key the app had quietly stood down is the
+   * single bug this feature can have. A running turn takes them away because the
+   * offers belong to the answer above the prompt that has just replaced them, and
+   * a modal because a digit in a list is a filter.
+   */
+  const items = useSyncExternalStore(transcript.subscribeList, transcript.getListSnapshot);
+  // `items` is the trigger and not the argument: the list changing is what makes
+  // the answer stale, and `suggestionsOf` reads the model itself.
+  const offers = useMemo(() => suggestionsOf(transcript), [transcript, items]);
+  const digitsBound = offers.length > 0 && !conversation.isLive && modal === null;
+
+  /**
+   * Take one: the prompt goes in the box, and a list asks where to run it.
+   *
+   * The prompt is in the composer before the list opens, which is what makes
+   * `here` a row with nothing left to do and Esc lossless — whatever is chosen,
+   * or nothing is, the words are where they can be read, edited and sent. A digit
+   * never sends: an offer the agent made is still a message the person sends.
+   *
+   * Two of the four rows are shown and refused, which is this codebase's rule for
+   * a target that exists and cannot be reached from here — the desktop splits a
+   * worktree and opens a server column, the terminal does not yet — because a row
+   * that was hidden instead would read as a thing Artemis cannot do. Each says
+   * which of the two it is, since "not set up" is something the reader can fix
+   * and "not built here" is not.
+   */
+  const takeSuggestion = useCallback(
+    (offer: Suggestion) => {
+      composerRef.current?.setText(offer.prompt);
+      setFocus('composer');
+      const settings = state.settings;
+      void (async () => {
+        // Asked rather than taken from `projectRoots`, which folds a directory
+        // that is in no repository onto itself and so cannot tell "no
+        // repository" from "its own root".
+        const described = await describeWorkspace(settings.cwd).catch(() => undefined);
+        // A server is an `artemis` account and nothing else: the terminal keeps
+        // no address of its own, and an account is what the desktop reads for the
+        // same row. `accounts` is already the enabled ones.
+        const hasServer = accounts.some((account) => account.providerId === 'artemis');
+        openPicker({
+          title: 'Run it',
+          items: [
+            { key: 'here', label: 'here', detail: 'the prompt is in the box, to send or to edit' },
+            { key: 'session', label: 'in a new conversation', detail: 'beside this one, in the same folder' },
+            {
+              key: 'worktree',
+              label: 'in a worktree',
+              disabled: true,
+              reason:
+                described?.repoRoot === undefined ? 'not in a git repository' : 'the terminal cannot open a worktree yet',
+            },
+            {
+              key: 'server',
+              label: 'on a server',
+              disabled: true,
+              reason: hasServer ? 'the terminal cannot open one there yet' : 'no server configured',
+            },
+          ],
+          hint: PICKER_KEYS,
+          onSelect: (item) => {
+            setModal(null);
+            if (item.key !== 'session') return;
+            /*
+             * The shape `startFreshOn` uses, less the briefing: a conversation of
+             * its own, switched to, and the prompt sent on it rather than left in
+             * the box. Sent on `next` and not through `submit`, because `submit`
+             * is about whatever is on the screen and on this frame that is still
+             * the conversation being left — which keeps the prompt as its draft,
+             * where it was typed and where going back finds it again.
+             */
+            const next = makeConversation(settings);
+            switchTo(next);
+            void next.send(offer.prompt);
+          },
+        });
+      })();
+    },
+    [state.settings, accounts, openPicker, makeConversation, switchTo],
+  );
+
   useInput((input, key) => {
+    /*
+     * Somebody is here. Every press pushes both bells back out to their full
+     * delay — a notification that fires while you are typing is noise, and
+     * noise is how a feature like this gets switched off. It is the first
+     * thing in the handler because it is true of every key, including the
+     * ones a modal below is about to answer.
+     *
+     * How long they had been gone is read *before* the press is recorded,
+     * because the press is what ends the absence. Past three minutes the same
+     * keystroke is a return, and a return is owed an account of what happened
+     * while nobody was here: see `awayRecap`, which says nothing at all when
+     * the answer is nothing. It goes first so that a key with a flash of its
+     * own — Ctrl+C, a pin — has the last word on the line, which is right:
+     * that one is about what was just pressed.
+     */
+    const away = attention.current?.idleMs() ?? 0;
+    attention.current?.touch();
+    if (away >= AWAY_MS) {
+      const recap = awayRecap(recapSubjects(), Date.now() - away);
+      if (recap !== undefined) showFlash(recap, RECAP_FLASH_MS);
+    }
+
     if (key.ctrl && input === 'c') {
       if (quitArmed.current !== null) {
         clearTimeout(quitArmed.current);
@@ -1452,16 +4529,288 @@ export function App({ launched }: AppProps): React.JSX.Element {
       return;
     }
 
+    // Ctrl+T opens and closes the checklist. The composer has no Ctrl+T of
+    // its own, so the key reaches here whatever has focus.
+    if (key.ctrl && input === 't') {
+      setTodoExpanded((open) => !open);
+      return;
+    }
+
+    /*
+     * Ctrl+] goes to whoever needs you: one conversation, or the list of them.
+     *
+     * Above the modal guard on purpose, because the commonest reason to press
+     * it is that *this* conversation has stopped to ask — and a permission
+     * card counts as a modal. Leaving it up over a different conversation is
+     * harmless: it is drawn from the state of whichever one is on screen, so
+     * it goes with the switch and is waiting again on the way back.
+     *
+     * A list or the pager is a different matter and is left alone: both are
+     * about the conversation being left, and a picker whose subject was
+     * swapped underneath it is a picker about nothing. A reverse search is
+     * holding the box's text, for the same reason Ctrl+O declines to.
+     *
+     * Past one conversation waiting, the press opens the card instead of
+     * taking the tour. Four asks answered one switch at a time is four
+     * transcripts nobody came to read and four ways back; the card answers the
+     * three that are only a yes where they stand and goes to the fourth. At
+     * exactly one the jump is still right — there is nowhere else to be, and a
+     * card of one row is a keystroke asking a question with one answer.
+     */
+    if (isNextNeedy(input, key)) {
+      if (modal !== null) return;
+      if (composerActive && composerRef.current?.isCapturing() === true) return;
+      if (asksNow.current.length > 1) {
+        setModal({ kind: 'asks' });
+        return;
+      }
+      goToNeedy();
+      return;
+    }
+
+    /*
+     * Esc belongs to the composer while it is capturing one — its reverse
+     * search is open — and to nothing else. Ink has no stop-propagation, so
+     * both handlers see the press whatever order they run in; the one that
+     * must not act is the one that asks. Interrupting the turn on the Esc that
+     * closed a search, or unfollowing the transcript with it, is the bug this
+     * is here to prevent.
+     */
+    if (key.escape && composerActive && composerRef.current?.isCapturing() === true) return;
+
     if (modal?.kind === 'replay') {
       if (key.escape) setModal(null);
       return;
     }
     if (modalOpen) return;
 
-    if (key.tab) {
-      if (showSidebar) setFocus((current) => (current === 'composer' ? 'sidebar' : 'composer'));
+    /*
+     * Ctrl+O unfolds the whole conversation. The pager draws the terminal and
+     * answers every key while it is up — the Ctrl+O that closes it included —
+     * so nothing below needs to know about it: it is a modal, and `modalOpen`
+     * above is what stands the rest of this down. Not out from under a reverse
+     * search, which is holding the box's text and would lose it.
+     */
+    if (key.ctrl && input === 'o') {
+      if (composerActive && composerRef.current?.isCapturing() === true) return;
+      setModal({ kind: 'pager' });
       return;
     }
+
+    /*
+     * Alt+H opens the hand-off offer. Below the modal guard, because the list
+     * it opens is a modal itself and a key that could open a second one over
+     * the first is a key with two owners.
+     *
+     * This was Ctrl+H, and Ctrl+H cannot be delivered. On any terminal that has
+     * not negotiated the kitty keyboard protocol the chord sends the C0 byte
+     * `\x08`, which Ink reports as `backspace` — the same thing the Backspace
+     * key sends — so the app could either ignore the press or take the
+     * composer's rub-out away everywhere, and a binding whose two outcomes are
+     * "does nothing" and "breaks Backspace" is not a binding. Alt+H arrives as
+     * an Escape-prefixed `h`, which Ink hands over as `meta` plus the letter,
+     * and which no other surface claims. `/handoff` is there for the terminal
+     * that swallows Alt as well — see `commands.ts`.
+     */
+    if (key.meta && input === 'h') {
+      openFailoverPicker();
+      return;
+    }
+
+    if (key.tab) {
+      /*
+       * Tab had two owners and this is where they are told apart. The press
+       * belongs to the box while it has something for Tab to do — the slash
+       * menu, the `@` popup or the `;;` popup with a row highlighted, or the
+       * holes a snippet left behind for Tab to walk — and a reverse search owns
+       * the keyboard outright. Otherwise Shift+Tab steps the permission mode
+       * on, and a bare Tab moves the focus.
+       *
+       * The question is asked above the Shift branch on purpose, so it stands
+       * *both* of them down: a snippet's slots are walked forwards with Tab and
+       * backwards with Shift+Tab, and a Shift+Tab that stepped the permission
+       * mode while somebody was walking back through the holes of a template
+       * would be a key with two owners in the one state that has a use for it.
+       */
+      if (composerActive && (composerRef.current?.hasPopup() === true || composerRef.current?.isCapturing() === true)) return;
+      if (key.shift) {
+        cycleMode();
+        return;
+      }
+      /*
+       * Three stops now, two of which come and go — the rail is dropped on a
+       * narrow terminal and the strip exists only while something is running —
+       * so which ones are there is answered here and which one is next by
+       * `nextFocus`, beside the row of the map that promises it.
+       */
+      setPreview(null);
+      setFocus((current) => nextFocus(current, { sidebar: showSidebar, delegated: delegatedCount > 0 }));
+      return;
+    }
+
+    /*
+     * `?` opens the key map. The composer answers it while it has the keys —
+     * it is the one that knows the box is empty, and the one that would
+     * otherwise insert the character on the same press — so what is left here
+     * is the `?` pressed with the focus in the rail.
+     */
+    if (input === '?' && !composerActive) {
+      // The map is the whole pane; a preview left under it would be a second
+      // box competing for the rows the map is already using.
+      setPreview(null);
+      setModal({ kind: 'help' });
+      return;
+    }
+
+    /*
+     * 1–4 take one of the follow-ups the agent offered.
+     *
+     * Guarded on the same boolean the chips are numbered from, so a digit cannot
+     * come to mean a different task from the one whose number is drawn on the
+     * screen — and only from an empty box, because the rest of the time these are
+     * four ordinary characters somebody is typing into a message.
+     *
+     * The composer will already have put the digit in the box by the time this
+     * runs: Ink gives the press to both handlers, the child's first, and there is
+     * no way to stand one of them down. `setText` replaces the whole buffer
+     * through the editor's own undo, so the digit goes and the prompt arrives on
+     * one keystroke that is still one Ctrl+_ from being taken back.
+     */
+    if (
+      digitsBound &&
+      composerActive &&
+      // A chorded digit is somebody else's key — nothing here claims one, and a
+      // Ctrl+1 that started a task would be a binding the map does not promise.
+      !key.ctrl &&
+      !key.meta &&
+      composerRef.current?.isCapturing() !== true &&
+      composerRef.current?.getText() === ''
+    ) {
+      const chosen = offers.find((offer) => offer.index <= SUGGESTION_DIGITS && String(offer.index) === input);
+      if (chosen !== undefined) {
+        takeSuggestion(chosen);
+        return;
+      }
+    }
+
+    /*
+     * Enter sends a failed check to the agent.
+     *
+     * One owner for the key and not two: the composer answers Enter whenever
+     * there is anything to send and declines on an empty box with nothing
+     * queued, so the press only gets this far when there is nothing else it
+     * could have meant. An attachment waiting counts as something to send —
+     * Enter is how it goes — so the offer waits its turn.
+     *
+     * `submit` is what clears it, along with every other way of sending
+     * something; see the line at the top of it.
+     */
+    if (
+      key.return &&
+      composerActive &&
+      checkOffer !== null &&
+      pendingAttachments.length === 0 &&
+      composerRef.current?.isCapturing() !== true &&
+      composerRef.current?.getText() === ''
+    ) {
+      const engine = checks.current;
+      if (engine !== null) submit(engine.handOff(checkOffer));
+      return;
+    }
+
+    /*
+     * The conversation's own rows, once Tab has reached them.
+     *
+     * Above the scrolling block and not beside the rail's, because two of
+     * these keys are ones the block below would otherwise answer first: a
+     * plain arrow, which here moves the cursor rather than the screen, and Esc,
+     * which here puts the cursor away. What is *not* answered here falls
+     * through on purpose — PgUp, PgDn, End and the modified arrows are about
+     * the screen rather than about a row, and they go on working from the
+     * transcript exactly as they do from anywhere else.
+     *
+     * Every verb is a lookup on the row under the cursor, the way the
+     * delegated strip's keys are a lookup on the row the strip reported: what
+     * a row answers to is `rowVerbs`' decision, taken once, printed as the
+     * hint, and consulted again here. A key pressed on a row that does not
+     * offer it does nothing rather than guessing — the hint has already said
+     * so, and a verb that half-worked on the rows it was not offered on is
+     * exactly what having the list in one place is meant to prevent.
+     */
+    if (transcriptActive) {
+      const bigStep = key.shift || key.ctrl;
+      if (key.escape) {
+        setCursorId(null);
+        setFocus('composer');
+        return;
+      }
+      if (!bigStep && (key.upArrow || key.downArrow)) {
+        setCursorId((current) => stepCursor(cursorRows, current, key.upArrow ? -1 : 1));
+        return;
+      }
+      const row = rowAt(cursorId);
+      if (cursorId !== null && row !== undefined && !key.ctrl && !key.meta) {
+        const offers = (kind: RowVerbKind): boolean => rowVerbs(row).some((verb) => verb.kind === kind);
+        // Only an item has arguments to read a path, a command or a diff out
+        // of; a group is a count of calls and answers the three that do not.
+        const item = isGroupId(cursorId) ? undefined : transcript.getItem(cursorId);
+        if (key.return) {
+          if (!offers('unfold')) return;
+          const id = cursorId;
+          setExpanded((current) => {
+            const next = new Set(current);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+          });
+          return;
+        }
+        if (input === 'o') {
+          const target = item === undefined ? null : rowTarget(item);
+          if (target !== null) void openInEditorAt(target);
+          return;
+        }
+        if (input === 'r') {
+          const command = item === undefined ? null : rowCommand(item);
+          if (command === null) return;
+          // A `!` in front, because that is what the box does with a command:
+          // the line is put up to be read and edited, and Enter is what runs
+          // it. Re-running something the agent did without being asked again
+          // would be this file deciding on somebody's behalf.
+          composerRef.current?.setText(`!${command}`);
+          setCursorId(null);
+          setFocus('composer');
+          return;
+        }
+        if (input === 'y') {
+          void putOnClipboard(rowYankText(row, isGroupId(cursorId) ? membersOf(cursorId) : []));
+          return;
+        }
+        if (input === 'd') {
+          const edit = item === undefined ? null : rowDiff(item);
+          if (edit === null) return;
+          setModal({
+            kind: 'text',
+            title: edit.path,
+            // Every row of it, at the width the reader has for its content —
+            // the same two numbers `/diff` builds its lines to, because this is
+            // the same view of the same kind of thing.
+            lines: renderDiff(edit, edit.rows.length, { columns: Math.max(20, mainWidth - TEXT_VIEW_CHROME), numbers: 'on' }),
+          });
+          return;
+        }
+        if (input === 'x') {
+          // The turn, not the call: a provider has no way to stop one tool
+          // call and leave the rest of a run going, so `x` on a running row is
+          // the interrupt Esc and Ctrl+C are — reached from the row that shows
+          // what is taking the time.
+          if (!offers('stop')) return;
+          void conversation.interrupt();
+          return;
+        }
+      }
+    }
+
     /*
      * Scrolling the conversation. Arrows, because a laptop has no Page keys
      * and because a terminal on the alternate screen turns the mouse wheel
@@ -1469,18 +4818,33 @@ export function App({ launched }: AppProps): React.JSX.Element {
      * or Ctrl with an arrow moves half a screen; Esc, when nothing is
      * running, follows the end again. The sidebar owns the arrows while it
      * has focus.
+     *
+     * A *plain* arrow belongs to the composer while the composer has focus: it
+     * moves the cursor through what is being typed, and the presses that run
+     * off its first and last line come back here as `onArrowOverflow` below,
+     * which scrolls exactly as a plain arrow did. A modified arrow and the
+     * page keys are never the composer's, so they still move half a screen
+     * from wherever focus is.
+     *
+     * End is the same division: the composer takes it to the end of the line
+     * while it has focus — two owners for one key is how the cursor ended up
+     * jumping and the transcript snapping to the bottom on a single press —
+     * and it follows the end of the conversation only when the composer does
+     * not have the keys. Ctrl+End and Ctrl+Home are the composer's own
+     * buffer-start and buffer-end, so nothing here answers them.
      */
-    if (!sidebarActive) {
+    if (!sidebarActive && !delegatedActive) {
       const half = Math.max(SCROLL_STEP, Math.floor(scrollExtent.current.viewportLines / 2));
-      if (key.upArrow || key.pageUp) {
-        scrollBy(key.pageUp || key.shift || key.ctrl ? half : SCROLL_STEP);
+      const bigStep = key.shift || key.ctrl;
+      if (key.pageUp || (key.upArrow && (bigStep || !composerActive))) {
+        scrollBy(key.pageUp || bigStep ? half : SCROLL_STEP);
         return;
       }
-      if (key.downArrow || key.pageDown) {
-        scrollBy(-(key.pageDown || key.shift || key.ctrl ? half : SCROLL_STEP));
+      if (key.pageDown || (key.downArrow && (bigStep || !composerActive))) {
+        scrollBy(-(key.pageDown || bigStep ? half : SCROLL_STEP));
         return;
       }
-      if (key.end || (key.escape && scroll > 0 && !conversation.isLive)) {
+      if ((key.end && !composerActive) || (key.escape && scroll > 0 && !conversation.isLive)) {
         setScroll(0);
         return;
       }
@@ -1488,19 +4852,210 @@ export function App({ launched }: AppProps): React.JSX.Element {
 
     if (sidebarActive) {
       const row = rail[railIndex];
-      if (key.upArrow || input === 'k') setRailIndex((i) => (i - 1 + rail.length) % Math.max(1, rail.length));
-      else if (key.downArrow || input === 'j') setRailIndex((i) => (i + 1) % Math.max(1, rail.length));
-      else if (key.return) {
+      const session = row?.kind === 'session' ? row.session : undefined;
+      /*
+       * Whether the rail is being typed at, which is what decides who owns five
+       * of its keys. `j`, `k`, `a`, `d` and `p` are movement and actions at a
+       * rail nobody has typed at, and letters of a title the moment somebody
+       * has — there is no third reading, and a rail that kept them as shortcuts
+       * would be a search box that cannot spell "jump", "and" or "api". The
+       * three actions keep working through their Ctrl chords, which are
+       * accepted either way so that nothing learned here has to be unlearned.
+       */
+      const filtering = railQuery.length > 0;
+
+      if (key.escape) {
+        // A query is a thing to undo before it is a thing to leave: the first
+        // Esc puts the whole list back, which is what somebody who mistyped
+        // means by it, and the second leaves the rail.
+        setPreview(null);
+        if (filtering) setRailFilter('');
+        else setFocus('composer');
+        return;
+      }
+      if (key.upArrow || (!filtering && input === 'k')) {
+        setRailIndex((i) => (i - 1 + rail.length) % Math.max(1, rail.length));
+        return;
+      }
+      if (key.downArrow || (!filtering && input === 'j')) {
+        setRailIndex((i) => (i + 1) % Math.max(1, rail.length));
+        return;
+      }
+      if (key.return) {
         if (row !== undefined) chooseRailRow(row);
-      } else if (input === 'a' && row?.kind === 'session') {
-        void archiveRailSession(row.session);
-      } else if (input === 'd' && row?.kind === 'session') {
-        deleteRailSession(row.session);
-      } else if (key.escape) setFocus('composer');
+        return;
+      }
+      if (key.backspace || key.delete) {
+        setRailFilter((current) => current.slice(0, -1));
+        return;
+      }
+      if (key.ctrl || key.meta) {
+        if (session === undefined) return;
+        if (input === 'a') void archiveRailSession(session);
+        else if (input === 'd') deleteRailSession(session);
+        else if (input === 'p') togglePinFor(session.id);
+        return;
+      }
+      if (!filtering && session !== undefined) {
+        if (input === 'a') {
+          void archiveRailSession(session);
+          return;
+        }
+        if (input === 'd') {
+          deleteRailSession(session);
+          return;
+        }
+        if (input === 'p') {
+          togglePinFor(session.id);
+          return;
+        }
+      }
+      /*
+       * Space shows what a conversation is without opening it, and shows it
+       * again to put the box away. Only while nothing is typed: under a query
+       * it is a space between two words, and a preview that cost somebody the
+       * space bar would be a filter that cannot hold a phrase.
+       */
+      if (!filtering && input === ' ') {
+        if (session !== undefined) setPreview((shown) => (shown?.id === session.id ? null : session));
+        return;
+      }
+      /*
+       * Anything left that is a character somebody typed is the query. `/` is
+       * the one exception, and only at a rail nobody has typed at yet: there it
+       * opens an empty query rather than typing itself, so that `/foo` and
+       * `foo` reach the same place and the key the legend advertises does what
+       * the legend says. Inside a query it is an ordinary character, because a
+       * project name is very often `apps/tui`.
+       */
+      if (!filtering && input === '/') {
+        setRailFilter('');
+        return;
+      }
+      if (isTypable(input, key)) setRailFilter((current) => current + input);
       return;
     }
 
-    if (key.escape && conversation.isLive) void conversation.interrupt();
+    if (delegatedActive) {
+      /*
+       * The strip's keys. Every one of them is a lookup on the row the strip
+       * reported — `openable`, `stoppable`, the task the row belongs to — and
+       * not a second reading of `state.tasks`, which is the arrangement the
+       * strip's header asks for and the reason Enter cannot open something the
+       * row was not offering.
+       */
+      if (key.escape) {
+        setFocus('composer');
+        return;
+      }
+      if (key.upArrow) {
+        setDelegatedSelected((i) => Math.max(0, i - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setDelegatedSelected((i) => Math.min(delegatedCount - 1, i + 1));
+        return;
+      }
+      if (delegatedRow === undefined) return;
+      if (key.return) {
+        // `openable` is the provider's own filing rather than a wish, so a row
+        // that says no is a row with no transcript to open — a backgrounded
+        // shell, or a workflow agent that has not been spawned yet.
+        const agentId = delegatedRow.agentId;
+        if (!delegatedRow.openable || agentId === undefined) {
+          showFlash('nothing was filed for that row');
+          return;
+        }
+        void openAgentTranscript(agentId, [delegatedRow.label, delegatedRow.description].filter((part) => part.length > 0).join(' · '));
+        return;
+      }
+      if (input === 'x') {
+        // Only ever the task: there is no per-agent stop inside a workflow, and
+        // `x` on one agent's row killing the whole workflow is not what anyone
+        // pressing it would have meant.
+        if (!delegatedRow.stoppable) return;
+        showFlash(`stopping ${oneLine(delegatedRow.label, 40)}`);
+        void conversation.stopTask(delegatedRow.taskId).then((outcome) => {
+          if (!outcome.ok) setNotice(outcome.reason);
+        });
+        return;
+      }
+      if (key.rightArrow) {
+        if (!delegatedRow.unfoldable) return;
+        setDelegatedExpanded((current) => new Set([...current, delegatedRow.taskId]));
+        return;
+      }
+      if (key.leftArrow) {
+        // From an agent row too: `←` on one of a workflow's agents folds the
+        // workflow it belongs to, which is the row the cursor came from.
+        setDelegatedExpanded((current) => {
+          if (!current.has(delegatedRow.taskId)) return current;
+          const next = new Set(current);
+          next.delete(delegatedRow.taskId);
+          return next;
+        });
+        return;
+      }
+      return;
+    }
+
+    if (!key.escape) return;
+
+    /*
+     * An Esc that has got this far puts the failed check away as well.
+     *
+     * Esc is this terminal's word for "not that", and of everything it already
+     * means the offer is the one thing no other key can decline. It rides along
+     * rather than claiming the press, because whatever this Esc is about to do —
+     * interrupt the turn, arm the second Esc — is still true on the same
+     * keystroke, and an offer that had to be dismissed before the turn could be
+     * interrupted would be a key somebody pressed twice for one thing.
+     *
+     * Here and not at the top of the handler, so the Escs that belong to another
+     * surface leave it alone: closing a search, leaving the rail, or following
+     * the end of a conversation that was scrolled back are none of them an answer
+     * to what the checks found.
+     */
+    setCheckOffer(null);
+
+    if (conversation.isLive) {
+      void conversation.interrupt();
+      return;
+    }
+
+    /*
+     * Esc, Esc goes back to an earlier prompt.
+     *
+     * A chord because the single Esc is spoken for four times over — it
+     * interrupts, it leaves the rail, it follows the end of a conversation
+     * that was scrolled back, and the composer takes it for its own search —
+     * and because the move it opens takes rows off the screen. All four of
+     * those have been answered above by the time the press arrives here, so
+     * what is left is an Esc at an empty box with nothing running, which
+     * means nothing else at all.
+     *
+     * While a rewind is armed the same key cancels it, from whatever is in
+     * the box: the status line is promising exactly that, and the box is not
+     * empty at that point — arming put the old prompt in it to be edited.
+     */
+    if (!composerActive) return;
+    if (state.rewindArmed !== undefined) {
+      conversation.disarmRewind();
+      showFlash('back where you were');
+      return;
+    }
+    if (composerRef.current?.getText() !== '') return;
+    if (escArmed.current !== null) {
+      clearTimeout(escArmed.current);
+      escArmed.current = null;
+      openRewindPicker();
+      return;
+    }
+    showFlash('Esc again to go back to an earlier prompt');
+    escArmed.current = setTimeout(() => {
+      escArmed.current = null;
+    }, ESC_ESC_WINDOW_MS);
+    escArmed.current.unref?.();
   });
 
   /* ---------------------------------------------------------------------- */
@@ -1510,7 +5065,34 @@ export function App({ launched }: AppProps): React.JSX.Element {
   const tallHeader = rows >= TALL_HEADER_MIN_ROWS;
   const headerRows = tallHeader ? 3 : 2;
   const bodyRows = Math.max(6, rows - headerRows);
-  const mainWidth = showSidebar ? columns - SIDEBAR_WIDTH : columns;
+
+  /*
+   * The pager is the whole terminal, so it is mounted instead of the layout
+   * rather than over it: Ink has no z-index, and a full-screen box drawn as a
+   * sibling would push the conversation off the top of the screen instead of
+   * covering it. Everything behind it is unmounted, which is the other half of
+   * why nothing behind it can answer a key.
+   */
+  if (modal?.kind === 'pager') {
+    return (
+      <Pager
+        transcript={transcript}
+        columns={columns}
+        rows={rows}
+        {...(modal.initialRowId === undefined ? {} : { initialRowId: modal.initialRowId })}
+        onClose={() => setModal(null)}
+        /*
+         * `v`. The same handover as Ctrl+G — `editExternally` is the only
+         * thing in here that may take the terminal — and whatever comes back
+         * is dropped: this is a copy to read in an editor, not a draft being
+         * written.
+         */
+        onOpenInEditor={(markdown) => {
+          void editExternally(markdown);
+        }}
+      />
+    );
+  }
 
   return (
     <Box flexDirection="column" width={columns} height={rows}>
@@ -1524,6 +5106,8 @@ export function App({ launched }: AppProps): React.JSX.Element {
             focused={sidebarActive}
             {...(state.sessionId === undefined ? {} : { activeSessionId: state.sessionId })}
             activity={railActivity}
+            pinned={pinned}
+            query={railQuery}
             currentProject={currentProject}
             width={SIDEBAR_WIDTH}
             height={bodyRows}
@@ -1532,14 +5116,121 @@ export function App({ launched }: AppProps): React.JSX.Element {
         )}
 
         <Box flexDirection="column" width={mainWidth} height={bodyRows}>
-          <TranscriptViewport transcript={transcript} live={live} offset={scroll} onExtent={onScrollExtent} />
+          {/* The pane's width, not the terminal's: what a diff has room for is
+              decided on the columns the conversation actually has. */}
+          <TranscriptViewport
+            transcript={transcript}
+            live={live}
+            offset={scroll}
+            onExtent={onScrollExtent}
+            columns={mainWidth}
+            /* What each finished turn took out of the plan, for the run-end
+               rows that print it. A row cannot reach the conversation and the
+               transcript model has nowhere to keep the reading, so it arrives
+               as a lookup. */
+            planDeltaFor={conversation.planDeltaForRow}
+            /*
+             * `null` rather than absent whenever the focus is elsewhere, and
+             * the difference is the layout's: the column the caret goes in is
+             * reserved as soon as the prop is *present*, so passing it always
+             * is what stops the whole conversation shifting one column
+             * sideways as Tab arrives and leaves.
+             */
+            cursor={focus === 'transcript' ? cursorId : null}
+            onCursorRows={setCursorRows}
+            expandedRows={expanded}
+            /*
+             * Whether an attached picture is drawn or described. Read here
+             * because this is the file that knows which terminal Artemis was
+             * started in; `render/images.ts` reads the environment and asks
+             * the terminal nothing, so it is a constant for the session and
+             * the viewport only hands it down. `'none'` is a chip with the
+             * size, which is what most terminals will go on getting.
+             */
+            imageProtocol={imageProtocol()}
+            /*
+             * Whether the chips under an answer wear their numbers. The same
+             * boolean the keys are guarded on, for the reason it is computed
+             * once: a number on a chip is a promise about a key, and the two
+             * must not be able to disagree. See `suggestions.ts`.
+             */
+            suggestionDigits={digitsBound}
+          />
+
+          {/*
+           * Above the card and the pickers rather than directly over the
+           * composer, which is where the mockup put it. Those are the surfaces
+           * the keys are addressing when they are open, and a readout that
+           * nothing can be typed at must not sit between a question and the
+           * thing that answers it. With nothing open — the ordinary case —
+           * this is the line above the composer either way.
+           */}
+          <DelegatedStrip
+            tasks={state.tasks}
+            columns={mainWidth}
+            focused={delegatedActive}
+            selected={delegatedSelected}
+            expanded={delegatedExpanded}
+            /*
+             * The strip clamps the cursor — its rows move on their own as work
+             * settles — and says where it came to rest, so the number held here
+             * and the one drawn cannot disagree. The row comes back with it, so
+             * Enter and `x` are a lookup rather than a second reading of the
+             * tasks.
+             */
+            onSelect={(row, index) => {
+              setDelegatedRow(row);
+              if (index >= 0) setDelegatedSelected(index);
+            }}
+          />
+
+          {/*
+           * Between what the agent is doing and what it has not read yet: what
+           * it plans. The strip is one line until Ctrl+T opens it, and nothing
+           * at all when the list is done or was never written.
+           */}
+          <TodoStrip transcript={conversation.transcript} expanded={todoExpanded} columns={mainWidth} />
+
+          {/*
+           * Under the delegated strip, for the same reason and in the order
+           * the two answer: what the agent is doing, then what it has not read
+           * yet. Both are given the conversation's width rather than the
+           * terminal's — the rail is not theirs to draw over — and both
+           * disappear entirely when there is nothing to say, so a conversation
+           * that never steers is laid out as it always was.
+           */}
+          <QueuedStrip messages={state.queuedMessages} columns={mainWidth} />
 
           {pendingRequest !== undefined && modal === null && (
             <Box paddingX={1} flexShrink={0}>
               <PermissionCard
                 key={pendingRequest.id}
                 request={pendingRequest}
-                onDecision={(decision) => void conversation.respondToPermission(pendingRequest.id, decision)}
+                /*
+                 * Where a relative path in the command would land, so the card
+                 * can say what a destructive one would actually touch. The
+                 * conversation's directory and not this process's: `/cwd` moves
+                 * one and not the other, and a preview resolved against the
+                 * wrong root is a preview of somebody else's files. The width
+                 * is the pane's, less the card's own padding, because the block
+                 * of paths is clipped to fit rather than wrapped.
+                 */
+                cwd={state.settings.cwd}
+                columns={mainWidth - 2}
+                /*
+                 * A comment typed under the answer travels as an ordinary
+                 * message, and only once the decision itself has landed: the
+                 * tool call is waiting on the response, and a steer sent
+                 * first would be a message the provider has nowhere to put.
+                 */
+                onDecision={(decision, followUp) => {
+                  void conversation.respondToPermission(pendingRequest.id, decision).then(
+                    () => {
+                      if (followUp !== undefined) submit(followUp);
+                    },
+                    () => undefined,
+                  );
+                }}
               />
             </Box>
           )}
@@ -1568,7 +5259,72 @@ export function App({ launched }: AppProps): React.JSX.Element {
                 {...(modal.initialKey === undefined ? {} : { initialKey: modal.initialKey })}
                 {...(modal.hint === undefined ? {} : { hint: modal.hint })}
                 onSelect={modal.onSelect}
-                onCancel={() => setModal(null)}
+                {...(preview === null
+                  ? {}
+                  : { maxRows: Math.max(3, Math.min(PICKER_ROWS_WITH_PREVIEW, bodyRows - PREVIEW_SLOT_ROWS)) })}
+                {...(modal.filterable === true ? { filterable: true } : {})}
+                {...(modal.onPreview === undefined ? {} : { onPreview: modal.onPreview })}
+                {...(modal.onRename === undefined ? {} : { onRename: modal.onRename })}
+                {...(modal.onSecondary === undefined ? {} : { onSecondary: modal.onSecondary })}
+                onCancel={() => {
+                  setModal(null);
+                  modal.onCancel?.();
+                }}
+              />
+            </Box>
+          )}
+          {modal?.kind === 'prompt' && (
+            <Box paddingX={1} flexShrink={0}>
+              <Prompt
+                title={modal.title}
+                initial={modal.initial}
+                placeholder="a name for this conversation"
+                onSubmit={modal.onSubmit}
+                onCancel={modal.onCancel}
+              />
+            </Box>
+          )}
+          {modal?.kind === 'asks' && (
+            <Box paddingX={1} flexShrink={0}>
+              {/*
+               * The rows are rebuilt on every render, so a request answered
+               * anywhere loses its row here on the next frame — and the card
+               * closes itself when the last one goes, which is why nothing
+               * below has to notice that the list has drained.
+               */}
+              <AsksCard asks={asks} columns={mainWidth - 2} onClose={() => setModal(null)} />
+            </Box>
+          )}
+          {/*
+           * Under whatever opened it. Space in the rail and Space in the
+           * conversation list put the same box in the same place — see the
+           * note on `preview` for why that place is here and not inside the
+           * thirty-two columns of the rail.
+           */}
+          {preview !== null && (
+            <Box paddingX={1} flexShrink={0}>
+              <SessionPreview session={preview} columns={mainWidth - 2} />
+            </Box>
+          )}
+          {modal?.kind === 'help' && (
+            <Box paddingX={1} flexShrink={0}>
+              {/* Sized to the pane it sits in rather than the screen, like
+                  everything else in this column; the overlay decides for
+                  itself whether that is wide enough for two columns of keys. */}
+              <Help columns={mainWidth - 2} rows={Math.max(8, bodyRows - 8)} onClose={() => setModal(null)} />
+            </Box>
+          )}
+          {modal?.kind === 'text' && (
+            <Box paddingX={1} flexShrink={0}>
+              {/* Sized to the pane, like everything else in this column. The
+                  lines were built to the same width when the command ran —
+                  see `TextModal` — so this is a fit and not a reflow. */}
+              <TextView
+                title={modal.title}
+                lines={modal.lines}
+                columns={mainWidth - 2}
+                rows={Math.max(8, bodyRows - 8)}
+                onClose={() => setModal(null)}
               />
             </Box>
           )}
@@ -1578,7 +5334,7 @@ export function App({ launched }: AppProps): React.JSX.Element {
                 <Text color={ACCENT} bold>
                   Agent · {modal.title}
                 </Text>
-                <ReplayRows events={modal.events} maxRows={Math.max(6, bodyRows - 8)} />
+                <ReplayRows events={modal.events} maxRows={Math.max(6, bodyRows - 8)} columns={mainWidth} />
                 <Text dimColor>Esc closes</Text>
               </Box>
             </Box>
@@ -1586,20 +5342,96 @@ export function App({ launched }: AppProps): React.JSX.Element {
 
           <Box flexDirection="column" flexShrink={0} paddingX={1}>
             <Composer
+              ref={composerRef}
               onSubmit={submit}
               live={live}
               locked={locked}
               isActive={composerActive}
               attachments={pendingAttachments.map((entry) => entry.name)}
               providerCommands={state.slashCommands}
+              history={history}
+              historyScopes={historyScopes}
+              {...(fileIndex === undefined ? {} : { fileIndex })}
+              /*
+               * `;;` — what the trigger offers, and what `/snip` expands. The
+               * store is the one thing both doors share, and handing it over
+               * rather than a callback is what lets the composer keep the whole
+               * of the trigger: it filters the list as the name is typed, and it
+               * is the only place the holes a template left behind can live.
+               */
+              snippets={snippets}
+              /*
+               * ↑ on an empty box. The composer knows it is empty and the
+               * conversation knows whether anything is waiting, so the
+               * composer asks and this answers: the words of the newest
+               * queued message, or nothing at all, which leaves ↑ to the
+               * history. Taking it back here is what the strip's header
+               * promises — see `Conversation.takeBackQueued`.
+               */
+              onTakeBackQueued={() => conversation.takeBackQueued()}
+              // An arrow the text and the history both had no use for — ↑ on
+              // the first line with nothing left to recall, ↓ on the last —
+              // scrolls the conversation, which is what a plain arrow has
+              // always done here.
+              onArrowOverflow={(direction) => {
+                scrollBy(direction === 'up' ? SCROLL_STEP : -SCROLL_STEP);
+              }}
+              // Ctrl+G and `!`. Both leave the composer knowing nothing about
+              // a terminal or a child process: one is a promise of text, the
+              // other a command and a flag.
+              onExternalEdit={editExternally}
+              onShell={runShellLine}
+              // `?` at an empty box. The composer owns the key — it is what
+              // knows the box is empty, and what would otherwise put the
+              // character in it — and this is what the key opens.
+              onHelp={() => setModal({ kind: 'help' })}
               {...(notice === undefined ? {} : { notice })}
             />
             <StatusBar
               state={state}
               columns={mainWidth}
+              needing={needing.length}
               {...(flash === undefined ? {} : { flash })}
               {...(update === undefined ? {} : { update })}
-              {...(sidebarActive ? { hint: 'sidebar: ↑↓ Enter · a archive · d delete · Esc back' } : scroll > 0 ? { hint: 'scrolled · Esc to follow' } : {})}
+              {...(/*
+                * The offer, worked out here and handed over as words. The bar
+                * draws it in yellow and knows nothing about plans — see
+                * `failover.ts` for what makes a window count as out, and ADR
+                * 0003 for why this is a line and a key rather than a move.
+                */
+              failoverWhy === null ? {} : { failover: { text: failoverLine(failoverWhy, failoverBest) } })}
+              /*
+               * An armed rewind outranks the other two: it is a state the next
+               * Enter behaves differently in, and the only place a person is
+               * told that the message they are about to send will land
+               * somewhere other than the end of the conversation.
+               */
+              {...(state.rewindArmed !== undefined
+                ? {
+                    hint: `${state.rewindArmed.fork ? 'branching from' : 'rewinding to'} an earlier prompt · Esc cancels`,
+                  }
+                : sidebarActive
+                  ? railQuery.length > 0
+                    ? // The rail's own legend has the room for three chords and
+                      // no more; this is where the words for them go.
+                      { hint: 'filtering: Ctrl+A archive · Ctrl+D delete · Ctrl+P pin · Esc clears' }
+                    : { hint: 'sidebar: ↑↓ Enter · a archive · d delete · p pin · Space preview · / filter' }
+                  : transcriptActive
+                    ? /*
+                       * What *this* row answers to, not what rows in general
+                       * do. `rowVerbs` is the same list the keys above consult,
+                       * so a verb is advertised exactly while it would work —
+                       * which is the whole reason the verbs are data.
+                       */
+                      {
+                        hint:
+                          cursorRow === undefined
+                            ? '↑↓ pick a row · Esc back to the composer'
+                            : `${rowVerbHint(rowVerbs(cursorRow))} · Esc back`,
+                      }
+                    : scroll > 0
+                      ? { hint: 'scrolled · Esc to follow' }
+                      : {})}
             />
           </Box>
         </Box>

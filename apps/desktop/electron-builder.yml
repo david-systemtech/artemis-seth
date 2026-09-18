@@ -24,13 +24,11 @@ asarUnpack:
   - '**/node_modules/@anthropic-ai/claude-agent-sdk/**'
   - '**/node_modules/node-pty/**'
 
-# The cerebro CLI Artemis ships for bootstrap: creating or joining a memory
-# bank on a machine that has none yet (a bank's own embedded copy wins once one
-# exists — see main/memoryBanks.ts). Outside the asar because it is spawned.
-# Refresh from the cerebro repo's bin/cerebro when the contract changes.
-extraResources:
-  - from: resources/cerebro
-    to: cerebro
+# Nothing is shipped beside the asar. Artemis used to vendor the cerebro CLI
+# here for bootstrap; it no longer needs one — reading, installing, describing
+# and writing a bank are core's, and the single job left for a CLI (wiring a
+# bank into stock Claude Code) is done by the bank's own embedded copy. See
+# main/memoryBanks.ts.
 
 # Unpacking preserves the mode the file had in the archive, and node-pty
 # publishes `spawn-helper` as 0644 — so without this every install arrives
@@ -72,6 +70,66 @@ linux:
     - AppImage
     - deb
     - pacman
+
+# The Arch package's dependencies, stated rather than inherited.
+#
+# electron-builder's default list for the pacman target is a constant inside
+# app-builder-lib (`FpmTarget.getDefaultDepends`) that describes a *different*
+# build of Electron than the one shipped here: `c-ares`, `ffmpeg`, `libevent`,
+# `libvpx`, `libxslt`, `minizip`, `re2`, `snappy` are the system libraries Arch's
+# own `electron` package links against because it is compiled with the
+# `use_system_*` GN flags. This build is the prebuilt Electron, which carries
+# every one of them inside itself, so each was a dependency the package claimed
+# and did not have.
+#
+# That was cosmetic until one of the names stopped existing. `http-parser` was
+# dropped from the Arch repositories, and a dependency that cannot be resolved
+# is not a warning — `pacman -U` refuses the transaction, so 2.16.1 could not be
+# installed over 2.4.8 at all, and `main/updater.ts` could not install it either:
+# it hands the file to `pacman -U --noconfirm`, and `--noconfirm` answers "no" to
+# the prompt offering to skip the package. Every Arch machine's in-app update
+# would have failed at the last step, after a correct download and checksum.
+#
+# So the list below is the one the binaries actually ask for: every soname in a
+# `readelf -d` of `artemis`, `chrome_crashpad_handler` and the shipped `.so`s,
+# mapped to its owning package, minus the three that `base` guarantees (glibc,
+# gcc-libs, systemd-libs). Two entries are not in that output and are here on
+# purpose:
+#
+#   - `libnotify` — Electron `dlopen`s it for `new Notification()`, which
+#     main/index.ts uses, so no NEEDED entry names it.
+#   - `xdg-utils` — `shell.openExternal` (main/security.ts) execs `xdg-open`.
+#
+# `libappindicator-gtk3` was in the defaults and is gone from here: it is for
+# `Tray`, and nothing in the app constructs one. `libxss` is gone because
+# current Electron no longer links libXss.
+#
+# Regenerate this the same way after an Electron major, and check the result
+# resolves — `pacman -T <the list>` names anything that no longer exists.
+pacman:
+  depends:
+    - alsa-lib
+    - at-spi2-core
+    - cairo
+    - dbus
+    - expat
+    - gtk3
+    - hicolor-icon-theme
+    - libcups
+    - libnotify
+    - libx11
+    - libxcb
+    - libxcomposite
+    - libxdamage
+    - libxext
+    - libxfixes
+    - libxkbcommon
+    - libxrandr
+    - mesa
+    - nspr
+    - nss
+    - pango
+    - xdg-utils
 
 # Declaring the provider makes electron-builder emit an update feed beside the
 # artifacts — latest-mac.yml from a mac build, latest.yml from a Windows one,

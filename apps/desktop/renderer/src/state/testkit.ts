@@ -63,8 +63,10 @@ const SESSION_KEYS: Readonly<Record<keyof SessionState, true>> = {
   permissionQueue: true,
   tasks: true,
   dismissedTasks: true,
+  dismissedSuggestedTasks: true,
   tasksRequested: true,
   filesRequested: true,
+  documentsRequested: true,
   promptHistory: true,
   handoff: true,
   handoffOffer: true,
@@ -163,9 +165,11 @@ export const ALL_CAPABILITIES: Capabilities = {
   rewind: true,
   usageReporting: true,
   costReporting: true,
+  contextReporting: true,
   planUsageReporting: true,
   imageInput: true,
   fileInput: true,
+  taskSuggestions: true,
 };
 
 /**

@@ -19,6 +19,7 @@ export { RunsSection } from './RunsSection';
 export { AppearanceSection } from './AppearanceSection';
 export { PermissionsSection } from './PermissionsSection';
 export { InstructionsSection } from './InstructionsSection';
+export { SkillsSection } from './SkillsSection';
 export { KeyManagersSection } from './KeyManagersSection';
 export { ServerSection } from './ServerSection';
 export { RemoteSection } from './RemoteSection';

@@ -76,6 +76,7 @@ import {
   createPushFeed,
   createRemoteRunGuard,
   createRemoteTerminals,
+  createServerRoutineStore,
   createWorkspaceResolver,
   sweepStaleWorkspaces,
   SessionLifecycleLog,
@@ -256,12 +257,17 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       readonly sessionId: string;
       readonly runId: string;
       readonly cwd?: string;
+      readonly limit?: number;
+      readonly offset?: number;
     }) =>
       options.engine.require().getSessionMessages({
         profileId: query.profileId as never,
         sessionId: query.sessionId as never,
         runId: query.runId as never,
         ...(query.cwd === undefined ? {} : { cwd: query.cwd }),
+        // The page the route was asked for; see `SessionSource.messages`.
+        ...(query.limit === undefined ? {} : { limit: query.limit }),
+        ...(query.offset === undefined ? {} : { offset: query.offset }),
       }),
     // The three writes, delegated to the same engine handlers the sidebar
     // uses, so a rename over the wire and a rename from the window are one
@@ -352,6 +358,17 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         ...(input.permissionMode === undefined
           ? {}
           : { permissionMode: input.permissionMode as never }),
+        // The client composed these on its own machine; apply them as an append
+        // on top of this profile's preset. `engine.startRun` also merges this
+        // machine's own library, and `withSystemPromptAppended` concatenates the
+        // two — a desktop that serves a client both of which have standing
+        // instructions sends both, which is additive rather than a conflict.
+        ...(input.systemPrompt === undefined
+          ? {}
+          : { systemPrompt: { kind: 'append', text: input.systemPrompt } as const }),
+        // Read and bounded by the route before it got here; the registry checks
+        // them again against this profile's provider.
+        ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
       } as never);
     },
     subscribe: (listener) => options.engine.require().subscribe(listener),
@@ -519,6 +536,30 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       checkAuth: async (query) =>
         (await options.engine.require().authStatus(query.profileId)).status,
     },
+  });
+
+  /**
+   * The routines that fire *in this server*, distinct from the desktop's own
+   * local ones (`main/routines.ts`).
+   *
+   * A server routine belongs to a served connection and fires whether or not a
+   * window is watching, in that connection's pinned directory — the whole point
+   * being work that survives the laptop being shut. It fires through the same
+   * `startUserRun` bridge runs use, because it is the connection owner's own
+   * scheduled work, and it looks its own connection up in the live config so a
+   * revoked token's routines quietly stop. Its scheduler runs for the life of
+   * this runtime, not the bound socket: an appointment is kept whether or not
+   * the HTTP server happens to be listening.
+   */
+  const routines = createServerRoutineStore({
+    dataDir: options.userDataDir,
+    runs: {
+      start: (input) => options.engine.require().startRun(input),
+      subscribe: (listener) => options.engine.require().subscribe(listener),
+    },
+    workspaces,
+    catalogue,
+    connections: () => config.connections,
   });
 
   function snapshot(): ServerState {
@@ -761,6 +802,7 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       // `describeScopedSessions` and the resume gate.
       ledger,
       sessions: sessionSource,
+      routines,
       usage: usageSource,
       onRequest: ({ rejected, connectionId }) => {
         // Counters only, never a log of what was asked — see `ServerTraffic`.
@@ -825,7 +867,15 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
     workspaces,
 
     async start() {
-      await Promise.all([load(), ledger.load()]);
+      await Promise.all([load(), ledger.load(), routines.load()]);
+      /*
+       * The routine scheduler runs for the life of the runtime, not the bound
+       * socket: a server routine is an appointment kept whether or not the HTTP
+       * server is currently listening, exactly as the desktop's own local
+       * routines fire with no window open. The start pass makes up at most one
+       * appointment per routine missed while the app was closed.
+       */
+      routines.start();
 
       /*
        * Clear out what a previous life left behind.
@@ -949,6 +999,9 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       boundPort = null;
       startedAt = null;
       guard.dispose();
+      // Stop the routine scheduler and flush its history before anything else:
+      // a firing in flight would otherwise be torn out from under its own row.
+      await routines.dispose();
       // The subscription and the visibility map, not the shells: stopping the
       // server must not kill a `pnpm dev` the local window is also showing.
       unsubscribeTerminals?.();

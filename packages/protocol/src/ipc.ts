@@ -28,6 +28,8 @@
 import type { AgentPromptsDocument,
   MemoryBankPromptInfo,
 } from './agentPrompts.js';
+import type { SkillInfo, SkillLibraryDocument, SkillSourceStatus } from './skills.js';
+import type { RepositoryOrigin } from './forge.js';
 import type { PullRequestRef, PullRequestResult } from './github.js';
 import type { AgentEvent, BackgroundTask } from './events.js';
 import type { AgentError } from './errors.js';
@@ -36,7 +38,13 @@ import type { PermissionDecision } from './permissions.js';
 import type { PermissionRequestId, ProfileId, RunId, SessionId } from './ids.js';
 import type { ProfileDraft, ProfileMetadata, ProfilePatch } from './profile.js';
 import type { ProviderDescriptor, ProviderId, ProviderModelOption } from './provider.js';
-import type { RoutineDraft, RoutineId, RoutinePatch, RoutinesState } from './routine.js';
+import type {
+  RoutineDraft,
+  RoutineId,
+  RoutinePatch,
+  RoutineSnapshot,
+  RoutinesState,
+} from './routine.js';
 import type { RunHandle, RunInput } from './run.js';
 import type {
   SecretAuthMethod,
@@ -51,6 +59,9 @@ import type {
 import type { UpdateProgress } from './update.js';
 import type {
   ServerAllowance,
+  ServerMemoryBank,
+  ServerMemoryBankAccount,
+  ServerMemoryBankScope,
   ServerProfile,
   ServerProfileCreatedBody,
   ServerSignInStatus,
@@ -148,6 +159,8 @@ export const IPC = {
   workspacePickDirectory: 'artemis:workspace:pick-directory',
   /** Name a directory: its own name, and its repository's when it has one. */
   workspaceDescribe: 'artemis:workspace:describe',
+  /** Split a new git worktree off a repository, for work that must not collide. */
+  workspaceCreateWorktree: 'artemis:workspace:create-worktree',
 
   /**
    * Read which of each Claude profile's shared entries are actually symlinked
@@ -370,6 +383,37 @@ export const IPC = {
   serverAccountsCancelSignIn: 'artemis:server-accounts:cancel-sign-in',
 
   /**
+   * The memory banks a *remote* server carries, and which of its accounts each
+   * one reaches.
+   *
+   * Distinct from the `memoryBank*` channels above, which are this machine's
+   * own registry: a bank on a server is a checkout on that machine, scoped by
+   * that machine's account ids, and the two registries never meet. Reached the
+   * same way the account channels are — through the local Artemis-Server
+   * profile whose token names the server — and gated by the same grant, so a
+   * token without account administration sees the pane report that rather than
+   * a refusal.
+   */
+  serverMemoryBanksList: 'artemis:server-memory-banks:list',
+  /** Choose which of the server's accounts one of its banks reaches. */
+  serverMemoryBanksSetProfiles: 'artemis:server-memory-banks:set-profiles',
+
+  /**
+   * Routines that live on a *remote* server: the appointments that fire there
+   * with this desktop closed. The client half of `/api/v0/routines`, reached
+   * the same way the account channels above reach the server — through the
+   * local Artemis-Server profile whose token says which server, and scoped by
+   * that server to the connection it names. Distinct from `routines:*`, which
+   * are the desktop's own local appointments.
+   */
+  serverRoutinesList: 'artemis:server-routines:list',
+  serverRoutinesCreate: 'artemis:server-routines:create',
+  serverRoutinesUpdate: 'artemis:server-routines:update',
+  serverRoutinesDelete: 'artemis:server-routines:delete',
+  /** Fire one server routine now, schedule and pause notwithstanding. */
+  serverRoutinesRunNow: 'artemis:server-routines:run-now',
+
+  /**
    * Window chrome.
    *
    * Artemis draws its own title bar, so the four things a native one would have
@@ -465,17 +509,45 @@ export const IPC = {
   memoryBankSync: 'artemis:memory-banks:sync',
   memoryBankRetire: 'artemis:memory-banks:retire',
   /**
-   * Wire one bank on or off — the machine's wiring, not Artemis's gate.
+   * Switch one bank on or off — this bank, not Artemis's master gate.
    *
-   * Runs the CLI's per-bank `enable`/`disable`: the profile block and install
-   * namespace for that bank come or go, and the CLI records the flag in its
-   * own config, where the SessionStart hook (stock Claude Code's path) reads
-   * it too. One switch per bank, honoured everywhere.
+   * On installs the bank into every project it reaches and describes it to
+   * runs; off removes those copies and stops describing it. The flag is
+   * recorded in Artemis's registry and mirrored into the CLI's config, where
+   * the SessionStart hook (stock Claude Code's path) reads it too, so one
+   * switch per bank is honoured on both paths.
    */
   memoryBankSetEnabled: 'artemis:memory-banks:set-enabled',
   /**
+   * Which profiles a bank reaches: every profile, or a chosen set.
+   *
+   * The scope decides everything downstream — which runs are briefed about
+   * the bank, which profiles' projects it is installed into, which runs may
+   * read its directory. Artemis's own record, in its own registry; the CLI's
+   * config has no room for it and does not need any.
+   */
+  memoryBankSetProfiles: 'artemis:memory-banks:set-profiles',
+  /**
+   * Wire one bank into *stock Claude Code* on this machine, or unwire it.
+   *
+   * A courtesy, and explicitly not Artemis's own path. Artemis reads, installs
+   * and describes a bank itself and runs with `settingSources: []`, so none of
+   * what this writes has any effect on an Artemis run. What it writes is the
+   * other harness's setup: a managed block in each profile's `CLAUDE.md`, a
+   * `/cerebro` slash command, and a `SessionStart` hook that syncs — the three
+   * things a person who also opens that profile in `claude` needs, and which
+   * only the bank's own embedded CLI knows how to write.
+   *
+   * An action rather than a side effect of enabling a bank, because it changes
+   * files Artemis does not own for the benefit of a program the user may not
+   * run. A bank that embeds no CLI cannot do it at all — see
+   * {@link MemoryBankInfo.embedsCli}, which is what lets the pane say so
+   * instead of failing on click.
+   */
+  memoryBankWireClaudeCode: 'artemis:memory-banks:wire-claude-code',
+  /**
    * Drop a bank from this machine: unwire it, remove its installed copies,
-   * forget it in the CLI config. The repository itself stays on disk — the
+   * forget it in the registry. The repository itself stays on disk — the
    * renderer cannot delete a git repo through this channel, deliberately.
    */
   memoryBankForget: 'artemis:memory-banks:forget',
@@ -505,6 +577,32 @@ export const IPC = {
    */
   agentPromptsList: 'artemis:agent-prompts:list',
   agentPromptsSave: 'artemis:agent-prompts:save',
+
+  /**
+   * The skills this machine offers a session, and which are always on.
+   *
+   * The same two verbs as the prompt library, for the same reason: the choices
+   * are one small document, edited as one, and the answer to a save is what
+   * landed. The *skills* are not part of what is saved — they are folders on
+   * disk, read fresh on every list, so a skill installed while the pane is
+   * open is there the next time it is asked.
+   */
+  skillsList: 'artemis:skills:list',
+  skillsSave: 'artemis:skills:save',
+
+  /**
+   * The repositories of skills this machine keeps cloned.
+   *
+   * Their own channels rather than part of the save, and the split is the
+   * security boundary of the feature: a source is a URL the main process will
+   * hand to `git clone`, so it crosses IPC through a validator written for a
+   * URL, on a channel that does nothing else — never as a field a save about
+   * switches happened to carry. All three answer with the whole skills state,
+   * because each of them changes what the list holds.
+   */
+  skillsSourceAdd: 'artemis:skills:source:add',
+  skillsSourceRemove: 'artemis:skills:source:remove',
+  skillsSourceSync: 'artemis:skills:source:sync',
 
   /**
    * The machine's key managers.
@@ -1514,12 +1612,13 @@ export interface WorkspaceDescribeResponse {
    */
   readonly worktree?: boolean;
   /**
-   * The GitHub repository the project's `origin` remote names, when it names
-   * one. What lets the renderer expand a bare `#123` in a transcript into a
-   * link to the pull request — absent for any other host, because that
-   * expansion is a GitHub convention and a wrong-host link is worse than none.
+   * The repository the project's `origin` remote names, on whatever host it
+   * names it — what lets the renderer expand a bare `#123` in a transcript
+   * into a link to the pull request, spelled the way that host spells one.
+   * Absent when there is no `origin`, or one this cannot read. See
+   * `forge.ts` for the hosts it can name and the default for the rest.
    */
-  readonly github?: { readonly owner: string; readonly repo: string };
+  readonly origin?: RepositoryOrigin;
   /**
    * Is {@link path} inside the machine's temporary directory?
    *
@@ -1533,6 +1632,44 @@ export interface WorkspaceDescribeResponse {
    * rather than anything the renderer could recognise by sight.
    */
   readonly temporary?: boolean;
+}
+
+/**
+ * Split a new worktree off a repository, and say where it landed.
+ *
+ * The one channel in this file that runs `git`, which is worth stating rather
+ * than hiding: everything else about repositories in Artemis is answered by
+ * walking directories, precisely so a label never depends on a binary being on
+ * the PATH. A worktree cannot be made that way — it is a `.git` write with
+ * bookkeeping — so this shells out, and inherits `git`'s absence as a plain
+ * failure the caller can show.
+ *
+ * Deliberately not general. There is no `remove`, no `list` and no branch
+ * argument that is not derived from a name: this exists to give one suggested
+ * task a place of its own to run, and a renderer that could name arbitrary git
+ * operations would be a renderer that could name arbitrary git operations.
+ */
+export interface WorkspaceCreateWorktreeRequest {
+  /**
+   * Any absolute path inside the repository to split. The main process
+   * resolves it to the checkout — a path inside an existing worktree splits
+   * from the repository that worktree belongs to, not from the worktree.
+   */
+  readonly path: string;
+  /**
+   * Branch to create, as {@link import('./suggestedTasks.js').suggestedTaskBranch}
+   * spells one. Taken as a *request*: a name already in use is suffixed rather
+   * than refused, because the alternative is an error message whose only
+   * remedy is for the user to invent a different name for the same work.
+   */
+  readonly branch: string;
+}
+
+export interface WorkspaceCreateWorktreeResponse {
+  /** Absolute path to the new worktree — where a session started here works. */
+  readonly path: string;
+  /** The branch actually created, which may be {@link WorkspaceCreateWorktreeRequest.branch} suffixed. */
+  readonly branch: string;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1912,6 +2049,36 @@ export interface ServerAccountsListResponse {
   readonly accounts: readonly ServerProfile[];
 }
 
+/**
+ * What one of a server's banks reaches, on the wire between renderer and main.
+ *
+ * `ServerMemoryBankScope` from the server protocol rather than
+ * {@link MemoryBankProfileScope}, which is this machine's: the ids in it are
+ * the *server's* account ids, and typing them as local {@link ProfileId}s
+ * would invite a renderer to hand one registry the other's ids.
+ */
+export interface ServerMemoryBanksListResponse {
+  /** This profile's token may change what a bank reaches. See the channel. */
+  readonly manageProfiles: boolean;
+  /** The server answers this surface at all — an older build does not. */
+  readonly available: boolean;
+  readonly banks: readonly ServerMemoryBank[];
+  /** The accounts a scope may name, for the checklist. */
+  readonly accounts: readonly ServerMemoryBankAccount[];
+}
+
+export interface ServerMemoryBanksSetProfilesRequest extends ServerAccountsRequest {
+  /** The bank on the server, by the slug its registry files it under. */
+  readonly slug: string;
+  /** Sent whole, not as a diff — the checklist says what it says. */
+  readonly profiles: ServerMemoryBankScope;
+}
+
+export interface ServerMemoryBanksSetProfilesResponse {
+  /** The bank as the server now has it, so a pane can render the answer. */
+  readonly bank: ServerMemoryBank;
+}
+
 export interface ServerAccountsCreateRequest extends ServerAccountsRequest {
   readonly label: string;
   /**
@@ -1980,6 +2147,56 @@ export interface ServerAccountSubmitCodeRequest extends ServerAccountSignInReque
  */
 export interface ServerAccountSignInResponse {
   readonly signIn: ServerSignInStatus | null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Routines on a remote Artemis                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which server, in every remote-routine request.
+ *
+ * The *local* Artemis-Server profile id, exactly as {@link ServerAccountsRequest}
+ * — it carries the address and the connection token. The server scopes every
+ * call to the connection that token names.
+ */
+export interface ServerRoutinesRequest {
+  readonly profileId: ProfileId;
+}
+
+export interface ServerRoutinesListResponse {
+  /** Every routine the server lets this connection see, next appointment and all. */
+  readonly routines: readonly RoutineSnapshot[];
+}
+
+export interface ServerRoutinesCreateRequest extends ServerRoutinesRequest {
+  /**
+   * The routine to create. Its `cwd` is ignored — a server routine runs in the
+   * connection's own pinned directory, decided by the server, not the client.
+   */
+  readonly draft: RoutineDraft;
+}
+
+export interface ServerRoutinesUpdateRequest extends ServerRoutinesRequest {
+  readonly routineId: string;
+  readonly patch: RoutinePatch;
+}
+
+export interface ServerRoutinesDeleteRequest extends ServerRoutinesRequest {
+  readonly routineId: string;
+}
+
+export interface ServerRoutinesRunNowRequest extends ServerRoutinesRequest {
+  readonly routineId: string;
+}
+
+/** One routine, for create, update and run-now alike. */
+export interface ServerRoutineResponse {
+  readonly routine: RoutineSnapshot;
+}
+
+export interface ServerRoutinesDeleteResponse {
+  readonly removed: boolean;
 }
 
 export interface UsagePlanRequest {
@@ -2230,6 +2447,8 @@ export interface UpdatesCheckResponse {
  */
 export interface MemoryBankMemory {
   readonly name: string;
+  /** The name as a heading, the way the index lists it. */
+  readonly title: string;
   readonly type: string;
   readonly description: string;
   readonly body: string;
@@ -2240,6 +2459,19 @@ export interface MemoryBankMemory {
   readonly org: string | null;
   /** Project or topic within the org. */
   readonly project: string | null;
+  /**
+   * The labels the memory's folders carry, in the bank's own vocabulary —
+   * `{ org, project }` for a cortex-shaped bank, `{ brand, system }` for a
+   * brand-first one, empty for a flat one. `org` and `project` above are the
+   * same facts for a bank that uses those words.
+   */
+  readonly scope: Readonly<Record<string, string>>;
+  /**
+   * Why the bank's reader would not install this memory. Empty for a memory
+   * that reaches agents; a memory with problems is browsable here so the
+   * person who can fix it can see what is wrong.
+   */
+  readonly problems: readonly string[];
   /**
    * From a read-only mirror tree the bank carries but does not own (cortex's
    * session-memory mirrors, for instance): browsable and searchable here,
@@ -2257,11 +2489,39 @@ export interface MemoryBankMemory {
 export type MemoryBankRole = 'readwrite' | 'readonly';
 
 /**
- * One configured bank, as the CLI's registry and a status probe describe it.
+ * Which profiles a bank reaches. The same two answers the prompt library's
+ * scope gives, for the same reason: `all` covers an account added next month,
+ * a list means exactly these.
+ */
+export type MemoryBankProfileScope =
+  | { readonly kind: 'all' }
+  | { readonly kind: 'profiles'; readonly profileIds: readonly ProfileId[] };
+
+/**
+ * How a bank is kept on disk. `manifest` means a `BANK.md` at its root; the
+ * two legacy formats are the `cerebro` CLI's, read unchanged. `null` when the
+ * path holds no bank at all.
+ */
+export type MemoryBankFormat = 'legacy-flat' | 'legacy-projects' | 'manifest';
+
+/**
+ * One configured bank, as Artemis's registry and a read of the bank describe it.
  */
 export interface MemoryBankInfo {
   /** The per-machine name; namespaces the bank's installs and prompts. */
   readonly slug: string;
+  /** What the bank calls itself in its manifest. The slug when it says nothing. */
+  readonly name: string;
+  /** One line on what it holds, from its manifest. */
+  readonly description: string | null;
+  readonly format: MemoryBankFormat | null;
+  readonly profiles: MemoryBankProfileScope;
+  /**
+   * What is wrong with the bank as a whole (an unreadable manifest, say) and
+   * with its entries, one line each, `file: reason` — the first few, since the
+   * count is in `validationErrors`.
+   */
+  readonly problems: readonly string[];
   readonly path: string;
   readonly remote: string | null;
   readonly role: MemoryBankRole;
@@ -2283,6 +2543,17 @@ export interface MemoryBankInfo {
   readonly validationErrors: number;
   /** Projects whose Artemis memory currently carries this bank's install. */
   readonly projects: number;
+  /**
+   * The bank carries a `bin/cerebro` of its own.
+   *
+   * Nothing Artemis does needs it — reading, installing and describing a bank
+   * are core's, and a run never spawns it. It is here for exactly one offer:
+   * wiring the bank into stock Claude Code, which is that CLI's own `enable`
+   * and cannot be done by anything else. False means the pane disables the
+   * offer with a reason rather than failing on click. See
+   * `IPC.memoryBankWireClaudeCode`.
+   */
+  readonly embedsCli: boolean;
   /**
    * Where this bank's git credential comes from, and what came of the last
    * attempt to use it.
@@ -2332,7 +2603,13 @@ export interface MemoryBankProfileState {
  * is the state the settings pane exists to fix, not an error to fail on.
  */
 export interface MemoryBanksStatus {
-  /** A CLI exists to drive (bank-embedded or the copy Artemis ships). */
+  /**
+   * At least one registered bank embeds a `bin/cerebro`.
+   *
+   * Artemis ships no copy of its own any more, so this is the machine's answer
+   * to one question only: can anything here be wired into stock Claude Code.
+   * `false` is an ordinary state — every Artemis path works without it.
+   */
   readonly cliAvailable: boolean;
   /**
    * Artemis's master gate: inject the prompt, sync at run start. Off by
@@ -2547,6 +2824,30 @@ export interface MemoryBankSetEnabledRequest {
 
 export type MemoryBankSetEnabledResponse = MemoryBankActionResponse;
 
+/** Attach one bank to every profile, or to a chosen set. See `IPC.memoryBankSetProfiles`. */
+export interface MemoryBankSetProfilesRequest {
+  readonly slug: string;
+  readonly profiles: MemoryBankProfileScope;
+}
+
+export type MemoryBankSetProfilesResponse = MemoryBankActionResponse;
+
+/**
+ * Wire this bank into stock Claude Code on this machine, or unwire it. See
+ * `IPC.memoryBankWireClaudeCode`.
+ *
+ * The desired state rather than a toggle, for {@link
+ * MemoryBankSetEnabledRequest}'s reason — and because the files being written
+ * are shared with another program, so two windows disagreeing about which way
+ * the toggle went would leave a managed block nobody meant to write.
+ */
+export interface MemoryBankWireClaudeCodeRequest {
+  readonly slug: string;
+  readonly enabled: boolean;
+}
+
+export type MemoryBankWireClaudeCodeResponse = MemoryBankActionResponse;
+
 /** Unwire, uninstall, and forget one bank. The repository stays on disk. */
 export interface MemoryBankForgetRequest {
   readonly slug: string;
@@ -2759,6 +3060,56 @@ export interface AgentPromptsSaveResponse {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Skills                                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** Empty; the skills are this machine's and main knows where they are. */
+export type SkillsListRequest = Record<string, never>;
+
+/**
+ * What a session here would be offered, and the stored always-on choices.
+ *
+ * Two things rather than one joined list, because they have different sources
+ * of truth and can disagree honestly: a choice can name a skill that is not on
+ * this machine right now (see `SkillLibraryDocument`), and the pane has to be
+ * able to show that row as "on, and missing" rather than lose it.
+ */
+export interface SkillsListResponse {
+  readonly skills: readonly SkillInfo[];
+  readonly document: SkillLibraryDocument;
+  /** The repositories kept cloned here, and how each copy is doing. */
+  readonly sources: readonly SkillSourceStatus[];
+}
+
+/** Subscribe to a repository of skills. Cloned before the answer comes back. */
+export interface SkillsSourceAddRequest {
+  /** `https://…`, `ssh://…` or `git@host:path`. See `skillSourceUrlProblem`. */
+  readonly url: string;
+  /** The folder inside it that holds the skills. Defaults to `skills`. */
+  readonly subdir?: string;
+}
+
+/** Unsubscribe, and delete this machine's copy. */
+export interface SkillsSourceRemoveRequest {
+  readonly id: string;
+}
+
+/** Pull now: the named source, or every one when none is named. */
+export interface SkillsSourceSyncRequest {
+  readonly id?: string;
+}
+
+/** Replace the always-on choices. */
+export interface SkillsSaveRequest {
+  readonly document: SkillLibraryDocument;
+}
+
+/** What landed, which may differ: main rebuilds the document on the way in. */
+export interface SkillsSaveResponse {
+  readonly document: SkillLibraryDocument;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Server                                                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -2958,6 +3309,7 @@ export type IpcRequestMap = {
   [IPC.sessionsListAll]: SessionsListAllRequest;
   [IPC.workspacePickDirectory]: WorkspacePickDirectoryRequest;
   [IPC.workspaceDescribe]: WorkspaceDescribeRequest;
+  [IPC.workspaceCreateWorktree]: WorkspaceCreateWorktreeRequest;
   [IPC.sharedConfigStatus]: SharedConfigStatusRequest;
   [IPC.previewOpen]: PreviewOpenRequest;
   [IPC.filesRead]: FilesReadRequest;
@@ -2993,6 +3345,13 @@ export type IpcRequestMap = {
   [IPC.serverAccountsSignInStatus]: ServerAccountSignInRequest;
   [IPC.serverAccountsSubmitCode]: ServerAccountSubmitCodeRequest;
   [IPC.serverAccountsCancelSignIn]: ServerAccountSignInRequest;
+  [IPC.serverMemoryBanksList]: ServerAccountsRequest;
+  [IPC.serverMemoryBanksSetProfiles]: ServerMemoryBanksSetProfilesRequest;
+  [IPC.serverRoutinesList]: ServerRoutinesRequest;
+  [IPC.serverRoutinesCreate]: ServerRoutinesCreateRequest;
+  [IPC.serverRoutinesUpdate]: ServerRoutinesUpdateRequest;
+  [IPC.serverRoutinesDelete]: ServerRoutinesDeleteRequest;
+  [IPC.serverRoutinesRunNow]: ServerRoutinesRunNowRequest;
   [IPC.windowMinimize]: WindowRequest;
   [IPC.windowToggleMaximize]: WindowRequest;
   [IPC.windowClose]: WindowRequest;
@@ -3011,6 +3370,8 @@ export type IpcRequestMap = {
   [IPC.memoryBankSync]: MemoryBankSyncRequest;
   [IPC.memoryBankRetire]: MemoryBankRetireRequest;
   [IPC.memoryBankSetEnabled]: MemoryBankSetEnabledRequest;
+  [IPC.memoryBankSetProfiles]: MemoryBankSetProfilesRequest;
+  [IPC.memoryBankWireClaudeCode]: MemoryBankWireClaudeCodeRequest;
   [IPC.memoryBankForget]: MemoryBankForgetRequest;
   [IPC.memoryBanksSetMasterEnabled]: MemoryBanksSetMasterEnabledRequest;
   [IPC.secretsConnectionsList]: SecretsConnectionsListRequest;
@@ -3021,6 +3382,11 @@ export type IpcRequestMap = {
   [IPC.secretsRefTest]: SecretsRefTestRequest;
   [IPC.agentPromptsList]: AgentPromptsListRequest;
   [IPC.agentPromptsSave]: AgentPromptsSaveRequest;
+  [IPC.skillsList]: SkillsListRequest;
+  [IPC.skillsSave]: SkillsSaveRequest;
+  [IPC.skillsSourceAdd]: SkillsSourceAddRequest;
+  [IPC.skillsSourceRemove]: SkillsSourceRemoveRequest;
+  [IPC.skillsSourceSync]: SkillsSourceSyncRequest;
   [IPC.serverStatus]: ServerStatusRequest;
   [IPC.serverStart]: ServerStartRequest;
   [IPC.serverStop]: ServerStopRequest;
@@ -3061,6 +3427,7 @@ export type IpcResponseMap = {
   [IPC.sessionsListAll]: SessionsListAllResponse;
   [IPC.workspacePickDirectory]: WorkspacePickDirectoryResponse;
   [IPC.workspaceDescribe]: WorkspaceDescribeResponse;
+  [IPC.workspaceCreateWorktree]: WorkspaceCreateWorktreeResponse;
   [IPC.sharedConfigStatus]: SharedConfigStatusResponse;
   [IPC.previewOpen]: PreviewOpenResponse;
   [IPC.filesRead]: FilesReadResponse;
@@ -3096,6 +3463,13 @@ export type IpcResponseMap = {
   [IPC.serverAccountsSignInStatus]: ServerAccountSignInResponse;
   [IPC.serverAccountsSubmitCode]: ServerAccountSignInResponse;
   [IPC.serverAccountsCancelSignIn]: ServerAccountSignInResponse;
+  [IPC.serverMemoryBanksList]: ServerMemoryBanksListResponse;
+  [IPC.serverMemoryBanksSetProfiles]: ServerMemoryBanksSetProfilesResponse;
+  [IPC.serverRoutinesList]: ServerRoutinesListResponse;
+  [IPC.serverRoutinesCreate]: ServerRoutineResponse;
+  [IPC.serverRoutinesUpdate]: ServerRoutineResponse;
+  [IPC.serverRoutinesDelete]: ServerRoutinesDeleteResponse;
+  [IPC.serverRoutinesRunNow]: ServerRoutineResponse;
   [IPC.windowMinimize]: WindowStateResponse;
   [IPC.windowToggleMaximize]: WindowStateResponse;
   [IPC.windowClose]: WindowStateResponse;
@@ -3114,6 +3488,8 @@ export type IpcResponseMap = {
   [IPC.memoryBankSync]: MemoryBankSyncResponse;
   [IPC.memoryBankRetire]: MemoryBankRetireResponse;
   [IPC.memoryBankSetEnabled]: MemoryBankSetEnabledResponse;
+  [IPC.memoryBankSetProfiles]: MemoryBankSetProfilesResponse;
+  [IPC.memoryBankWireClaudeCode]: MemoryBankWireClaudeCodeResponse;
   [IPC.memoryBankForget]: MemoryBankForgetResponse;
   [IPC.memoryBanksSetMasterEnabled]: MemoryBanksSetMasterEnabledResponse;
   [IPC.secretsConnectionsList]: SecretsConnectionsListResponse;
@@ -3124,6 +3500,11 @@ export type IpcResponseMap = {
   [IPC.secretsRefTest]: SecretsRefTestResponse;
   [IPC.agentPromptsList]: AgentPromptsListResponse;
   [IPC.agentPromptsSave]: AgentPromptsSaveResponse;
+  [IPC.skillsList]: SkillsListResponse;
+  [IPC.skillsSave]: SkillsSaveResponse;
+  [IPC.skillsSourceAdd]: SkillsListResponse;
+  [IPC.skillsSourceRemove]: SkillsListResponse;
+  [IPC.skillsSourceSync]: SkillsListResponse;
   [IPC.serverStatus]: ServerStateResponse;
   [IPC.serverStart]: ServerStateResponse;
   [IPC.serverStop]: ServerStateResponse;
@@ -3369,6 +3750,17 @@ export interface ArtemisBridge {
      * it whenever the working directory changes.
      */
     describe(request: WorkspaceDescribeRequest): Promise<IpcResult<WorkspaceDescribeResponse>>;
+
+    /**
+     * Split a new worktree off the repository a path is in.
+     *
+     * Unlike its two neighbours this runs `git`, creates a directory and
+     * writes a branch, so it is called on a click and never on a keystroke.
+     * See {@link WorkspaceCreateWorktreeRequest}.
+     */
+    createWorktree(
+      request: WorkspaceCreateWorktreeRequest,
+    ): Promise<IpcResult<WorkspaceCreateWorktreeResponse>>;
   };
 
   /**
@@ -3389,13 +3781,14 @@ export interface ArtemisBridge {
   };
 
   /**
-   * The memory banks, through the banks' own CLI.
+   * The memory banks.
    *
    * Reads and actions — and none of them lets the renderer name a path, a
-   * binary, or an arbitrary git remote outside `add`. Main resolves each
-   * bank's repo and the CLI to drive it; the banks' own validation and PR
-   * gates decide what actually lands. See the channel comments in {@link IPC}
-   * for why the write channels answer with a message rather than data.
+   * binary, or an arbitrary git remote outside `add`. Main owns each bank's
+   * location and reads the bank itself; what a write actually lands is decided
+   * by the bank's own schema and its review path. See the channel comments in
+   * {@link IPC} for why the write channels answer with a message rather than
+   * data.
    */
   readonly memoryBanks: {
     /** Every configured bank's condition. `banks: []` is an answer, not an error. */
@@ -3418,8 +3811,18 @@ export interface ArtemisBridge {
     sync(request: MemoryBankSyncRequest): Promise<IpcResult<MemoryBankSyncResponse>>;
     /** Remove a memory through the same gates. */
     retire(request: MemoryBankRetireRequest): Promise<IpcResult<MemoryBankRetireResponse>>;
-    /** Wire one bank on or off (profile blocks + CLI config flag). */
+    /** Switch one bank on or off (the registry flag, and its installs). */
     setEnabled(request: MemoryBankSetEnabledRequest): Promise<IpcResult<MemoryBankSetEnabledResponse>>;
+    /** Attach one bank to every profile, or to a chosen set. Installs follow. */
+    setProfiles(request: MemoryBankSetProfilesRequest): Promise<IpcResult<MemoryBankSetProfilesResponse>>;
+    /**
+     * Wire this bank into stock Claude Code on this machine, or unwire it —
+     * the other harness's managed block, slash command and session-start
+     * hook. Nothing an Artemis run reads.
+     */
+    wireClaudeCode(
+      request: MemoryBankWireClaudeCodeRequest,
+    ): Promise<IpcResult<MemoryBankWireClaudeCodeResponse>>;
     /** Unwire, uninstall, and forget one bank. The repo stays on disk. */
     forget(request: MemoryBankForgetRequest): Promise<IpcResult<MemoryBankForgetResponse>>;
     /** Artemis's master gate: prompt injection + run-start syncs. */
@@ -3438,6 +3841,26 @@ export interface ArtemisBridge {
     list(request: AgentPromptsListRequest): Promise<IpcResult<AgentPromptsListResponse>>;
     /** Replace the library. Answers with what landed, which may differ. */
     save(request: AgentPromptsSaveRequest): Promise<IpcResult<AgentPromptsSaveResponse>>;
+  };
+
+  /**
+   * The skills this machine offers, and the ones switched always-on.
+   *
+   * Read and write, and nothing that starts a run — the same division the
+   * prompt library keeps. An always-on skill is composed into a run where runs
+   * start, in main, from the folder as it is at that moment.
+   */
+  readonly skills: {
+    /** Every skill a session here would be offered, and the stored choices. */
+    list(request: SkillsListRequest): Promise<IpcResult<SkillsListResponse>>;
+    /** Replace the always-on choices. Answers with what landed. */
+    save(request: SkillsSaveRequest): Promise<IpcResult<SkillsSaveResponse>>;
+    /** Subscribe to a repository of skills. Answers once the clone was tried. */
+    addSource(request: SkillsSourceAddRequest): Promise<IpcResult<SkillsListResponse>>;
+    /** Unsubscribe and delete the copy. */
+    removeSource(request: SkillsSourceRemoveRequest): Promise<IpcResult<SkillsListResponse>>;
+    /** Pull now. */
+    syncSources(request: SkillsSourceSyncRequest): Promise<IpcResult<SkillsListResponse>>;
   };
 
   /**
@@ -3682,6 +4105,46 @@ export interface ArtemisBridge {
     cancelSignIn(
       request: ServerAccountSignInRequest,
     ): Promise<IpcResult<ServerAccountSignInResponse>>;
+  };
+
+  /**
+   * The memory banks a *remote* server carries.
+   *
+   * Two calls, not the eight {@link memoryBanks} has. Adding, cloning and
+   * pulling a bank touch the serving machine's disk and its git credentials,
+   * which is a job for whoever administers it; what a client is missing is the
+   * one field nothing on the wire could reach — which of the server's accounts
+   * each bank is attached to.
+   */
+  readonly serverMemoryBanks: {
+    /** The server's banks, its accounts, and whether this token may rescope. */
+    list(request: ServerAccountsRequest): Promise<IpcResult<ServerMemoryBanksListResponse>>;
+    /** Attach one bank to every account, or to exactly these. */
+    setProfiles(
+      request: ServerMemoryBanksSetProfilesRequest,
+    ): Promise<IpcResult<ServerMemoryBanksSetProfilesResponse>>;
+  };
+
+  /**
+   * Routines that fire *on a remote server*, with this desktop closed.
+   *
+   * The client half of `/api/v0/routines`, reached through the local
+   * Artemis-Server profile whose token names the server. Distinct from
+   * {@link routines}, which are this machine's own appointments and fire only
+   * while it is open. Every call is scoped by the server to the connection the
+   * token names.
+   */
+  readonly serverRoutines: {
+    /** Every routine this connection owns on the server, next appointment and all. */
+    list(request: ServerRoutinesRequest): Promise<IpcResult<ServerRoutinesListResponse>>;
+    /** Create one. Its directory is the connection's — the draft's `cwd` is ignored. */
+    create(request: ServerRoutinesCreateRequest): Promise<IpcResult<ServerRoutineResponse>>;
+    /** Edit one. Absent fields are left alone. */
+    update(request: ServerRoutinesUpdateRequest): Promise<IpcResult<ServerRoutineResponse>>;
+    /** Delete one. */
+    delete(request: ServerRoutinesDeleteRequest): Promise<IpcResult<ServerRoutinesDeleteResponse>>;
+    /** Fire one now, schedule and pause notwithstanding. */
+    runNow(request: ServerRoutinesRunNowRequest): Promise<IpcResult<ServerRoutineResponse>>;
   };
 
   /**

@@ -130,6 +130,20 @@ export interface RunInput {
   readonly rewindToMessageId?: string;
 
   /**
+   * Attach to the run already serving {@link resumeSessionId} on the provider
+   * instead of sending a prompt: replay what that run has done so far, then
+   * follow it live, as this run. `prompt` is ignored. Requires
+   * {@link Capabilities.attachLive}; refused without `resumeSessionId`.
+   *
+   * What a window does with a conversation the provider is working on
+   * somewhere it cannot see — a run another client started, one this client
+   * started before it was reloaded, or a turn the provider took on its own —
+   * so the pane draws the work as it happens and a message typed into it
+   * steers that run rather than starting a rival one.
+   */
+  readonly attachToLive?: boolean;
+
+  /**
    * Model identifier, as the provider names it. Omit for the provider default.
    *
    * {@link import('./provider.js').ProviderDescriptor.models} is what the UI

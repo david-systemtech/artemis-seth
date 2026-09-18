@@ -37,6 +37,7 @@ import { resolve, sep } from 'node:path';
 
 import type { FeedEvent, FeedScope, PushFeed } from './feed.js';
 import type {
+  Attachment,
   PermissionDecision,
   RunHandle,
   RunInput,
@@ -55,9 +56,11 @@ import type {
   ServerTerminalsBody,
 } from '@rx-artemis/protocol';
 import {
+  AttachmentError,
   connectionAllowsModel,
   connectionAllowsProfile,
   connectionHasExpired,
+  readAttachments,
   visibleToConnection,
   parseRemoteResourcePath,
   REMOTE_EVENTS_PATH,
@@ -65,6 +68,7 @@ import {
   REMOTE_RUNS_PATH,
   REMOTE_STREAM_CLOSED,
   REMOTE_STREAM_GAP,
+  REMOTE_STREAM_EPOCH_PARAM,
   REMOTE_STREAM_HELLO,
   REMOTE_TERMINALS_PATH,
   SSE_HEARTBEAT,
@@ -82,6 +86,7 @@ import type {
 } from './http.js';
 import { workspaceKeyFor } from './ledger.js';
 import { CORS_HEADERS, fail, ok } from './replies.js';
+import { resolveResumeProfile } from './sessionHome.js';
 import { pathsOf, readRunInput, RunInputError, type ParsedRunInput } from './runInput.js';
 import { TooManyRemoteTerminalsError, UnknownRemoteTerminalError } from './terminals.js';
 import { WorkspaceUnavailableError } from './workspaces.js';
@@ -525,6 +530,32 @@ async function handleStartRun(input: RemoteRequestInput): Promise<ServerReply> {
       profileIds: profiles.map((profile) => String(profile.id)),
     };
     if (!ledger.mayAccess(scope, String(runInput.resumeSessionId))) return unknownSession();
+
+    /*
+     * The account that holds the conversation continues it. A resume that
+     * names another account would fail in the provider — it looks in one
+     * store only — and, worse, would already have been recorded against the
+     * wrong account by the time it did. The bridge's spelling of the redirect
+     * is the profile id, with the model kept where the holding account offers
+     * it. The handle in the reply names the account the run is really on.
+     * See `sessionHome.ts`.
+     */
+    const home = await resolveResumeProfile({
+      sessions: context.sessions,
+      ledger,
+      profiles,
+      requestedProfileId: runInput.profileId,
+      requestedModel: runInput.model,
+      sessionId: String(runInput.resumeSessionId),
+    });
+    if (home.redirected !== undefined) {
+      const { model: _requestedModel, ...rest } = runInput;
+      runInput = {
+        ...rest,
+        profileId: home.profileId,
+        ...(home.model === undefined ? {} : { model: home.model }),
+      };
+    }
   }
 
   const pinned = await resolvePinnedCwd(input, runInput.cwd, runInput.resumeSessionId);
@@ -777,9 +808,23 @@ async function handleRunAction(
         if (typeof body['text'] !== 'string' || body['text'].length === 0) {
           return fail(400, 'invalid_request_error', 'invalid_body', '`text` must be a non-empty string.');
         }
-        const attachments = Array.isArray(body['attachments'])
-          ? (body['attachments'] as never)
-          : undefined;
+        /*
+         * Read rather than trusted. This used to cast the array straight
+         * through, which put an unbounded base64 blob from a bearer token into
+         * an adapter's argument encoder without anything in between; the same
+         * reader the start route uses is the thing that was missing.
+         */
+        let attachments: readonly Attachment[] | undefined;
+        try {
+          attachments = readAttachments(body['attachments'], 'attachments');
+        } catch (error) {
+          return fail(
+            400,
+            'invalid_request_error',
+            'invalid_body',
+            error instanceof AttachmentError ? error.message : 'The attachments could not be read.',
+          );
+        }
         record();
         const outcome = await runs.send(runId, body['text'], attachments);
         const reply: ServerRunSendBody = {
@@ -1084,6 +1129,9 @@ function handleEventStream(input: RemoteRequestInput): ServerReply | ServerStrea
     }
     afterSeq = Number(rawAfter);
   }
+  // Which feed the client believes that number was counted by. Absent from a
+  // client older than the field; `streamFeed` reads a bare number on its own.
+  const clientEpoch = url.searchParams.get(REMOTE_STREAM_EPOCH_PARAM) ?? undefined;
 
   return {
     status: 200,
@@ -1106,6 +1154,7 @@ function handleEventStream(input: RemoteRequestInput): ServerReply | ServerStrea
       recheckMs: context.remoteStream?.recheckMs ?? AUTHORISATION_RECHECK_MS,
       stillAuthorised: authorisationCheck(context, connection),
       ...(afterSeq === undefined ? {} : { afterSeq }),
+      ...(clientEpoch === undefined ? {} : { clientEpoch }),
       ...(request.signal === undefined ? {} : { signal: request.signal }),
       ...(context.guard === undefined ? {} : { guard: context.guard }),
     }),
@@ -1164,6 +1213,8 @@ async function* streamFeed(input: {
   readonly version: string;
   readonly heartbeatMs: number;
   readonly afterSeq?: number;
+  /** The epoch the client says {@link afterSeq} was counted by, when it says. */
+  readonly clientEpoch?: string;
   readonly signal?: { readonly aborted: boolean };
   readonly guard?: import('./guard.js').RemoteRunGuard;
   readonly recheckMs?: number;
@@ -1203,17 +1254,53 @@ async function* streamFeed(input: {
       yield sseMessage({ event: REMOTE_STREAM_CLOSED, data: JSON.stringify(opening) });
       return;
     }
-    const hello: RemoteHelloPayload = { seq: feed.head(), version: input.version };
+    const hello: RemoteHelloPayload = {
+      seq: feed.head(),
+      version: input.version,
+      epoch: feed.epoch,
+      heartbeatMs: input.heartbeatMs,
+    };
     yield sseMessage({ event: REMOTE_STREAM_HELLO, data: JSON.stringify(hello) });
+
+    /*
+     * A cursor counted by another feed is not a resume point.
+     *
+     * Seqs start over with the process, so a client that reconnects across a
+     * restart names a number from a count this feed never made. Honouring it
+     * was the defect: `lastSent` began at the stale number, the guard below
+     * dropped every live event beneath it, and a window went deaf — hello
+     * received, heartbeats arriving, nothing else — until this feed had counted
+     * past wherever the old one stopped. Minutes on a busy server, for ever on
+     * a quiet one. Reproduced 2026-09-18: a restart at 05:45 UTC, and a
+     * transcript frozen mid-sentence until a new run opened a stream of its own.
+     *
+     * A client that names its epoch is answered exactly. One that does not —
+     * any build older than the field — is read the only way a bare number can
+     * be: a cursor *ahead of the head* cannot have come from this feed, whoever
+     * sent it. That misses the restart this feed has already counted past, which
+     * is the case the epoch exists for.
+     *
+     * Either way the client is told what a gap tells it, because it is one:
+     * everything it asked for is gone, and the recovery is the same re-sync.
+     */
+    const foreign =
+      input.afterSeq !== undefined &&
+      ((input.clientEpoch !== undefined && input.clientEpoch !== feed.epoch) ||
+        input.afterSeq > hello.seq);
+    const afterSeq = foreign ? undefined : input.afterSeq;
+    if (foreign && input.afterSeq !== undefined) {
+      const gap: RemoteGapPayload = { afterSeq: input.afterSeq, firstSeq: hello.seq + 1 };
+      yield sseMessage({ event: REMOTE_STREAM_GAP, data: JSON.stringify(gap) });
+    }
 
     // Without a resume point the stream starts *now*: the hello names the
     // head, and everything after it flows live.
-    let lastSent = input.afterSeq ?? hello.seq;
+    let lastSent = afterSeq ?? hello.seq;
 
-    if (input.afterSeq !== undefined) {
-      const replay = feed.since(input.afterSeq);
+    if (afterSeq !== undefined) {
+      const replay = feed.since(afterSeq);
       if (replay.truncated) {
-        const gap: RemoteGapPayload = { afterSeq: input.afterSeq, firstSeq: replay.firstSeq };
+        const gap: RemoteGapPayload = { afterSeq, firstSeq: replay.firstSeq };
         yield sseMessage({ event: REMOTE_STREAM_GAP, data: JSON.stringify(gap) });
       }
       for (const event of replay.events) {

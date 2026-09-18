@@ -554,3 +554,108 @@ describe('the deadlines on a run nobody is watching', () => {
     expect(engine.calls).toEqual([]);
   });
 });
+
+describe('a client that comes back', () => {
+  it('stops the abandoned-run clock and starts the parked prompts\' one', async () => {
+    /*
+     * The mirror image of detaching. A detached run's prompt waits without a
+     * deadline — nobody is there to answer it — and the run itself is reaped
+     * after the TTL. A client attaching to the run's stream is somebody being
+     * there again: the run is no longer abandoned, and the question in front
+     * of the person who just walked in is counted from now.
+     */
+    const { engine, directory, advance } = harness({ ttlMs: 60_000, parkMs: 10_000 });
+    directory.claim({ runId: 'run-1' as never, connectionId: 'conn-1', permissions: true, route: 'work-max/opus' });
+    directory.noteDetached('run-1' as never);
+    engine.emit({
+      type: 'permission.request',
+      requestId: 'perm-1',
+      request: { id: 'perm-1', toolName: 'Bash', input: {} },
+    } as never);
+
+    // Detached: the prompt waits past its deadline, untouched.
+    advance(30_000);
+    await directory.sweep();
+    expect(engine.calls.map((call) => call.name)).toEqual([]);
+
+    directory.noteAttached('run-1' as never);
+    expect(directory.routeOf('run-1' as never)).toBe('work-max/opus');
+
+    // Attached: the run's own deadline is off, however long it has been.
+    advance(60_000);
+    await directory.sweep();
+    expect(engine.calls.map((call) => call.name)).toEqual(['respondToPermission']);
+    expect(engine.calls[0]?.args[1]).toBe('perm-1');
+    // …and the prompt was denied ten seconds after the attach, not thirty
+    // seconds before it: the clock restarted when somebody arrived.
+    expect(engine.calls.some((call) => call.name === 'interrupt')).toBe(false);
+  });
+
+  it('does not resurrect a run that has ended', async () => {
+    const { engine, directory, advance } = harness({ ttlMs: 60_000 });
+    directory.claim({ runId: 'run-1' as never, connectionId: 'conn-1', permissions: false });
+    engine.emit({ type: 'run.end', reason: 'completed' } as never);
+    directory.noteAttached('run-1' as never);
+    advance(120_000);
+    await directory.sweep();
+    expect(directory.owns('conn-1', 'run-1' as never)).toBe(false);
+  });
+});
+
+describe('a question waits for the person it was asked of', () => {
+  const asked = {
+    type: 'permission.request',
+    requestId: 'ask-1',
+    request: {},
+  } as Partial<AgentEvent>;
+
+  it('is never answered on their behalf while they are attached, however long they take', async () => {
+    // The fifteen-minute deadline this replaces did exactly that: a person at
+    // the machine, busy in another window, came back to a conversation that
+    // had answered its own question in prose and stopped. A client that opted
+    // into remote permissions is a person at a machine, and the server does
+    // not decide for them. No `permissionParkMs` here: this is the default.
+    const engine = fakeEngine();
+    let clock = 1_000;
+    const directory = createRunDirectory({
+      runs: engine.source,
+      detachedRunTtlMs: 60_000,
+      now: () => clock,
+      sweepIntervalMs: 0,
+    });
+    directories.push(directory);
+    directory.claim({ runId: 'run-1', connectionId: CONNECTION.id, permissions: true });
+    engine.emit(asked);
+
+    clock += 24 * 60 * 60 * 1000;
+    await directory.sweep();
+    clock += 7 * 24 * 60 * 60 * 1000;
+    await directory.sweep();
+
+    expect(engine.calls).toEqual([]);
+  });
+
+  it('still honours a deadline a deployment configured', async () => {
+    // The override is for clients that are unattended scripts asking for
+    // prompts they will never answer; it is opt-in, and it still works.
+    const engine = fakeEngine();
+    let clock = 1_000;
+    const directory = createRunDirectory({
+      runs: engine.source,
+      detachedRunTtlMs: 60_000,
+      permissionParkMs: 5_000,
+      now: () => clock,
+      sweepIntervalMs: 0,
+    });
+    directories.push(directory);
+    directory.claim({ runId: 'run-1', connectionId: CONNECTION.id, permissions: true });
+    engine.emit(asked);
+
+    clock += 6_000;
+    await directory.sweep();
+    expect(engine.calls.at(-1)).toEqual({
+      name: 'respondToPermission',
+      args: ['run-1', 'ask-1', { behavior: 'deny', message: UNATTENDED_PERMISSION_MESSAGE }],
+    });
+  });
+});

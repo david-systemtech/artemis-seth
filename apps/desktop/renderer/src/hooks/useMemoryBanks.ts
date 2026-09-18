@@ -32,6 +32,7 @@ import type {
   MemoryBankAddRequest,
   MemoryBankMemory,
   MemoryBankPreflight,
+  MemoryBankProfileScope,
   MemoryBankRetireRequest,
   MemoryBankVerifyRemoteRequest,
   MemoryBankVerifyRemoteResponse,
@@ -45,7 +46,9 @@ export type MemoryBankAction =
   | 'sync'
   | 'retire'
   | 'switch'
+  | 'profiles'
   | 'master'
+  | 'wire'
   | 'forget';
 
 /** What the last click came to — the CLI's own words, kept until the next click. */
@@ -106,6 +109,25 @@ export interface MemoryBanksPane {
   readonly retire: (request: MemoryBankRetireRequest) => void;
   /** Wire one bank on or off — the CLI's per-bank switch, honoured by hooks too. */
   readonly setEnabled: (slug: string, enabled: boolean) => void;
+  /**
+   * Which profiles this bank reaches: every one, or a chosen set.
+   *
+   * Through the same busy/receipt/refresh path as the switches rather than as
+   * an optimistic tick, because it is not a local preference — the scope
+   * decides which runs are briefed about the bank and which projects it is
+   * installed into, so the answer that matters is the registry's after the
+   * write, not the checkbox's before it.
+   */
+  readonly setProfiles: (slug: string, profiles: MemoryBankProfileScope) => void;
+  /**
+   * Wire this bank into stock Claude Code on this machine, or unwire it.
+   *
+   * The other harness's setup — a managed block per profile, a `/cerebro`
+   * command, a session-start hook — written by the bank's own embedded CLI.
+   * Nothing an Artemis run reads, which is why it is its own action rather
+   * than part of the bank's on/off switch.
+   */
+  readonly wireClaudeCode: (slug: string, enabled: boolean) => void;
   /** Artemis's master gate: prompt injection + run-start syncs. */
   readonly setMasterEnabled: (enabled: boolean) => void;
   /** Unwire, uninstall, and forget one bank. The repo stays on disk. */
@@ -236,6 +258,15 @@ export function useMemoryBanks(): MemoryBanksPane {
     (slug: string, enabled: boolean) => void act('switch', (c) => c.setEnabled({ slug, enabled })),
     [act],
   );
+  const setProfiles = useCallback(
+    (slug: string, profiles: MemoryBankProfileScope) =>
+      void act('profiles', (c) => c.setProfiles({ slug, profiles })),
+    [act],
+  );
+  const wireClaudeCode = useCallback(
+    (slug: string, enabled: boolean) => void act('wire', (c) => c.wireClaudeCode({ slug, enabled })),
+    [act],
+  );
   const setMasterEnabled = useCallback(
     (enabled: boolean) => void act('master', (c) => c.setMasterEnabled({ enabled })),
     [act],
@@ -261,6 +292,8 @@ export function useMemoryBanks(): MemoryBanksPane {
     sync,
     retire,
     setEnabled,
+    setProfiles,
+    wireClaudeCode,
     setMasterEnabled,
     forget,
   };

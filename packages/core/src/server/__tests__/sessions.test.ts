@@ -271,6 +271,64 @@ describe('GET /api/v0/sessions/{id}/messages', () => {
     expect(foreign.status).toBe(404);
     expect(JSON.stringify(absent.body)).toBe(JSON.stringify(foreign.body));
   });
+
+  it('reads the page it is asked for, and hands it to the store', async () => {
+    /*
+     * A window attaching to a run in progress reads the turns *before* it as
+     * `limit: historyOffset`. The route used to drop both numbers and answer
+     * the whole file, so the turn in progress was drawn from the file and
+     * then again from the run's own replay.
+     */
+    const { ledger } = await freshLedger();
+    seedOwnership(ledger);
+    const asked: Record<string, unknown>[] = [];
+    const source: SessionSource = {
+      ...sessionSource,
+      messages: async (query) => {
+        asked.push(query as Record<string, unknown>);
+        return { events: [], hasMore: true };
+      },
+    };
+
+    const reply = await handleServerRequest(
+      get('/api/v0/sessions/sess-1/messages?limit=911&offset=2', TOKEN_A),
+      context(ledger, { sessions: source }),
+    );
+
+    expect(reply.status).toBe(200);
+    expect(asked).toEqual([expect.objectContaining({ sessionId: 'sess-1', limit: 911, offset: 2 })]);
+    expect((reply.body as { hasMore: boolean }).hasMore).toBe(true);
+  });
+
+  it('asks for nothing in particular when no page is named, and refuses one that is not a number', async () => {
+    const { ledger } = await freshLedger();
+    seedOwnership(ledger);
+    const asked: Record<string, unknown>[] = [];
+    const source: SessionSource = {
+      ...sessionSource,
+      messages: async (query) => {
+        asked.push(query as Record<string, unknown>);
+        return { events: [], hasMore: false };
+      },
+    };
+
+    const whole = await handleServerRequest(
+      get('/api/v0/sessions/sess-1/messages', TOKEN_A),
+      context(ledger, { sessions: source }),
+    );
+    expect(whole.status).toBe(200);
+    expect(asked[0]).not.toHaveProperty('limit');
+    expect(asked[0]).not.toHaveProperty('offset');
+
+    // A client that sent a limit meant one; "everything" is the over-read the
+    // parameter exists to prevent.
+    const junk = await handleServerRequest(
+      get('/api/v0/sessions/sess-1/messages?limit=lots', TOKEN_A),
+      context(ledger, { sessions: source }),
+    );
+    expect(junk.status).toBe(400);
+    expect(asked).toHaveLength(1);
+  });
 });
 
 describe('the resume gate on chat completions', () => {
@@ -379,5 +437,532 @@ describe('the ledger itself', () => {
     expect(
       ledger.mayAccess({ profileIds: ['prof-a'], workspaceKey: 'conn:conn-y' }, 'scratch-1'),
     ).toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The account that holds the conversation                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A second served account, with its own store.
+ *
+ * What the tests below are about: a transcript lives in exactly one account's
+ * store, and the provider looks nowhere else. The ledger names an account,
+ * the request names an account, and neither is guaranteed to be the one whose
+ * store actually holds the file.
+ */
+const PROF_B: ServerProfile = {
+  id: 'prof-b' as ServerProfile['id'],
+  slug: 'other',
+  label: 'Other',
+  provider: { id: 'claude', label: 'Claude', kind: 'hosted' },
+  available: true,
+  disabled: false,
+  live: true,
+  capabilities: NO_CAPABILITIES,
+  models: [
+    {
+      route: 'other/opus',
+      id: 'opus',
+      label: 'Opus 5',
+      note: 'The big one, elsewhere.',
+      profileId: 'prof-b' as ServerProfile['id'],
+      profileSlug: 'other',
+      profileLabel: 'Other',
+      providerId: 'claude',
+      thinkingLevels: [],
+      adaptiveThinking: false,
+      fastMode: false,
+      ultracode: false,
+    },
+  ],
+};
+
+const twoAccounts: Catalogue = {
+  read: async () => [...PROFILES, PROF_B],
+  invalidate: () => undefined,
+};
+
+/** prof-a's store holds sess-1 and sess-2 as above; prof-b's holds sess-3, in the same directory. */
+const twoStores: SessionSource = {
+  list: async (query) => {
+    if (query.cwd !== '/work/repo') return { sessions: [], hasMore: false };
+    if (query.profileId === 'prof-a') return sessionSource.list(query);
+    if (query.profileId === 'prof-b') {
+      return {
+        sessions: [
+          {
+            id: 'sess-3' as never,
+            providerId: 'claude' as never,
+            profileId: 'prof-b' as never,
+            cwd: '/work/repo',
+            title: 'Held elsewhere',
+            updatedAt: 333,
+          },
+        ],
+        hasMore: false,
+      };
+    }
+    return { sessions: [], hasMore: false };
+  },
+  messages: sessionSource.messages,
+};
+
+function recordAs(ledger: SessionLedger, sessionId: string, profileId: string): void {
+  ledger.record({
+    sessionId,
+    connectionId: LAPTOP_ONE.id,
+    profileId,
+    workspaceKey: 'dir:/work/repo',
+    cwd: '/work/repo',
+  });
+}
+
+describe('a conversation the ledger files under the wrong account', () => {
+  it('is listed under the account whose store holds it, and the ledger is corrected', async () => {
+    const { ledger } = await freshLedger();
+    // A resume sent on prof-a re-recorded sess-3 against it before the
+    // provider refused; the transcript has been in prof-b's store all along.
+    recordAs(ledger, 'sess-3', 'prof-a');
+
+    const reply = await handleServerRequest(
+      get('/api/v0/sessions', TOKEN_A),
+      context(ledger, { catalogue: twoAccounts, sessions: twoStores }),
+    );
+    expect(reply.status).toBe(200);
+    const body = reply.body as {
+      sessions: { id: string; profileId?: string; profileSlug: string; title: string }[];
+    };
+    expect(body.sessions.map((row) => row.id)).toEqual(['sess-3']);
+    expect(body.sessions[0]).toMatchObject({
+      profileId: 'prof-b',
+      profileSlug: 'other',
+      title: 'Held elsewhere',
+    });
+    // Corrected in place, so the next listing needs no second pass.
+    expect(ledger.get('sess-3')?.profileId).toBe('prof-b');
+  });
+
+  it('drops only a conversation no visible store holds', async () => {
+    const { ledger } = await freshLedger();
+    recordAs(ledger, 'sess-gone', 'prof-a');
+    const reply = await handleServerRequest(
+      get('/api/v0/sessions', TOKEN_A),
+      context(ledger, { catalogue: twoAccounts, sessions: twoStores }),
+    );
+    expect((reply.body as { sessions: unknown[] }).sessions).toEqual([]);
+    expect(ledger.get('sess-gone')?.profileId).toBe('prof-a');
+  });
+
+  it('keeps the ledger where the store it names agrees', async () => {
+    const { ledger } = await freshLedger();
+    seedOwnership(ledger);
+    await handleServerRequest(
+      get('/api/v0/sessions', TOKEN_A),
+      context(ledger, { catalogue: twoAccounts, sessions: twoStores }),
+    );
+    expect(ledger.get('sess-1')?.profileId).toBe('prof-a');
+  });
+});
+
+describe('resuming on the wrong account', () => {
+  /** A run source that starts, says one thing, and ends — recording what it was asked. */
+  function runsEndingWith(sessionId: string) {
+    const listeners = new Set<(event: AgentEvent) => void>();
+    const started: { profileId: string; model: string }[] = [];
+    const source = {
+      started,
+      startRun: async (input: {
+        providerId: string;
+        profileId: string;
+        cwd: string;
+        model: string;
+      }) => {
+        started.push({ profileId: input.profileId, model: input.model });
+        queueMicrotask(() => {
+          for (const listener of listeners) {
+            listener({
+              type: 'text.complete',
+              runId: 'run-1',
+              seq: 0,
+              ts: 0,
+              messageId: 'm1',
+              role: 'assistant',
+              text: 'continued',
+            } as unknown as AgentEvent);
+            listener({
+              type: 'run.end',
+              runId: 'run-1',
+              seq: 1,
+              ts: 0,
+              reason: 'completed',
+              sessionId,
+            } as unknown as AgentEvent);
+          }
+        });
+        return {
+          runId: 'run-1',
+          providerId: input.providerId,
+          profileId: input.profileId,
+          cwd: input.cwd,
+          status: 'working',
+          capabilities: NO_CAPABILITIES,
+          startedAt: 0,
+        } as never;
+      },
+      subscribe: (listener: (event: AgentEvent) => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      interrupt: async () => undefined,
+      respondToPermission: async () => undefined,
+      disposeRun: async () => undefined,
+    };
+    return source;
+  }
+
+  function chatOn(route: string, sessionId: string) {
+    return {
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { host: '127.0.0.1:6472', authorization: `Bearer ${TOKEN_A}` },
+      body: {
+        model: route,
+        messages: [{ role: 'user', content: 'continue' }],
+        artemis: { sessionId },
+      },
+    };
+  }
+
+  const workspaces = {
+    resolve: async () => ({ path: '/work/repo', ephemeral: false }),
+  } as never;
+
+  it('moves the run to the account holding the conversation, and says so', async () => {
+    const { ledger } = await freshLedger();
+    // The ledger is right; the column that sent this was left on prof-a.
+    recordAs(ledger, 'sess-3', 'prof-b');
+    const runs = runsEndingWith('sess-3');
+
+    const reply = await handleServerRequest(
+      chatOn('work-max/opus', 'sess-3'),
+      context(ledger, {
+        catalogue: twoAccounts,
+        sessions: twoStores,
+        runs: runs as never,
+        workspaces,
+      }),
+    );
+    expect(reply.status).toBe(200);
+    expect(runs.started).toEqual([{ profileId: 'prof-b', model: 'opus' }]);
+    const body = reply.body as {
+      model: string;
+      artemis: { redirected?: { from: string; to: string } };
+    };
+    expect(body.model).toBe('other/opus');
+    expect(body.artemis.redirected).toEqual({
+      from: 'work-max/opus',
+      to: 'other/opus',
+      profileId: 'prof-b',
+      profileSlug: 'other',
+      profileLabel: 'Other',
+    });
+    // Never re-recorded against the account that could not have opened it.
+    expect(ledger.get('sess-3')?.profileId).toBe('prof-b');
+  });
+
+  it('follows the store when the ledger itself names the wrong account', async () => {
+    const { ledger } = await freshLedger();
+    // The clobber this repairs: a failed resume left the entry on prof-a.
+    recordAs(ledger, 'sess-3', 'prof-a');
+    const runs = runsEndingWith('sess-3');
+
+    const reply = await handleServerRequest(
+      // Sent on prof-b's route, which the ledger disagrees with. The store
+      // settles it: prof-b holds the file, so the request stands and the
+      // ledger is corrected by the run it records.
+      chatOn('other/opus', 'sess-3'),
+      context(ledger, {
+        catalogue: twoAccounts,
+        sessions: twoStores,
+        runs: runs as never,
+        workspaces,
+      }),
+    );
+    expect(reply.status).toBe(200);
+    expect(runs.started).toEqual([{ profileId: 'prof-b', model: 'opus' }]);
+    expect(
+      (reply.body as { artemis: { redirected?: unknown } }).artemis.redirected,
+    ).toBeUndefined();
+    expect(ledger.get('sess-3')?.profileId).toBe('prof-b');
+  });
+
+  it('leaves a resume alone when the requested account holds the conversation', async () => {
+    const { ledger } = await freshLedger();
+    seedOwnership(ledger);
+    const runs = runsEndingWith('sess-1');
+
+    const reply = await handleServerRequest(
+      chatOn('work-max/opus', 'sess-1'),
+      context(ledger, {
+        catalogue: twoAccounts,
+        sessions: twoStores,
+        runs: runs as never,
+        workspaces,
+      }),
+    );
+    expect(reply.status).toBe(200);
+    expect(runs.started).toEqual([{ profileId: 'prof-a', model: 'opus' }]);
+    expect(
+      (reply.body as { artemis: { redirected?: unknown } }).artemis.redirected,
+    ).toBeUndefined();
+  });
+
+  it('reports the redirect on the first chunk of a stream', async () => {
+    const { ledger } = await freshLedger();
+    recordAs(ledger, 'sess-3', 'prof-b');
+    const runs = runsEndingWith('sess-3');
+    const request = chatOn('work-max/opus', 'sess-3');
+    const reply = await handleServerRequest(
+      { ...request, body: { ...request.body, stream: true } },
+      context(ledger, {
+        catalogue: twoAccounts,
+        sessions: twoStores,
+        runs: runs as never,
+        workspaces,
+      }),
+    );
+    expect(reply.status).toBe(200);
+    expect('stream' in reply).toBe(true);
+    const chunks: string[] = [];
+    for await (const piece of (reply as { stream: AsyncIterable<string> }).stream) {
+      chunks.push(piece);
+    }
+    const first = chunks[0] ?? '';
+    expect(first).toContain('"redirected"');
+    expect(first).toContain('"to":"other/opus"');
+  });
+});
+
+describe('correcting the ledger in place', () => {
+  it('changes the account and keeps the order', async () => {
+    const { ledger } = await freshLedger();
+    recordAs(ledger, 'sess-1', 'prof-a');
+    recordAs(ledger, 'sess-3', 'prof-a');
+    recordAs(ledger, 'sess-2', 'prof-a');
+
+    expect(ledger.reattribute('sess-3', 'prof-b')).toBe(true);
+    expect(ledger.get('sess-3')?.profileId).toBe('prof-b');
+    // Newest first, and sess-3 did not become the newest by being corrected.
+    const scope = { workspaceKey: 'dir:/work/repo', profileIds: ['prof-a', 'prof-b'] };
+    expect(ledger.listFor(scope).map((entry) => entry.sessionId)).toEqual([
+      'sess-2',
+      'sess-3',
+      'sess-1',
+    ]);
+  });
+
+  it('answers false for an absent entry, or one that already says so', async () => {
+    const { ledger } = await freshLedger();
+    recordAs(ledger, 'sess-1', 'prof-a');
+    expect(ledger.reattribute('sess-1', 'prof-a')).toBe(false);
+    expect(ledger.reattribute('no-such', 'prof-b')).toBe(false);
+  });
+
+  it('persists the correction', async () => {
+    const { ledger, dir } = await freshLedger();
+    recordAs(ledger, 'sess-1', 'prof-a');
+    ledger.reattribute('sess-1', 'prof-b');
+    await ledger.flush();
+    const stored = JSON.parse(await readFile(join(dir, 'serverSessions.json'), 'utf8')) as {
+      entries: { sessionId: string; profileId: string }[];
+    };
+    expect(stored.entries).toEqual([
+      expect.objectContaining({ sessionId: 'sess-1', profileId: 'prof-b' }),
+    ]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Forking and rewinding over the wire                                        */
+/* -------------------------------------------------------------------------- */
+
+/** An account whose provider can fork and rewind, unlike prof-a's bare one. */
+const PROF_C: ServerProfile = {
+  id: 'prof-c' as ServerProfile['id'],
+  slug: 'branchy',
+  label: 'Branchy',
+  provider: { id: 'claude', label: 'Claude', kind: 'hosted' },
+  available: true,
+  disabled: false,
+  live: true,
+  capabilities: { ...NO_CAPABILITIES, forkSession: true, rewind: true },
+  models: [
+    {
+      route: 'branchy/opus',
+      id: 'opus',
+      label: 'Opus 5',
+      note: 'Can branch.',
+      profileId: 'prof-c' as ServerProfile['id'],
+      profileSlug: 'branchy',
+      profileLabel: 'Branchy',
+      providerId: 'claude',
+      thinkingLevels: [],
+      adaptiveThinking: false,
+      fastMode: false,
+      ultracode: false,
+    },
+  ],
+};
+
+const withBranchy: Catalogue = {
+  read: async () => [...PROFILES, PROF_C],
+  invalidate: () => undefined,
+};
+
+/** prof-c's store holds sess-9 in the pinned directory; prof-a's store is as above. */
+const storeOfC: SessionSource = {
+  list: async (query) =>
+    query.profileId === 'prof-c' && query.cwd === '/work/repo'
+      ? {
+          sessions: [
+            {
+              id: 'sess-9' as never,
+              providerId: 'claude' as never,
+              profileId: 'prof-c' as never,
+              cwd: '/work/repo',
+              title: 'Branchable',
+              updatedAt: 9,
+            },
+          ],
+          hasMore: false,
+        }
+      : sessionSource.list(query),
+  messages: sessionSource.messages,
+};
+
+/** A run source that ends at once with the session it is told, recording what it was asked. */
+function scriptedRuns(sessionId: string) {
+  const listeners = new Set<(event: AgentEvent) => void>();
+  const started: Record<string, unknown>[] = [];
+  return {
+    started,
+    startRun: async (input: Record<string, unknown>) => {
+      const { profileId, model, resumeSessionId, forkSession, rewindToMessageId } = input;
+      started.push({
+        profileId,
+        model,
+        ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
+        ...(forkSession === undefined ? {} : { forkSession }),
+        ...(rewindToMessageId === undefined ? {} : { rewindToMessageId }),
+      });
+      queueMicrotask(() => {
+        for (const listener of listeners) {
+          listener({
+            type: 'text.complete',
+            runId: 'run-1',
+            seq: 0,
+            ts: 0,
+            messageId: 'm1',
+            role: 'assistant',
+            text: 'branched',
+          } as unknown as AgentEvent);
+          listener({
+            type: 'run.end',
+            runId: 'run-1',
+            seq: 1,
+            ts: 0,
+            reason: 'completed',
+            sessionId,
+          } as unknown as AgentEvent);
+        }
+      });
+      return {
+        runId: 'run-1',
+        providerId: input['providerId'],
+        profileId,
+        cwd: input['cwd'],
+        status: 'working',
+        capabilities: NO_CAPABILITIES,
+        startedAt: 0,
+      } as never;
+    },
+    subscribe: (listener: (event: AgentEvent) => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    interrupt: async () => undefined,
+    respondToPermission: async () => undefined,
+    disposeRun: async () => undefined,
+  };
+}
+
+describe('forking and rewinding over the wire', () => {
+  const workspaces = {
+    resolve: async () => ({ path: '/work/repo', ephemeral: false }),
+  } as never;
+
+  function chatWith(route: string, artemis: Record<string, unknown>) {
+    return {
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { host: '127.0.0.1:6472', authorization: `Bearer ${TOKEN_A}` },
+      body: {
+        model: route,
+        messages: [{ role: 'user', content: 'again, differently' }],
+        artemis,
+      },
+    };
+  }
+
+  it('refuses a fork on an account whose provider cannot fork', async () => {
+    const { ledger } = await freshLedger();
+    seedOwnership(ledger);
+    const runs = scriptedRuns('sess-1');
+    const reply = await handleServerRequest(
+      chatWith('work-max/opus', { sessionId: 'sess-1', forkSession: true }),
+      context(ledger, { catalogue: withBranchy, sessions: storeOfC, runs: runs as never, workspaces }),
+    );
+    expect(reply.status).toBe(400);
+    expect(JSON.stringify(reply.body)).toContain('cannot fork');
+    // Refused before anything was spent.
+    expect(runs.started).toEqual([]);
+  });
+
+  it('refuses a rewind with no conversation to cut', async () => {
+    const { ledger } = await freshLedger();
+    const runs = scriptedRuns('sess-new');
+    const reply = await handleServerRequest(
+      chatWith('branchy/opus', { rewindToMessageId: 'msg-7' }),
+      context(ledger, { catalogue: withBranchy, sessions: storeOfC, runs: runs as never, workspaces }),
+    );
+    expect(reply.status).toBe(400);
+    expect(JSON.stringify(reply.body)).toContain('artemis.sessionId');
+    expect(runs.started).toEqual([]);
+  });
+
+  it('passes a fork and a rewind anchor to the run on a capable account', async () => {
+    const { ledger } = await freshLedger();
+    recordAs(ledger, 'sess-9', 'prof-c');
+    const runs = scriptedRuns('sess-9-branch');
+    const reply = await handleServerRequest(
+      chatWith('branchy/opus', { sessionId: 'sess-9', forkSession: true, rewindToMessageId: 'msg-7' }),
+      context(ledger, { catalogue: withBranchy, sessions: storeOfC, runs: runs as never, workspaces }),
+    );
+    expect(reply.status).toBe(200);
+    expect(runs.started).toEqual([
+      {
+        profileId: 'prof-c',
+        model: 'opus',
+        resumeSessionId: 'sess-9',
+        forkSession: true,
+        rewindToMessageId: 'msg-7',
+      },
+    ]);
+    // The branch the run announced is this connection's now, like any
+    // conversation it starts — listable and resumable by the same token.
+    expect(ledger.get('sess-9-branch')?.profileId).toBe('prof-c');
+    expect(ledger.get('sess-9')?.profileId).toBe('prof-c');
   });
 });

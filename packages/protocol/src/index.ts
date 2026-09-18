@@ -32,6 +32,8 @@
  * | `sharedConfig`  | what a shared `~/.claude` covers, and how to describe it    |
  * | `github`        | `parsePullRequestUrl`, `PullRequestSummary`                 |
  * | `agentPrompts`  | the standing-instruction library, and how it composes       |
+ * | `skills`        | what a machine's skills are, and which are always on        |
+ * | `suggestedTasks`| the follow-up work an agent offers, and where it can be run  |
  * | `secretRefs`    | addressing a secret held by a key manager, without holding it |
  * | `ipc`           | channel constants, request/response maps, `ArtemisBridge`    |
  *
@@ -55,6 +57,7 @@ export * from './attachment.js';
 export * from './run.js';
 export * from './session.js';
 export * from './profile.js';
+export * from './toolServer.js';
 export * from './terminal.js';
 export * from './browser.js';
 export * from './openai.js';
@@ -62,8 +65,12 @@ export * from './server.js';
 export * from './remote.js';
 export * from './routine.js';
 export * from './sharedConfig.js';
+export * from './forge.js';
 export * from './github.js';
 export * from './update.js';
 export * from './agentPrompts.js';
+export * from './skills.js';
+export * from './describeBank.js';
+export * from './suggestedTasks.js';
 export * from './secretRefs.js';
 export * from './ipc.js';

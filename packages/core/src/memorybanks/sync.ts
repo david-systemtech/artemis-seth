@@ -1,0 +1,280 @@
+/**
+ * Keeping a bank fresh and installed, from either host.
+ *
+ * Two halves. `pullBank` brings a checkout up to date with its remote — one
+ * `git pull --ff-only`, with whatever credential the host composed in the
+ * environment, never a merge and never a prompt. `installBankEverywhere` reads
+ * the bank once and installs it into every project of every profile the bank
+ * reaches, plus the project a run is about to start in, which may not have a
+ * memory directory yet. The desktop calls both at run start and from the
+ * settings pane; the headless server calls both before a served turn. What
+ * neither does is decide *when*: throttles and locks are the host's, because
+ * only the host knows what else it is doing.
+ *
+ * This module spawns git and is therefore never on the synchronous path of a
+ * run start; the hosts call it in the background and never wait on it.
+ */
+
+import { execFile } from 'node:child_process';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+
+import { projectKey } from './bankIndex.js';
+import { banksForProfile } from './describe.js';
+import { readBankAt } from './formats.js';
+import { installBank, profileProjectKeys, projectMemoryDir, readGitHead, readProfileDirs, sourceStamp, uninstallBank, type ArtemisProfileDir, type InstallReport } from './install.js';
+import type { Bank, IndexBudget } from './model.js';
+import { scopeCoversProfile, type BankRecord, type BankRegistryV2 } from './registryV2.js';
+
+/**
+ * The allowance a project's memory file has for bank indexes altogether,
+ * shared out when a project carries several banks. Below Claude Code's cap
+ * so the user's own entries above the blocks still fit.
+ */
+export const SHARED_INDEX_BUDGET: IndexBudget = { lines: 170, bytes: 22_000 };
+
+/** One bank's share of {@link SHARED_INDEX_BUDGET} when `count` banks reach a project. */
+export function sharedIndexBudget(count: number): IndexBudget {
+  const banks = Math.max(1, count);
+  return { lines: Math.max(10, Math.floor(SHARED_INDEX_BUDGET.lines / banks)), bytes: Math.max(2000, Math.floor(SHARED_INDEX_BUDGET.bytes / banks)) };
+}
+
+const execFileAsync = promisify(execFile);
+
+export interface PullResult {
+  /** The checkout moved. */
+  readonly pulled: boolean;
+  /** One line for a log or a receipt. */
+  readonly detail: string;
+}
+
+/** Is this checkout one `git pull` could move: a clone with a remote configured? */
+export function hasRemote(root: string): boolean {
+  const config = join(root, '.git', 'config');
+  try {
+    if (!statSync(join(root, '.git')).isDirectory() || !existsSync(config)) return false;
+    return /^\s*\[remote\s+"[^"]+"\]/m.test(readFileSync(config, 'utf8'));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `git pull --ff-only` in a bank's checkout.
+ *
+ * Never a merge: a bank is written through pull requests and a machine's
+ * clone should never have local commits to reconcile; a clone that does is
+ * left alone and the reason is returned rather than resolved. `env` is where
+ * the host puts a private remote's credential and `GIT_TERMINAL_PROMPT=0`.
+ */
+export async function pullBank(
+  root: string,
+  env: Readonly<Record<string, string>> = {},
+  timeoutMs = 60_000,
+): Promise<PullResult> {
+  if (!hasRemote(root)) return { pulled: false, detail: 'no remote to pull from' };
+  // Whether the checkout moved is read off `.git` before and after, not off
+  // git's words: `--quiet` prints nothing on either outcome.
+  const before = readGitHead(root);
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', root, 'pull', '--ff-only', '--quiet'], {
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
+    });
+    const after = readGitHead(root);
+    const moved = after !== null && after !== before;
+    const said = stdout.trim();
+    return {
+      pulled: moved,
+      detail: said.length > 0 ? said : moved ? `moved to ${after}` : 'already up to date',
+    };
+  } catch (error) {
+    const raw = error as { stderr?: unknown; message?: unknown };
+    const said = typeof raw.stderr === 'string' && raw.stderr.trim().length > 0 ? raw.stderr : String(raw.message ?? 'git pull failed');
+    const last = said.split('\n').filter((line) => line.trim().length > 0).at(-1) ?? 'git pull failed';
+    return { pulled: false, detail: last.trim() };
+  }
+}
+
+export interface InstallEverywhereOptions {
+  readonly record: BankRecord;
+  /** The Artemis data directory holding `profiles.json`. */
+  readonly dataDir: string;
+  /** A run's working directory: installed for even when it has no memory directory yet. */
+  readonly cwd?: string;
+  /** Only this profile's projects, for a host that serves one profile at a time. */
+  readonly profileId?: string;
+  /** ISO date. Defaults to today. */
+  readonly today?: string;
+  /**
+   * The index budget for this bank, when the host shares one allowance
+   * between several banks. Absent means the bank's own (its manifest's, or
+   * the default).
+   *
+   * Superseded by {@link registry} when that is given, because the right
+   * share is a per-profile fact: an account that carries one bank should not
+   * have its index halved for a bank attached to some other account.
+   */
+  readonly budget?: IndexBudget;
+  /**
+   * The machine's banks, so each profile's share of its memory file can be
+   * worked out from the banks *that profile* carries.
+   *
+   * Without it a caller has to pick one number for every profile, and the
+   * only safe number is the total — which spends half of a single-bank
+   * account's allowance on a bank it will never see.
+   */
+  readonly registry?: BankRegistryV2;
+}
+
+export interface InstallEverywhereReport {
+  /** Project directories written. */
+  readonly projects: number;
+  readonly profiles: number;
+  readonly installed: number;
+  /** The first refusal met, if any project was refused. */
+  readonly refused: string | null;
+  readonly shadowed: readonly string[];
+}
+
+/**
+ * Read a bank once and install it into every project it should reach.
+ *
+ * Profiles are read off `profiles.json`; a bank scoped to some profiles is
+ * installed into those alone. Two profiles that share one projects store
+ * (a symlink) are written once.
+ */
+export async function installBankEverywhere(
+  bank: Bank,
+  options: InstallEverywhereOptions,
+): Promise<InstallEverywhereReport> {
+  const { record } = options;
+  const today = options.today ?? new Date().toISOString().slice(0, 10);
+  const source = sourceStamp(bank.root);
+  const cwdKey = options.cwd === undefined ? null : projectKey(options.cwd);
+  const seen = new Set<string>();
+  let projects = 0;
+  let installed = 0;
+  let refused: string | null = null;
+  const shadowed = new Set<string>();
+
+  const targets: { profile: ArtemisProfileDir; budget: IndexBudget | undefined }[] = [];
+  for (const profile of readProfileDirs(options.dataDir)) {
+    if (!scopeCoversProfile(record.profiles, profile.id)) continue;
+    if (options.profileId !== undefined && profile.id !== options.profileId) continue;
+    // This profile's own share: the banks it carries, not the banks the
+    // machine has. Worked out per profile because that is the only place the
+    // answer is the same for every bank written into one memory file.
+    const budget =
+      options.registry === undefined
+        ? options.budget
+        : sharedIndexBudget(banksForProfile({ registry: options.registry, profileId: profile.id }).length);
+    targets.push({ profile, budget });
+  }
+
+  const one = (profile: ArtemisProfileDir, budget: IndexBudget | undefined, key: string): void => {
+    const memoryDir = projectMemoryDir(profile.configDir, key);
+    const identity = `${memoryDir} ${record.slug}`;
+    if (seen.has(identity)) return;
+    seen.add(identity);
+    const report: InstallReport = installBank(bank, {
+      slug: record.slug,
+      memoryDir,
+      projectKey: key,
+      source,
+      today,
+      ...(budget === undefined ? {} : { budget }),
+    });
+    if (report.refused !== null) {
+      refused ??= report.refused;
+      return;
+    }
+    projects += 1;
+    installed = report.installed;
+    for (const name of report.shadowed) shadowed.add(name);
+  };
+
+  /*
+   * The run's own project first, and before the first await.
+   *
+   * That is the project about to be opened, and the host starts the run the
+   * moment this call returns — so its install has to be done by then, which
+   * an async function guarantees for everything ahead of its first `await`.
+   * Every other project of every profile is the same work as last time, and
+   * is done behind the run: one project, then a turn of the event loop. On the
+   * desktop this whole loop used to run on the main thread at every run start,
+   * measured at 0.3–0.6 s on Linux for 114 projects × 201 entries, and the
+   * keyboard goes through that thread — a typed line froze and then arrived
+   * in a burst (2026-09-18).
+   */
+  if (cwdKey !== null) for (const { profile, budget } of targets) one(profile, budget, cwdKey);
+  for (const { profile, budget } of targets) {
+    for (const key of profileProjectKeys(profile.configDir)) {
+      if (key === cwdKey) continue;
+      await yieldToHost();
+      one(profile, budget, key);
+    }
+  }
+  return { projects, profiles: targets.length, installed, refused, shadowed: [...shadowed] };
+}
+
+/** Let the host's event loop turn between one project's writes and the next's. */
+function yieldToHost(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/** Remove a bank's copies from every project of every profile, whatever its scope was. */
+export async function uninstallBankEverywhere(slug: string, dataDir: string): Promise<number> {
+  let removed = 0;
+  for (const profile of readProfileDirs(dataDir)) {
+    for (const key of profileProjectKeys(profile.configDir)) {
+      await yieldToHost();
+      uninstallBank(slug, projectMemoryDir(profile.configDir, key));
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
+/**
+ * Bring one bank's installs into line with its profile scope: installed
+ * where it reaches, removed where it no longer does.
+ *
+ * The install is started first, so the run's own project is written before
+ * this returns its promise — see {@link installBankEverywhere} — and the
+ * removals from the profiles the bank no longer reaches follow behind it,
+ * one project per turn of the event loop like the installs.
+ */
+export async function reconcileBankInstalls(
+  record: BankRecord,
+  dataDir: string,
+  cwd?: string,
+  budget?: IndexBudget | BankRegistryV2,
+): Promise<InstallEverywhereReport | null> {
+  const bank = readBankAt(record.path, { slug: record.slug });
+  const installing = bank !== null && record.enabled;
+  // A registry says "work each profile's share out yourself"; a plain budget
+  // is one number for every profile, which is what a caller with no registry
+  // to hand can honestly offer.
+  const shared = budget !== undefined && 'banks' in budget ? { registry: budget } : { budget };
+  const install =
+    bank !== null && record.enabled
+      ? installBankEverywhere(bank, {
+          record,
+          dataDir,
+          ...(cwd === undefined ? {} : { cwd }),
+          ...(budget === undefined ? {} : shared),
+        })
+      : null;
+  for (const profile of readProfileDirs(dataDir)) {
+    if (installing && scopeCoversProfile(record.profiles, profile.id)) continue;
+    for (const key of profileProjectKeys(profile.configDir)) {
+      await yieldToHost();
+      uninstallBank(record.slug, projectMemoryDir(profile.configDir, key));
+    }
+  }
+  return install;
+}

@@ -20,6 +20,29 @@
  * stored is a small map keyed by profile, and an account that has never been
  * chosen for simply opens on its provider's default.
  *
+ * Pinned conversations are remembered here too, as a list of session ids. They
+ * are a judgement about a conversation rather than about an account, they
+ * outlive the launch that made them by definition — a pin whose whole point is
+ * "keep this at the top" and that is forgotten on exit is a worse feature than
+ * none — and they are the user's own words about their own work, which is the
+ * same promise the rest of this file makes and not the one `cache.ts` makes.
+ *
+ * Unsent drafts are here for that last reason and no other. What is in the
+ * composer is something somebody wrote and has not sent, which makes it the
+ * most obviously *theirs* of everything this file holds; losing it to a quit is
+ * losing work, not losing a convenience. They are kept against the session id
+ * for the same reason pins are — a title moves and a directory is shared, and
+ * the id is what a conversation is — and a conversation that has never been
+ * sent in has no id to file one under, so its draft lives only as long as the
+ * process does.
+ *
+ * The command a directory runs after the agent has edited something is here
+ * for a different reason again: it is a fact about a project, not about an
+ * account or a conversation. `pnpm test` in one checkout and `cargo clippy` in
+ * another is the ordinary case, so the key is the absolute directory — the one
+ * name a checkout has that Artemis can be sure of — and being asked for it
+ * again at every launch is the reason nobody would use the feature twice.
+ *
  * One JSON file, rewritten whole, atomically, and unreadable-means-empty: a
  * launch is never something a preferences file gets to fail.
  */
@@ -77,10 +100,79 @@ export interface Preferences {
   readonly permissionMode?: string;
   /** Model and its effort and speed, per account. See the file header. */
   readonly models?: Readonly<Record<string, ModelChoice>>;
+  /**
+   * Session ids the user has pinned, oldest pin first.
+   *
+   * Session ids and nothing else: a title is the provider's to change and a
+   * path is the directory's, while the id is what the conversation *is*. Ids
+   * of conversations that no longer exist are kept rather than pruned — this
+   * file has no way to ask a provider what it still holds, and a list that
+   * quietly drops what it cannot explain would unpin a conversation for the
+   * duration of an account being logged out.
+   */
+  readonly pinned?: readonly string[];
+  /**
+   * What was in the composer of each conversation, oldest first.
+   *
+   * A list rather than a map keyed by session id, though it is read by session
+   * id: the order is what {@link MAX_DRAFTS} is a bound on, and an object's key
+   * order is a thing JSON happens to preserve rather than a thing it promises.
+   * Written as a list, the bound is visible in the file.
+   */
+  readonly drafts?: readonly StoredDraft[];
+  /**
+   * The command each directory runs after a turn that edited files.
+   *
+   * A map, where {@link drafts} is a list, because unlike a draft this is the
+   * one thing in this file somebody might reasonably set by hand:
+   * `"/work/artemis": "pnpm test"` is the whole setting, and a list of objects
+   * would only bury it. The bound still needs an order, and the order JSON
+   * keeps is the one they were inserted in — a directory can never be a key
+   * that looks like an array index, which is the only case where that would
+   * not hold.
+   */
+  readonly afterEdit?: Readonly<Record<string, string>>;
+}
+
+/** One conversation's unsent composer text. */
+export interface StoredDraft {
+  readonly sessionId: string;
+  readonly text: string;
 }
 
 const FILE_VERSION = 1;
 const FILE_NAME = 'preferences.json';
+
+/**
+ * How many conversations' drafts are kept.
+ *
+ * A bound rather than none, because this file is rewritten whole on every save
+ * and an unbounded list of prompts would make that write grow without limit for
+ * the sake of conversations nobody has looked at in months. Twenty is more than
+ * the pool ever holds at once, so the draft of anything reachable by Tab or by
+ * the rail's recent rows is always there; the oldest fall off the front.
+ */
+const MAX_DRAFTS = 20;
+
+/**
+ * How many directories' check commands are kept.
+ *
+ * Bounded for the same reason drafts are — the file is rewritten whole — but
+ * far higher, because a check command is a decision somebody made once about a
+ * project they will come back to, and fifty is more repositories than anyone
+ * works in between one Artemis release and the next.
+ */
+const MAX_AFTER_EDIT = 50;
+
+/** Shared, so that "nothing pinned" is one array and the memo below holds. */
+const NO_PINS: readonly string[] = [];
+
+/** A file edited by hand can hold anything at all under `drafts`. */
+function isStoredDraft(value: unknown): value is StoredDraft {
+  if (typeof value !== 'object' || value === null) return false;
+  const row = value as Partial<StoredDraft>;
+  return typeof row.sessionId === 'string' && typeof row.text === 'string';
+}
 
 interface FileShape {
   readonly version: number;
@@ -93,6 +185,9 @@ export class PreferencesStore {
   #value: Preferences = {};
   /** Writes are chained so two quick changes cannot race each other's rename. */
   #writing: Promise<void> = Promise.resolve();
+  /** {@link pinnedSet}'s answer, and the array it was built from. */
+  #pinned: ReadonlySet<string> | undefined;
+  #pinnedFrom: readonly unknown[] | undefined;
 
   constructor(dir: string) {
     this.#dir = dir;
@@ -131,6 +226,127 @@ export class PreferencesStore {
   /** Resolves once every `save` so far is on disk (or has given up). */
   flush(): Promise<void> {
     return this.#writing;
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Pins                                                                    */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Every pinned session id, as a set.
+   *
+   * The rail asks this once per draw and then asks it of every row, so it is a
+   * set rather than a list — and the set is built from the stored array only
+   * when that array is a different array, which is what keeps a redraw of two
+   * hundred rows from being two hundred linear scans. Keying the memo on the
+   * array's identity rather than on a flag is what makes it impossible for a
+   * {@link save} from anywhere to leave a stale answer behind.
+   */
+  pinnedSet(): ReadonlySet<string> {
+    // A file edited by hand can hold anything at all under `pinned`, and the
+    // rail drawing a conversation list is not the place to find that out.
+    const stored: readonly unknown[] = Array.isArray(this.#value.pinned) ? this.#value.pinned : NO_PINS;
+    if (this.#pinnedFrom !== stored || this.#pinned === undefined) {
+      this.#pinnedFrom = stored;
+      this.#pinned = new Set(stored.filter((id): id is string => typeof id === 'string'));
+    }
+    return this.#pinned;
+  }
+
+  isPinned(sessionId: string): boolean {
+    return this.pinnedSet().has(sessionId);
+  }
+
+  /**
+   * Pin an unpinned conversation, or unpin a pinned one; answers with what it
+   * now is, since the caller has to say which happened.
+   *
+   * Newest pin last, so the list reads as the order they were made in. An
+   * unpin of something that was never pinned is a pin, which is what a toggle
+   * means and is also the only sane reading of an id this file has never seen.
+   */
+  togglePin(sessionId: string): boolean {
+    const pinned = this.isPinned(sessionId);
+    const next = pinned
+      ? [...this.pinnedSet()].filter((id) => id !== sessionId)
+      : [...this.pinnedSet(), sessionId];
+    this.save({ pinned: next });
+    return !pinned;
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Drafts                                                                  */
+  /* ---------------------------------------------------------------------- */
+
+  /** What was left in this conversation's composer, if anything was. */
+  draftFor(sessionId: string): string | undefined {
+    return this.#drafts().find((draft) => draft.sessionId === sessionId)?.text;
+  }
+
+  /**
+   * Remember what is in a conversation's composer, or forget it.
+   *
+   * Blank forgets rather than storing an empty string, because "nothing typed"
+   * is the state every conversation starts in and a row saying so is a row
+   * spending one of the twenty on no information at all. A draft that is
+   * written again goes to the back of the list: what has just been typed at is
+   * the last thing that should fall off the front of it.
+   */
+  setDraft(sessionId: string, text: string): void {
+    const others = this.#drafts().filter((draft) => draft.sessionId !== sessionId);
+    const next = text.trim().length === 0 ? others : [...others, { sessionId, text }];
+    this.save({ drafts: next.slice(-MAX_DRAFTS) });
+  }
+
+  #drafts(): readonly StoredDraft[] {
+    const stored: unknown = this.#value.drafts;
+    return Array.isArray(stored) ? stored.filter(isStoredDraft) : [];
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* The check a directory runs after an edit                                */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * What this directory runs after a turn that edited files, if anything.
+   *
+   * Resolved on the way in and on the way out, so a path typed with a trailing
+   * slash and the directory the app is running in are one directory rather than
+   * two settings that disagree.
+   */
+  afterEditFor(cwd: string): string | undefined {
+    const stored = this.#afterEdits()[resolve(cwd)];
+    return stored === undefined || stored.trim().length === 0 ? undefined : stored;
+  }
+
+  /**
+   * Set this directory's check command, or clear it.
+   *
+   * Nothing and blank both clear it, because `/check off` and a command of
+   * spaces are the same request, and a stored empty string would be a setting
+   * that is switched on and does nothing at all. A directory set again moves to
+   * the back: what somebody is working in today should be the last thing to
+   * fall off the front when the fifty-first arrives.
+   */
+  setAfterEdit(cwd: string, command: string | undefined): void {
+    const directory = resolve(cwd);
+    const text = command?.trim() ?? '';
+    const others: readonly (readonly [string, string])[] = Object.entries(this.#afterEdits()).filter(
+      ([dir]) => dir !== directory,
+    );
+    const next = text.length === 0 ? others : [...others, [directory, text] as const];
+    this.save({ afterEdit: Object.fromEntries(next.slice(-MAX_AFTER_EDIT)) });
+  }
+
+  /** A file edited by hand can hold anything at all under `afterEdit`. */
+  #afterEdits(): Readonly<Record<string, string>> {
+    const stored: unknown = this.#value.afterEdit;
+    if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) return {};
+    const kept: Record<string, string> = {};
+    for (const [dir, command] of Object.entries(stored as Record<string, unknown>)) {
+      if (typeof command === 'string') kept[dir] = command;
+    }
+    return kept;
   }
 
   async #write(snapshot: FileShape): Promise<void> {

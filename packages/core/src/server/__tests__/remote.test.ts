@@ -714,6 +714,104 @@ describe('GET /api/v0/events', () => {
     await stream.close();
   });
 
+  it('says which feed it is, and how often a quiet one speaks', async () => {
+    const feed = createPushFeed({ epoch: 'this-process' });
+    const stream = await openStream({ feed, remoteStream: { heartbeatMs: 1_234 } });
+
+    const [hello] = decode(await stream.next());
+    expect(JSON.parse(hello?.data ?? '')).toMatchObject({
+      seq: 0,
+      epoch: 'this-process',
+      heartbeatMs: 1_234,
+    });
+    await stream.close();
+  });
+
+  /*
+   * The restart. Seqs start over with the process, so a window that was
+   * reading the last one reconnects naming a number this feed never counted.
+   * Honoured, that number became `lastSent`, every live event fell under it,
+   * and the window heard a hello, heartbeats and nothing else.
+   */
+  it('drops a cursor from another feed, says so, and follows the live feed', async () => {
+    const feed = createPushFeed({ epoch: 'this-process' });
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 1), { profileId: 'prof-a' });
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 2), { profileId: 'prof-a' });
+    const stream = await openStream(
+      { feed },
+      { 'last-event-id': '9000' },
+      `${REMOTE_EVENTS_PATH}?epoch=the-last-process`,
+    );
+
+    const [hello] = decode(await stream.next());
+    expect(JSON.parse(hello?.data ?? '')).toMatchObject({ seq: 2, epoch: 'this-process' });
+    const [gap] = decode(await stream.next());
+    expect(gap?.event).toBe(REMOTE_STREAM_GAP);
+    expect(JSON.parse(gap?.data ?? '')).toEqual({ afterSeq: 9000, firstSeq: 3 });
+
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 3), { profileId: 'prof-a' });
+    const [live] = decode(await stream.next());
+    expect(live?.id).toBe('3');
+    await stream.close();
+  });
+
+  it('drops a cursor ahead of the head from a client too old to name its feed', async () => {
+    const feed = createPushFeed();
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 1), { profileId: 'prof-a' });
+    const stream = await openStream({ feed }, { 'last-event-id': '9000' });
+
+    expect(decode(await stream.next())[0]?.event).toBe(REMOTE_STREAM_HELLO);
+    const [gap] = decode(await stream.next());
+    expect(gap?.event).toBe(REMOTE_STREAM_GAP);
+    expect(JSON.parse(gap?.data ?? '')).toEqual({ afterSeq: 9000, firstSeq: 2 });
+
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 2), { profileId: 'prof-a' });
+    const [live] = decode(await stream.next());
+    expect(live?.id).toBe('2');
+    await stream.close();
+  });
+
+  it('does not replay this feed’s events to a cursor another feed counted', async () => {
+    // The case a bare number cannot catch: this feed has already counted past
+    // the stale cursor, so `since(2)` has an answer — for a question nobody
+    // asked. Events 3 to 5 here are not what the client missed after *its* 2.
+    const feed = createPushFeed({ epoch: 'this-process' });
+    for (let i = 1; i <= 5; i += 1) {
+      feed.publish('artemis:push:agent-event', agentEvent('run-a', i), { profileId: 'prof-a' });
+    }
+    const stream = await openStream(
+      { feed },
+      { 'last-event-id': '2' },
+      `${REMOTE_EVENTS_PATH}?epoch=the-last-process`,
+    );
+
+    expect(decode(await stream.next())[0]?.event).toBe(REMOTE_STREAM_HELLO);
+    const [gap] = decode(await stream.next());
+    expect(JSON.parse(gap?.data ?? '')).toEqual({ afterSeq: 2, firstSeq: 6 });
+
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 6), { profileId: 'prof-a' });
+    const [live] = decode(await stream.next());
+    expect(live?.id).toBe('6');
+    await stream.close();
+  });
+
+  it('replays as it always did for a client naming this feed', async () => {
+    const feed = createPushFeed({ epoch: 'this-process' });
+    for (let i = 1; i <= 4; i += 1) {
+      feed.publish('artemis:push:agent-event', agentEvent('run-a', i), { profileId: 'prof-a' });
+    }
+    const stream = await openStream(
+      { feed },
+      { 'last-event-id': '2' },
+      `${REMOTE_EVENTS_PATH}?epoch=this-process`,
+    );
+
+    expect(decode(await stream.next())[0]?.event).toBe(REMOTE_STREAM_HELLO);
+    expect(decode(await stream.next())[0]?.id).toBe('3');
+    expect(decode(await stream.next())[0]?.id).toBe('4');
+    await stream.close();
+  });
+
   it('keeps another account\'s events out of a narrowed stream', async () => {
     const feed = createPushFeed();
     const stream = await openStream({ feed }, asNarrow);
@@ -770,5 +868,197 @@ describe('GET /api/v0/events', () => {
     const [frame] = decode(await stream.next());
     expect(frame?.id).toBe('2');
     await stream.close();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* A bridge resume on the wrong account                                       */
+/* -------------------------------------------------------------------------- */
+
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach } from 'vitest';
+
+import { createSessionLedger, type SessionLedger } from '../ledger.js';
+import type { SessionSource } from '../http.js';
+
+function servedProfile(id: string, slug: string, models: readonly string[]): ServerProfile {
+  return {
+    id: id as ServerProfile['id'],
+    slug,
+    label: slug,
+    provider: { id: 'claude', label: 'Claude', kind: 'hosted' },
+    available: true,
+    disabled: false,
+    live: true,
+    capabilities: NO_CAPABILITIES,
+    models: models.map((model) => ({
+      route: `${slug}/${model}`,
+      id: model,
+      label: model,
+      note: '.',
+      profileId: id as ServerProfile['id'],
+      profileSlug: slug,
+      profileLabel: slug,
+      providerId: 'claude',
+      thinkingLevels: [],
+      adaptiveThinking: false,
+      fastMode: false,
+      ultracode: false,
+    })),
+  };
+}
+
+const twoAccounts: Catalogue = {
+  read: async () => [servedProfile('prof-a', 'work', ['opus', 'sonnet']), servedProfile('prof-b', 'other', ['opus'])],
+  invalidate: () => undefined,
+};
+
+/** prof-b's store holds sess-3 under the pin; prof-a's holds nothing. */
+const storeOfB: SessionSource = {
+  list: async (query) => ({
+    sessions:
+      query.profileId === 'prof-b' && query.cwd === '/w'
+        ? [
+            {
+              id: 'sess-3' as never,
+              providerId: 'claude' as never,
+              profileId: 'prof-b' as never,
+              cwd: '/w',
+              title: 'Held by other',
+              updatedAt: 3,
+            },
+          ]
+        : [],
+    hasMore: false,
+  }),
+  messages: async () => ({ events: [], hasMore: false }),
+};
+
+const ledgerCleanups: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  while (ledgerCleanups.length > 0) await ledgerCleanups.pop()?.();
+});
+
+async function ledgerSaying(profileId: string): Promise<SessionLedger> {
+  const dir = await mkdtemp(join(tmpdir(), 'artemis-bridge-ledger-'));
+  const ledger = createSessionLedger(dir);
+  ledgerCleanups.push(async () => {
+    await ledger.flush();
+    await rm(dir, { recursive: true, force: true });
+  });
+  await ledger.load();
+  ledger.record({
+    sessionId: 'sess-3',
+    connectionId: CONNECTION.id,
+    profileId,
+    workspaceKey: 'dir:/w',
+    cwd: '/w',
+    origin: 'bridge',
+  });
+  return ledger;
+}
+
+function recording(): { source: RunSource; started: RunInput[] } {
+  const started: RunInput[] = [];
+  const source: RunSource = {
+    ...observableRuns,
+    startUserRun: async (input) => {
+      started.push(input);
+      return runHandle('run-new', String(input.profileId));
+    },
+  };
+  return { source, started };
+}
+
+async function resumeOn(
+  ledger: SessionLedger,
+  source: RunSource,
+  input: Record<string, unknown>,
+): ReturnType<typeof handleServerRequest> {
+  return handleServerRequest(
+    {
+      method: 'POST',
+      url: REMOTE_RUNS_PATH,
+      headers: { host: '127.0.0.1:6472', authorization: `Bearer ${TOKEN}` },
+      body: { input: { providerId: 'claude', cwd: '/w', prompt: 'go on', resumeSessionId: 'sess-3', ...input } },
+    },
+    {
+      connections: [CONNECTION, NARROW],
+      version: '1',
+      catalogue: twoAccounts,
+      startedAt: 0,
+      runs: source,
+      ledger,
+      sessions: storeOfB,
+    },
+  );
+}
+
+describe('a bridge resume on the wrong account', () => {
+  it('starts the run on the account holding the conversation, keeping a model it offers', async () => {
+    const ledger = await ledgerSaying('prof-b');
+    const { source, started } = recording();
+    const reply = await resumeOn(ledger, source, { profileId: 'prof-a', model: 'opus' });
+    expect(reply.status).toBe(200);
+    expect(started[0]).toMatchObject({ profileId: 'prof-b', model: 'opus', resumeSessionId: 'sess-3' });
+    // The handle names the account the run is really on.
+    expect((reply.body as { run: { profileId: string } }).run.profileId).toBe('prof-b');
+  });
+
+  it('drops a model the holding account does not offer', async () => {
+    const ledger = await ledgerSaying('prof-b');
+    const { source, started } = recording();
+    const reply = await resumeOn(ledger, source, { profileId: 'prof-a', model: 'sonnet' });
+    expect(reply.status).toBe(200);
+    expect(started[0]?.profileId).toBe('prof-b');
+    expect(started[0]?.model).toBeUndefined();
+  });
+
+  it('does not second-guess a resume the ledger agrees with', async () => {
+    const ledger = await ledgerSaying('prof-a');
+    const { source, started } = recording();
+    let reads = 0;
+    const counting: SessionSource = {
+      ...storeOfB,
+      list: async (query) => {
+        reads += 1;
+        return storeOfB.list(query);
+      },
+    };
+    const reply = await handleServerRequest(
+      {
+        method: 'POST',
+        url: REMOTE_RUNS_PATH,
+        headers: { host: '127.0.0.1:6472', authorization: `Bearer ${TOKEN}` },
+        body: {
+          input: { providerId: 'claude', profileId: 'prof-a', cwd: '/w', prompt: 'go on', resumeSessionId: 'sess-3' },
+        },
+      },
+      {
+        connections: [CONNECTION, NARROW],
+        version: '1',
+        catalogue: twoAccounts,
+        startedAt: 0,
+        runs: source,
+        ledger,
+        sessions: counting,
+      },
+    );
+    expect(reply.status).toBe(200);
+    // The ordinary path: ledger and request agree, so no store is opened and
+    // the request stands. A ledger that is itself wrong is corrected by the
+    // listing, which is where every row a client resumes from comes from.
+    expect(started[0]?.profileId).toBe('prof-a');
+    expect(reads).toBe(0);
+  });
+
+  it('leaves a resume alone when the requested account is the ledger’s', async () => {
+    const ledger = await ledgerSaying('prof-b');
+    const { source, started } = recording();
+    const reply = await resumeOn(ledger, source, { profileId: 'prof-b', model: 'opus' });
+    expect(reply.status).toBe(200);
+    expect(started[0]).toMatchObject({ profileId: 'prof-b', model: 'opus' });
   });
 });

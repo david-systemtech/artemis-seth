@@ -45,6 +45,7 @@
 import type {
   AgentEvent,
   Attachment,
+  Capabilities,
   PermissionDecision,
   PermissionRequestId,
   Profile,
@@ -68,8 +69,17 @@ import type {
   AuthStatusResponse,
   AgentPromptsDocument,
   BuiltInPromptId,
+  ServerMemoryBank,
+  ServerMemoryBankScope,
   ServerProfileCreatedBody,
   ServerSignInStatus,
+  RoutineDraft,
+  RoutinePatch,
+  RoutineSnapshot,
+  SkillInfo,
+  SkillLibraryDocument,
+  SkillSourceStatus,
+  ToolServerConfig,
 } from '@rx-artemis/protocol';
 
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
@@ -83,12 +93,19 @@ import {
   checkAuthStatus,
   createDefaultProviderRegistry,
   createRemoteAccount,
+  createRemoteRoutine,
   deleteRemoteAccount,
+  deleteRemoteRoutine,
+  listRemoteRoutines,
+  runRemoteRoutine,
   updateRemoteAccount,
+  updateRemoteRoutine,
   managedEnvKeys,
   ProfileStore,
   profileConfigDir,
   readRemoteAccounts,
+  readRemoteMemoryBanks,
+  setRemoteMemoryBankScope,
   readRemoteUsage,
   readRemoteSignIn,
   resolveEnv,
@@ -105,18 +122,35 @@ import {
   submitRemoteSignInCode,
   type EnvBundle,
   type RemoteAccounts,
+  type RemoteMemoryBanks,
   type LocalPlugin,
   type ProviderCredentialSpec,
   type ProviderRegistry,
   type SessionListScope,
   type SessionNamingPlan,
   type SignInShell,
+  createSkillSources,
   resolveContentPlugins,
   linkSkillsIntoCodexHome,
+  listSkills,
+  resolveSkills,
+  skillRootsFor,
+  takesHostToolServers,
 } from '@rx-artemis/core';
-import { applyPlanLimit, composeAgentPrompts, lowestTierModel } from '@rx-artemis/protocol';
+import {
+  alwaysOnSkillNames,
+  applyPlanLimit,
+  composeAgentPrompts,
+  composeAlwaysOnSkills,
+  composesAlwaysOnSkillsHere,
+  enabledToolServers,
+  lowestTierModel,
+  withoutSkillSource,
+  withSkillSource,
+} from '@rx-artemis/protocol';
 
 import { AgentPromptStore } from './agentPrompts.js';
+import { SkillLibraryStore } from './skillLibrary.js';
 import { anyBankAvailable, banksForRun, configureMemoryBanks, isMasterEnabled, promptBanks, syncMemoryBanksInBackground } from './memoryBanks.js';
 import { EngineUnavailableError, ValidationError } from './errors.js';
 import { createLogger } from './log.js';
@@ -165,6 +199,60 @@ const MAX_SESSION_TITLE = 200;
  * the input back untouched, which is what keeps an empty library from putting
  * an `append` carrying nothing on every run.
  */
+/**
+ * The built-ins a run on this provider may carry.
+ *
+ * The memory-bank prompt is about *this machine*: its banks' slugs, its path
+ * to the CLI, "this machine carries…". A run served by an Artemis server
+ * executes on that machine instead, which has banks of its own and describes
+ * them itself (`apps/server/src/host.ts` composes the same prompt from its own
+ * registry). Sending this machine's rendering across the wire told the agent
+ * about a Windows path to `bin\cerebro` on a Linux box. So for the `artemis`
+ * provider the built-in stays home, and only the user's own prompts cross —
+ * those are about the user, and travel with them.
+ *
+ * Pure, so the rule is the unit under test rather than the engine around it.
+ */
+export function builtInsFor(
+  providerId: string,
+  available: ReadonlySet<BuiltInPromptId>,
+): ReadonlySet<BuiltInPromptId> {
+  if (providerId !== 'artemis' || !available.has('builtin:cerebro')) return available;
+  const rest = new Set(available);
+  rest.delete('builtin:cerebro');
+  return rest;
+}
+
+/**
+ * Does this provider need each bank's index carried in the prompt itself?
+ *
+ * A Claude profile's harness loads the project's `MEMORY.md`, where the same
+ * budgeted index already sits between the banks' markers — inlining it would
+ * put every line in front of the model twice and pay for it twice. Every other
+ * harness (a local model, Codex, an ACP agent) loads no such file, and for
+ * those the index in the prompt is the whole of what makes the bank reachable:
+ * without it the agent knows a bank exists and nothing about what is in it.
+ *
+ * Pure, and named, because it is a claim about other people's harnesses rather
+ * than a preference — the sort of thing that should be stated once and tested.
+ */
+export function inlineBankIndex(providerId: string): boolean {
+  return providerId !== 'claude';
+}
+
+/**
+ * Does this run receive the memory tools?
+ *
+ * The same question as "does this provider get the host's tool servers",
+ * answered from core's one list so the prompt and the run agree: a Claude or
+ * local-model run gets `artemisMemory` through `agentToolServers` and is
+ * taught `memory_draft`; a Codex or OpenCode run gets neither and is taught
+ * the CLI for a bank that embeds one.
+ */
+export function bankToolsAvailable(providerId: string): boolean {
+  return takesHostToolServers(providerId);
+}
+
 export function withSystemPromptAppended(input: RunInput, text: string | undefined): RunInput {
   if (text === undefined || text.length === 0) return input;
 
@@ -339,6 +427,40 @@ export interface ArtemisEngine {
   /** Replace the library. Answers with what was actually stored. */
   writeAgentPrompts(document: AgentPromptsDocument): Promise<AgentPromptsDocument>;
 
+  /**
+   * Every skill a session on this machine would be offered.
+   *
+   * On the host for the reason the prompt library is: the same folders are read
+   * again on the path of a run, to compose the always-on ones, and the list a
+   * person is shown has to come from the same reading of the disk.
+   */
+  listSkills(): Promise<readonly SkillInfo[]>;
+  /**
+   * Which skills are always on, as stored. For the pane: rejects when the
+   * file cannot be read, rather than handing it a guess it would save over.
+   */
+  readSkillLibrary(): Promise<SkillLibraryDocument>;
+  /**
+   * Replace those choices. Answers with what was actually stored.
+   *
+   * The *choices*, and only them: the document also lists this machine's skill
+   * sources, which the pane never writes. A URL there is one main will clone,
+   * so it arrives by {@link addSkillSource} and its own validator, never on the
+   * back of a save about switches.
+   */
+  writeSkillLibrary(document: SkillLibraryDocument): Promise<SkillLibraryDocument>;
+  /** The repositories kept cloned on this machine, and how each copy is doing. */
+  listSkillSources(): Promise<readonly SkillSourceStatus[]>;
+  /**
+   * Subscribe to a repository of skills and clone it now. Resolves once the
+   * first sync has been tried, so the pane can show the skills or the reason.
+   */
+  addSkillSource(url: string, subdir: string): Promise<void>;
+  /** Unsubscribe, and delete the copy. Always-on choices are left alone. */
+  removeSkillSource(id: string): Promise<void>;
+  /** Pull now: one source, or all of them. Not throttled; a person asked. */
+  syncSkillSources(id?: string): Promise<void>;
+
   startRun(input: RunInput): Promise<RunHandle>;
   sendToRun(
     runId: RunId,
@@ -456,6 +578,17 @@ export interface ArtemisEngine {
    * the *server's* id for it as well.
    */
   remoteAccounts(profileId: ProfileId): Promise<RemoteAccounts>;
+  /**
+   * The server's memory banks, its accounts, and whether this token may
+   * rescope one. The client half of `/api/v0/memory-banks`.
+   */
+  remoteMemoryBanks(profileId: ProfileId): Promise<RemoteMemoryBanks>;
+  /** Attach one of the server's banks to every account there, or to exactly these. */
+  setRemoteMemoryBankScope(
+    profileId: ProfileId,
+    slug: string,
+    scope: ServerMemoryBankScope,
+  ): Promise<ServerMemoryBank>;
   createRemoteAccount(
     profileId: ProfileId,
     request: { readonly label: string; readonly provider?: string },
@@ -478,6 +611,25 @@ export interface ArtemisEngine {
     code: string,
   ): Promise<ServerSignInStatus>;
   cancelRemoteSignIn(profileId: ProfileId, accountId: string): Promise<ServerSignInStatus | null>;
+
+  /**
+   * Routines that live on a *remote* server — the appointments that fire there
+   * with this desktop closed, distinct from the desktop's own local ones.
+   *
+   * Each takes the local Artemis-Server profile id (whose address and token
+   * name the server) and, where it acts on one, the server's id for the
+   * routine. The server scopes every call to the connection this profile's
+   * token names, so a call only ever reaches this profile's own routines.
+   */
+  remoteRoutines(profileId: ProfileId): Promise<readonly RoutineSnapshot[]>;
+  createRemoteRoutine(profileId: ProfileId, draft: RoutineDraft): Promise<RoutineSnapshot>;
+  updateRemoteRoutine(
+    profileId: ProfileId,
+    routineId: string,
+    patch: RoutinePatch,
+  ): Promise<RoutineSnapshot>;
+  deleteRemoteRoutine(profileId: ProfileId, routineId: string): Promise<{ readonly removed: boolean }>;
+  runRemoteRoutine(profileId: ProfileId, routineId: string): Promise<RoutineSnapshot>;
 
   listSessions(options: {
     readonly providerId: ProviderId;
@@ -753,6 +905,19 @@ function createEngine(options: EngineOptions): ArtemisEngine {
         }
       },
     },
+    /*
+     * The same factory, handed to the provider whose loop is Artemis's own.
+     *
+     * The one call, not a second one built for the occasion: which browser a
+     * run gets is decided once, in `agentBrowserServers`, and a local run that
+     * asked the question separately would eventually answer it differently.
+     * `local/mcp.ts` is the client that reaches what comes back.
+     */
+    local: {
+      ...(options.agentToolServers === undefined
+        ? {}
+        : { agentToolServers: options.agentToolServers }),
+    },
   });
 
   /**
@@ -779,6 +944,18 @@ function createEngine(options: EngineOptions): ArtemisEngine {
   const profiles = new ProfileStore({ userDataDir, managedEnvKeys: managed, secrets });
 
   const agentPrompts = new AgentPromptStore({ userDataDir });
+  const skillLibrary = new SkillLibraryStore({ userDataDir });
+  /*
+   * The repositories of skills this machine subscribes to, kept cloned under
+   * `userData`. Synced behind every run start, throttled — see core's
+   * `skillSources.ts` for why a sync never stands between a person and a run.
+   */
+  const skillSources = createSkillSources({
+    dataDir: userDataDir,
+    onWarning: (message) => log.warn(message),
+  });
+  /** The synced folders, for everything that reads skills off this disk. */
+  const skillSourceRoots = async () => skillSources.roots((await skillLibrary.read()).sources ?? []);
 
   /*
    * The key managers, before the memory banks — because a bank may hold a
@@ -803,17 +980,22 @@ function createEngine(options: EngineOptions): ArtemisEngine {
    * change while the app is open — adding a bank is a button in the settings
    * dialog, and a user who clicks it should not have to restart before the
    * prompt that describes it starts arriving. Both halves are cheap at that
-   * rate: a cached file read and a registry read with a few `existsSync`s. The
-   * full status probe, which spawns the CLI, is not.
+   * rate: a cached file read, and a registry read with a couple of `stat`s per
+   * bank. Nothing here spawns.
+   *
+   * Asked **of the run's profile**. A bank can be attached to one account and
+   * not another, and a profile that carries no bank has nothing for the
+   * built-in to describe — so the prompt is withheld there rather than
+   * describing somebody else's banks.
    *
    * Configured **and** switched on. Banks being registered is not consent to
    * spending every run's context describing them, so a machine that has them
    * but has not said yes gets the prompt withheld however enabled its row is —
    * which is exactly what `BuiltInAgentPrompt.requires` exists to explain.
    */
-  const availableBuiltIns = (): ReadonlySet<BuiltInPromptId> => {
+  const availableBuiltIns = (profileId: ProfileId): ReadonlySet<BuiltInPromptId> => {
     const available = new Set<BuiltInPromptId>();
-    if (isMasterEnabled() && anyBankAvailable()) available.add('builtin:cerebro');
+    if (isMasterEnabled() && anyBankAvailable(profileId)) available.add('builtin:cerebro');
     return available;
   };
 
@@ -847,18 +1029,97 @@ function createEngine(options: EngineOptions): ArtemisEngine {
 
     try {
       const { prompts } = await agentPrompts.read();
-      const available = availableBuiltIns();
+      const available = builtInsFor(input.providerId, availableBuiltIns(input.profileId));
       const text = composeAgentPrompts(prompts, {
         profileId: input.profileId,
         availableBuiltIns: available,
-        // The banks by name, so the composed prompt teaches this machine's
-        // slugs and read-only rules instead of the generic preview.
-        ...(available.has('builtin:cerebro') ? { memoryBanks: promptBanks() } : {}),
+        // The banks this profile carries, described against the project the run
+        // starts in: their own names, how they are filed, the index of the
+        // entries that apply here, and whether this run can write through the
+        // memory tools or has to be taught the CLI — see `bankToolsAvailable`.
+        ...(available.has('builtin:cerebro')
+          ? {
+              memoryBanks: promptBanks(
+                input.profileId,
+                input.cwd,
+                bankToolsAvailable(input.providerId),
+              ),
+              memoryBanksOptions: { inlineIndex: inlineBankIndex(input.providerId) },
+            }
+          : {}),
       });
       return withSystemPromptAppended(input, text);
     } catch (error) {
       log.warn('Could not compose the agent prompt library; starting without it', error);
       return input;
+    }
+  };
+
+  /**
+   * Append the skills the user switched always-on, after the standing prompts.
+   *
+   * The same two refusals {@link withAgentPrompts} makes, for the same reasons:
+   * nothing is sent to a provider that cannot take an append, and nothing here
+   * can fail a run. After the prompts rather than before, because the prompts
+   * are the user's own words about how to work and a skill is a procedure to
+   * follow while doing it.
+   *
+   * ## Composed from the run's own account, at the moment it starts
+   *
+   * The names are resolved against the folders *this* account is offered skills
+   * from — its own `skills/`, then the machine's — which is the precedence the
+   * content bridge uses, so the always-on text is the text of the very skill
+   * the session could also be asked to run. And it is read now, not cached: a
+   * skill a synced source updated overnight is the updated skill this morning.
+   *
+   * A local model gets these too. It has no skill mechanism of its own, which
+   * makes this the *only* way it is ever told what a skill says.
+   *
+   * Which runs this applies to is {@link composesAlwaysOnSkillsHere}.
+   */
+  const withAlwaysOnSkills = async (input: RunInput): Promise<RunInput> => {
+    let capabilities;
+    try {
+      capabilities = providers.require(input.providerId).capabilities;
+    } catch {
+      return input;
+    }
+    if (!composesAlwaysOnSkillsHere(input.providerId, capabilities.systemPromptAppend)) return input;
+
+    try {
+      const names = alwaysOnSkillNames(await skillLibrary.read(), input.profileId);
+      if (names.length === 0) return input;
+      const configDir = profileConfigDir(await profiles.require(input.profileId));
+      const skills = await resolveSkills(
+        names,
+        skillRootsFor({ profileId: input.profileId, configDir }, undefined, await skillSourceRoots()),
+      );
+      return withSystemPromptAppended(input, composeAlwaysOnSkills(skills));
+    } catch (error) {
+      log.warn('Could not compose the always-on skills; starting without them', error);
+      return input;
+    }
+  };
+
+  /**
+   * Profile → the tool servers its runs may reach.
+   *
+   * Read here rather than sent by the renderer for the reason every path
+   * through this function exists: an entry can name an executable, and a
+   * renderer that could put one in a run request could start any binary on the
+   * machine. What crosses the boundary is a profile id.
+   *
+   * A profile that cannot be read is no servers rather than a failed run: the
+   * run itself is about to resolve the same profile for its environment and
+   * will report the problem properly if there is one.
+   */
+  const toolServersFor = async (profileId: ProfileId): Promise<readonly ToolServerConfig[]> => {
+    try {
+      const profile = await profiles.require(profileId);
+      return enabledToolServers(profile.toolServers);
+    } catch (error) {
+      log.warn(`Could not read the tool servers for profile ${profileId}`, error);
+      return [];
     }
   };
 
@@ -1000,7 +1261,11 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     const configDir = profileConfigDir(await profiles.require(profileId));
 
     if (providerId === 'codex') {
-      await linkSkillsIntoCodexHome({ configDir, onWarning: (message, error) => log.warn(message, error) });
+      await linkSkillsIntoCodexHome({
+        configDir,
+        extraSkillDirs: (await skillSourceRoots()).map((root) => root.dir),
+        onWarning: (message, error) => log.warn(message, error),
+      });
       return [];
     }
 
@@ -1010,6 +1275,7 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     return resolveContentPlugins({
       configDir,
       dataDir: options.userDataDir,
+      extraSkillDirs: (await skillSourceRoots()).map((root) => root.dir),
       onWarning: (message, error) => log.warn(message, error),
     });
   };
@@ -1048,11 +1314,18 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       // Concurrent because they share only the profile record, which the store
       // caches: the credential decryption and the content scan have no reason to
       // wait for each other on the path of a run that is starting.
-      const [env, plugins] = await Promise.all([
+      const [env, plugins, toolServers] = await Promise.all([
         envFor(profileId, providerId),
         contentPluginsFor(profileId, providerId),
+        toolServersFor(profileId),
       ]);
-      return { env, plugins };
+      return {
+        env,
+        plugins,
+        // Omitted when there are none, so a run on a profile that configured
+        // nothing is byte-for-byte the run it always was.
+        ...(toolServers.length === 0 ? {} : { toolServers }),
+      };
     },
     onError: (error, context) => {
       log.error(`Run ${context.runId} reported a swallowed error during ${context.phase}`, error);
@@ -1393,13 +1666,48 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     readAgentPrompts: () => agentPrompts.read(),
     writeAgentPrompts: (document) => agentPrompts.write(document),
 
+    listSkills: async () => {
+      // The accounts that have a skills folder of their own. Every other kind
+      // of account is still offered the machine-wide ones, which are listed
+      // whoever is asking.
+      const accounts = (await profiles.list())
+        .filter((profile) => profile.providerId === 'claude' || profile.providerId === 'codex')
+        .map((profile) => ({ profileId: profile.id, configDir: profileConfigDir(profile) }));
+      return listSkills({ accounts, sources: await skillSourceRoots() });
+    },
+    readSkillLibrary: () => skillLibrary.load(),
+    writeSkillLibrary: (document) =>
+      skillLibrary.update((current) => ({ ...current, alwaysOn: document.alwaysOn })),
+    listSkillSources: async () => skillSources.status((await skillLibrary.load()).sources ?? []),
+    addSkillSource: async (url, subdir) => {
+      const next = await skillLibrary.update((current) => withSkillSource(current, url, subdir));
+      const added = next.sources?.at(-1);
+      // Tried now rather than left to the next run, so the pane that asked
+      // shows either the skills or git's own reason for their absence.
+      if (added !== undefined) await skillSources.sync(added, { force: true });
+    },
+    removeSkillSource: async (id) => {
+      const source = (await skillLibrary.load()).sources?.find((entry) => entry.id === id);
+      await skillLibrary.update((current) => withoutSkillSource(current, id));
+      if (source !== undefined) await skillSources.remove(source);
+    },
+    syncSkillSources: async (id) => {
+      const sources = (await skillLibrary.load()).sources ?? [];
+      await Promise.all(
+        sources
+          .filter((source) => id === undefined || source.id === id)
+          .map((source) => skillSources.sync(source, { force: true })),
+      );
+    },
+
     startRun: async (input) => {
       // The banks' own `SessionStart` hook cannot run under `settingSources:
-      // []`, so Artemis runs the sync cycle itself — one spawn, every enabled
-      // bank. Started before the run and never awaited: it promotes what the
-      // last session drafted and pulls what teammates landed, neither of which
-      // this run may wait on.
-      syncMemoryBanksInBackground();
+      // []`, so Artemis keeps the banks turning itself. The install half is
+      // synchronous and finishes before the run starts — that is what puts the
+      // bank in this project's memory the first time it is opened — and the
+      // pull half is fired and forgotten, because fetching what teammates
+      // landed is the next run's business and this one may not wait on it.
+      syncMemoryBanksInBackground(input.cwd);
 
       // Every enabled bank is attached to the run as a directory it may read.
       // A bank lives outside cwd — a clone in `~/Documents`, typically — so a
@@ -1409,7 +1717,7 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       // with banks off or none configured starts exactly the run it would have.
       const bankDirs = mergeAdditionalDirectories(
         input.additionalDirectories,
-        isMasterEnabled() ? banksForRun().map((bank) => bank.path) : [],
+        isMasterEnabled() ? banksForRun(input.profileId).map((bank) => bank.path) : [],
         isMasterEnabled(),
       );
       const withBanks =
@@ -1421,7 +1729,13 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       // they record what the user asked for — the prompt to name the session
       // by, the account to attribute it to — and neither is a fact about the
       // system prompt or the bank directories the run happened to carry.
-      const handle = await runs.start(await withAgentPrompts(withBanks));
+      // Behind the run, never before it: a run reads whatever copy of a source
+      // is on disk, and the sync is throttled, so a busy hour is one fetch.
+      void skillLibrary
+        .read()
+        .then((library) => skillSources.syncInBackground(library.sources ?? []))
+        .catch(() => undefined);
+      const handle = await runs.start(await withAlwaysOnSkills(await withAgentPrompts(withBanks)));
       namer.noteRun(input, handle.runId);
       owners.noteRun(input, handle.runId);
       return handle;
@@ -1612,6 +1926,9 @@ function createEngine(options: EngineOptions): ArtemisEngine {
      * place for the address to be wrong.
      */
     remoteAccounts: async (profileId) => readRemoteAccounts(await remoteEnvFor(profileId)),
+    remoteMemoryBanks: async (profileId) => readRemoteMemoryBanks(await remoteEnvFor(profileId)),
+    setRemoteMemoryBankScope: async (profileId, slug, scope) =>
+      (await setRemoteMemoryBankScope(await remoteEnvFor(profileId), slug, scope)).bank,
 
     createRemoteAccount: async (profileId, request) =>
       createRemoteAccount(await remoteEnvFor(profileId), request),
@@ -1643,6 +1960,26 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       stopSignInForwarder(accountId);
       return cancelRemoteSignIn(await remoteEnvFor(profileId), accountId);
     },
+
+    /*
+     * The remote routines, on the same authenticated wire as the accounts
+     * above and the runs beside them. Each unwraps the route's body to the one
+     * thing the renderer wants — the routine, or the list — so the IPC layer
+     * carries a `RoutineSnapshot` rather than an envelope. `remoteEnvFor`
+     * refuses a profile that is not an Artemis Server, so a stray id cannot be
+     * sent to the default loopback address.
+     */
+    remoteRoutines: async (profileId) =>
+      (await listRemoteRoutines(await remoteEnvFor(profileId))).routines,
+    createRemoteRoutine: async (profileId, draft) =>
+      (await createRemoteRoutine(await remoteEnvFor(profileId), draft)).routine,
+    updateRemoteRoutine: async (profileId, routineId, patch) =>
+      (await updateRemoteRoutine(await remoteEnvFor(profileId), routineId, patch)).routine,
+    deleteRemoteRoutine: async (profileId, routineId) => ({
+      removed: (await deleteRemoteRoutine(await remoteEnvFor(profileId), routineId)).deleted,
+    }),
+    runRemoteRoutine: async (profileId, routineId) =>
+      (await runRemoteRoutine(await remoteEnvFor(profileId), routineId)).routine,
 
     getSessionMessages: async (query) => {
       const profile = await profiles.require(query.profileId);

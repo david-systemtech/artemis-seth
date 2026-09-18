@@ -61,6 +61,7 @@ import type {
   SessionDelegatedWork,
   SessionId,
   SessionSummary,
+  ToolServerConfig,
 } from '@rx-artemis/protocol';
 
 import type { XdgRootSpec } from '../profiles/xdgFarm.js';
@@ -196,6 +197,21 @@ export interface ResolvedRunInput extends RunInput {
   readonly plugins?: readonly LocalPlugin[];
 
   /**
+   * Tool servers this run may reach, as the profile recorded them.
+   *
+   * Resolved rather than requested, like {@link plugins} and for a sharper
+   * version of the same reason: an entry can name an executable, so a renderer
+   * that could send one could start any binary on the machine under the
+   * agent's environment. What the renderer names is a profile; what the host
+   * returns is what that profile holds.
+   *
+   * Read today by the local adapter, which owns its own MCP client
+   * (`local/mcp.ts`). The other providers connect their own tool servers
+   * through the runtime they wrap and ignore this.
+   */
+  readonly toolServers?: readonly ToolServerConfig[];
+
+  /**
    * Cancels the run from the outside — app shutdown, window close, a global
    * "stop everything". Aborting is equivalent to calling {@link Run.dispose}:
    * the adapter still emits `run.end` before the stream completes.
@@ -271,6 +287,22 @@ export interface Run {
 
   /** The provider session this run is writing to. Set once `session.started` arrives. */
   readonly sessionId: SessionId | undefined;
+
+  /**
+   * How many stored messages predate the turn this run follows, when the
+   * adapter is the side that knows.
+   *
+   * The registry measures that seam for a run it starts, before the provider
+   * is spawned. Three kinds of run can only be told later, and report it here:
+   * one that joins a turn already going (`RunInput.attachToLive`), whose seam
+   * the serving side measured when the turn began; a turn the provider opened
+   * on its own, which counts the conversation the moment it announces itself;
+   * and a served run, which learns the seam its server measured off the
+   * stream. It may therefore become defined after the run has started — the
+   * registry reads it whenever a handle is snapshotted, never only once.
+   * Absent while unknown, which a reader must not take for zero.
+   */
+  readonly historyOffset?: number;
 
   /**
    * The normalized event stream.

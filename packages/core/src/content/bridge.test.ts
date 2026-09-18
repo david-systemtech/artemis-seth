@@ -30,6 +30,7 @@
  */
 
 import {
+  existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -750,5 +751,96 @@ describeIfSymlinks('resolveContentPlugins', () => {
     // at all — either way it offers `tdd` no longer.
     const offered = bridge === undefined ? [] : listSkills(path.join(bridge.path, 'skills'));
     expect(offered).toEqual([]);
+  });
+});
+
+/**
+ * Folders beyond the account's own and the machine's — in practice the
+ * repositories Artemis keeps cloned. What matters is where they sit in the
+ * merge: last, so a skill a person installed by hand keeps its name over the
+ * copy that arrived by subscription.
+ */
+describeIfSymlinks('extra skill folders (synced sources)', () => {
+  it('offers a Claude session the skills in an extra folder', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    seedSkill(path.join(configDir, 'skills'), 'supacode-cli');
+
+    const [plugin] = await buildContentBridge({ configDir, dataDir, home, extraSkillDirs: [source] });
+
+    expect(listSkills(path.join(plugin!.path, 'skills'))).toEqual(['supacode-cli', 'unslop']);
+  });
+
+  it('lets a skill installed by hand win its name over the synced copy', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop', 'synced-copy');
+    seedSkill(path.join(home, '.agents', 'skills'), 'unslop', 'hand-installed');
+
+    const [plugin] = await buildContentBridge({ configDir, dataDir, home, extraSkillDirs: [source] });
+
+    const bridged = path.join(plugin!.path, 'skills');
+    expect(listSkills(bridged)).toEqual(['unslop']);
+    expect(readFileSync(path.join(bridged, 'unslop', 'SKILL.md'), 'utf8')).toContain('hand-installed');
+  });
+
+  it('bridges a profile whose only skills are synced ones, and tolerates a source not cloned yet', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    const notYet = path.join(dataDir, 'skill-sources', 'pending', 'skills');
+
+    const [plugin] = await buildContentBridge({ configDir, dataDir, home, extraSkillDirs: [notYet, source] });
+
+    expect(listSkills(path.join(plugin!.path, 'skills'))).toEqual(['unslop']);
+  });
+
+  it('stops offering a synced skill when its source is removed', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    seedSkill(path.join(configDir, 'skills'), 'supacode-cli');
+    await buildContentBridge({ configDir, dataDir, home, extraSkillDirs: [source] });
+
+    const [plugin] = await buildContentBridge({ configDir, dataDir, home });
+
+    expect(listSkills(path.join(plugin!.path, 'skills'))).toEqual(['supacode-cli']);
+  });
+
+  it('links a synced skill into a Codex profile, which has no reason to read Artemis’s data folder', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    seedSkill(path.join(home, '.codex', 'skills'), 'codex-own');
+
+    await linkSkillsIntoCodexHome({ configDir, home, extraSkillDirs: [source] });
+
+    expect(listSkills(path.join(configDir, 'skills'))).toEqual(['codex-own', 'unslop']);
+  });
+
+  it('takes a synced skill back out of a Codex profile when it leaves the source', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    seedSkill(source, 'tdd');
+    await linkSkillsIntoCodexHome({ configDir, home, extraSkillDirs: [source] });
+
+    rmSync(path.join(source, 'tdd'), { recursive: true, force: true });
+    await linkSkillsIntoCodexHome({ configDir, home, extraSkillDirs: [source] });
+
+    expect(listSkills(path.join(configDir, 'skills'))).toEqual(['unslop']);
+  });
+
+  it('does not link into Codex a synced skill it already reads from ~/.agents/skills', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    seedSkill(path.join(home, '.agents', 'skills'), 'unslop');
+
+    await linkSkillsIntoCodexHome({ configDir, home, extraSkillDirs: [source] });
+
+    // Codex would otherwise list it twice: once natively, once by this link.
+    expect(existsSync(path.join(configDir, 'skills', 'unslop'))).toBe(false);
   });
 });

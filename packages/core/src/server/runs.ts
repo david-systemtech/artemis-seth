@@ -49,22 +49,28 @@
  * `ARTEMIS_DETACHED_RUN_TTL_MS` moves it.
  *
  * A parked run is *blocked*, and everything downstream of the question is
- * waiting on a person who may never look. Fifteen minutes is chosen to be
- * longer than someone takes to read a notification and shorter than they take
- * to notice a run has silently stopped making progress; past it the model is
- * told nobody is there and gets to route around the door, which is a far better
- * outcome than a turn that produced nothing for an afternoon.
- * `ARTEMIS_PERMISSION_PARK_MS` moves it.
+ * waiting on a person. There used to be a second, fifteen-minute deadline on
+ * that wait while a client was attached: past it the model was told nobody was
+ * there and got to route around the door. It was removed after it did exactly
+ * that to a person who was there. A client that opted into remote permissions
+ * *is* a person at a machine — that is what the opt-in asserts — and someone
+ * who has stepped away from the window for twenty minutes has not delegated
+ * the decision. The agent answered its own question in prose, ended the turn,
+ * and the user came back to a conversation that had stopped. A question is
+ * kept until it is answered or the run itself goes: the desktop pins it above
+ * the prompt box and files the session under "waiting" until then.
  *
- * **The park deadline only runs while a client is attached**, and that is the
- * subtlest rule in the file. It exists to stop a run stalling silently in front
- * of somebody who is not going to answer. A *detached* run has nobody in front
- * of it by definition, and the open question is very often the exact thing its
- * client left and is coming back for — a laptop that slept on an approval and
- * wakes to grant it. Denying on their behalf while they were away would be the
- * server making the one decision it was told not to make. So a detached run's
- * prompt waits, and the run's own deadline is what bounds it: nobody comes
- * back, the whole run goes.
+ * `ARTEMIS_PERMISSION_PARK_MS` opts a deployment back into a deadline — a
+ * server whose clients really are unattended scripts that asked for prompts
+ * they will never answer — and is off by default.
+ *
+ * **A deadline, where one is configured, only runs while a client is
+ * attached.** A *detached* run has nobody in front of it by definition, and the
+ * open question is very often the exact thing its client left and is coming
+ * back for — a laptop that slept on an approval and wakes to grant it. Denying
+ * on their behalf while they were away would be the server making the one
+ * decision it was told not to make. So a detached run's prompt waits, and the
+ * run's own deadline is what bounds it: nobody comes back, the whole run goes.
  *
  * ---------------------------------------------------------------------------
  * THIS IS NOT `guard.ts`, AND THE TWO NEVER SEE THE SAME RUN
@@ -105,16 +111,20 @@ import { UNATTENDED_PERMISSION_MESSAGE, type RunSource } from './completions.js'
 /** Six hours. See the file comment on why it is this long. */
 export const DEFAULT_DETACHED_RUN_TTL_MS = 6 * 60 * 60 * 1000;
 
-/** Fifteen minutes. See the file comment on why it is this short. */
-export const DEFAULT_PERMISSION_PARK_MS = 15 * 60 * 1000;
+/**
+ * No deadline. See the file comment on why a question waits for the person it
+ * was asked of; `ARTEMIS_PERMISSION_PARK_MS` sets one for deployments that
+ * want it back.
+ */
+export const DEFAULT_PERMISSION_PARK_MS = Number.POSITIVE_INFINITY;
 
 /**
  * How often the deadlines are checked.
  *
  * A sweep rather than a timer per run, because the timers would be per
- * *request* — a busy server would hold thousands of them to enforce two
- * durations measured in hours and minutes. Half a minute of slack on a
- * fifteen-minute deadline is not a slack anyone can perceive.
+ * *request* — a busy server would hold thousands of them to enforce durations
+ * measured in hours. Half a minute of slack on a six-hour deadline is not a
+ * slack anyone can perceive.
  */
 const SWEEP_INTERVAL_MS = 30_000;
 
@@ -132,6 +142,15 @@ const MAX_TRACKED_RUNS = 1_000;
 interface RunRecord {
   /** The only connection that may address this run. */
   readonly connectionId: string;
+  /**
+   * The route the run was started on, as `POST /v1/chat/completions` named it.
+   *
+   * Kept so a resumed stream can stamp its chunks with the same `model` the
+   * original stream did — the engine knows the run's provider and model id,
+   * but the route is the completions surface's own vocabulary and lives
+   * nowhere else. Absent for a claim that did not say.
+   */
+  readonly route: string | undefined;
   /**
    * The caller asked to be shown permission prompts.
    *
@@ -191,6 +210,8 @@ export interface RunDirectory {
     readonly runId: RunId;
     readonly connectionId: string;
     readonly permissions: boolean;
+    /** See {@link RunRecord.route}. */
+    readonly route?: string;
   }): void;
 
   /** May this connection address this run at all? The only authorisation there is. */
@@ -208,6 +229,21 @@ export interface RunDirectory {
 
   /** The client walked away and the run was kept. Starts the run's own deadline. */
   noteDetached(runId: RunId): void;
+
+  /**
+   * A client attached to the run's stream again.
+   *
+   * The inverse of {@link noteDetached}, and the thing that makes a resumed
+   * stream a real attachment rather than a touch: the detached-run deadline
+   * stops, because the run is no longer abandoned, and the park deadline on
+   * its open prompts starts, because somebody is now in front of them again —
+   * the same somebody who would have been asked had the socket held. No-op for
+   * a run that has ended.
+   */
+  noteAttached(runId: RunId): void;
+
+  /** The route a claimed run was started on, when the claim said. */
+  routeOf(runId: RunId): string | undefined;
 
   /**
    * Somebody just addressed this run through an authorised route.
@@ -319,6 +355,7 @@ export function createRunDirectory(options: RunDirectoryOptions): RunDirectory {
       if (records.has(input.runId)) return;
       records.set(input.runId, {
         connectionId: input.connectionId,
+        route: input.route,
         permissions: input.permissions,
         detachedAt: undefined,
         ended: false,
@@ -352,6 +389,21 @@ export function createRunDirectory(options: RunDirectoryOptions): RunDirectory {
       const record = records.get(runId);
       if (record !== undefined && record.detachedAt !== undefined) record.detachedAt = now();
     },
+
+    noteAttached: (runId) => {
+      const record = records.get(runId);
+      if (record === undefined || record.ended) return;
+      record.detachedAt = undefined;
+      /*
+       * The prompts that waited for this client are counted from now, not from
+       * when they were raised: a question asked an hour ago into an empty room
+       * has not been ignored for an hour by the person who just walked in.
+       */
+      const at = now();
+      for (const requestId of [...record.parked.keys()]) record.parked.set(requestId, at);
+    },
+
+    routeOf: (runId) => records.get(runId)?.route,
 
     noteAnswered: (runId, requestId) => {
       records.get(runId)?.parked.delete(requestId);

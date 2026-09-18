@@ -28,9 +28,19 @@
 import type { ServerUsageBody } from '@rx-artemis/protocol';
 import type {
   ProfileId,
+  RoutineDraft,
+  RoutinePatch,
   ServerProfile,
   ServerProfileCreatedBody,
   ServerProfilesBody,
+  ServerMemoryBank,
+  ServerMemoryBankAccount,
+  ServerMemoryBankBody,
+  ServerMemoryBankScope,
+  ServerMemoryBanksBody,
+  ServerRoutineBody,
+  ServerRoutineDeletedBody,
+  ServerRoutinesBody,
   ServerSignInStatus,
 } from '@rx-artemis/protocol';
 import { SERVER_API_VERSION } from '@rx-artemis/protocol';
@@ -134,6 +144,78 @@ export async function updateRemoteAccount(
   );
 }
 
+/** The server's memory banks as a client has to meet them. */
+export interface RemoteMemoryBanks {
+  /**
+   * This profile's token was granted account administration, which is the same
+   * grant that scopes a bank. False is the ordinary answer for a token pasted
+   * from `connection create` without `--manage-profiles`.
+   */
+  readonly manageProfiles: boolean;
+  /**
+   * The server answers this surface at all.
+   *
+   * False for a server too old to have the routes and for one that keeps no
+   * registry — which the wire cannot tell apart, by design, and which a client
+   * has no reason to: both mean there is nothing here to edit. Distinct from
+   * `manageProfiles` because the sentences a pane should show differ: "this
+   * server cannot" against "this token may not".
+   */
+  readonly available: boolean;
+  readonly banks: readonly ServerMemoryBank[];
+  /** The accounts a scope may name, for the checklist. */
+  readonly profiles: readonly ServerMemoryBankAccount[];
+}
+
+/**
+ * The server's memory banks, the accounts a scope may name, and whether this
+ * token may change either.
+ *
+ * Shaped like {@link readRemoteAccounts} and for the same reason: a pane needs
+ * the grant and the rows together or it will render controls it cannot use.
+ * The banks read is allowed to be absent — a 404 is what both an older server
+ * and an unprivileged token get, and neither is an error worth a banner.
+ */
+export async function readRemoteMemoryBanks(
+  env: ArtemisProfileEnv,
+  options?: { readonly signal?: AbortSignal },
+): Promise<RemoteMemoryBanks> {
+  const [connection, banks] = await Promise.all([
+    call<{ manageProfiles?: unknown }>(env, `${API_PREFIX}/connection`, options),
+    absentOnUnavailable(
+      call<ServerMemoryBanksBody>(env, `${API_PREFIX}/memory-banks`, options),
+    ),
+  ]);
+  return {
+    manageProfiles: connection.manageProfiles === true,
+    available: banks !== null,
+    banks: Array.isArray(banks?.banks) ? banks.banks : [],
+    profiles: Array.isArray(banks?.profiles) ? banks.profiles : [],
+  };
+}
+
+/**
+ * Choose which of the server's accounts one of its banks reaches.
+ *
+ * The scope is sent whole rather than as a diff — the same shape the desktop
+ * stores for its own banks — so a client that has just drawn a checklist sends
+ * what the checklist says, and two clients editing at once do not interleave
+ * into a scope neither asked for.
+ */
+export async function setRemoteMemoryBankScope(
+  env: ArtemisProfileEnv,
+  slug: string,
+  profiles: ServerMemoryBankScope,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerMemoryBankBody> {
+  return call<ServerMemoryBankBody>(
+    env,
+    `${API_PREFIX}/memory-banks/${encodeURIComponent(slug)}`,
+    options,
+    { method: 'PATCH', body: { profiles } },
+  );
+}
+
 /** Remove one account. The server keeps the directory; see the route's contract. */
 export async function deleteRemoteAccount(
   env: ArtemisProfileEnv,
@@ -196,9 +278,103 @@ export async function cancelRemoteSignIn(
   );
 }
 
+/* -------------------------------------------------------------------------- */
+/* Routines that live on the server                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Driving a *remote* server's routines — the appointments that fire in the
+ * server itself, with this desktop closed. The client half of the routes in
+ * `server/routines.ts`, reusing the same address and token an ordinary run
+ * against this profile is given: a profile that can run a turn on a server can
+ * schedule one there too. Every call is scoped by the server to the connection
+ * this profile's token names, so a client sees only its own routines.
+ */
+
+/** Every routine this connection owns on the server. */
+export async function listRemoteRoutines(
+  env: ArtemisProfileEnv,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerRoutinesBody> {
+  return call<ServerRoutinesBody>(env, `${API_PREFIX}/routines`, options);
+}
+
+/** Create a routine on the server. Its directory is the connection's — see the route. */
+export async function createRemoteRoutine(
+  env: ArtemisProfileEnv,
+  draft: RoutineDraft,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerRoutineBody> {
+  return call<ServerRoutineBody>(env, `${API_PREFIX}/routines`, options, {
+    method: 'POST',
+    body: { draft },
+  });
+}
+
+/** Edit a routine on the server. Absent fields are left alone. */
+export async function updateRemoteRoutine(
+  env: ArtemisProfileEnv,
+  routineId: string,
+  patch: RoutinePatch,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerRoutineBody> {
+  return call<ServerRoutineBody>(
+    env,
+    `${API_PREFIX}/routines/${encodeURIComponent(routineId)}`,
+    options,
+    { method: 'PATCH', body: { patch } },
+  );
+}
+
+/** Delete a routine on the server. */
+export async function deleteRemoteRoutine(
+  env: ArtemisProfileEnv,
+  routineId: string,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerRoutineDeletedBody> {
+  return call<ServerRoutineDeletedBody>(
+    env,
+    `${API_PREFIX}/routines/${encodeURIComponent(routineId)}`,
+    options,
+    { method: 'DELETE' },
+  );
+}
+
+/** Fire a routine on the server now, schedule and pause notwithstanding. */
+export async function runRemoteRoutine(
+  env: ArtemisProfileEnv,
+  routineId: string,
+  options?: { readonly signal?: AbortSignal },
+): Promise<ServerRoutineBody> {
+  return call<ServerRoutineBody>(
+    env,
+    `${API_PREFIX}/routines/${encodeURIComponent(routineId)}/run-now`,
+    options,
+    { method: 'POST' },
+  );
+}
+
 /** An account id is opaque and may be anything the server minted. Encode it. */
 function signInPath(accountId: ProfileId | string): string {
   return `${API_PREFIX}/profiles/${encodeURIComponent(String(accountId))}/signin`;
+}
+
+/**
+ * `null` for a surface this server does not offer.
+ *
+ * {@link absentOnMissing}'s 404 plus the `501` a build that serves accounts but
+ * keeps no memory-bank registry answers. Both are "nothing to show here" and
+ * neither is worth an error in a pane the user merely opened.
+ */
+async function absentOnUnavailable<T>(pending: Promise<T>): Promise<T | null> {
+  try {
+    return await pending;
+  } catch (error) {
+    if (!isAdapterError(error)) throw error;
+    const status = error.agentError.httpStatus;
+    if (status === 404 || status === 501) return null;
+    throw error;
+  }
 }
 
 async function absentOnMissing<T>(pending: Promise<T>): Promise<T | null> {

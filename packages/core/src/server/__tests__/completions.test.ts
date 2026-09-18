@@ -11,9 +11,15 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AgentEvent, RunHandle, ServerModel } from '@rx-artemis/protocol';
-import { NO_CAPABILITIES } from '@rx-artemis/protocol';
+import { ATTACHMENT_LIMITS, AttachmentError, NO_CAPABILITIES } from '@rx-artemis/protocol';
 
-import { promptFromMessages, runTurn, type RunSource } from '../completions.js';
+import {
+  attachmentsFromMessages,
+  promptFromMessages,
+  resumeTurn,
+  runTurn,
+  type RunSource,
+} from '../completions.js';
 
 const MODEL: ServerModel = {
   route: 'work-max/opus',
@@ -153,17 +159,98 @@ describe('a turn', () => {
     expect(done.result.text).toBe('Summary.');
   });
 
-  it('never puts thinking into the answer', async () => {
+  it('never puts thinking into the answer, and carries it on its own channel', async () => {
     // A caller reading `content` must not receive the model's private
-    // reasoning as though it were the reply.
+    // reasoning as though it were the reply — and a caller that wants to
+    // watch the model think has to be able to, or a served turn shows an
+    // answer with nothing behind it.
     const source = fakeRuns([
-      { type: 'thinking.delta', text: 'Let me consider…' },
+      { type: 'thinking.delta', text: 'Let me ' },
+      { type: 'thinking.delta', text: 'consider…' },
       { type: 'text.delta', text: 'Done.' },
       { type: 'run.end', reason: 'completed' },
     ] as Partial<AgentEvent>[]);
 
-    const done = (await drain(source)).at(-1) as { result: { text: string } };
+    const events = await drain(source);
+    expect(events.filter((e) => e.kind === 'thinking').map((e) => (e as { text: string }).text)).toEqual(
+      ['Let me ', 'consider…'],
+    );
+    const done = events.at(-1) as { result: { text: string; thinking?: string } };
     expect(done.result.text).toBe('Done.');
+    expect(done.result.thinking).toBe('Let me consider…');
+  });
+
+  it('sets one reasoning block off from the next with a paragraph break', async () => {
+    // Two blocks either side of a tool call. The wire carries fragments, not
+    // blocks, so the boundary has to be spelled out or the two arrive glued.
+    const source = fakeRuns([
+      { type: 'thinking.delta', messageId: 'm1', blockIndex: 0, text: 'First, look.' },
+      { type: 'tool.start', name: 'Read', toolCallId: 't1', input: { file_path: '/w/a.ts' } },
+      { type: 'thinking.delta', messageId: 'm2', blockIndex: 0, text: 'Now the ' },
+      { type: 'thinking.delta', messageId: 'm2', blockIndex: 0, text: 'other file.' },
+      { type: 'text.delta', text: 'Done.' },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+
+    const events = await drain(source);
+    expect(events.filter((e) => e.kind === 'thinking').map((e) => (e as { text: string }).text)).toEqual(
+      ['First, look.', '\n\nNow the ', 'other file.'],
+    );
+    const done = events.at(-1) as { result: { thinking?: string } };
+    expect(done.result.thinking).toBe('First, look.\n\nNow the other file.');
+  });
+
+  it('forwards no thinking the provider withheld, and none it never had', async () => {
+    // A redacted block is a signature with no plaintext, and an empty delta is
+    // not a delivery: neither has anything a client could draw, and a
+    // `reasoning_content` of "" would still open a fold that never fills.
+    const source = fakeRuns([
+      { type: 'thinking.delta', text: '', redacted: true },
+      { type: 'thinking.delta', text: '' },
+      { type: 'text.delta', text: 'Done.' },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+
+    const events = await drain(source);
+    expect(events.some((e) => e.kind === 'thinking')).toBe(false);
+    const done = events.at(-1) as { result: { thinking?: string } };
+    expect(done.result.thinking).toBeUndefined();
+  });
+
+  it('leaves a subagent’s words out of the answer', async () => {
+    // A subagent reports to the agent, not to the caller. Relaying its text
+    // handed the caller the findings inline *and then* the agent's account of
+    // them — the same answer twice, in two voices. The call that spawned it is
+    // still reported, as activity.
+    const source = fakeRuns([
+      { type: 'tool.start', name: 'Task', toolCallId: 't1', input: { prompt: 'look around' } },
+      { type: 'thinking.delta', text: 'sub-thought', agentId: 't1' },
+      { type: 'text.delta', text: 'I found three files. ', agentId: 't1' },
+      { type: 'text.complete', role: 'assistant', text: 'I found three files. ', agentId: 't1' },
+      { type: 'text.delta', text: 'There are three files.' },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+
+    const events = await drain(source);
+    expect(events.some((e) => e.kind === 'thinking')).toBe(false);
+    const done = events.at(-1) as {
+      result: { text: string; activity: readonly { tool: string }[] };
+    };
+    expect(done.result.text).toBe('There are three files.');
+    expect(done.result.activity.map((entry) => entry.tool)).toEqual(['task']);
+  });
+
+  it('does not read replayed history back as this turn’s answer', async () => {
+    // A resumed conversation replays its stored blocks through the same
+    // event, marked. A previous turn's reply is not this one's.
+    const source = fakeRuns([
+      { type: 'text.complete', role: 'assistant', text: 'Last time I said this.', replay: true },
+      { type: 'text.complete', role: 'assistant', text: 'And now this.' },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+
+    const done = (await drain(source)).at(-1) as { result: { text: string } };
+    expect(done.result.text).toBe('And now this.');
   });
 
   it('reports what the agent did, without reporting what it found', async () => {
@@ -206,6 +293,16 @@ describe('a turn', () => {
     expect(plain.started[0]?.input).not.toHaveProperty('permissionMode');
   });
 
+  it('hands appended standing instructions to the run, and omits an absent one', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed' }] as Partial<AgentEvent>[]);
+    await drain(source, turn({ extensions: { systemPrompt: 'Follow the house style.' } }));
+    expect(source.started[0]?.input).toMatchObject({ systemPrompt: 'Follow the house style.' });
+
+    const plain = fakeRuns([{ type: 'run.end', reason: 'completed' }] as Partial<AgentEvent>[]);
+    await drain(plain);
+    expect(plain.started[0]?.input).not.toHaveProperty('systemPrompt');
+  });
+
   it('announces a fresh session the moment it exists, not only on done', async () => {
     // A client whose stream dies mid-turn would otherwise learn the id never —
     // and the Artemis-driving-Artemis adapter builds its `session.started`
@@ -219,7 +316,7 @@ describe('a turn', () => {
     const events = await drain(source);
     const kinds = events.map((event) => event.kind);
     expect(kinds).toEqual(['run', 'session', 'text', 'done']);
-    expect(events[1]).toEqual({ kind: 'session', sessionId: 'sess-9' });
+    expect(events[1]).toMatchObject({ kind: 'session', sessionId: 'sess-9' });
   });
 
   it('does not re-announce a session its caller already named', async () => {
@@ -230,7 +327,25 @@ describe('a turn', () => {
     ] as Partial<AgentEvent>[]);
 
     const events = await drain(source, turn({ extensions: { sessionId: 'sess-9' } }));
-    expect(events.map((event) => event.kind)).toEqual(['run', 'done']);
+    // The announcement rides no chunk of its own; only its cursor passes by.
+    expect(events.map((event) => event.kind)).toEqual(['run', 'cursor', 'done']);
+    expect(events.some((event) => event.kind === 'session')).toBe(false);
+  });
+
+  it('moves the cursor past an event that puts nothing on the wire', async () => {
+    // A tool ending, a bill, a plan reading: no words, but the run moved. The
+    // client's resume cursor follows it — so a resume asks for exactly what
+    // was missed — and a client measuring its stream against the run's
+    // position on the server can tell a quiet agent from a stream that has
+    // lost its place. See `#stallProbe` in the served adapter.
+    const source = fakeRuns([
+      { type: 'tool.end', toolCallId: 'call-1', name: 'Bash', status: 'ok', seq: 4 },
+      { type: 'run.end', reason: 'completed', seq: 5 },
+    ] as Partial<AgentEvent>[]);
+
+    const events = await drain(source);
+    expect(events.map((event) => event.kind)).toEqual(['run', 'cursor', 'done']);
+    expect(events[1]).toEqual({ kind: 'cursor', seq: 4 });
   });
 
   it('announces the new id when a resumed run lands in a different session', async () => {
@@ -242,7 +357,7 @@ describe('a turn', () => {
     ] as Partial<AgentEvent>[]);
 
     const events = await drain(source, turn({ extensions: { sessionId: 'sess-9' } }));
-    expect(events[1]).toEqual({ kind: 'session', sessionId: 'sess-fork' });
+    expect(events[1]).toMatchObject({ kind: 'session', sessionId: 'sess-fork' });
   });
 
   it('maps usage into OpenAI’s three numbers', async () => {
@@ -255,6 +370,150 @@ describe('a turn', () => {
     ] as Partial<AgentEvent>[]);
 
     const done = (await drain(source)).at(-1) as { result: { usage?: Record<string, number> } };
+    expect(done.result.usage).toEqual({
+      prompt_tokens: 100,
+      completion_tokens: 40,
+      total_tokens: 140,
+    });
+  });
+
+  /*
+   * The context reading is a separate measurement from the bill, and the whole
+   * reason these exist is that it used to be discarded: `toOpenAiUsage` took
+   * the two token counts off a usage event and dropped everything else, so a
+   * served conversation could report what it had spent and never how full it
+   * was. Every property below is one half of what "reported" has to mean.
+   */
+  it('puts the context reading on the wire as the run restates it', async () => {
+    const source = fakeRuns([
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 0 }, contextTokens: 4_000 },
+      },
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 0 }, contextTokens: 9_000 },
+      },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+
+    const readings = (await drain(source)).filter((event) => event.kind === 'context');
+    expect(readings).toMatchObject([{ reading: { tokens: 4_000 } }, { reading: { tokens: 9_000 } }]);
+  });
+
+  it('holds the two halves together when they arrive on different events', async () => {
+    // Claude's own shape: occupancy per assistant message with no window, and
+    // the window once on the result with no occupancy. Taking either snapshot
+    // wholesale leaves a gauge with a needle and no dial.
+    const source = fakeRuns([
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 0 }, contextTokens: 9_000 },
+      },
+      {
+        type: 'run.end',
+        reason: 'completed',
+        usage: {
+          scope: 'final',
+          tokens: { inputTokens: 100, outputTokens: 40 },
+          contextWindow: 200_000,
+        },
+      },
+    ] as Partial<AgentEvent>[]);
+
+    const done = (await drain(source)).at(-1) as {
+      result: { context?: Record<string, number> };
+    };
+    expect(done.result.context).toEqual({ tokens: 9_000, window: 200_000 });
+  });
+
+  it('says nothing at all when the run reports no context', async () => {
+    // A route that only bills must not start sending empty readings: the gauge
+    // renders "unknown" from an absent field, and `{}` is not absent.
+    const source = fakeRuns([
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 2 } },
+      },
+      {
+        type: 'run.end',
+        reason: 'completed',
+        usage: { scope: 'final', tokens: { inputTokens: 100, outputTokens: 40 } },
+      },
+    ] as Partial<AgentEvent>[]);
+
+    const events = await drain(source);
+    expect(events.filter((event) => event.kind === 'context')).toEqual([]);
+    expect((events.at(-1) as { result: { context?: unknown } }).result.context).toBeUndefined();
+  });
+
+  it('does not put a chunk on the wire for a reading that has not moved', async () => {
+    // Codex repeats the window on every update. Relaying each one would be a
+    // chunk per assistant message saying exactly what the last one said.
+    const source = fakeRuns([
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 5, outputTokens: 0 }, contextTokens: 7_000, contextWindow: 272_000 },
+      },
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 5, outputTokens: 0 }, contextTokens: 7_000, contextWindow: 272_000 },
+      },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+
+    const readings = (await drain(source)).filter((event) => event.kind === 'context');
+    expect(readings).toHaveLength(1);
+  });
+
+  it('counts the whole prompt, not the uncached remainder of it', async () => {
+    /*
+     * The bug this replaced reported a twenty-thousand-token prompt as ten
+     * tokens. Artemis's triple is disjoint — uncached, cache reads, cache
+     * writes — and OpenAI's `prompt_tokens` is all three together, so passing
+     * `inputTokens` through alone was a different measurement wearing the same
+     * name. Nothing looked broken; it looked cheap.
+     */
+    const source = fakeRuns([
+      {
+        type: 'run.end',
+        reason: 'completed',
+        usage: {
+          scope: 'final',
+          tokens: {
+            inputTokens: 10,
+            outputTokens: 173,
+            cacheReadInputTokens: 19_000,
+            cacheCreationInputTokens: 1_800,
+          },
+        },
+      },
+    ] as Partial<AgentEvent>[]);
+
+    const done = (await drain(source)).at(-1) as { result: { usage?: Record<string, unknown> } };
+    expect(done.result.usage).toEqual({
+      prompt_tokens: 20_810,
+      completion_tokens: 173,
+      total_tokens: 20_983,
+      // The parts a cost calculation needs: cached input is billed at a
+      // fraction of the full rate, and a cache write above it.
+      prompt_tokens_details: { cached_tokens: 19_000 },
+      cache_creation_input_tokens: 1_800,
+    });
+  });
+
+  it('omits the cache figures rather than zeroing them', async () => {
+    // `0` claims the provider has a prompt cache and used none of it. A
+    // provider with no cache at all has made no such claim.
+    const source = fakeRuns([
+      {
+        type: 'run.end',
+        reason: 'completed',
+        usage: { scope: 'final', tokens: { inputTokens: 100, outputTokens: 40 } },
+      },
+    ] as Partial<AgentEvent>[]);
+
+    const done = (await drain(source)).at(-1) as { result: { usage?: Record<string, unknown> } };
     expect(done.result.usage).toEqual({
       prompt_tokens: 100,
       completion_tokens: 40,
@@ -323,7 +582,9 @@ describe('permission requests, with nobody to answer them', () => {
     ] as Partial<AgentEvent>[]);
 
     const kinds = (await drain(source)).map((event) => event.kind);
-    expect(kinds).toEqual(['run', 'done']);
+    // The request and its denial pass by as bare cursors: nothing about
+    // permissions reaches a caller that did not ask.
+    expect(kinds).toEqual(['run', 'cursor', 'cursor', 'done']);
   });
 });
 
@@ -344,7 +605,7 @@ describe('permission requests, with somebody who can answer them', () => {
     // Nothing was answered here: the decision arrives on its own request,
     // routinely after this stream is gone.
     expect(source.denied).toEqual([]);
-    expect(events.find((event) => event.kind === 'permission')).toEqual({
+    expect(events.find((event) => event.kind === 'permission')).toMatchObject({
       kind: 'permission',
       notice: {
         status: 'requested',
@@ -369,7 +630,7 @@ describe('permission requests, with somebody who can answer them', () => {
     ] as Partial<AgentEvent>[]);
 
     const events = await drain(source, turn({ extensions: REMOTE }));
-    expect(events.filter((event) => event.kind === 'permission').at(-1)).toEqual({
+    expect(events.filter((event) => event.kind === 'permission').at(-1)).toMatchObject({
       kind: 'permission',
       notice: {
         status: 'resolved',
@@ -536,6 +797,26 @@ describe('what gets sent to the provider', () => {
     await drain(source, turn({ extensions: { sessionId: 'sess-3' } }));
     expect(source.started[0]?.input).toMatchObject({ resumeSessionId: 'sess-3' });
   });
+
+  it('carries a fork and a rewind anchor beside the session', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed' }]);
+    await drain(
+      source,
+      turn({ extensions: { sessionId: 'sess-3', forkSession: true, rewindToMessageId: 'msg-7' } }),
+    );
+    expect(source.started[0]?.input).toMatchObject({
+      resumeSessionId: 'sess-3',
+      forkSession: true,
+      rewindToMessageId: 'msg-7',
+    });
+  });
+
+  it('sends neither when neither was asked for', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed' }]);
+    await drain(source, turn({ extensions: { sessionId: 'sess-3' } }));
+    expect(source.started[0]?.input).not.toHaveProperty('forkSession');
+    expect(source.started[0]?.input).not.toHaveProperty('rewindToMessageId');
+  });
 });
 
 describe('promptFromMessages', () => {
@@ -593,29 +874,324 @@ describe('promptFromMessages', () => {
     }
   });
 
-  it('reads content given as parts, and names an image it cannot forward', () => {
+  it('reads content given as parts, and leaves a carried image out of the text', () => {
     const prompt = promptFromMessages(
       [
         {
           role: 'user',
           content: [
             { type: 'text', text: 'what is this' },
-            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
           ],
         },
       ],
       { resuming: false },
     );
     expect(prompt).toContain('what is this');
-    // Named rather than dropped: the model should know something was meant to
-    // be there.
+    // The model is about to be shown it, so there is nothing to say about it.
+    expect(prompt).not.toContain('image omitted');
+  });
+
+  it('names an image it will not carry, rather than dropping it in silence', () => {
+    const prompt = promptFromMessages(
+      [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'what is this' },
+            { type: 'image_url', image_url: { url: 'https://example.test/shot.png' } },
+          ],
+        },
+      ],
+      { resuming: false },
+    );
+    // Nothing here fetches a URL on a caller's behalf, so the answer would have
+    // been about nothing. The reader of the reply gets to know that.
     expect(prompt).toContain('image omitted');
+    expect(prompt).toContain('data:');
+  });
+
+  it('carries only the turn its own images, never the history above it', () => {
+    const prompt = promptFromMessages(
+      [
+        {
+          role: 'user',
+          content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }],
+        },
+        { role: 'assistant', content: 'a cat' },
+        { role: 'user', content: 'and now?' },
+      ],
+      { resuming: false },
+    );
+    expect(prompt).toContain('only the newest message carries images');
+  });
+});
+
+describe('attachmentsFromMessages', () => {
+  const dataUrl = (type = 'image/png'): string => `data:${type};base64,AAAA`;
+
+  it('reads the trailing user message\'s data URLs as image attachments', () => {
+    const attachments = attachmentsFromMessages([
+      { role: 'user', content: 'earlier' },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'why is this misaligned' },
+          { type: 'image_url', image_url: { url: dataUrl() } },
+        ],
+      },
+    ]);
+    expect(attachments).toEqual([
+      { kind: 'image', id: 'image-url-1', mediaType: 'image/png', data: 'AAAA' },
+    ]);
+  });
+
+  it('ignores an image on a message that is not the turn', () => {
+    expect(
+      attachmentsFromMessages([
+        {
+          role: 'user',
+          content: [{ type: 'image_url', image_url: { url: dataUrl() } }],
+        },
+        { role: 'user', content: 'and now?' },
+      ]),
+    ).toBeUndefined();
+  });
+
+  it('ignores a link and a format no provider reads as an image', () => {
+    expect(
+      attachmentsFromMessages([
+        {
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: 'https://example.test/shot.png' } },
+            { type: 'image_url', image_url: { url: dataUrl('image/heic') } },
+          ],
+        },
+      ]),
+    ).toBeUndefined();
+  });
+
+  it('refuses a data URL whose payload is not base64', () => {
+    expect(() =>
+      attachmentsFromMessages([
+        {
+          role: 'user',
+          content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,not base64!' } }],
+        },
+      ]),
+    ).toThrow(AttachmentError);
+  });
+
+  it('holds the parts to the same ceiling as an Artemis client', () => {
+    const parts = Array.from({ length: ATTACHMENT_LIMITS.images + 1 }, () => ({
+      type: 'image_url' as const,
+      image_url: { url: dataUrl() },
+    }));
+    expect(() => attachmentsFromMessages([{ role: 'user', content: parts }])).toThrow(
+      /at most 4 images/,
+    );
   });
 });
 
 /* -------------------------------------------------------------------------- */
 /* Over a real socket                                                          */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * A run source that remembers what it emitted, so a resume can replay it.
+ *
+ * `runEvents` is the engine's retained tail; `emit` publishes live. The two
+ * paths a resume has to reconcile are exactly these — what was kept and what
+ * arrives — so the fake keeps them separate rather than scripting one list.
+ */
+function retainingRuns(retained: readonly Partial<AgentEvent>[] = []) {
+  const listeners = new Set<(event: AgentEvent) => void>();
+  const events: AgentEvent[] = retained.map(
+    (partial) => ({ runId: 'run-1', ts: 0, ...partial }) as AgentEvent,
+  );
+  const denied: string[] = [];
+  const interrupted: string[] = [];
+  const disposed: string[] = [];
+  const source: RunSource = {
+    startRun: async () => {
+      throw new Error('not started here');
+    },
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    interrupt: async (runId) => {
+      interrupted.push(String(runId));
+    },
+    respondToPermission: async (_runId, requestId) => {
+      denied.push(requestId);
+    },
+    disposeRun: async (runId) => {
+      disposed.push(String(runId));
+    },
+    runEvents: async (query) => {
+      const after = query.afterSeq ?? -1;
+      const kept = events.filter((event) => event.runId === query.runId && event.seq > after);
+      const first = kept[0];
+      return { events: kept, truncated: first !== undefined && first.seq > after + 1 };
+    },
+  };
+  const emit = (partial: Partial<AgentEvent>): void => {
+    const event = { runId: 'run-1', ts: 0, ...partial } as AgentEvent;
+    events.push(event);
+    for (const listener of listeners) listener(event);
+  };
+  return Object.assign(source, { emit, denied, interrupted, disposed });
+}
+
+describe('a turn, numbered', () => {
+  it('stamps every piece with the event it came from, and the announcement with nothing', async () => {
+    // The cursor a client resumes from. Pieces from the event stream carry
+    // their event's seq; the run announcement comes from nowhere in it.
+    const source = fakeRuns([
+      { type: 'session.started', sessionId: 'sess-9', seq: 0 },
+      { type: 'thinking.delta', text: 'hm', seq: 1 },
+      { type: 'text.delta', text: 'Hi', seq: 2 },
+      { type: 'run.end', reason: 'completed', seq: 3 },
+    ] as Partial<AgentEvent>[]);
+
+    const events = await drain(source);
+    expect(events.map((event) => [event.kind, event.seq])).toEqual([
+      ['run', undefined],
+      ['session', 0],
+      ['thinking', 1],
+      ['text', 2],
+      ['done', 3],
+    ]);
+  });
+});
+
+describe('picking a run back up', () => {
+  const drainResume = async (
+    source: RunSource,
+    request: Parameters<typeof resumeTurn>[1],
+    onEach?: (kind: string) => void,
+  ) => {
+    const events = [];
+    for await (const event of resumeTurn(source, request)) {
+      events.push(event);
+      onEach?.(event.kind);
+    }
+    return events;
+  };
+
+  it('replays what the client missed, then follows the run live, without repeating anything', async () => {
+    const source = retainingRuns([
+      { type: 'session.started', sessionId: 'sess-9', seq: 0 },
+      { type: 'text.delta', text: 'one ', seq: 1 },
+      { type: 'text.delta', text: 'two ', seq: 2 },
+    ]);
+
+    const events = await drainResume(source, { runId: 'run-1' as never, afterSeq: 1 }, (kind) => {
+      // The moment the replay is consumed the run is still going: two more
+      // events arrive live, one of them a repeat of the last retained event
+      // — a race the subscribe-before-replay ordering makes routine.
+      if (kind === 'text') {
+        queueMicrotask(() => {
+          source.emit({ type: 'text.delta', text: 'two ', seq: 2 });
+          source.emit({ type: 'text.delta', text: 'three', seq: 3 });
+          source.emit({ type: 'run.end', reason: 'completed', seq: 4 });
+        });
+      }
+    });
+
+    expect(events.map((event) => [event.kind, event.seq])).toEqual([
+      ['run', undefined],
+      ['text', 2],
+      ['text', 3],
+      ['done', 4],
+    ]);
+    const done = events.at(-1) as { result: { text: string; sessionId?: string } };
+    // The reply is rebuilt from the whole tail, not only the part replayed:
+    // what the client already had is counted, what it never saw is too.
+    expect(done.result.text).toBe('one two three');
+    expect(done.result.sessionId).toBe('sess-9');
+    expect(source.interrupted).toEqual([]);
+    expect(source.disposed).toEqual([]);
+  });
+
+  it('ends at once when the run already ended while nobody was attached', async () => {
+    const source = retainingRuns([
+      { type: 'text.delta', text: 'all of it', seq: 0 },
+      { type: 'run.end', reason: 'completed', seq: 1 },
+    ]);
+    const events = await drainResume(source, { runId: 'run-1' as never, afterSeq: 0 });
+    expect(events.map((event) => event.kind)).toEqual(['run', 'done']);
+  });
+
+  it('replays from the beginning for a client that had rendered nothing', async () => {
+    const source = retainingRuns([
+      { type: 'text.delta', text: 'a', seq: 0 },
+      { type: 'run.end', reason: 'completed', seq: 1 },
+    ]);
+    const events = await drainResume(source, { runId: 'run-1' as never });
+    expect(events.map((event) => [event.kind, event.seq])).toEqual([
+      ['run', undefined],
+      ['text', 0],
+      ['done', 1],
+    ]);
+  });
+
+  it('says so first when the retained tail no longer reaches the cursor', async () => {
+    // The engine keeps a bounded tail. A cursor older than its head is a hole
+    // the client has to be told about, or it splices two halves of an answer
+    // together as though nothing were missing.
+    const source = retainingRuns([
+      { type: 'text.delta', text: 'late', seq: 7 },
+      { type: 'run.end', reason: 'completed', seq: 8 },
+    ]);
+    const events = await drainResume(source, { runId: 'run-1' as never, afterSeq: 2 });
+    expect(events.map((event) => event.kind)).toEqual(['run', 'gap', 'text', 'done']);
+    expect(events[1]).toMatchObject({ kind: 'gap', afterSeq: 2, firstSeq: 7 });
+  });
+
+  it('never denies a prompt: a question asked into an empty room is what the client came back for', async () => {
+    const source = retainingRuns([
+      {
+        type: 'permission.request',
+        requestId: 'perm-1',
+        request: { id: 'perm-1', toolName: 'Bash', input: { command: 'ls' } },
+        seq: 0,
+      },
+      { type: 'run.end', reason: 'completed', seq: 1 },
+    ]);
+    const events = await drainResume(source, { runId: 'run-1' as never });
+    expect(events[1]).toMatchObject({
+      kind: 'permission',
+      notice: { status: 'requested', request: { id: 'perm-1' } },
+      seq: 0,
+    });
+    expect(source.denied).toEqual([]);
+  });
+
+  it('hands the run back when the client goes again, and never ends it', async () => {
+    const source = retainingRuns([{ type: 'text.delta', text: 'so far', seq: 0 }]);
+    const signal = { aborted: false };
+    const detached: string[] = [];
+
+    const stream = resumeTurn(source, {
+      runId: 'run-1' as never,
+      afterSeq: 0,
+      signal,
+      onDetach: (runId) => detached.push(String(runId)),
+    });
+    expect((await stream.next()).value).toMatchObject({ kind: 'run' });
+    // Nothing more is retained and nothing arrives; the client hangs up.
+    const pending = stream.next();
+    signal.aborted = true;
+    expect((await pending).done).toBe(true);
+
+    expect(detached).toEqual(['run-1']);
+    expect(source.interrupted).toEqual([]);
+    expect(source.disposed).toEqual([]);
+  });
+});
 
 describe('POST /v1/chat/completions', () => {
   const TOKEN = 'completions-token-0123456789abcdef';
@@ -643,7 +1219,13 @@ describe('POST /v1/chat/completions', () => {
     invalidate: () => undefined,
   };
 
-  async function serve(source: RunSource, extra: { onError?: (error: unknown) => void } = {}) {
+  async function serve(
+    source: RunSource,
+    extra: {
+      onError?: (error: unknown) => void;
+      remoteStream?: { heartbeatMs?: number };
+    } = {},
+  ) {
     const { createArtemisServer } = await import('../http.js');
     const { createWorkspaceResolver } = await import('../workspaces.js');
     const server = createArtemisServer({
@@ -804,6 +1386,267 @@ describe('POST /v1/chat/completions', () => {
       expect(content).toBe('one two');
       expect(JSON.parse(chunks.at(-2)!).choices[0].finish_reason).toBe('stop');
       expect(chunks.at(-1)).toBe('[DONE]');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('streams reasoning on its own field, never in content', async () => {
+    // The field the reasoning-capable OpenAI-shaped servers use. An OpenAI
+    // client appends nothing from it; an Artemis client draws a thinking row.
+    const source = fakeRuns([
+      { type: 'thinking.delta', text: 'Weighing ' },
+      { type: 'thinking.delta', text: 'it up.' },
+      { type: 'text.delta', text: 'Yes.' },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+
+    const { server, url } = await serve(source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      });
+      const deltas = (await response.text())
+        .split('\n\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => line.slice(6))
+        .filter((chunk) => chunk !== '[DONE]')
+        .map((chunk) => JSON.parse(chunk).choices[0].delta as Record<string, string>);
+
+      const reasoning = deltas.map((delta) => delta['reasoning_content'] ?? '').join('');
+      const content = deltas.map((delta) => delta['content'] ?? '').join('');
+      expect(reasoning).toBe('Weighing it up.');
+      expect(content).toBe('Yes.');
+      // Never both on one chunk, and never the reasoning inside the answer.
+      expect(deltas.some((delta) => 'reasoning_content' in delta && 'content' in delta)).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('puts the reasoning beside the whole answer, when the caller did not stream', async () => {
+    const source = fakeRuns([
+      { type: 'thinking.delta', text: 'Weighing it up.' },
+      { type: 'text.delta', text: 'Yes.' },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+
+    const { server, url } = await serve(source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      const body = (await response.json()) as {
+        choices: { message: { content: string; reasoning_content?: string } }[];
+      };
+      expect(body.choices[0]?.message).toEqual({
+        role: 'assistant',
+        content: 'Yes.',
+        reasoning_content: 'Weighing it up.',
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('puts the context reading on the wire, as the turn fills the window', async () => {
+    /*
+     * The whole point, end to end and through `chunkFor`: a client watching a
+     * served conversation can see how full it is *while* it runs. The reading
+     * cannot ride `usage` — that is a bill, and OpenAI has no field for an
+     * occupancy — so it rides an empty delta in the namespace, and an OpenAI
+     * client appends nothing from it.
+     */
+    const source = fakeRuns([
+      {
+        type: 'usage',
+        usage: { scope: 'delta', tokens: { inputTokens: 10, outputTokens: 0 }, contextTokens: 4_000 },
+        seq: 0,
+      },
+      { type: 'text.delta', text: 'working', seq: 1 },
+      {
+        type: 'run.end',
+        reason: 'completed',
+        seq: 2,
+        usage: {
+          scope: 'final',
+          tokens: { inputTokens: 120, outputTokens: 40 },
+          contextTokens: 9_500,
+          contextWindow: 200_000,
+        },
+      },
+    ] as Partial<AgentEvent>[]);
+
+    const { server, url } = await serve(source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      });
+      const chunks = (await response.text())
+        .split('\n\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => line.slice(6))
+        .filter((chunk) => chunk !== '[DONE]')
+        .map((chunk) => JSON.parse(chunk) as { artemis?: { context?: unknown }; choices: { delta: unknown }[] });
+
+      const carrying = chunks.filter((chunk) => chunk.artemis?.context !== undefined);
+      expect(carrying.map((chunk) => chunk.artemis?.context)).toEqual([
+        { tokens: 4_000 },
+        { tokens: 9_500, window: 200_000 },
+      ]);
+      // Mid-turn it arrives on an empty delta, so no OpenAI client renders it
+      // as part of the answer.
+      expect(carrying[0]?.choices[0]?.delta).toEqual({});
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('numbers every chunk that came from an event', async () => {
+    const source = fakeRuns([
+      { type: 'text.delta', text: 'one', seq: 0 },
+      { type: 'text.delta', text: 'two', seq: 1 },
+      { type: 'run.end', reason: 'completed', seq: 2 },
+    ] as Partial<AgentEvent>[]);
+
+    const { server, url } = await serve(source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      });
+      const chunks = (await response.text())
+        .split('\n\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => line.slice(6))
+        .filter((chunk) => chunk !== '[DONE]')
+        .map((chunk) => JSON.parse(chunk));
+
+      // Role, run announcement, two text chunks, the final chunk.
+      expect(chunks.map((chunk) => chunk.artemis?.seq)).toEqual([undefined, undefined, 0, 1, 2]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('keeps a quiet stream alive with a heartbeat comment', async () => {
+    // An agent inside a long tool call sends nothing for minutes. Without a
+    // heartbeat a client cannot tell that from a dead socket, and an idle
+    // timeout somewhere on the path can make it one.
+    const listeners = new Set<(event: AgentEvent) => void>();
+    const source: RunSource = {
+      ...fakeRuns([]),
+      startRun: async (input) => {
+        setTimeout(() => {
+          for (const listener of listeners) {
+            listener({ runId: 'run-1', seq: 0, ts: 0, type: 'run.end', reason: 'completed' } as AgentEvent);
+          }
+        }, 120);
+        return {
+          runId: 'run-1',
+          providerId: input.providerId,
+          profileId: input.profileId,
+          cwd: input.cwd,
+          status: 'working',
+          capabilities: NO_CAPABILITIES,
+        } as unknown as RunHandle;
+      },
+      subscribe: (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+
+    const { server, url } = await serve(source, { remoteStream: { heartbeatMs: 20 } });
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      });
+      const text = await response.text();
+      expect(text.split(':hb\n\n').length).toBeGreaterThan(2);
+      expect(text.trimEnd().endsWith('data: [DONE]')).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('picks the stream back up on GET /api/v0/runs/{id}/stream, after the cursor the client names', async () => {
+    const source = retainingRuns();
+    source.startRun = async (input) => {
+      queueMicrotask(() => {
+        source.emit({ type: 'session.started', sessionId: 'sess-9', seq: 0 });
+        source.emit({ type: 'text.delta', text: 'one ', seq: 1 });
+        source.emit({ type: 'text.delta', text: 'two', seq: 2 });
+        source.emit({ type: 'run.end', reason: 'completed', seq: 3 });
+      });
+      return {
+        runId: 'run-1',
+        providerId: input.providerId,
+        profileId: input.profileId,
+        cwd: input.cwd,
+        status: 'working',
+        capabilities: NO_CAPABILITIES,
+      } as unknown as RunHandle;
+    };
+
+    const { server, url } = await serve(source);
+    const base = url.replace('/v1/chat/completions', '');
+    try {
+      // The original stream claims the run for this connection.
+      const first = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+        artemis: { remote: { detach: true, permissions: true } },
+      });
+      await first.text();
+
+      const resumed = await fetch(`${base}/api/v0/runs/run-1/stream?after=1`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      expect(resumed.status).toBe(200);
+      expect(resumed.headers.get('content-type')).toContain('text/event-stream');
+      const raw = await resumed.text();
+      const chunks = raw
+        .split('\n\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => line.slice(6));
+      expect(chunks.at(-1)).toBe('[DONE]');
+      const parsed = chunks.slice(0, -1).map((chunk) => JSON.parse(chunk));
+      // The run id first, then only what came after the cursor — and no role
+      // chunk, because the client is appending to a message it already has.
+      expect(parsed.map((chunk) => [chunk.artemis?.runId, chunk.artemis?.seq, chunk.choices[0].delta.content])).toEqual([
+        ['run-1', undefined, undefined],
+        [undefined, 2, 'two'],
+        [undefined, 3, undefined],
+      ]);
+      expect(parsed.at(-1)).toMatchObject({
+        choices: [{ finish_reason: 'stop' }],
+        artemis: { endReason: 'completed', sessionId: 'sess-9', seq: 3 },
+      });
+      // Stamped with the route the run was started on.
+      expect(parsed[0].model).toBe('work-max/opus');
+
+      // A cursor that is not a number is refused, not guessed at.
+      const bad = await fetch(`${base}/api/v0/runs/run-1/stream?after=soon`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      expect(bad.status).toBe(400);
+
+      // A run this connection did not start is not there, in the same words
+      // as one that never existed.
+      const stranger = await fetch(`${base}/api/v0/runs/run-999/stream`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      expect(stranger.status).toBe(404);
     } finally {
       await server.close();
     }
@@ -980,6 +1823,99 @@ describe('POST /v1/chat/completions', () => {
     }
   });
 
+  /*
+   * The catalogue says whether an account's provider can append standing
+   * instructions; Codex and OpenCode cannot, and their adapters never read the
+   * field. Sending it anyway would be accepted and unread — the one failure
+   * the capability flag exists to prevent — so it is dropped *and reported*.
+   */
+  async function serveWith(appendable: boolean, source: RunSource) {
+    const { createArtemisServer } = await import('../http.js');
+    const { createWorkspaceResolver } = await import('../workspaces.js');
+    const profiles = await CATALOGUE.read();
+    const server = createArtemisServer({
+      port: 0,
+      connections: () => [CONNECTION],
+      version: '1.1.1',
+      catalogue: {
+        read: async () =>
+          profiles.map((profile) => ({
+            ...profile,
+            capabilities: { ...NO_CAPABILITIES, systemPromptAppend: appendable },
+          })),
+        invalidate: () => undefined,
+      },
+      runs: source,
+      workspaces: createWorkspaceResolver(),
+    });
+    const port = await server.listen();
+    return { server, url: `http://127.0.0.1:${port}/v1/chat/completions` };
+  }
+
+  it('drops standing instructions for an account whose provider cannot append, and says so', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed', result: 'ok' }]);
+    const { server, url } = await serveWith(false, source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        artemis: { systemPrompt: 'Follow the house style.' },
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { artemis: { ignored?: readonly string[] } };
+      expect(body.artemis.ignored).toEqual(['artemis.systemPrompt']);
+      // And the run was started without it: nothing downstream ever saw the text.
+      expect(source.started[0]?.input).not.toHaveProperty('systemPrompt');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('carries the drop on the first chunk of a stream, before any token', async () => {
+    const source = fakeRuns([
+      { type: 'text.delta', text: 'ok' },
+      { type: 'run.end', reason: 'completed' },
+    ] as Partial<AgentEvent>[]);
+    const { server, url } = await serveWith(false, source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+        artemis: { systemPrompt: 'Follow the house style.' },
+      });
+      const chunks = (await response.text())
+        .split('\n\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => line.slice(6))
+        .filter((chunk) => chunk !== '[DONE]')
+        .map((chunk) => JSON.parse(chunk) as Record<string, any>);
+      expect(chunks[0]?.choices[0]?.delta).toEqual({ role: 'assistant' });
+      expect(chunks[0]?.artemis?.ignored).toEqual(['artemis.systemPrompt']);
+      expect(source.started[0]?.input).not.toHaveProperty('systemPrompt');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('hands standing instructions through, unreported, where the provider can append', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed', result: 'ok' }]);
+    const { server, url } = await serveWith(true, source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        artemis: { systemPrompt: 'Follow the house style.' },
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { artemis: { ignored?: readonly string[] } };
+      expect(body.artemis).not.toHaveProperty('ignored');
+      expect(source.started[0]?.input).toMatchObject({ systemPrompt: 'Follow the house style.' });
+    } finally {
+      await server.close();
+    }
+  });
+
   it('refuses a route this connection may not use, as though it did not exist', async () => {
     const source = fakeRuns([{ type: 'run.end', reason: 'completed' }]);
     const { createArtemisServer } = await import('../http.js');
@@ -1087,5 +2023,107 @@ describe('a resumed conversation', () => {
     ) as { result: { sessionId?: string } };
 
     expect(done.result.sessionId).toBe('sess-forked');
+  });
+});
+
+describe('every block of the answer reaches the wire, not only the first', () => {
+  it('keeps a completed block that arrives after earlier text — the summary after a tool call', async () => {
+    // The bug this prevents, seen on a served session on 2026-09-15: the agent
+    // said an opening sentence, ran a tool, and wrote its bolded summary as a
+    // block that arrived whole. The check was "has any text been sent this
+    // turn", so the first block won and the summary — the one message a person
+    // reads — was dropped, while the transcript on the server had it.
+    const source = fakeRuns([
+      { type: 'text.complete', role: 'assistant', text: 'Starting the probe.', messageId: 'm1', blockIndex: 0 },
+      { type: 'tool.start', toolCallId: 't1', name: 'Bash', input: {} },
+      { type: 'text.complete', role: 'assistant', text: '**Probe complete.**', messageId: 'm1', blockIndex: 2 },
+      { type: 'run.end', reason: 'completed' },
+    ]);
+
+    const events = await drain(source);
+    const texts = events.filter((e) => e.kind === 'text').map((e) => (e as { text: string }).text);
+    // Two paragraphs, parted the way two reasoning blocks are.
+    expect(texts).toEqual(['Starting the probe.', '\n\n**Probe complete.**']);
+    const done = events.at(-1) as { result: { text: string } };
+    expect(done.result.text).toBe('Starting the probe.\n\n**Probe complete.**');
+  });
+
+  it('dedupes by block: a streamed block is not repeated, a later whole block still lands', async () => {
+    const source = fakeRuns([
+      { type: 'text.delta', text: 'Hel', messageId: 'm1', blockIndex: 0 },
+      { type: 'text.delta', text: 'lo', messageId: 'm1', blockIndex: 0 },
+      { type: 'text.complete', role: 'assistant', text: 'Hello', messageId: 'm1', blockIndex: 0 },
+      { type: 'text.complete', role: 'assistant', text: 'Bye', messageId: 'm1', blockIndex: 1 },
+      { type: 'run.end', reason: 'completed' },
+    ]);
+
+    const done = (await drain(source)).at(-1) as { result: { text: string } };
+    expect(done.result.text).toBe('Hello\n\nBye');
+  });
+
+  it('treats a delta and a completion that carry no block index as one block', async () => {
+    // Adapters that never numbered their blocks keep the old guarantee: one
+    // answer, once. `blockKey` reads an absent index as the same key.
+    const source = fakeRuns([
+      { type: 'text.delta', text: 'Hello' },
+      { type: 'text.complete', role: 'assistant', text: 'Hello' },
+      { type: 'run.end', reason: 'completed' },
+    ]);
+    const done = (await drain(source)).at(-1) as { result: { text: string } };
+    expect(done.result.text).toBe('Hello');
+  });
+});
+
+describe('the run announcement carries the seam', () => {
+  it('names how much of the conversation predates the run, when the registry measured it', async () => {
+    /*
+     * The client that started this run is the one that cannot count it: the
+     * conversation lives on this side. Without the number a window that
+     * reloaded mid-turn had nothing to read history up to, and drew the turn
+     * alone.
+     */
+    const base = fakeRuns([{ type: 'run.end', reason: 'completed', seq: 0 }]);
+    const source: RunSource = {
+      ...base,
+      startRun: async (input) => ({ ...(await base.startRun(input)), historyOffset: 911 }),
+    };
+
+    const events = await drain(source);
+
+    expect(events[0]).toMatchObject({ kind: 'run', runId: 'run-1', historyOffset: 911 });
+  });
+
+  it('says nothing about it when the registry could not count', async () => {
+    const events = await drain(fakeRuns([{ type: 'run.end', reason: 'completed', seq: 0 }]));
+    expect(events[0]).toMatchObject({ kind: 'run', runId: 'run-1' });
+    expect(events[0]).not.toHaveProperty('historyOffset');
+  });
+
+  it('repeats it on a stream picked back up, while the registry still knows the run', async () => {
+    // A client joining a turn in progress rebuilds from this stream alone, so
+    // it is told where the history it reads should end.
+    const base = retainingRuns([
+      { type: 'text.delta', text: 'so far', seq: 0 },
+      { type: 'run.end', reason: 'completed', seq: 1 },
+    ]);
+    const source: RunSource = {
+      ...base,
+      getRun: async (runId) =>
+        ({
+          runId,
+          providerId: 'claude',
+          profileId: 'prof-a',
+          cwd: '/w',
+          status: 'running',
+          capabilities: NO_CAPABILITIES,
+          startedAt: 0,
+          historyOffset: 911,
+        }) as unknown as RunHandle,
+    };
+
+    const events = [];
+    for await (const event of resumeTurn(source, { runId: 'run-1' as never })) events.push(event);
+
+    expect(events[0]).toMatchObject({ kind: 'run', runId: 'run-1', historyOffset: 911 });
   });
 });

@@ -54,6 +54,15 @@ export {
 } from './ledger.js';
 
 export {
+  createServerRoutineStore,
+  readServerRoutines,
+  SERVER_ROUTINES_FILE,
+  type ServerRoutineRuns,
+  type ServerRoutineStore,
+  type ServerRoutineStoreOptions,
+} from './routines.js';
+
+export {
   chatChunk,
   chatResponse,
   finishReasonFor,
@@ -100,6 +109,8 @@ export {
   isStreamReply,
   type ArtemisServer,
   type ArtemisServerOptions,
+  type CommandSource,
+  type MemoryBankAdmin,
   type ServerContext,
   type ServerReply,
   type ServerRequestInfo,

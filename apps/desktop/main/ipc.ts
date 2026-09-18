@@ -59,7 +59,7 @@ import {
   type WorkspacePickDirectoryRequest,
 } from '@rx-artemis/protocol';
 
-import { checkWorkingDirectory, describeWorkspace } from '@rx-artemis/core';
+import { checkWorkingDirectory, createWorktree, describeWorkspace } from '@rx-artemis/core';
 
 import {
   addMemoryBank,
@@ -70,8 +70,10 @@ import {
   retireMemoryBankMemory,
   setMasterEnabled,
   setMemoryBankEnabled,
+  setMemoryBankProfiles,
   syncMemoryBank,
   verifyMemoryBankRemote,
+  wireMemoryBankClaudeCode,
   promptBanks,
 } from './memoryBanks.js';
 import type { EngineHost } from './engine.js';
@@ -175,14 +177,27 @@ import {
   validateServerAccountsUpdate,
   validateServerAccountSignIn,
   validateServerAccountSubmitCode,
+  validateServerMemoryBanksSetProfiles,
+  validateServerRoutines,
+  validateServerRoutinesCreate,
+  validateServerRoutinesUpdate,
+  validateServerRoutinesDelete,
+  validateServerRoutinesRunNow,
   validateAgentPromptsList,
   validateAgentPromptsSave,
+  validateSkillsList,
+  validateSkillsSave,
+  validateSkillsSourceAdd,
+  validateSkillsSourceRemove,
+  validateSkillsSourceSync,
   validateMemoryBankAdd,
   validateMemoryBankForget,
   validateMemoryBankMemories,
   validateMemoryBankRetire,
   validateMemoryBankSetEnabled,
+  validateMemoryBankSetProfiles,
   validateMemoryBankSync,
+  validateMemoryBankWireClaudeCode,
   validateMemoryBanksPreflight,
   validateMemoryBanksSetMasterEnabled,
   validateSecretsConnectionDelete,
@@ -201,6 +216,7 @@ import {
   validateUpdatesRestart,
   validateUpdatesState,
   validateWindowRequest,
+  validateWorkspaceCreateWorktree,
   validateWorkspaceDescribe,
   validateWorkspacePickDirectory,
 } from './validate.js';
@@ -280,6 +296,20 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
   const withoutServerSessions = <T extends { readonly id: string }>(
     sessions: readonly T[],
   ): readonly T[] => sessions.filter((session) => !server.isServerSession(session.id));
+
+  /**
+   * Everything the Skills pane draws, read in one go: the skills on this disk,
+   * the always-on choices, and the sources with how each copy is doing.
+   */
+  const skillsState = async () => {
+    const host = engine.require();
+    const [skills, document, sources] = await Promise.all([
+      host.listSkills(),
+      host.readSkillLibrary(),
+      host.listSkillSources(),
+    ]);
+    return { skills, document, sources };
+  };
 
   const handlers: ChannelHandlers = {
     /* ---------------------------------------------------------------- */
@@ -560,6 +590,25 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       handle: async (request) => describeWorkspace(request.path),
     },
 
+    /**
+     * Split a worktree off the repository a directory is in.
+     *
+     * The neighbour above is a read; this writes, and runs `git` to do it, so
+     * a failure here is something the user has to be told about rather than a
+     * label that quietly falls back to a directory name. `createWorktree`
+     * answers rather than throws — see its own docs for why every failure a
+     * user can cause is a sentence — and this turns that answer into the
+     * channel's, so the renderer's one error path covers both.
+     */
+    [IPC.workspaceCreateWorktree]: {
+      validate: validateWorkspaceCreateWorktree,
+      handle: async (request) => {
+        const result = await createWorktree(request.path, request.branch);
+        if (!result.ok) throw new WorkspaceError(result.message);
+        return { path: result.path, branch: result.branch };
+      },
+    },
+
     /* ---------------------------------------------------------------- */
     /* Shared Claude config                                             */
     /* ---------------------------------------------------------------- */
@@ -637,6 +686,27 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       handle: async (request) => setMemoryBankEnabled(request),
     },
 
+    /*
+     * Artemis's own record, in Artemis's own registry: the CLI's config has no
+     * room for a profile scope. The installs follow the write, which is why
+     * this answers with a message like the other write channels.
+     */
+    [IPC.memoryBankSetProfiles]: {
+      validate: validateMemoryBankSetProfiles,
+      handle: async (request) => setMemoryBankProfiles(request),
+    },
+
+    /*
+     * The one bank channel whose whole effect is outside Artemis: it runs the
+     * bank's own CLI to write (or strip) stock Claude Code's managed block,
+     * slash command and session-start hook. Nothing an Artemis run reads, and
+     * refused by name on a bank that embeds no CLI.
+     */
+    [IPC.memoryBankWireClaudeCode]: {
+      validate: validateMemoryBankWireClaudeCode,
+      handle: async (request) => wireMemoryBankClaudeCode(request),
+    },
+
     [IPC.memoryBankForget]: {
       validate: validateMemoryBankForget,
       handle: async (request) => forgetMemoryBank(request),
@@ -708,9 +778,15 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       validate: validateAgentPromptsList,
       // The banks ride along because only main can see them, and the pane's
       // preview of a built-in is wrong without them — see the response type.
+      //
+      // `toolsAvailable: true` so the preview shows the memory tools, which is
+      // what a Claude run on this machine is actually told. A preview is not a
+      // run and has no provider to ask; showing the CLI's verbs instead would
+      // make the pane disagree with every run the user then starts, and this
+      // is also the text an override is seeded from.
       handle: async () => ({
         document: await engine.require().readAgentPrompts(),
-        memoryBanks: promptBanks(),
+        memoryBanks: promptBanks(undefined, undefined, true),
       }),
     },
 
@@ -719,6 +795,55 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       handle: async (request) => ({
         document: await engine.require().writeAgentPrompts(request.document),
       }),
+    },
+
+    /*
+     * Through the engine for the prompt library's reason: the always-on choices
+     * are read on the path of every run, so the one store `startRun` composes
+     * from has to be the one the pane writes to. The skills themselves are read
+     * off the disk on every list rather than cached, so a skill installed — or
+     * pulled — while the pane is open is there the next time it is opened.
+     */
+    [IPC.skillsList]: {
+      validate: validateSkillsList,
+      handle: () => skillsState(),
+    },
+
+    [IPC.skillsSave]: {
+      validate: validateSkillsSave,
+      handle: async (request) => ({
+        document: await engine.require().writeSkillLibrary(request.document),
+      }),
+    },
+
+    /*
+     * The three that change which skills exist answer with the whole state —
+     * the list, the choices and the sources — because each of them changes the
+     * list, and a pane that patched its own copy would be guessing at what a
+     * clone had just put on the disk.
+     */
+    [IPC.skillsSourceAdd]: {
+      validate: validateSkillsSourceAdd,
+      handle: async (request) => {
+        await engine.require().addSkillSource(request.url, request.subdir ?? 'skills');
+        return skillsState();
+      },
+    },
+
+    [IPC.skillsSourceRemove]: {
+      validate: validateSkillsSourceRemove,
+      handle: async (request) => {
+        await engine.require().removeSkillSource(request.id);
+        return skillsState();
+      },
+    },
+
+    [IPC.skillsSourceSync]: {
+      validate: validateSkillsSourceSync,
+      handle: async (request) => {
+        await engine.require().syncSkillSources(request.id);
+        return skillsState();
+      },
     },
 
     /* ---------------------------------------------------------------- */
@@ -1237,6 +1362,31 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       },
     },
 
+    [IPC.serverMemoryBanksList]: {
+      validate: validateServerAccounts,
+      handle: async (request) => {
+        // `profiles` on the wire, `accounts` here, for the same reason the
+        // account list above renames them: "profile" already means a local one
+        // in every other channel.
+        const remote = await engine.require().remoteMemoryBanks(request.profileId);
+        return {
+          manageProfiles: remote.manageProfiles,
+          available: remote.available,
+          banks: remote.banks,
+          accounts: remote.profiles,
+        };
+      },
+    },
+
+    [IPC.serverMemoryBanksSetProfiles]: {
+      validate: validateServerMemoryBanksSetProfiles,
+      handle: async (request) => ({
+        bank: await engine
+          .require()
+          .setRemoteMemoryBankScope(request.profileId, request.slug, request.profiles),
+      }),
+    },
+
     [IPC.serverAccountsCreate]: {
       validate: validateServerAccountsCreate,
       handle: async (request) => ({
@@ -1293,6 +1443,55 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       validate: validateServerAccountSignIn,
       handle: async (request) => ({
         signIn: await engine.require().cancelRemoteSignIn(request.profileId, request.accountId),
+      }),
+    },
+
+    /* ---------------------------------------------------------------- */
+    /* Routines on a remote server                                      */
+    /* ---------------------------------------------------------------- */
+
+    /**
+     * The server-routine channels: the appointments that fire *on the server*,
+     * distinct from `routines:*` (this machine's own). Each is one
+     * authenticated request to the server the profile names, unwrapped by the
+     * engine to the routine or the list the pane renders.
+     */
+    [IPC.serverRoutinesList]: {
+      validate: validateServerRoutines,
+      handle: async (request) => ({
+        routines: await engine.require().remoteRoutines(request.profileId),
+      }),
+    },
+
+    [IPC.serverRoutinesCreate]: {
+      validate: validateServerRoutinesCreate,
+      handle: async (request) => ({
+        routine: await engine.require().createRemoteRoutine(request.profileId, request.draft),
+      }),
+    },
+
+    [IPC.serverRoutinesUpdate]: {
+      validate: validateServerRoutinesUpdate,
+      handle: async (request) => ({
+        routine: await engine
+          .require()
+          .updateRemoteRoutine(request.profileId, request.routineId, request.patch),
+      }),
+    },
+
+    [IPC.serverRoutinesDelete]: {
+      validate: validateServerRoutinesDelete,
+      handle: async (request) => ({
+        removed: (
+          await engine.require().deleteRemoteRoutine(request.profileId, request.routineId)
+        ).removed,
+      }),
+    },
+
+    [IPC.serverRoutinesRunNow]: {
+      validate: validateServerRoutinesRunNow,
+      handle: async (request) => ({
+        routine: await engine.require().runRemoteRoutine(request.profileId, request.routineId),
       }),
     },
 

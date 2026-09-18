@@ -44,7 +44,10 @@ import {
   isSameModel,
   NO_CAPABILITIES,
   recommendProfile,
+  isSuggestedTaskTarget,
+  renderDescribeBankPrompt,
   resolvePlanWeight,
+  suggestedTaskBranch,
 } from '@rx-artemis/protocol';
 import type {
   ArtemisBridge,
@@ -55,6 +58,7 @@ import type {
   Attachment,
   Capabilities,
   IpcError,
+  MemoryBankInfo,
   PermissionDecision,
   PermissionMode,
   PermissionRequest,
@@ -78,11 +82,16 @@ import type {
   RunInput,
   RunStatus,
   ServerAccountsListResponse,
+  ServerMemoryBank,
+  ServerMemoryBankScope,
+  ServerMemoryBanksListResponse,
   ServerProfileCreatedBody,
   ServerSignInStatus,
   SessionDelegatedWork,
   SessionId,
   SessionSummary,
+  SuggestedTask,
+  SuggestedTaskTarget,
   TerminalId,
   TokenUsage,
   HandoffTrigger,
@@ -103,6 +112,7 @@ import {
   handoffCandidates,
   handoffTargetBlock,
 } from './handoffTargets';
+import { servedAccountLabel, servedResumeModel } from './servedAccounts';
 import { call, resolveBridge, type BridgeMode } from '../lib/bridge';
 import {
   describeWorkspace,
@@ -116,7 +126,14 @@ import { detectArtifact, type Artifact } from '../lib/artifact';
 import { detectFileEdit } from '@rx-artemis/transcript';
 import { isAbsolutePath, lastSegment } from '../lib/paths';
 import { newId } from '../lib/id';
-import { entriesFiling, sessionKey } from '../lib/sessionGroups';
+import {
+  entriesFiling,
+  moveGroup,
+  sessionKey,
+  type CustomGroup,
+  type GroupEdge,
+  type GroupMembership,
+} from '../lib/sessionGroups';
 import {
   disposeTerminalSession,
   ensureTerminalSession,
@@ -197,9 +214,9 @@ export type Screen = 'chat' | 'profiles';
  *
  * An id is an address, not a label, so ids outlive the panes they named.
  * `browser` and `cerebro` no longer have panes of their own — the browser
- * switches live under Permissions & access, the banks under Instructions — but
- * every deep link and every preferences file that says `cerebro` is still a
- * correct request, so the ids stay in the union and
+ * switches live under Permissions & access, the banks under their own
+ * `memory-banks` pane — but every deep link and every preferences file that
+ * says `cerebro` is still a correct request, so the ids stay in the union and
  * {@link resolveSettingsSection} says where each one lands today. Renaming a
  * *pane* is cheap; renaming an *address* breaks callers that were never wrong.
  */
@@ -211,7 +228,9 @@ export type SettingsSection =
   | 'browser'
   | 'permissions'
   | 'agents'
+  | 'skills'
   | 'cerebro'
+  | 'memory-banks'
   | 'secrets'
   | 'server'
   | 'remote'
@@ -228,8 +247,11 @@ export type SettingsSection =
  *
  *  - `browser` — its two switches were always permission questions, and they
  *    moved in with the pane that answers the rest of them.
- *  - `cerebro` — memory banks are one instance of "what the agent is told
- *    before the conversation starts", and they live with the rule now.
+ *  - `cerebro` — the banks were folded into Instructions for a while and have
+ *    their own pane again, now that a bank carries a name, a format and a set
+ *    of profiles rather than being one paragraph under the prompt library.
+ *    The CLI's name is still what people type and deep-link, so it keeps
+ *    resolving — to `memory-banks` now, which is where the room moved.
  *
  * Everything else is its own home, including `agents` (the Instructions pane
  * kept the id it was born with) and `advanced` (the This-machine pane, same).
@@ -242,7 +264,9 @@ const SETTINGS_SECTION_HOMES: Readonly<Record<SettingsSection, SettingsSection>>
   browser: 'permissions',
   permissions: 'permissions',
   agents: 'agents',
-  cerebro: 'agents',
+  skills: 'skills',
+  cerebro: 'memory-banks',
+  'memory-banks': 'memory-banks',
   secrets: 'secrets',
   server: 'server',
   remote: 'remote',
@@ -784,6 +808,34 @@ export interface AppState {
    */
   readonly modelBySession: Readonly<Record<string, ModelChoice>>;
   /**
+   * The conversation each account was last working in.
+   *
+   * What a launch reopens into. Nothing used to record it, so every restart
+   * landed on a blank column and left the user to find their own conversation
+   * in a sidebar ordered by the transcript file's mtime — a list that says
+   * which file was written last, which is not the same question and answers it
+   * wrongly the moment a background agent, a scheduled firing or another
+   * profile has touched a file since. The reported failure is exactly that: an
+   * unclean restart, a blank column, and the wrong conversation picked out of
+   * the list a moment later.
+   *
+   * Per profile rather than one id for the window, because a session id only
+   * resolves under the config directory it was written in — see
+   * {@link resumeSession}. The account is the key the restore is looked up
+   * under, so an app that comes back on a different profile comes back on
+   * *that* profile's last conversation rather than on one it cannot read.
+   *
+   * Written the moment a column is pointed at a conversation and the moment a
+   * conversation first reports an id, never on the way out — see
+   * {@link rememberOpenSession}. A pointer that were flushed at quit would be
+   * absent from precisely the restarts it exists for.
+   *
+   * Bounded by the number of profiles, so unlike {@link modelBySession} it
+   * needs no cap. A stale entry costs nothing: the restore resolves it against
+   * the live listing and simply does not fire when the conversation is gone.
+   */
+  readonly lastSessionByProfile: Readonly<Record<string, SessionId>>;
+  /**
    * The dock's arrangement as it was when the app last closed.
    *
    * Read once at boot by `restoreDockLayout` and otherwise inert — it is the
@@ -1125,6 +1177,52 @@ export interface AppState {
    */
   readonly pinnedCollapsed: boolean;
   /**
+   * The groups the user has made in the sidebar, in the order they are drawn.
+   *
+   * The third way a session can leave its project heading, after the pin and
+   * the archive, and the only one whose sections a person names themselves. See
+   * {@link CustomGroup} for the shape and `sessionGroups.ts` for why it exists
+   * at all — the short version is an Artemis Server, whose entire history
+   * shares one working directory and therefore one heading.
+   *
+   * **Desktop-local, like the pins.** Nothing here touches the provider's
+   * store, so grouping works against a provider whose CLI cannot even list its
+   * own history, and a group is a fact about this machine's sidebar rather than
+   * about the transcripts. It rides in `prefs.json` beside
+   * {@link pinnedSessions} for exactly that reason.
+   *
+   * The order is the user's own. A new group starts at the bottom of the stack
+   * and is moved from there by dragging its heading, or a step at a time from
+   * the heading's menu — see {@link reorderSessionGroup}. It is never *derived*,
+   * from names least of all: the one thing worse than a shelf in the wrong
+   * place is a shelf that moves when you rename it. (The first version had no
+   * reordering at all, on the argument that a handful of shelves does not need
+   * it. A handful is exactly when the order gets noticed: the group made last
+   * week for the work that matters most sat under three older ones for good.)
+   * `collapsed`
+   * lives on the record instead of in a parallel set like
+   * {@link collapsedProjects}, because a group has an id to hang it on and
+   * deleting the group then takes its fold state with it rather than leaving an
+   * orphan entry behind.
+   */
+  readonly sessionGroups: readonly CustomGroup[];
+  /**
+   * Which group each grouped session is in: `sessionKey` → {@link CustomGroup.id}.
+   *
+   * Keys are `profileId:id` strings, the same ones {@link pinnedSessions} and
+   * {@link archivedSessions} store, so a session held on an Artemis Server is
+   * keyed by the desktop's server profile — which is stable — and all the
+   * alias handling those two already needed applies unchanged. See
+   * `groupIdOf`.
+   *
+   * A flat record rather than an array per group: a session is in at most one
+   * group, the question asked on every render is "which group is this row in",
+   * and one record answers it in a lookup instead of a scan. An entry naming a
+   * group that no longer exists reads as ungrouped; {@link deleteSessionGroup}
+   * sweeps them, so a survivor can only come from a hand-edited file.
+   */
+  readonly sessionGroupOf: GroupMembership;
+  /**
    * Directories worked in, capped at {@link RECENT_FOLDERS_LIMIT}.
    *
    * The folder control above the composer is a list of these rather than a
@@ -1168,6 +1266,17 @@ export interface AppState {
   readonly runLocation: 'local' | ProfileId;
   /** The local account to come back to when leaving a server. */
   readonly lastLocalProfileId: ProfileId | null;
+  /**
+   * Which target a suggested task's chip offers as its primary button.
+   *
+   * A window setting rather than a pane one, and remembered across launches,
+   * because it is a habit rather than a decision about one conversation: a
+   * person who works in worktrees works in worktrees, and making them open the
+   * menu every time is the whole cost the primary button exists to remove. The
+   * menu still lists all four, with this one ticked, so the habit is visible
+   * and one click from being changed.
+   */
+  readonly suggestedTaskTarget: SuggestedTaskTarget;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1456,6 +1565,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   'browser',
   'permissions',
   'agents',
+  'skills',
   'cerebro',
   'secrets',
   'server',
@@ -1501,6 +1611,8 @@ interface Prefs {
   readonly runLocation?: string;
   /** The local account to come back to when leaving a server. */
   readonly lastLocalProfileId?: string;
+  /** The suggested-task target the chip's primary button offers. */
+  readonly suggestedTaskTarget?: string;
   /**
    * The last directory worked in, restored as the starting point for the first
    * session of the next launch.
@@ -1535,6 +1647,10 @@ interface Prefs {
   archivedExpanded?: boolean;
   pinnedSessions?: readonly string[];
   pinnedCollapsed?: boolean;
+  /** See {@link AppState.sessionGroups}. Local to this desktop, like the pins. */
+  sessionGroups?: readonly CustomGroup[];
+  /** See {@link AppState.sessionGroupOf}. */
+  sessionGroupOf?: GroupMembership;
   settingsSection?: SettingsSection;
   quickModelIdsByProfile?: Readonly<Record<string, readonly string[]>>;
   /**
@@ -1548,6 +1664,15 @@ interface Prefs {
    * the next launch, which has no id to be looked up under.
    */
   modelBySession?: Record<string, ModelChoice>;
+  /**
+   * The conversation each account was last working in. See
+   * {@link AppState.lastSessionByProfile}.
+   *
+   * Persisted for the reason the field exists: the whole value of knowing which
+   * conversation a window was in is being able to open it again after the
+   * window is gone.
+   */
+  lastSessionByProfile?: Record<string, string>;
   dockLayout?: unknown;
   /**
    * Each conversation's dock arrangement, keyed by session id. The
@@ -1613,6 +1738,38 @@ function boolOrUndefined(value: unknown): boolean | undefined {
 function stringList(value: unknown): readonly string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value.filter((entry): entry is string => typeof entry === 'string');
+}
+
+/**
+ * The user's sidebar groups, kept only where each record is whole.
+ *
+ * The same rule as {@link stringList} over a record rather than a string, and
+ * it earns the extra lines: these are *rendered*, not matched. A group whose
+ * `name` survived out of the blob as a number would reach the heading and be
+ * drawn as one; a group with no `id` would collect memberships that can never
+ * be resolved and could never be deleted, because every action on a group names
+ * it by id.
+ *
+ * Duplicate ids are dropped rather than repaired — a second record under a
+ * live id is a heading that cannot be told from the first by any control in the
+ * UI, and the first one is the one the memberships already point at.
+ *
+ * `collapsed` is copied only when it is a real boolean and only when it is
+ * `true`, so the stored shape stays the minimal one: absent means open.
+ */
+function groupList(value: unknown): readonly CustomGroup[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Set<string>();
+  const groups: CustomGroup[] = [];
+  for (const entry of value as readonly unknown[]) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const { id, name, collapsed } = entry as Record<string, unknown>;
+    if (typeof id !== 'string' || id === '' || seen.has(id)) continue;
+    if (typeof name !== 'string') continue;
+    seen.add(id);
+    groups.push(collapsed === true ? { id, name, collapsed: true } : { id, name });
+  }
+  return groups;
 }
 
 /**
@@ -1859,6 +2016,23 @@ function numberMap(value: unknown): Record<string, number> | undefined {
 }
 
 /**
+ * Keep only the entries whose value is a non-empty string.
+ *
+ * The same rule as {@link stringList} one map deeper. `lastSessionByProfile`
+ * reaches a session lookup at boot, and an empty string there would match
+ * nothing while still counting as a pointer — a launch that spends a listing
+ * resolving a conversation that cannot exist.
+ */
+function stringMap(value: unknown): Record<string, string> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry === 'string' && entry !== '') out[key] = entry;
+  }
+  return out;
+}
+
+/**
  * The stored preferences text, from the file, or from `localStorage` once.
  *
  * The file is where these live now — see `main/prefs.ts` for why they left
@@ -1977,14 +2151,24 @@ function loadPrefs(): Prefs {
     // And again for the pinned set, which is matched against the same keys.
     pinnedSessions: stringList(raw['pinnedSessions']),
     pinnedCollapsed: boolOrUndefined(raw['pinnedCollapsed']),
+    // The groups are drawn rather than matched, so a bad record here would
+    // reach the heading; the membership beside them is matched against session
+    // keys like the pins are, and `stringMap` drops the entries that could
+    // never match. See `groupList` for what "whole" means for a group.
+    sessionGroups: groupList(raw['sessionGroups']),
+    sessionGroupOf: stringMap(raw['sessionGroupOf']),
     // Same treatment again, and here the entry is rendered rather than matched:
     // a non-string surviving into the menu would reach `lastSegment` and throw
     // on a control the user opens to get *out* of a bad directory.
     recentFolders: stringList(raw['recentFolders']),
     modelBySession: modelChoiceMap(raw['modelBySession']),
+    lastSessionByProfile: stringMap(raw['lastSessionByProfile']),
     ...(typeof raw['runLocation'] === 'string' ? { runLocation: raw['runLocation'] } : {}),
     ...(typeof raw['lastLocalProfileId'] === 'string'
       ? { lastLocalProfileId: raw['lastLocalProfileId'] }
+      : {}),
+    ...(typeof raw['suggestedTaskTarget'] === 'string'
+      ? { suggestedTaskTarget: raw['suggestedTaskTarget'] }
       : {}),
   };
 }
@@ -2102,9 +2286,12 @@ function savePrefs(): void {
     archivedExpanded: s.archivedExpanded,
     pinnedSessions: s.pinnedSessions,
     pinnedCollapsed: s.pinnedCollapsed,
+    sessionGroups: s.sessionGroups,
+    sessionGroupOf: s.sessionGroupOf,
     settingsSection: s.settingsSection,
     quickModelIdsByProfile: s.quickModelIdsByProfile,
     modelBySession: s.modelBySession,
+    lastSessionByProfile: s.lastSessionByProfile,
     dockLayout: captureDockLayout(s),
     dockLayouts: captureDockArrangements(s),
     conversationWidth: s.conversationWidth,
@@ -2125,6 +2312,7 @@ function savePrefs(): void {
     sharedClaudeConfigAcknowledged: s.sharedClaudeConfigAcknowledged,
     contextWindows: s.contextWindows,
     runLocation: s.runLocation,
+    suggestedTaskTarget: s.suggestedTaskTarget,
     ...(s.lastLocalProfileId === null ? {} : { lastLocalProfileId: s.lastLocalProfileId }),
   };
   const json = JSON.stringify(prefs);
@@ -2232,8 +2420,10 @@ function seedSession(overrides: Partial<SessionState> = {}): SessionState {
     permissionQueue: [],
     tasks: [],
     dismissedTasks: [],
+    dismissedSuggestedTasks: [],
     tasksRequested: false,
     filesRequested: false,
+    documentsRequested: false,
     promptHistory: [],
     handoff: 'none',
     handoffOffer: null,
@@ -2326,6 +2516,7 @@ export const useApp = create<AppState>(() => ({
 
   quickModelIdsByProfile: prefs.quickModelIdsByProfile ?? {},
   modelBySession: prefs.modelBySession ?? {},
+  lastSessionByProfile: prefs.lastSessionByProfile ?? {},
   conversationWidth: prefs.conversationWidth ?? DEFAULT_CONVERSATION_WIDTH,
   runSummary: prefs.runSummary ?? DEFAULT_RUN_SUMMARY,
   fontSize: initialFontSize,
@@ -2386,6 +2577,8 @@ export const useApp = create<AppState>(() => ({
   archivedExpanded: prefs.archivedExpanded ?? false,
   pinnedSessions: prefs.pinnedSessions ?? [],
   pinnedCollapsed: prefs.pinnedCollapsed ?? false,
+  sessionGroups: prefs.sessionGroups ?? [],
+  sessionGroupOf: prefs.sessionGroupOf ?? {},
   recentFolders: initialRecentFolders(prefs),
   // 'local' when unset or when the stored value is garbage; whether a stored
   // server id still names a real, enabled profile is judged where it is used
@@ -2393,6 +2586,12 @@ export const useApp = create<AppState>(() => ({
   // honest fallback there is this machine.
   runLocation: (prefs.runLocation ?? 'local') as 'local' | ProfileId,
   lastLocalProfileId: (prefs.lastLocalProfileId as ProfileId | undefined) ?? null,
+  // Guarded rather than cast, unlike its neighbour above: this one names a
+  // branch of a switch, and a stored string from a build that spelled the
+  // targets differently would reach that switch and match nothing at all.
+  suggestedTaskTarget: isSuggestedTaskTarget(prefs.suggestedTaskTarget)
+    ? prefs.suggestedTaskTarget
+    : 'here',
 }));
 
 /* -------------------------------------------------------------------------- */
@@ -3213,6 +3412,35 @@ export function closeFiles(paneId: PaneId): void {
   setPaneState(pane, { filesRequested: false });
 }
 
+/**
+ * Open the list of documents this conversation has made, bring it forward, or
+ * shut it.
+ *
+ * {@link toggleFiles}'s twin in every respect, including the absence of a
+ * guard: a conversation that has made nothing still has a list — an empty one
+ * that says so — and refusing to open it would leave the menu row looking
+ * broken on exactly the conversation where the reader wonders whether anything
+ * was made. The way in is the header's opener and the dock's own strip; the
+ * tiles in the thread are each document's own way in, and this is the index
+ * of them.
+ */
+export function toggleDocuments(pane: Pane = focusedPane()): void {
+  const tab: DockTab = { kind: 'documents', paneId: pane.id };
+  if (sameTab(useApp.getState().activeDockTab, tab)) {
+    closeDocuments(pane.id);
+    return;
+  }
+  if (!paneState(pane).documentsRequested) setPaneState(pane, { documentsRequested: true });
+  focusDockTab(tab);
+}
+
+export function closeDocuments(paneId: PaneId): void {
+  const pane = allLivePanes().find((one) => one.id === paneId);
+  if (pane === undefined) return;
+  // Which tab comes forward is `reconcileDock`'s, on this write.
+  setPaneState(pane, { documentsRequested: false });
+}
+
 export function closeTasks(paneId: PaneId): void {
   const pane = allLivePanes().find((one) => one.id === paneId);
   if (pane === undefined) return;
@@ -3431,6 +3659,7 @@ export function openAgentTab(paneId: PaneId, taskId: string): void {
     permissionQueue: [],
     tasks: [],
     dismissedTasks: [],
+    dismissedSuggestedTasks: [],
     tasksRequested: false,
     rewindToMessageId: null,
     draft: '',
@@ -3692,6 +3921,7 @@ function describeShown(): readonly ShownConversation[] {
       // open on its own.
       ...(state.tasksRequested ? { tasksRequested: true } : {}),
       ...(state.filesRequested ? { filesRequested: true } : {}),
+      ...(state.documentsRequested ? { documentsRequested: true } : {}),
     };
   });
 
@@ -3710,7 +3940,8 @@ function describeShown(): readonly ShownConversation[] {
         // strip stops tracking it — which is what closing the folder browser
         // did: the flag went false, this said "nothing moved", and the tab sat
         // there with nothing behind it.
-        one.filesRequested === before.filesRequested
+        one.filesRequested === before.filesRequested &&
+        one.documentsRequested === before.documentsRequested
       );
     });
 
@@ -3772,10 +4003,11 @@ function reconcileDock(): void {
     // empty, the dock shut, and that press looking like it did nothing. The
     // condition is `visibleTabs`', which the two have to agree on exactly —
     // and the folder browser is the second tab a column can claim without
-    // anything else being in the dock, so it is in here for the same reason.
+    // anything else being in the dock, so it is in here for the same reason —
+    // as is the documents list, the third.
     !allPanes().some((pane) => {
       const one = paneState(pane);
-      if (one.filesRequested === true) return true;
+      if (one.filesRequested === true || one.documentsRequested === true) return true;
       return showsTasks(one) && (state.dockAutoOpen || one.tasksRequested);
     })
   ) {
@@ -5754,6 +5986,373 @@ export function dismissSuggestion(pane: Pane): void {
   setPaneState(pane, { suggestion: null });
 }
 
+/* -------------------------------------------------------------------------- */
+/* Suggested tasks                                                            */
+/* -------------------------------------------------------------------------- */
+
+/** Whether a suggested task can be started here, and the sentence when it cannot. */
+export type SuggestedTaskTargetStatus =
+  | { readonly available: true }
+  | { readonly available: false; readonly reason: string };
+
+/**
+ * Everything {@link suggestedTaskTargetStatus} needs, and nothing else.
+ *
+ * Three values rather than the two stores, so the chip can subscribe to exactly
+ * what could change its menu and memoise on it. Handed the whole `SessionState`
+ * the function would be correct and the component would recompute four statuses
+ * on every keystroke in the composer beside it.
+ */
+export interface SuggestedTaskContext {
+  readonly cwd: string;
+  readonly workspace: WorkspaceNames | null;
+  /** Is there an enabled Artemis Server profile to send work to? */
+  readonly hasServer: boolean;
+}
+
+/** Read {@link SuggestedTaskContext} off the stores. */
+export function suggestedTaskContext(
+  state: SessionState,
+  app: AppState = useApp.getState(),
+): SuggestedTaskContext {
+  return { cwd: state.cwd, workspace: state.workspace, hasServer: serverProfile(app) !== undefined };
+}
+
+/**
+ * Where a suggested task can be started from this column, and why not.
+ *
+ * One function rather than four checks scattered through the menu, because the
+ * menu's whole obligation is to be *the same* answer as the action: an option
+ * that opens and then fails is worse than one that was disabled with a reason,
+ * and the only way to guarantee the two agree is for both to read this.
+ *
+ * Never hides a target. All four stay in the menu — see `capability-button.tsx`
+ * on the house rule — because "Start with worktree, disabled: this directory is
+ * not in a git repository" tells the user something about their situation, and
+ * a menu that is silently one item shorter tells them nothing at all.
+ */
+export function suggestedTaskTargetStatus(
+  context: SuggestedTaskContext,
+  target: SuggestedTaskTarget,
+): SuggestedTaskTargetStatus {
+  switch (target) {
+    case 'here':
+      // Deliberately available mid-run: `submitPrompt` steers a live turn where
+      // the provider allows it and refuses with its own sentence where it does
+      // not, and both are better answers to "do this next" than a greyed row.
+      return { available: true };
+
+    case 'session':
+      // Always. A full grid is not a refusal — the column falls back to
+      // starting the conversation in place, which keeps the old one running in
+      // the background. See `openTaskColumn`.
+      return { available: true };
+
+    case 'worktree': {
+      if (context.cwd.trim().length === 0) {
+        return { available: false, reason: 'This conversation has no working directory yet.' };
+      }
+      // `workspace` is null for the moment after a column moves, while the
+      // directory is being described. Refusing then would make the menu's
+      // answer depend on how quickly the user opened it.
+      if (context.workspace === null) {
+        return { available: false, reason: 'Still reading what this directory is.' };
+      }
+      if (context.workspace.repoRoot === undefined) {
+        return {
+          available: false,
+          reason: `${context.cwd} is not in a git repository, so there is nothing to split a worktree off.`,
+        };
+      }
+      return { available: true };
+    }
+
+    case 'server':
+      return context.hasServer
+        ? { available: true }
+        : {
+            available: false,
+            reason:
+              'No Artemis Server profile is set up, so there is no other machine to run this on.',
+          };
+  }
+}
+
+/** The server this column would send a task to, or `undefined`. */
+function serverProfile(app: AppState = useApp.getState()): ProfileMetadata | undefined {
+  return app.profiles.find(
+    (profile) => profile.providerId === 'artemis' && isProfileEnabled(profile),
+  );
+}
+
+/**
+ * Put a suggested task away.
+ *
+ * By the id of the call that offered it, and only in this column — see
+ * `SessionState.dismissedSuggestedTasks` for why this is not persisted, and why
+ * that is the right way round.
+ */
+export function dismissSuggestedTask(callId: string, pane: Pane = focusedPane()): void {
+  const { dismissedSuggestedTasks } = paneState(pane);
+  if (dismissedSuggestedTasks.includes(callId)) return;
+  setPaneState(pane, { dismissedSuggestedTasks: [...dismissedSuggestedTasks, callId] });
+}
+
+/** Whether this column has put that suggestion away. */
+export function suggestedTaskDismissed(state: SessionState, callId: string): boolean {
+  return state.dismissedSuggestedTasks.includes(callId);
+}
+
+/**
+ * Remember which target the chip's primary button should offer.
+ *
+ * Written on every start rather than by a separate "make this the default"
+ * control, so the habit follows what the user does instead of asking them to
+ * declare it. See {@link AppState.suggestedTaskTarget}.
+ */
+export function setSuggestedTaskTarget(target: SuggestedTaskTarget): void {
+  if (useApp.getState().suggestedTaskTarget === target) return;
+  useApp.setState({ suggestedTaskTarget: target });
+  savePrefs();
+}
+
+/**
+ * Start a suggested task, wherever the user chose to put it.
+ *
+ * Every target ends in the same place — `submitPrompt` carrying the agent's own
+ * prompt — and differs only in *which column* and *which directory* that prompt
+ * lands in. One function with a switch rather than four exported actions,
+ * because the four share the part that is easy to get wrong: the send must go
+ * to the pane that came back and never to the one the chip was clicked in, and
+ * a target that could not prepare its column must not send at all.
+ *
+ * The chip is put away on success only. A worktree that could not be created
+ * leaves the offer standing, because the user is about to try it somewhere
+ * else, and hunting back through a transcript for a chip that vanished on a
+ * failure is the wrong way to learn what happened.
+ *
+ * ## The server target hands over rather than sending
+ *
+ * Three of the four end in a send. `server` deliberately does not: it opens the
+ * column, points it at the server, puts the prompt in the composer and gives
+ * the caret back. The user picks the account, the model and the thinking level
+ * and presses send themselves.
+ *
+ * That is not politeness, it is the only correct behaviour available here, and
+ * two concrete faults say so. **The catalogue is not there yet.** A freshly
+ * split column has no models until `refreshModels` answers, which for a server
+ * is a round trip; sending into that gap posts a run with no model and the
+ * server replies `model_not_found`. **And the account would be arbitrary.** The
+ * new column's model choice is null, so `activeModel` falls back to
+ * `models[0]` — whichever route the server happened to list first. A local
+ * target has one obvious answer to both questions and a server has neither:
+ * which served account runs the work, on which model, at what thinking level,
+ * is exactly the choice a person moves work to a server in order to make.
+ *
+ * So `serverProfile()` picks only the column's *starting* profile. Nothing is
+ * live in it, so every one of those choices is still the user's to change.
+ */
+export async function startSuggestedTask(
+  callId: string,
+  task: SuggestedTask,
+  target: SuggestedTaskTarget,
+  pane: Pane = focusedPane(),
+): Promise<void> {
+  const column = await prepareSuggestedTaskColumn(target, task, pane);
+  if (column === null) return;
+
+  setSuggestedTaskTarget(target);
+  dismissSuggestedTask(callId, pane);
+
+  if (target === 'server') {
+    // The same field a restored or parked draft lands in — see `swapDraft` —
+    // so the prompt is editable, recallable and survives the column being
+    // looked away from, exactly as anything else typed here would.
+    setPaneState(column, { draft: task.prompt });
+    focusComposer(column.id);
+    return;
+  }
+
+  await submitPrompt(task.prompt, undefined, column);
+}
+
+/**
+ * Get a column ready for a suggested task, or `null` if it could not be.
+ *
+ * The half of {@link startSuggestedTask} that can fail, split out so that the
+ * send itself has no branches in it.
+ */
+async function prepareSuggestedTaskColumn(
+  target: SuggestedTaskTarget,
+  task: SuggestedTask,
+  pane: Pane,
+): Promise<Pane | null> {
+  switch (target) {
+    case 'here':
+      return pane;
+
+    case 'session':
+      return openTaskColumn(pane);
+
+    case 'worktree': {
+      // Before the column, so a failure costs the user nothing: an empty pane
+      // opened for work that then could not start is a pane they have to close.
+      const path = await createTaskWorktree(task, pane);
+      if (path === null) return null;
+      const column = openTaskColumn(pane);
+      // On the column that will do the sending, which is what makes the run
+      // start in the worktree rather than in the checkout it was split from —
+      // the entire point of the choice.
+      setCwd(path, column);
+      return column;
+    }
+
+    case 'server': {
+      const server = serverProfile();
+      if (server === undefined) {
+        pushBanner(
+          'error',
+          'No server to send this to',
+          'Add an Artemis Server profile, and this option will start the task on it.',
+        );
+        return null;
+      }
+      const column = openTaskColumn(pane);
+      // Per column, not `setRunLocation`: choosing where *one task* runs says
+      // nothing about where new conversations go, and quietly moving that
+      // preference is how somebody ends up billing a week of work to a machine
+      // they picked once.
+      //
+      // A starting point, not a decision. The caller hands the prompt to this
+      // column's composer instead of sending it, so the profile — and the
+      // model and thinking level under it — are all still open. See
+      // {@link startSuggestedTask}.
+      setProfile(server.id, column);
+      return column;
+    }
+  }
+}
+
+/**
+ * A column for a task that is not this conversation.
+ *
+ * Beside it where the grid has room, because the conversation that offered the
+ * suggestion is the context for reading it, and taking that off screen is a
+ * strange reward for accepting. A full grid falls back to {@link newSession} in
+ * place, which leaves the old conversation running in the background and
+ * reachable from the sidebar — a smaller loss than refusing.
+ */
+function openTaskColumn(pane: Pane): Pane {
+  return splitPane('right', pane) ?? newSession(pane);
+}
+
+/**
+ * Split a worktree for a task, and say where it landed.
+ *
+ * `null` on any failure, with the reason already on screen. The branch is named
+ * from the task's *title* rather than its prompt, so `task/add-parser-tests` is
+ * what shows up in `git branch` a week later.
+ */
+async function createTaskWorktree(task: SuggestedTask, pane: Pane): Promise<string | null> {
+  const state = paneState(pane);
+  const { bridge } = resolveBridge();
+  if (!bridge) return null;
+
+  const status = suggestedTaskTargetStatus(suggestedTaskContext(state), 'worktree');
+  if (!status.available) {
+    pushBanner('warn', 'Cannot make a worktree here', status.reason);
+    return null;
+  }
+
+  const result = await bridge.workspace.createWorktree({
+    path: state.cwd,
+    branch: suggestedTaskBranch(task.title),
+  });
+  if (!result.ok) {
+    reportFailure('Could not create a worktree', result.error);
+    return null;
+  }
+  return result.value.path;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Describing a memory bank                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Start the conversation that writes a bank's `BANK.md`.
+ *
+ * A bank with no manifest still works — the legacy layouts are read as they
+ * are — but it cannot say what it holds or how a new entry is filed, and
+ * Artemis cannot say it on the bank's behalf. No form in the settings pane
+ * could: nearly every answer is already in the tree, and the two or three that
+ * are not are questions for the person. So the pane does not ask them, and
+ * hands the job to an agent standing in the bank's own checkout instead. The
+ * words it sends are `renderDescribeBankPrompt`'s, kept in the protocol so a
+ * server-side starter would compose the same ones.
+ *
+ * Modelled on {@link startSuggestedTask}'s `session` target, down to sharing
+ * its column: beside the focused pane where the grid has room, falling back to
+ * a new conversation in place where it does not. The settings dialog closes on
+ * the way out, because what it was asked for is now happening in a column
+ * behind it, and a dialog left open over the answer is a dialog the user has
+ * to dismiss before they can read it.
+ *
+ * ## It sends, unless the column could not have sent
+ *
+ * The checkout is local and the prompt is complete, so in the ordinary case
+ * there is nothing left for the user to decide and sending is the whole of
+ * what a one-click action is for. Two columns cannot be sent into, and both
+ * fall back the way the `server` target does — the prompt into the composer,
+ * the caret in it — rather than posting a run that will fail:
+ *
+ *  - **A served column.** Which account runs the work, on which model, at what
+ *    thinking level is exactly the choice a person moves work to a server in
+ *    order to make, and a freshly split column has answered none of them.
+ *    {@link startSuggestedTask} has the long version, including the
+ *    `model_not_found` a send into that gap actually produces.
+ *  - **A column with no model, or no profile to get one from.** `refreshModels`
+ *    has not landed, or the account has no catalogue at all; either way the run
+ *    would go out with no model behind it.
+ *
+ * The prompt is on screen and editable in both cases, so the fallback costs one
+ * keypress and never costs the words.
+ */
+export async function describeMemoryBank(
+  bank: Pick<MemoryBankInfo, 'slug' | 'path' | 'format' | 'name'>,
+  pane: Pane = focusedPane(),
+): Promise<void> {
+  const column = openTaskColumn(pane);
+  // On the column that will do the sending, for the reason the worktree target
+  // does the same: every instruction in the prompt is about reading the tree
+  // around the run and landing a file in it, so the run has to be *in* the bank.
+  setCwd(bank.path, column);
+  closeSettings();
+
+  const prompt = renderDescribeBankPrompt({
+    slug: bank.slug,
+    path: bank.path,
+    format: bank.format,
+    name: bank.name,
+  });
+
+  const state = paneState(column);
+  const canSend =
+    state.activeProviderId !== 'artemis' &&
+    state.activeProfileId !== null &&
+    activeModel(state) !== undefined;
+  if (!canSend) {
+    // The same field a restored or parked draft lands in — see `swapDraft` — so
+    // the prompt is editable, recallable and survives the column being looked
+    // away from, exactly as anything else typed here would be.
+    setPaneState(column, { draft: prompt });
+    focusComposer(column.id);
+    return;
+  }
+
+  await submitPrompt(prompt, undefined, column);
+}
+
 /**
  * Subscribe to terminal output. Call alongside {@link installEventBridge}.
  *
@@ -6606,6 +7205,12 @@ export async function bootstrap(): Promise<void> {
   await adoptTerminals(focusedPane());
   await adoptBrowsers(focusedPane());
   await refreshSessions();
+  // The conversation this account was last working in, back in the column it
+  // was left in. After the listing, which is what resolves the stored id into
+  // something openable, and before the reads below, so those are issued for the
+  // account and directory the restored conversation runs under rather than for
+  // the seed it displaced.
+  restoreLastSession(focusedPane());
   useApp.setState({ booted: true });
 
   // Deliberately after `booted`, and deliberately not awaited. Fetching the
@@ -7294,12 +7899,44 @@ async function attachRun(pane: Pane, handle: RunHandle): Promise<void> {
     (previous.resumeSessionId === handle.sessionId ||
       previous.run?.sessionId === handle.sessionId);
 
+  /*
+   * Keep the conversation on screen when nothing could put it back.
+   *
+   * The rebuild below is exact only with a seam: history read up to
+   * `historyOffset`, the run's own events under it. Without one there is no
+   * history read at all, so the reset left the pane holding the run alone —
+   * every earlier turn gone. Reported 2026-09-18 on a served conversation:
+   * "read now" on a queued message interrupts the turn, the provider opens the
+   * queued message as a turn of its own, the server adopts that turn with no
+   * seam, and the live-work poll re-attached this pane to it over the very rows
+   * it had been showing a moment before. A *local* continuation never lost
+   * them, because `claimContinuation` repoints an idle pane without touching a
+   * row; this is the same rule for the served one.
+   *
+   * Only for a pane that was live on this conversation and whose run has ended.
+   * Its rows were drawn from the stream, and the run being attached is a later
+   * turn of the same conversation, so nothing in the replay overlaps them. A
+   * pane with no run on the session holds a stored snapshot, or nothing — and a
+   * snapshot taken while the turn was already running has part of the turn in
+   * it, so keeping it under the run's replay would draw that turn twice. The
+   * reset stays the honest choice there, and the seam the honest cure.
+   */
+  const keepRows =
+    handle.historyOffset === undefined &&
+    handle.sessionId !== undefined &&
+    previous.run !== null &&
+    previous.run.status === 'ended' &&
+    previous.run.sessionId === handle.sessionId &&
+    !pane.transcript.isEmpty;
+
   replayBuffers.set(handle.runId, []);
-  // The transcript is about to be rebuilt from the first retained event, so
-  // the gate's memory of this run belongs to a drawing that no longer exists.
-  // Left in place it would silently drop the whole replay.
-  appliedSeqs.delete(handle.runId);
-  pane.transcript.reset();
+  if (!keepRows) {
+    // The transcript is about to be rebuilt from the first retained event, so
+    // the gate's memory of this run belongs to a drawing that no longer exists.
+    // Left in place it would silently drop the whole replay.
+    appliedSeqs.delete(handle.runId);
+    pane.transcript.reset();
+  }
   setPaneState(pane, {
     run: fromHandle(handle),
     activeProviderId: handle.providerId,
@@ -7307,10 +7944,13 @@ async function attachRun(pane: Pane, handle: RunHandle): Promise<void> {
     cwd: handle.cwd,
     // The reset above took every row; the two reads below put them back. Until
     // they do — or give up — this pane is a conversation being read in, not a
-    // new one. See `blankTranscript`, and the clear in the `finally`.
-    historyLoading: true,
+    // new one. See `blankTranscript`, and the clear in the `finally`. A pane
+    // that kept its rows has nothing to wait for.
+    historyLoading: !keepRows,
     permissionQueue: [],
-    ...(sameSession ? {} : { tasks: [], dismissedTasks: [], tasksRequested: false }),
+    ...(sameSession
+      ? {}
+      : { tasks: [], dismissedTasks: [], dismissedSuggestedTasks: [], tasksRequested: false }),
     // The session the next prompt continues is this run's own. Set now rather
     // than waiting for `run.end`, because until it is set the sidebar cannot
     // mark the row the user needs in order to find this conversation again.
@@ -8325,6 +8965,138 @@ export function togglePinnedCollapsed(): void {
   savePrefs();
 }
 
+/* -------------------------------------------------------------------------- */
+/* Groups the user made                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The name a group is born with.
+ *
+ * Not empty, because the heading is created before it is named — the button
+ * makes the group and opens the rename field on it in the same gesture, and a
+ * heading with no text would be a blank strip behind an input. Not a clever
+ * generated name either ("Group 3"), which reads as a name the user chose and
+ * has to be deleted before theirs can be typed; this one is obviously a
+ * placeholder and the field opens with it selected.
+ */
+const NEW_GROUP_NAME = 'New group';
+
+/**
+ * Make a group. Returns its id, because the caller's next move needs it.
+ *
+ * Every other control here acts on a group that already exists and is named by
+ * the row that was clicked; this one is the only place an id comes into
+ * being, and the sidebar immediately opens the rename field on the heading it
+ * just created. Returning the id is what makes that one call instead of
+ * creating a group and then guessing which of them is new.
+ *
+ * Appended rather than prepended: a new group appears at the bottom of the
+ * group stack rather than displacing the ones above it, and is the user's to
+ * move from there — see {@link reorderSessionGroup}.
+ */
+export function createSessionGroup(name: string = NEW_GROUP_NAME): string {
+  const id = newId('grp');
+  useApp.setState((s) => ({ sessionGroups: [...s.sessionGroups, { id, name }] }));
+  savePrefs();
+  return id;
+}
+
+/**
+ * Rename a group.
+ *
+ * A blank name is declined rather than stored, and that is not input validation
+ * for its own sake: the heading *is* the only handle on a group — it is what
+ * you click to fold it, right-click to delete it and drop a session onto — so a
+ * group named with an empty string would be a strip of nothing that still owns
+ * its sessions. Declining leaves the previous name, which is the state the user
+ * can see and correct.
+ *
+ * Trimmed for the same reason the rename of a session is: leading space in a
+ * heading is invisible and shifts the label away from every other one in the
+ * column.
+ */
+export function renameSessionGroup(id: string, name: string): void {
+  const trimmed = name.trim();
+  if (trimmed === '') return;
+  useApp.setState((s) => ({
+    sessionGroups: s.sessionGroups.map((group) =>
+      group.id === id ? { ...group, name: trimmed } : group,
+    ),
+  }));
+  savePrefs();
+}
+
+/**
+ * Delete a group. Its sessions go back to their project headings.
+ *
+ * Nothing is destroyed, which is why there is no confirmation on this the way
+ * there is on deleting a session: a group is a view of history, the transcripts
+ * are untouched, and every row it held reappears under the project it ran in —
+ * where it would have been all along had the group never existed.
+ *
+ * The membership entries are swept with it rather than left to be ignored.
+ * `groupIdOf` already treats an entry naming a missing group as ungrouped, so
+ * the rows would be filed correctly either way; what the sweep buys is that a
+ * preferences file does not accumulate a growing record of groups that no
+ * longer exist, and that a freshly minted id can never collide with one.
+ */
+export function deleteSessionGroup(id: string): void {
+  useApp.setState((s) => {
+    const membership: Record<string, string> = {};
+    for (const [key, groupId] of Object.entries(s.sessionGroupOf)) {
+      if (groupId !== id) membership[key] = groupId;
+    }
+    return {
+      sessionGroups: s.sessionGroups.filter((group) => group.id !== id),
+      sessionGroupOf: membership,
+    };
+  });
+  savePrefs();
+}
+
+/**
+ * Fold a group shut, or open it.
+ *
+ * The fold lives on the group record rather than in a set beside it — see
+ * {@link AppState.sessionGroups} — so this rewrites one entry. Stored only when
+ * shut, keeping "absent means open" true of a record as well as of the
+ * `collapsedProjects` list, which is what lets a group created in a later build
+ * arrive open rather than folded away.
+ */
+export function toggleSessionGroupCollapsed(id: string): void {
+  useApp.setState((s) => ({
+    sessionGroups: s.sessionGroups.map((group) => {
+      if (group.id !== id) return group;
+      if (group.collapsed === true) {
+        const { collapsed: _shut, ...open } = group;
+        return open;
+      }
+      return { ...group, collapsed: true };
+    }),
+  }));
+  savePrefs();
+}
+
+/**
+ * Move a group to sit directly before or after another.
+ *
+ * The order of {@link AppState.sessionGroups} is the order the headings are
+ * drawn in, and it is the user's to arrange: by dragging a heading, or a step
+ * at a time from the heading's menu. Both name an anchor and a side rather than
+ * a position, and `moveGroup` in `sessionGroups.ts` says why.
+ *
+ * Nothing is written when nothing moved — an unknown id, a group dropped on
+ * itself, one dropped where it already sits — so a drag that ends where it
+ * began does not touch the preferences file.
+ */
+export function reorderSessionGroup(id: string, anchorId: string, edge: GroupEdge): void {
+  const current = useApp.getState().sessionGroups;
+  const next = moveGroup(current, id, anchorId, edge);
+  if (next === current) return;
+  useApp.setState({ sessionGroups: next });
+  savePrefs();
+}
+
 export function setPermissionMode(mode: PermissionMode, pane: Pane = focusedPane()): void {
   setPaneState(pane, { permissionMode: mode });
   savePrefs();
@@ -8442,6 +9214,93 @@ function rememberModelChoice(pane: Pane): void {
     next[sessionId] = choice;
     return { modelBySession: capModelMemory(next) };
   });
+}
+
+/**
+ * File the conversation showing in a column under the account that pays for it.
+ *
+ * The pointer {@link restoreLastSession} reads at boot, and the moments it is
+ * written are the whole of it. Both are moments *inside* a session's life
+ * rather than at the end of one:
+ *
+ *  - a column is pointed at a conversation ({@link resumeSession}), and
+ *  - a conversation first reports an id (`session.started`, and the promotion
+ *    at `run.end` for the fork whose id only arrives there).
+ *
+ * Writing it on the way out instead — at quit, or from a window listener —
+ * would record nothing in exactly the case this exists for. The incident that
+ * prompted it was a machine that went down with the app still running: there
+ * was no quit, so a quit-time write would have persisted the conversation
+ * *before* the one the user lost.
+ *
+ * A column showing nothing records nothing, the same rule
+ * {@link rememberModelChoice} follows: an unstarted conversation has no id, and
+ * "the account is between conversations" is not worth overwriting a good
+ * pointer with.
+ *
+ * Writes state and nothing else, as its neighbour does — persisting is the
+ * caller's, because the two call sites in {@link resumeSession} save anyway and
+ * a second write there would be a second atomic rewrite of the file per click.
+ * Returns whether the entry moved, so the call site on the event path can save
+ * only when it did.
+ */
+function rememberOpenSession(pane: Pane): boolean {
+  const state = paneState(pane);
+  const profileId = state.activeProfileId;
+  const sessionId = sessionShownBy(state);
+  if (profileId === null || sessionId === null) return false;
+  // Never file a conversation under an account that is not the one running it.
+  // A run bills the account it started on for its whole life, so a profile
+  // switched while a turn was in flight leaves the column naming one account
+  // and the run another — and a pointer written from that moment would send
+  // the next launch at a transcript the account it is filed under cannot read,
+  // over the top of a perfectly good one.
+  if (state.run !== null && state.run.profileId !== profileId) return false;
+  if (useApp.getState().lastSessionByProfile[profileId] === sessionId) return false;
+
+  useApp.setState((s) => ({
+    lastSessionByProfile: { ...s.lastSessionByProfile, [profileId]: sessionId },
+  }));
+  return true;
+}
+
+/**
+ * Put a column back on the conversation its account was last working in.
+ *
+ * Called once, from {@link bootstrap}, after the listing has landed — the
+ * listing is both what proves the conversation still exists and what carries
+ * the profile, provider and directory it has to be opened under.
+ *
+ * Nothing happens when the column already holds a conversation. A run adopted
+ * seconds earlier by {@link adoptLiveRuns} is an agent working *now*, which
+ * outranks any pointer written before the app went down, and a window that
+ * moved the column onto it must not have that taken away by a restore.
+ *
+ * Resolved through {@link resumeSession} rather than by writing
+ * `resumeSessionId`, because the id alone is not enough: a session resolves
+ * only under the account and directory it was written in, and everything else
+ * that belongs to reopening a conversation — its model, its dock, its history —
+ * hangs off that one function. This is the click the user used to have to make
+ * themselves, made for them.
+ */
+function restoreLastSession(pane: Pane = focusedPane()): void {
+  const state = paneState(pane);
+  if (state.run !== null || state.resumeSessionId !== null) return;
+
+  const profileId = state.activeProfileId;
+  if (profileId === null) return;
+
+  const app = useApp.getState();
+  const wanted = app.lastSessionByProfile[profileId];
+  if (wanted === undefined) return;
+
+  // Reachable by *this* account, not merely present: the listing spans every
+  // profile, and resuming a row another account owns would switch who pays
+  // without anyone asking for it.
+  const session = app.sessions.find((one) => one.id === wanted && canReachSession(one, profileId));
+  if (session === undefined) return;
+
+  resumeSession(session, pane);
 }
 
 /**
@@ -9617,6 +10476,48 @@ export function toggleSessionPinned(session: SessionSummary): void {
 }
 
 /**
+ * File a session into one of the user's groups, or take it back out.
+ *
+ * `null` means "back to its project", which is the whole of removal: there is
+ * no third state, because a session that is in no group is filed by the
+ * directory it ran in, exactly as it was before groups existed.
+ *
+ * **It does not touch the pin or the archive.** Those say where the user's
+ * attention is and this says how their history is filed, and the two are
+ * allowed to disagree: a pinned session that is also in a group shows under
+ * Pinned — see `partitionSessions`, which runs first — and reappears in its
+ * group the moment it is unpinned. Clearing the pin here would mean dragging a
+ * row into a group silently unpinned it, an effect nobody asked for on a
+ * gesture about something else.
+ *
+ * Every entry that filed this session is removed before the new one is written,
+ * not just the canonical key. A shared store's rows change the profile half of
+ * their key the first time they are opened, so a session can be carrying an
+ * entry under a profile it no longer reports; leaving that behind would put the
+ * row back in its old group the next time the listing came round the other way.
+ * See {@link entriesFiling}, which pinning and archiving already go through for
+ * the same reason.
+ */
+export function moveSessionToGroup(session: SessionSummary, groupId: string | null): void {
+  const key = sessionKey(session);
+  useApp.setState((s) => {
+    const stale = new Set(entriesFiling(session, Object.keys(s.sessionGroupOf)));
+    const membership: Record<string, string> = {};
+    for (const [entry, id] of Object.entries(s.sessionGroupOf)) {
+      if (!stale.has(entry)) membership[entry] = id;
+    }
+    // A group that has gone away takes nothing with it: writing a membership
+    // for an id that is not in the list would be an entry `deleteSessionGroup`
+    // never got the chance to sweep.
+    if (groupId !== null && s.sessionGroups.some((group) => group.id === groupId)) {
+      membership[key] = groupId;
+    }
+    return { sessionGroupOf: membership };
+  });
+  savePrefs();
+}
+
+/**
  * Destroy a session's transcript. There is no undo.
  *
  * Not optimistic, unlike {@link renameSession}, and the asymmetry is the point:
@@ -9653,8 +10554,17 @@ export async function deleteSession(session: SessionSummary): Promise<boolean> {
     // entry the canonical key would miss. See `entriesFiling`.
     const archivedHits = new Set(entriesFiling(session, s.archivedSessions));
     const pinnedHits = new Set(entriesFiling(session, s.pinnedSessions));
+    // And the group membership, swept the same way and for the same reason as
+    // the pin below: a recycled id would otherwise arrive pre-filed under a
+    // heading the user did not put it in.
+    const groupHits = new Set(entriesFiling(session, Object.keys(s.sessionGroupOf)));
+    const membership: Record<string, string> = {};
+    for (const [entry, id] of Object.entries(s.sessionGroupOf)) {
+      if (!groupHits.has(entry)) membership[entry] = id;
+    }
     return {
       sessions: s.sessions.filter((entry) => sessionKey(entry) !== key),
+      sessionGroupOf: membership,
       // Swept together with the row. An archive key for a session that no
       // longer exists is inert, but it would accumulate in the persisted
       // preferences forever, and a session id that came round again would
@@ -9999,7 +10909,14 @@ async function restoreLiveRunBindings(working: readonly SessionId[]): Promise<vo
       const handle = listed.value.runs.find(
         (run) => run.status !== 'ended' && run.sessionId === sessionId,
       );
-      if (handle === undefined) return;
+      if (handle === undefined) {
+        // Nothing local serves it. A served conversation can still be working
+        // on the server with no run in this registry to bind — a window that
+        // restarted, a turn another client or the provider itself started.
+        // See `attachServedRun`.
+        if (paneState(pane).activeProviderId === 'artemis') await attachServedRun(pane, sessionId);
+        return;
+      }
 
       // The selection or state may have moved while the registry answered.
       // Never overwrite a new live run or a different conversation with an old
@@ -10016,6 +10933,104 @@ async function restoreLiveRunBindings(working: readonly SessionId[]): Promise<vo
       await attachRun(pane, handle);
     }),
   );
+}
+
+/** Sessions with a served attach in flight, so two polls cannot open two runs. */
+const servedAttaching = new Set<SessionId>();
+/** When a served attach was last refused per session, so a run the server no longer has is not asked for on every tick. */
+const servedAttachDeclined = new Map<SessionId, number>();
+const SERVED_ATTACH_RETRY_MS = 60_000;
+
+/**
+ * Join the run the server is still working on for a served conversation.
+ *
+ * A served run lives on the server, and this window's registry knows nothing
+ * of it whenever the turn was started by something other than this window:
+ * this window before a restart, another machine holding the same token, or
+ * the provider itself when a subagent settled. The live-work poll reports the
+ * session working, but until now the pane could only draw a static transcript
+ * over it, and the first thing that put the work on screen was the user
+ * typing a message into it — which the server turned into a steer and
+ * answered with a replay of everything so far. Reported 2026-09-17 as "it
+ * should have loaded live before sending a new prompt".
+ *
+ * This asks for that replay without the message: the engine starts an
+ * `attachToLive` run, the adapter joins the server's stream from its retained
+ * start, and the pane attaches to it exactly as it attaches to a run this
+ * registry started — history above the seam, the run's own events below it,
+ * and a live route for steering, stopping and answering from then on.
+ *
+ * Quiet when it cannot: the conversation stays readable as history, and the
+ * refusal is remembered for a while so a run the server has since finished is
+ * not asked for on every poll. True when the pane is now attached.
+ */
+async function attachServedRun(pane: Pane, sessionId: SessionId): Promise<boolean> {
+  const state = paneState(pane);
+  if (state.activeProviderId !== 'artemis' || state.activeProfileId === null) return false;
+  if (servedAttaching.has(sessionId)) return false;
+  const declined = servedAttachDeclined.get(sessionId);
+  if (declined !== undefined && Date.now() - declined < SERVED_ATTACH_RETRY_MS) return false;
+  const { bridge } = resolveBridge();
+  if (!bridge) return false;
+
+  servedAttaching.add(sessionId);
+  const runId = newId('run');
+  /*
+   * Held from before the start call, not from `attachRun`.
+   *
+   * A served run's first event is the `session.started` that names the
+   * conversation being joined, and it can reach this window before
+   * `runs.start` has answered. Routed on arrival, with no pane holding the id
+   * yet, `claimContinuation` adopted it onto this very pane — which then read
+   * as live, so the guard below concluded the column had moved on and let the
+   * run go. Disposing it drew a stopped card with nothing under it, the pane
+   * fell idle again, and the next live-work tick did the same: one "no reply"
+   * every few seconds, for as long as the server kept working (seen
+   * 2026-09-18). Holding the id first means nothing of this run's is drawn,
+   * or adopted, until `attachRun` rebuilds the conversation and releases it;
+   * the paths that give the run up release the hold themselves.
+   */
+  replayBuffers.set(runId, []);
+  try {
+    const input: RunInput = {
+      providerId: state.activeProviderId,
+      profileId: state.activeProfileId,
+      cwd: state.cwd,
+      prompt: '',
+      runId,
+      resumeSessionId: sessionId,
+      attachToLive: true,
+      ...(state.model ? { model: state.model } : {}),
+    };
+    const result = await call(() => bridge.runs.start({ input }));
+    if (!result.ok) {
+      replayBuffers.delete(runId);
+      servedAttachDeclined.set(sessionId, Date.now());
+      return false;
+    }
+    // The column may have moved on while the server was asked. A run nobody
+    // will draw is let go rather than left streaming into a buffer.
+    const current = paneState(pane);
+    if (isLive(current) || !sessionIdsOf(current).includes(sessionId)) {
+      replayBuffers.delete(runId);
+      void call(() => bridge.runs.dispose({ runId }));
+      return false;
+    }
+    servedAttachDeclined.delete(sessionId);
+    /*
+     * The handle `runs.start` answers with is the registry's first snapshot,
+     * taken before the run's own `session.started` has been pumped, so it
+     * names no session. Handed over as it is, `attachRun` could neither read
+     * the history above the seam (`replayEarlierTurns` reads nothing for a
+     * run whose session is unknown) nor tell that this pane already holds the
+     * conversation. The session is the one this attach was asked for.
+     */
+    const joined = result.value.run;
+    await attachRun(pane, joined.sessionId === undefined ? { ...joined, sessionId } : joined);
+    return true;
+  } finally {
+    servedAttaching.delete(sessionId);
+  }
 }
 
 /** Re-read history once the provider has had a moment to flush its own writes. */
@@ -10098,8 +11113,10 @@ export function newSession(
       permissionQueue: [],
       tasks: [],
       dismissedTasks: [],
+      dismissedSuggestedTasks: [],
       tasksRequested: false,
       filesRequested: false,
+      documentsRequested: false,
       // A new conversation is exactly what a handoff was asking for, so the
       // latch comes off with everything else. Whether the account still has
       // room is a question for the next reading, not a state to inherit — and a
@@ -10257,6 +11274,9 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
   if (open !== undefined) {
     if (useApp.getState().background.some((p) => p.id === open.id)) handOver(pane, open);
     useApp.setState({ paletteOpen: false, focusedPaneId: open.id });
+    // A return is a switch: this is the conversation to come back to now, and
+    // the column it is in is the one that knows which account is paying.
+    rememberOpenSession(open);
     savePrefs();
     /*
      * "Already open" is only a layout answer, not a liveness answer.
@@ -10283,6 +11303,38 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
 
   const switchedProfile = state.activeProfileId !== resumeProfileId;
   const switchedCwd = state.cwd !== session.cwd;
+  const providerChanged = state.activeProviderId !== session.providerId;
+
+  /*
+   * A served conversation continues on the account that holds it.
+   *
+   * The profile switch above is only half of a served resume: an Artemis
+   * Server profile wears every account the server offers, and the transcript
+   * lives in exactly one of their stores. The route this column was left on
+   * says nothing about which — so with no correction here the resume went out
+   * on whatever account the picker showed, the server's provider looked in
+   * that account's store, and the conversation failed to open and then, worse,
+   * disappeared from the list. The row names its account (`accountSlug`),
+   * and the model is moved onto it: the conversation's own remembered choice
+   * where that is already there, the same model on that account otherwise.
+   * The catalogue consulted is this column's only while it stays on the same
+   * profile; across a switch it belongs to another server.
+   */
+  const remembered = providerDefaultChoice(session.id, providerChanged);
+  const preferredModel = remembered.model === undefined ? state.model : remembered.model;
+  const servedModel =
+    session.accountSlug === undefined
+      ? null
+      : servedResumeModel(
+          switchedProfile || providerChanged ? [] : activeModels(state),
+          session.accountSlug,
+          preferredModel,
+        );
+  const switchedAccount = servedModel !== null && servedModel !== preferredModel;
+  const servedAccountName =
+    servedAccountLabel(activeModels(state).find((m) => m.id === servedModel)) ??
+    session.accountSlug ??
+    '';
 
   // Whatever this column was working on moves aside rather than being killed —
   // the same rule as `newSession`, for the same reason. `target` is the pane
@@ -10309,20 +11361,27 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
     permissionQueue: [],
     tasks: [],
     dismissedTasks: [],
+    dismissedSuggestedTasks: [],
     tasksRequested: false,
     // The question belonged to the conversation this column is leaving.
     handoffOffer: null,
     // Same rule as `setProvider`: a catalogue belongs to a provider, so
     // landing on a different one has to drop it rather than show the previous
     // provider's models under the new one's name.
-    ...(state.activeProviderId === session.providerId ? {} : { models: [], modelsError: null }),
+    ...(providerChanged ? { models: [], modelsError: null } : {}),
     // The model this conversation was last being run on, where it has ever said.
     // Spread last so it wins, and spread as a whole or not at all: half a choice
     // is a combination nobody picked. No entry leaves the column on what it was
     // using — *unless* the provider changed under it, in which case what it was
     // using names nothing here. See `providerDefaultChoice`.
-    ...providerDefaultChoice(session.id, state.activeProviderId !== session.providerId),
+    ...remembered,
+    // Except the account, which a served conversation does not get to choose:
+    // the model moves onto the one holding the transcript. See above.
+    ...(switchedAccount ? { model: servedModel } : {}),
   });
+  // The corrected choice is this conversation's from now on, so the next
+  // resume finds it already on the right account and moves nothing.
+  if (switchedAccount) rememberModelChoice(target);
   // Opening a session is a deliberate act on one column, so that column takes
   // the focus — which is what makes ⌘K, the run inspector and settings point
   // at what the user just opened rather than at whatever they last clicked.
@@ -10334,10 +11393,15 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
   // the one that most often names a scratch checkout, which `rememberFolder`
   // declines.
   rememberFolder(session.cwd);
+  // The conversation to reopen into next launch, recorded now rather than at
+  // quit — see `rememberOpenSession`. Before the save below, so the pointer and
+  // the directory beside it reach the file in the same write.
+  rememberOpenSession(target);
   savePrefs();
 
   const moved = [
     switchedProfile ? `profile → ${profile.label}` : '',
+    switchedAccount ? `account → ${servedAccountName}` : '',
     switchedCwd ? `directory → ${session.cwd}` : '',
   ].filter(Boolean);
 
@@ -10349,7 +11413,9 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
      * reason and it is the same sentence the sidebar's badge is making. An
      * unattributed one moved only because the account in use cannot read the
      * store at all — nothing recorded who ran it, so claiming otherwise here
-     * would be the guess the whole attribution path exists to refuse.
+     * would be the guess the whole attribution path exists to refuse. A
+     * served one moved because the server keeps the transcript under exactly
+     * one of its accounts, and that account is the only one that can open it.
      */
     const because = [
       switchedProfile
@@ -10357,6 +11423,7 @@ export function resumeSession(session: SessionSummary, pane: Pane = focusedPane(
           ? 'under the account it last ran on'
           : 'under a profile that can reach it'
         : '',
+      switchedAccount ? 'on the server account that holds it' : '',
       switchedCwd ? 'in the directory it was created in' : '',
     ]
       .filter(Boolean)
@@ -10509,6 +11576,17 @@ async function openSessionContents(session: SessionSummary, pane: Pane): Promise
       await attachRun(pane, live);
       return;
     }
+  }
+
+  // A served conversation the server reports as working is joined rather than
+  // read as a snapshot; see `attachServedRun`. A poll that has not answered yet
+  // leaves this to `restoreLiveRunBindings` on its next tick.
+  if (
+    session.providerId === 'artemis' &&
+    useApp.getState().sessionsWorking.includes(session.id) &&
+    (await attachServedRun(pane, session.id))
+  ) {
+    return;
   }
 
   await loadSessionHistory(session, pane);
@@ -11709,6 +12787,47 @@ export async function readServerAccounts(
 }
 
 /**
+ * The memory banks on that server, and the accounts a scope may name.
+ *
+ * Uncached and silent on failure for the same two reasons {@link
+ * readServerAccounts} is, one line above: it is another machine's state, one
+ * pane renders it, and a server that happens to be asleep must not fire a
+ * banner because a settings dialog was opened.
+ */
+export async function readServerMemoryBanks(
+  profileId: ProfileId,
+): Promise<ServerMemoryBanksListResponse | { readonly error: string }> {
+  const { bridge } = resolveBridge();
+  if (!bridge) return { error: 'This build cannot reach the main process.' };
+  const result = await call(() => bridge.serverMemoryBanks.list({ profileId }));
+  return result.ok ? result.value : { error: result.error.message };
+}
+
+/**
+ * Attach one of that server's banks to every account there, or to exactly
+ * these.
+ *
+ * Loud on failure: a tick someone made is a thing they expect to have taken
+ * effect, and a scope that silently did not change is worse than none.
+ */
+export async function setServerMemoryBankProfiles(
+  profileId: ProfileId,
+  slug: string,
+  profiles: ServerMemoryBankScope,
+): Promise<ServerMemoryBank | null> {
+  const { bridge } = resolveBridge();
+  if (!bridge) return null;
+  const result = await call(() =>
+    bridge.serverMemoryBanks.setProfiles({ profileId, slug, profiles }),
+  );
+  if (!result.ok) {
+    reportFailure('Could not change which accounts that bank reaches', result.error);
+    return null;
+  }
+  return result.value.bank;
+}
+
+/**
  * Add an account to that server.
  *
  * Loud on failure, unlike the read: this is a button someone pressed, and a
@@ -12212,6 +13331,11 @@ function applyAgentEvent(event: AgentEvent): void {
           ...(event.permissionMode === undefined ? {} : { permissionMode: event.permissionMode }),
         },
       });
+      // The moment a brand-new conversation acquires an identity is the moment
+      // it can be reopened, so it becomes this account's conversation to come
+      // back to now — not when the turn ends, and certainly not at quit. See
+      // `rememberOpenSession`.
+      if (rememberOpenSession(pane)) savePrefs();
       // A session that has only just been created is not in the list the
       // sidebar is currently showing. Waiting for `run.end` to reveal it means
       // the thing the user is watching happen is the one thing missing from
@@ -12323,6 +13447,10 @@ function applyAgentEvent(event: AgentEvent): void {
             }
           : s.run,
       }));
+      // A fork's own id exists only from here — `session.started` reported the
+      // conversation it branched from — so the promotion above is the first and
+      // only chance to record the branch as what this account is working in.
+      if (rememberOpenSession(pane)) savePrefs();
       if (event.error) {
         if (event.error.code === 'rate_limit') {
           // The limit wall grows a door: name the window that tripped and when

@@ -13,8 +13,16 @@
 import { describe, expect, it } from 'vitest';
 
 import type { RunInput } from '@rx-artemis/protocol';
+import { composesAlwaysOnSkillsHere } from '@rx-artemis/protocol';
 
-import { mergeAdditionalDirectories, rememberModels, withSystemPromptAppended } from './engine.js';
+import {
+  bankToolsAvailable,
+  builtInsFor,
+  inlineBankIndex,
+  mergeAdditionalDirectories,
+  rememberModels,
+  withSystemPromptAppended,
+} from './engine.js';
 
 const RUN: RunInput = {
   providerId: 'claude',
@@ -171,5 +179,81 @@ describe('rememberModels', () => {
 
   it('merges a model that came back rather than listing it twice', () => {
     expect(rememberModels([FABLE_5_1], [FABLE_5_1, SONNET])).toEqual([FABLE_5_1, SONNET]);
+  });
+});
+
+describe('builtInsFor', () => {
+  const every = new Set<'builtin:cerebro'>(['builtin:cerebro']);
+
+  it('keeps the memory-bank prompt for a provider that runs here', () => {
+    expect(builtInsFor('claude', every)).toBe(every);
+    expect(builtInsFor('llamacpp', every)).toBe(every);
+  });
+
+  it('keeps it home for a run an Artemis server executes elsewhere', () => {
+    // The prompt names this machine's banks and this machine's CLI path; the
+    // server describes its own. The user's prompts are not built-ins and are
+    // unaffected by this set.
+    expect(builtInsFor('artemis', every).has('builtin:cerebro')).toBe(false);
+    expect(builtInsFor('artemis', new Set())).toEqual(new Set());
+  });
+});
+
+describe('composesAlwaysOnSkillsHere', () => {
+  it('composes them for a provider that runs here and can take an append', () => {
+    expect(composesAlwaysOnSkillsHere('claude', true)).toBe(true);
+    // A local model has no skill mechanism of its own: this is the only way it
+    // is ever told what a skill says.
+    expect(composesAlwaysOnSkillsHere('llamacpp', true)).toBe(true);
+  });
+
+  it('sends nothing to a provider that cannot take an append', () => {
+    // The pane would otherwise be claiming something the model never read.
+    expect(composesAlwaysOnSkillsHere('codex', false)).toBe(false);
+    expect(composesAlwaysOnSkillsHere('opencode', false)).toBe(false);
+  });
+
+  it('leaves a served run to the server, which knows where its own skills are', () => {
+    // The served adapter can take an append, and that is not the question: an
+    // always-on skill names the folder its files are in, and composed here it
+    // would hand an agent on another machine the paths of this one.
+    expect(composesAlwaysOnSkillsHere('artemis', true)).toBe(false);
+  });
+});
+
+/**
+ * Whether the bank's index rides in the prompt, which is a claim about other
+ * people's harnesses: the Claude SDK loads the project's `MEMORY.md` where the
+ * same index already sits, and nothing else does.
+ */
+describe('inlineBankIndex', () => {
+  it('leaves the index to the file on a Claude profile', () => {
+    // Inlining there would put every line in front of the model twice.
+    expect(inlineBankIndex('claude')).toBe(false);
+  });
+
+  it('carries the index for every harness that loads no memory file', () => {
+    // Without it these know a bank exists and nothing about what is in it.
+    expect(inlineBankIndex('llamacpp')).toBe(true);
+    expect(inlineBankIndex('codex')).toBe(true);
+    expect(inlineBankIndex('artemis')).toBe(true);
+  });
+});
+
+/**
+ * Whether the prompt teaches the memory tools or the bank's CLI.
+ *
+ * Not a preference: a run told about `memory_draft` when it has no such tool
+ * will call it and conclude the bank is broken. The question is whether this
+ * provider takes the host's tool servers at all, which is what
+ * `taskSuggestions` records — the memory server travels through the very same
+ * `agentToolServers` seam the suggested-task server does.
+ */
+describe('bankToolsAvailable', () => {
+  it('follows the providers that receive the host tool servers', () => {
+    expect(bankToolsAvailable('claude')).toBe(true);
+    expect(bankToolsAvailable('llamacpp')).toBe(true);
+    expect(bankToolsAvailable('codex')).toBe(false);
+    expect(bankToolsAvailable('artemis')).toBe(false);
   });
 });
