@@ -46,6 +46,30 @@ RUN pnpm --filter @rx-artemis/server build
 # symlink step below then finds without any hand-copying.
 RUN pnpm --filter @rx-artemis/server deploy --prod --legacy --config.node-linker=hoisted /out
 
+# Which Artemis release this image is. A release is one version across every
+# artifact it ships, written in `apps/desktop/package.json` (`release.yml`
+# refuses a tag that disagrees with it), and the server reads it to answer
+# `/health` — see `apps/server/src/version.ts`. The desktop app is not in this
+# image, so its manifest alone is copied, outside the workspace where pnpm
+# cannot mistake it for a package, and its version is stamped onto the
+# server's own. Copied here rather than with the sources above so that a
+# version bump does not throw away the install and build layers.
+#
+# Then proved, the way `scripts/package-tui.ts` proves the terminal UI: the
+# built server is asked its version and the build fails if it answers anything
+# else. An image that reported the wrong release would be worse than one that
+# said nothing, because it would be believed.
+COPY apps/desktop/package.json /release/package.json
+RUN set -eu; \
+  version="$(node -p "require('/release/package.json').version")"; \
+  node -e "const f='/out/package.json', m=JSON.parse(require('fs').readFileSync(f,'utf8')); m.version=process.argv[1]; require('fs').writeFileSync(f, JSON.stringify(m, null, 2) + '\\n')" "$version"; \
+  reported="$(node /out/dist/main.js --version)"; \
+  if [ "$reported" != "$version" ]; then \
+    echo "The built server reports \"$reported\", expected $version." >&2; \
+    exit 1; \
+  fi; \
+  echo "artemis-server $version"
+
 FROM node:22-bookworm-slim
 RUN apt-get update \
   && apt-get install -y --no-install-recommends git ca-certificates curl \
