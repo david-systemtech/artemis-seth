@@ -35,9 +35,10 @@ describe('parseSkillLibraryDocument', () => {
     const parsed = parseSkillLibraryDocument({
       version: 1,
       alwaysOn: [
-        { name: ' unslop ', scope: { kind: 'profiles', profileIds: [WORK, WORK, ''] }, smuggled: true },
+        { name: 'unslop', scope: { kind: 'profiles', profileIds: [WORK, WORK, ''] }, smuggled: true },
         { name: 'unslop', scope: { kind: 'all' } },
         { name: '' },
+        { name: '   ' },
         'not an entry',
         { name: 'tdd' },
       ],
@@ -51,6 +52,19 @@ describe('parseSkillLibraryDocument', () => {
         { name: 'tdd', scope: { kind: 'all' } },
       ],
     });
+  });
+
+  it('keeps a name exactly as given, because it is a folder’s name and not prose', () => {
+    // A folder can legally be called " notes ". The list reports it that way and
+    // every match downstream is by equality, so a tidied copy would name a
+    // different skill: the real row would read "off" and a phantom row for the
+    // tidied name would appear as missing.
+    const parsed = parseSkillLibraryDocument({
+      alwaysOn: [{ name: ' notes ', scope: { kind: 'all' } }, { name: 'notes', scope: { kind: 'all' } }],
+    });
+
+    expect(parsed.alwaysOn.map((entry) => entry.name)).toEqual([' notes ', 'notes']);
+    expect(isAlwaysOn(parsed, ' notes ')).toBe(true);
   });
 
   it('reads a scope it cannot make sense of as everyone, never as nobody', () => {

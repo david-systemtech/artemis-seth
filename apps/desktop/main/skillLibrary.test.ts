@@ -123,6 +123,17 @@ describe('SkillLibraryStore', () => {
     expect(await store.read()).toEqual(ON);
   });
 
+  it('answers a save with the skill’s name exactly as it was given', async () => {
+    // The pane adopts this answer and matches rows by equality. A name that
+    // came back tidied would read "off" on the real row and appear a second
+    // time as a skill that is not on the machine.
+    const store = new SkillLibraryStore({ userDataDir: sandbox() });
+
+    const landed = await store.write({ version: 1, alwaysOn: [{ name: ' notes ', scope: { kind: 'all' } }] });
+
+    expect(landed.alwaysOn.map((entry) => entry.name)).toEqual([' notes ']);
+  });
+
   it('refuses a relative user-data directory', () => {
     expect(() => new SkillLibraryStore({ userDataDir: 'relative/path' })).toThrow();
   });

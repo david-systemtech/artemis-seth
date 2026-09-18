@@ -196,6 +196,15 @@ function parseScope(value: unknown): AgentPromptScope {
  * entries it cannot make sense of, and keeps the first of two entries naming
  * the same skill. An unreadable document is the defaults, never an error: this
  * is read on the path of every run.
+ *
+ * A name is kept **exactly as it was given**, never trimmed. It is a folder's
+ * name, which is an identity rather than prose: a folder can legally be called
+ * `" notes"`, the list reports it that way, and everything downstream — the
+ * switch on its row, the lookup when a run composes it — matches by equality.
+ * Tidying the stored copy would make the choice name a different skill from the
+ * one that was switched on: the real row would read "off" and a second row for
+ * the tidied name would appear under "not on this machine". Only a name with
+ * nothing in it at all is refused.
  */
 export function parseSkillLibraryDocument(value: unknown): SkillLibraryDocument {
   if (!isRecord(value) || !Array.isArray(value['alwaysOn'])) return defaultSkillLibraryDocument();
@@ -204,8 +213,8 @@ export function parseSkillLibraryDocument(value: unknown): SkillLibraryDocument 
   const seen = new Set<string>();
   for (const raw of value['alwaysOn']) {
     if (!isRecord(raw)) continue;
-    const name = typeof raw['name'] === 'string' ? raw['name'].trim() : '';
-    if (name.length === 0 || name.length > SKILL_LIMITS.name || seen.has(name)) continue;
+    const name = typeof raw['name'] === 'string' ? raw['name'] : '';
+    if (name.trim().length === 0 || name.length > SKILL_LIMITS.name || seen.has(name)) continue;
     seen.add(name);
     alwaysOn.push({ name, scope: parseScope(raw['scope']) });
     if (alwaysOn.length >= SKILL_LIMITS.count) break;
