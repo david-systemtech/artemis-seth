@@ -17,7 +17,13 @@
 import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import type { SkillInfo, SkillLibraryDocument, SkillsSaveRequest } from '@rx-artemis/protocol';
+import type {
+  SkillInfo,
+  SkillLibraryDocument,
+  SkillSourceStatus,
+  SkillsSaveRequest,
+  SkillsSourceAddRequest,
+} from '@rx-artemis/protocol';
 import { NO_CAPABILITIES } from '@rx-artemis/protocol';
 
 import { SkillsSection } from '@/components/settings/SkillsSection';
@@ -56,11 +62,17 @@ let saveFails: string | null = null;
  */
 let saveScript: (string | null)[] = [];
 const saves: SkillsSaveRequest[] = [];
+let sources: readonly SkillSourceStatus[] = [];
+/** Why the next source action fails, or `null` for it to succeed. */
+let sourceFails: string | null = null;
+const added: SkillsSourceAddRequest[] = [];
+const removed: string[] = [];
+const pulled: (string | undefined)[] = [];
 
 /** Installed before the first render: `resolveBridge` memoises on first use. */
 (globalThis.window as unknown as { artemis: unknown }).artemis = {
   skills: {
-    list: async () => (listFails === null ? ok({ skills, document: stored }) : failed(listFails)),
+    list: async () => (listFails === null ? ok({ skills, document: stored, sources }) : failed(listFails)),
     save: async (request: SkillsSaveRequest) => {
       saves.push(request);
       const outcome = saveScript.length > 0 ? saveScript.shift() : saveFails;
@@ -68,8 +80,39 @@ const saves: SkillsSaveRequest[] = [];
       stored = request.document;
       return ok({ document: stored });
     },
+    addSource: async (request: SkillsSourceAddRequest) => {
+      added.push(request);
+      if (sourceFails !== null) return failed(sourceFails);
+      // What main does: clone it, then answer with everything that changed.
+      sources = [...sources, sourceStatus(request.url, { skillCount: 1 })];
+      skills = [...skills, skill({ name: 'from-the-repo', origin: { kind: 'source', sourceId: sources.at(-1)!.source.id } })];
+      return ok({ skills, document: stored, sources });
+    },
+    removeSource: async (request: { id: string }) => {
+      removed.push(request.id);
+      if (sourceFails !== null) return failed(sourceFails);
+      sources = sources.filter((status) => status.source.id !== request.id);
+      return ok({ skills, document: stored, sources });
+    },
+    syncSources: async (request: { id?: string }) => {
+      pulled.push(request.id);
+      if (sourceFails !== null) return failed(sourceFails);
+      return ok({ skills, document: stored, sources });
+    },
   },
 };
+
+/** One subscribed repository, cloned and current unless told otherwise. */
+function sourceStatus(url: string, over: Partial<SkillSourceStatus> = {}): SkillSourceStatus {
+  return {
+    source: { id: `id-${url.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`, url, subdir: 'skills' },
+    cloned: true,
+    head: 'a1b2c3d',
+    syncedAt: Date.now() - 5 * 60_000,
+    skillCount: 12,
+    ...over,
+  };
+}
 
 async function renderPane(): Promise<void> {
   render(
@@ -84,6 +127,11 @@ const toggle = (name: string): HTMLElement => screen.getByRole('switch', { name:
 const isOn = (name: string): boolean => toggle(name).getAttribute('aria-checked') === 'true';
 
 beforeEach(() => {
+  sources = [];
+  sourceFails = null;
+  added.length = 0;
+  removed.length = 0;
+  pulled.length = 0;
   skills = [skill({ name: 'tdd' }), skill({ name: 'unslop' })];
   stored = { version: 1, alwaysOn: [] };
   listFails = null;
@@ -296,5 +344,117 @@ describe('always on', () => {
     await renderPane();
 
     expect(screen.getByText(/A Codex or OpenCode account cannot take an appended prompt/)).toBeTruthy();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Repositories                                                               */
+/* -------------------------------------------------------------------------- */
+
+describe('skill repositories', () => {
+  const URL = 'https://github.com/david-systemtech/agent-skills.git';
+  const field = (): HTMLInputElement => screen.getByLabelText('Repository URL') as HTMLInputElement;
+  const add = (): HTMLButtonElement => screen.getByRole('button', { name: 'Add' }) as HTMLButtonElement;
+
+  it('says what a person needs to trust a copy: how many skills, how fresh, which commit', async () => {
+    sources = [sourceStatus(URL)];
+    await renderPane();
+
+    expect(screen.getByText('david-systemtech/agent-skills')).toBeTruthy();
+    expect(screen.getByText(/12 skills · synced 5m ago · a1b2c3d/)).toBeTruthy();
+  });
+
+  it('says a failed sync did not cost the skills it already had', async () => {
+    // The first thing anyone wants to know about a failed sync.
+    sources = [sourceStatus(URL, { error: 'Could not resolve host: github.com' })];
+    await renderPane();
+
+    const alert = screen.getByText(/Could not sync: Could not resolve host: github\.com/);
+    expect(alert.textContent).toContain('Still using the copy it has');
+    expect(alert.textContent).toContain('12 skills');
+  });
+
+  it('says so when a source has never been cloned, rather than implying skills that are not there', async () => {
+    sources = [sourceStatus(URL, { cloned: false, skillCount: 0, error: 'Authentication failed', head: undefined, syncedAt: undefined })];
+    await renderPane();
+
+    expect(screen.getByText(/Nothing has been cloned yet, so it offers no skills/)).toBeTruthy();
+  });
+
+  it('names the repository on the row of a skill that came from one', async () => {
+    sources = [sourceStatus(URL)];
+    skills = [skill({ name: 'unslop', origin: { kind: 'source', sourceId: sources[0]!.source.id } })];
+    await renderPane();
+
+    expect(screen.getByText(/Every account on this machine, from david-systemtech\/agent-skills\./)).toBeTruthy();
+  });
+
+  it('adds a repository, shows what the clone brought, and clears the field', async () => {
+    await renderPane();
+    expect(add().disabled).toBe(true);
+
+    fireEvent.change(field(), { target: { value: `  ${URL} ` } });
+    expect(add().disabled).toBe(false);
+    fireEvent.click(add());
+    await act(async () => {});
+
+    expect(added).toEqual([{ url: URL, subdir: 'skills' }]);
+    // Main's whole answer is adopted: the source, and the skills it cloned.
+    expect(screen.getByText('david-systemtech/agent-skills')).toBeTruthy();
+    expect(screen.getByText('/artemis-skills:from-the-repo')).toBeTruthy();
+    expect(field().value).toBe('');
+  });
+
+  it('refuses a URL main would refuse, in the same words, before anything is sent', async () => {
+    await renderPane();
+
+    fireEvent.change(field(), { target: { value: 'https://me:my-token-value@github.com/a/b.git' } });
+
+    // A token in a URL is a secret in a settings file. Refused as it is typed.
+    expect(screen.getByRole('alert').textContent).toContain('git credentials');
+    expect(add().disabled).toBe(true);
+    fireEvent.submit(field().closest('form')!);
+    await act(async () => {});
+    expect(added).toEqual([]);
+  });
+
+  it('keeps the URL in the field when adding fails, and says why', async () => {
+    sourceFails = 'Repository not found.';
+    await renderPane();
+
+    fireEvent.change(field(), { target: { value: URL } });
+    fireEvent.click(add());
+    await act(async () => {});
+
+    // A URL that failed is one the person is about to correct, not retype.
+    expect(field().value).toBe(URL);
+    expect(screen.getByRole('alert').textContent).toContain('Repository not found.');
+  });
+
+  it('pulls one repository now, and removes one', async () => {
+    sources = [sourceStatus(URL)];
+    await renderPane();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pull now: david-systemtech/agent-skills' }));
+    await act(async () => {});
+    expect(pulled).toEqual([sources[0]!.source.id]);
+
+    const id = sources[0]!.source.id;
+    fireEvent.click(screen.getByRole('button', { name: 'Remove: david-systemtech/agent-skills' }));
+    await act(async () => {});
+    expect(removed).toEqual([id]);
+    expect(screen.queryByText('david-systemtech/agent-skills')).toBeNull();
+  });
+
+  it('leaves the always-on switches alone when a repository changes', async () => {
+    stored = { version: 1, alwaysOn: [{ name: 'tdd', scope: { kind: 'all' } }] };
+    await renderPane();
+
+    fireEvent.change(field(), { target: { value: URL } });
+    fireEvent.click(add());
+    await act(async () => {});
+
+    expect(isOn('tdd')).toBe(true);
+    expect(saves).toEqual([]);
   });
 });

@@ -25,7 +25,14 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import type { ArtemisBridge, SkillInfo, SkillLibraryDocument } from '@rx-artemis/protocol';
+import type {
+  ArtemisBridge,
+  IpcResult,
+  SkillInfo,
+  SkillLibraryDocument,
+  SkillSourceStatus,
+  SkillsListResponse,
+} from '@rx-artemis/protocol';
 import { defaultSkillLibraryDocument, withSkillAlwaysOn } from '@rx-artemis/protocol';
 
 import { call, resolveBridge } from '../lib/bridge';
@@ -42,6 +49,22 @@ export interface SkillsPaneState {
   readonly saveError: string | null;
   /** Switch a skill always-on, or off. */
   readonly setAlwaysOn: (name: string, on: boolean) => void;
+  /** The repositories this machine keeps cloned, and how each copy is doing. */
+  readonly sources: readonly SkillSourceStatus[];
+  /**
+   * Which source action is running: `'add'`, a source's id while it is being
+   * pulled or removed, `'all'` for "pull everything", or `null`. One at a time —
+   * a clone can take a while, and two racing each other would each answer with
+   * a list the other had already changed.
+   */
+  readonly sourceBusy: string | null;
+  /** Why the last source action failed, already safe to show. */
+  readonly sourceError: string | null;
+  /** Subscribe to a repository. Resolves true when it was added. */
+  readonly addSource: (url: string, subdir: string) => Promise<boolean>;
+  readonly removeSource: (id: string) => void;
+  /** Pull now: one source, or every one when no id is given. */
+  readonly syncSources: (id?: string) => void;
 }
 
 function channel(): ArtemisBridge['skills'] | null {
@@ -54,6 +77,9 @@ export function useSkills(): SkillsPaneState {
   const [skills, setSkills] = useState<readonly SkillInfo[]>([]);
   const [document, setDocument] = useState<SkillLibraryDocument>(defaultSkillLibraryDocument);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [sources, setSources] = useState<readonly SkillSourceStatus[]>([]);
+  const [sourceBusy, setSourceBusy] = useState<string | null>(null);
+  const [sourceError, setSourceError] = useState<string | null>(null);
 
   /**
    * The document as of the latest switch, for the next one to start from.
@@ -101,6 +127,7 @@ export function useSkills(): SkillsPaneState {
       }
       setError(null);
       setSkills(result.value.skills);
+      setSources(result.value.sources);
       stored.current = result.value.document;
       setDocument(result.value.document);
     })();
@@ -149,5 +176,65 @@ export function useSkills(): SkillsPaneState {
     })();
   }, []);
 
-  return { loading, error, skills, document, saveError, setAlwaysOn };
+  /**
+   * Run one source action and take main's whole answer.
+   *
+   * The list and the sources are adopted as answered, because a clone just
+   * changed what is on the disk and nothing here could have guessed how. The
+   * *choices* are not: a source action never changes them, and adopting the
+   * document from its answer could overwrite a switch still in flight.
+   */
+  const sourceAction = useCallback(
+    async (
+      busy: string,
+      act: (bridge: ArtemisBridge['skills']) => Promise<IpcResult<SkillsListResponse>>,
+    ): Promise<boolean> => {
+      const bridge = channel();
+      if (bridge === null) {
+        setSourceError('This window cannot reach the main process.');
+        return false;
+      }
+      setSourceBusy(busy);
+      const result = await call(() => act(bridge));
+      setSourceBusy(null);
+      if (!result.ok) {
+        setSourceError(result.error.message);
+        return false;
+      }
+      setSourceError(null);
+      setSkills(result.value.skills);
+      setSources(result.value.sources);
+      return true;
+    },
+    [],
+  );
+
+  const addSource = useCallback(
+    (url: string, subdir: string) => sourceAction('add', (bridge) => bridge.addSource({ url, subdir })),
+    [sourceAction],
+  );
+  const removeSource = useCallback(
+    (id: string) => void sourceAction(id, (bridge) => bridge.removeSource({ id })),
+    [sourceAction],
+  );
+  const syncSources = useCallback(
+    (id?: string) =>
+      void sourceAction(id ?? 'all', (bridge) => bridge.syncSources(id === undefined ? {} : { id })),
+    [sourceAction],
+  );
+
+  return {
+    loading,
+    error,
+    skills,
+    document,
+    saveError,
+    setAlwaysOn,
+    sources,
+    sourceBusy,
+    sourceError,
+    addSource,
+    removeSource,
+    syncSources,
+  };
 }

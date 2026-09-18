@@ -32,6 +32,7 @@ import type {
   RunEndReason,
   SkillInfo,
   SkillLibraryDocument,
+  SkillsListResponse,
   RunHandle,
   RunSuggestion,
   Routine,
@@ -68,6 +69,8 @@ import {
   normalizeProfileColor,
   parseAgentPromptsDocument,
   parseSkillLibraryDocument,
+  withoutSkillSource,
+  withSkillSource,
   type BrowserEvent,
   type BrowserInfo,
   type BrowserState,
@@ -805,7 +808,23 @@ const MOCK_SKILLS: readonly SkillInfo[] = [
 let mockSkillLibrary: SkillLibraryDocument = parseSkillLibraryDocument({
   version: 1,
   alwaysOn: [{ name: 'unslop', scope: { kind: 'all' } }],
+  sources: [{ url: 'https://github.com/demo/agent-skills.git', subdir: 'skills' }],
 });
+
+/** The whole skills state, with every mock source drawn as cloned and current. */
+function mockSkillsState(): SkillsListResponse {
+  return {
+    skills: MOCK_SKILLS,
+    document: mockSkillLibrary,
+    sources: (mockSkillLibrary.sources ?? []).map((source) => ({
+      source,
+      cloned: true,
+      head: 'a1b2c3d',
+      syncedAt: Date.now() - 12 * 60_000,
+      skillCount: 2,
+    })),
+  };
+}
 
 /**
  * The prompt library, in memory.
@@ -2193,11 +2212,20 @@ export function createMockBridge(): ArtemisBridge {
     },
 
     skills: {
-      list: async () => ok({ skills: MOCK_SKILLS, document: mockSkillLibrary }),
+      list: async () => ok(mockSkillsState()),
       save: async (request) => {
-        mockSkillLibrary = parseSkillLibraryDocument(request.document);
+        mockSkillLibrary = parseSkillLibraryDocument({ ...request.document, sources: mockSkillLibrary.sources });
         return ok({ document: mockSkillLibrary });
       },
+      addSource: async (request) => {
+        mockSkillLibrary = withSkillSource(mockSkillLibrary, request.url, request.subdir);
+        return ok(mockSkillsState());
+      },
+      removeSource: async (request) => {
+        mockSkillLibrary = withoutSkillSource(mockSkillLibrary, request.id);
+        return ok(mockSkillsState());
+      },
+      syncSources: async () => ok(mockSkillsState()),
     },
 
     /*

@@ -395,6 +395,15 @@ export interface ContentBridgeOptions {
   readonly dataDir: string;
   /** Stand-in for `$HOME`. Overridden only by tests. */
   readonly home?: string;
+  /**
+   * More folders of skills, read after the account's own and the machine's.
+   *
+   * In practice the repositories Artemis keeps cloned — see `skillSources.ts`.
+   * Last in the merge on purpose: a skill a person put on this machine by hand,
+   * in either of the folders above, is the more deliberate act, and it should
+   * win the name over the copy that arrived by subscription.
+   */
+  readonly extraSkillDirs?: readonly string[];
   readonly onWarning?: ContentWarning;
 }
 
@@ -409,7 +418,11 @@ export async function buildContentBridge(
   options: ContentBridgeOptions,
 ): Promise<readonly LocalPlugin[]> {
   const home = options.home ?? homedir();
-  const skillSources = [join(options.configDir, 'skills'), join(home, ...NEUTRAL_SKILLS)];
+  const skillSources = [
+    join(options.configDir, 'skills'),
+    join(home, ...NEUTRAL_SKILLS),
+    ...(options.extraSkillDirs ?? []),
+  ];
   const commandsDir = join(options.configDir, 'commands');
 
   try {
@@ -623,6 +636,14 @@ export interface CodexSkillLinkOptions {
   readonly configDir: string;
   /** Stand-in for `$HOME`. Overridden only by tests. */
   readonly home?: string;
+  /**
+   * More folders of skills to link in, after `~/.codex/skills`.
+   *
+   * The repositories Artemis keeps cloned live under its own data directory,
+   * which Codex has no reason to read, so they reach a Codex account the way
+   * `~/.codex/skills` does: as links. See `ContentBridgeOptions.extraSkillDirs`.
+   */
+  readonly extraSkillDirs?: readonly string[];
   readonly onWarning?: ContentWarning;
 }
 
@@ -667,7 +688,8 @@ export async function linkSkillsIntoCodexHome(options: CodexSkillLinkOptions): P
     const native = new Set(
       (await readSource(join(home, ...NEUTRAL_SKILLS))).map((skill) => skill.name),
     );
-    const skills = (await discoverSkills([sourceDir])).filter((skill) => !native.has(skill.name));
+    const managed = [sourceDir, ...(options.extraSkillDirs ?? [])];
+    const skills = (await discoverSkills(managed)).filter((skill) => !native.has(skill.name));
 
     // Nothing to link and no directory to tidy: leave the filesystem untouched,
     // so a profile whose Codex has never started stays exactly as it was. When
@@ -705,7 +727,11 @@ export async function linkSkillsIntoCodexHome(options: CodexSkillLinkOptions): P
       const dangling = !(await stat(at)
         .then(() => true)
         .catch(() => false));
-      const fromSource = target !== null && resolve(target).startsWith(`${resolve(sourceDir)}/`);
+      // Any of the folders this function links from — the user's Codex skills
+      // or a synced source — so a skill that left one of them leaves here too.
+      const fromSource =
+        target !== null &&
+        managed.some((root) => resolve(target).startsWith(`${resolve(root)}/`));
       if (dangling || fromSource) await rm(at, { force: true, recursive: true });
       else wanted.delete(name);
     }

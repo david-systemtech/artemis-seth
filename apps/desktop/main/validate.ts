@@ -42,8 +42,11 @@ import { readSchedule } from './routines.js';
 import {
   AGENT_PROMPTS_VERSION,
   AGENT_PROMPT_LIMITS,
+  DEFAULT_SKILL_SOURCE_SUBDIR,
   SKILL_LIBRARY_VERSION,
   SKILL_LIMITS,
+  skillSourceSubdirProblem,
+  skillSourceUrlProblem,
   AttachmentError,
   configDirProblem,
   BUILT_IN_PROMPT_IDS,
@@ -74,6 +77,9 @@ import {
   type AgentPromptsSaveRequest,
   type SkillsListRequest,
   type SkillsSaveRequest,
+  type SkillsSourceAddRequest,
+  type SkillsSourceRemoveRequest,
+  type SkillsSourceSyncRequest,
   type Attachment,
   type BuiltInPromptId,
   type MemoryBankAddRequest,
@@ -2702,6 +2708,51 @@ export function validateSkillsSave(raw: unknown): SkillsSaveRequest {
       }),
     },
   };
+}
+
+/**
+ * A repository to subscribe to.
+ *
+ * The one string on this surface that becomes an argument to a program: main
+ * hands it to `git clone`. The rule is the protocol's, so the pane's disabled
+ * Add button and this refusal cannot drift — three transports, no leading
+ * hyphen, no credential in the URL — and the message is the rule's own, which
+ * is written to be shown.
+ */
+export function validateSkillsSourceAdd(raw: unknown): SkillsSourceAddRequest {
+  const request = requireRequest(raw);
+  const url = requireString(request['url'], 'url', SKILL_LIMITS.url).trim();
+  const urlProblem = skillSourceUrlProblem(url);
+  if (urlProblem !== null) throw new ValidationError('url', urlProblem);
+
+  const subdir = (optionalString(request['subdir'], 'subdir', SKILL_LIMITS.subdir) ?? DEFAULT_SKILL_SOURCE_SUBDIR).trim();
+  const subdirProblem = skillSourceSubdirProblem(subdir);
+  if (subdirProblem !== null) throw new ValidationError('subdir', subdirProblem);
+
+  return { url, subdir };
+}
+
+/**
+ * A source id names a folder main will delete, so it is held to the alphabet
+ * `skillSourceIdFor` writes and nothing wider. Main still looks the id up in
+ * its own list before acting; this is the first of the two checks, not the only.
+ */
+function requireSkillSourceId(value: unknown, field: string): string {
+  const id = requireString(value, field, 120);
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) {
+    throw new ValidationError(field, 'must be a skill source id');
+  }
+  return id;
+}
+
+export function validateSkillsSourceRemove(raw: unknown): SkillsSourceRemoveRequest {
+  const request = requireRequest(raw);
+  return { id: requireSkillSourceId(request['id'], 'id') };
+}
+
+export function validateSkillsSourceSync(raw: unknown): SkillsSourceSyncRequest {
+  const request = requireRequest(raw);
+  return request['id'] === undefined ? {} : { id: requireSkillSourceId(request['id'], 'id') };
 }
 
 /* -------------------------------------------------------------------------- */
