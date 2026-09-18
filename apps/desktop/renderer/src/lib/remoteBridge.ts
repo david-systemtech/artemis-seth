@@ -461,11 +461,13 @@ export function createRemoteBridge(
         for (;;) {
           const { done, value } = await reader.read();
           if (done || ended()) break;
-          // Any bytes count, a heartbeat comment included — that is its job.
-          heard();
           for (const message of decoder.feed(text.decode(value, { stream: true }))) {
             dispatch(message);
           }
+          // Any bytes count, a heartbeat comment included — that is its job.
+          // After the dispatch, so that a hello naming a slower heartbeat
+          // starts the clock it asks for rather than the one it replaced.
+          heard();
           if (reconnectRequested) {
             reconnectRequested = false;
             abortConnection();

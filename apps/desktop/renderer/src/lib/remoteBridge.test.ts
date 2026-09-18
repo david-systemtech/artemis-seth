@@ -547,6 +547,59 @@ describe('the event stream', () => {
     expect(eventStreams()).toHaveLength(2);
   });
 
+  /*
+   * The hello that names the heartbeat arrives in the same read that proves
+   * the stream alive, so the clock that read starts must already be the one
+   * the hello asks for — or a server with a slower heartbeat than the default
+   * gets one spurious reconnect before its first heartbeat can land.
+   */
+  it('holds the stream to the heartbeat its hello names from the first quiet moment', async () => {
+    vi.useFakeTimers();
+    try {
+      const opened: string[] = [];
+      install((async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        opened.push(String(input));
+        const signal = init?.signal ?? undefined;
+        let sent = false;
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            getReader: () => ({
+              read: (): Promise<{ done: boolean; value?: Uint8Array }> => {
+                if (!sent) {
+                  sent = true;
+                  const hello = sseMessage({
+                    event: REMOTE_STREAM_HELLO,
+                    data: '{"seq":0,"version":"t","heartbeatMs":60000}',
+                  });
+                  return Promise.resolve({ done: false, value: new TextEncoder().encode(hello) });
+                }
+                return new Promise((_resolve, reject) => {
+                  signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+                });
+              },
+            }),
+          },
+        } as unknown as Response;
+      }) as typeof fetch);
+
+      // No pinned limit: the default until the hello says otherwise.
+      createRemoteBridge(CONFIG, null, { signal: lifetime.signal });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(opened).toHaveLength(1);
+
+      // Three of its sixty-second heartbeats is three minutes. Silence past the
+      // forty-five-second default is not death on this server...
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(opened).toHaveLength(1);
+      // ...silence past what it asked for is.
+      await vi.advanceTimersByTimeAsync(125_000);
+      expect(opened.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('control verbs on the wire', () => {
