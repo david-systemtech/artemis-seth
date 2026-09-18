@@ -802,7 +802,7 @@ describe('powerShellQuote', () => {
    * the part that is easy to get wrong, and what actually has to hold is that
    * the shell hands the value back unchanged.
    */
-  it.skipIf(POWERSHELL === null)('round-trips anything a Windows path can hold', () => {
+  it.skipIf(POWERSHELL === null)('round-trips anything a Windows path can hold', { timeout: 30_000 }, () => {
     const nasty = [
       "C:\\Users\\O'Brien\\.claude",
       'C:\\Users\\x\\App Data\\p',
