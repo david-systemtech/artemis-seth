@@ -714,6 +714,104 @@ describe('GET /api/v0/events', () => {
     await stream.close();
   });
 
+  it('says which feed it is, and how often a quiet one speaks', async () => {
+    const feed = createPushFeed({ epoch: 'this-process' });
+    const stream = await openStream({ feed, remoteStream: { heartbeatMs: 1_234 } });
+
+    const [hello] = decode(await stream.next());
+    expect(JSON.parse(hello?.data ?? '')).toMatchObject({
+      seq: 0,
+      epoch: 'this-process',
+      heartbeatMs: 1_234,
+    });
+    await stream.close();
+  });
+
+  /*
+   * The restart. Seqs start over with the process, so a window that was
+   * reading the last one reconnects naming a number this feed never counted.
+   * Honoured, that number became `lastSent`, every live event fell under it,
+   * and the window heard a hello, heartbeats and nothing else.
+   */
+  it('drops a cursor from another feed, says so, and follows the live feed', async () => {
+    const feed = createPushFeed({ epoch: 'this-process' });
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 1), { profileId: 'prof-a' });
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 2), { profileId: 'prof-a' });
+    const stream = await openStream(
+      { feed },
+      { 'last-event-id': '9000' },
+      `${REMOTE_EVENTS_PATH}?epoch=the-last-process`,
+    );
+
+    const [hello] = decode(await stream.next());
+    expect(JSON.parse(hello?.data ?? '')).toMatchObject({ seq: 2, epoch: 'this-process' });
+    const [gap] = decode(await stream.next());
+    expect(gap?.event).toBe(REMOTE_STREAM_GAP);
+    expect(JSON.parse(gap?.data ?? '')).toEqual({ afterSeq: 9000, firstSeq: 3 });
+
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 3), { profileId: 'prof-a' });
+    const [live] = decode(await stream.next());
+    expect(live?.id).toBe('3');
+    await stream.close();
+  });
+
+  it('drops a cursor ahead of the head from a client too old to name its feed', async () => {
+    const feed = createPushFeed();
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 1), { profileId: 'prof-a' });
+    const stream = await openStream({ feed }, { 'last-event-id': '9000' });
+
+    expect(decode(await stream.next())[0]?.event).toBe(REMOTE_STREAM_HELLO);
+    const [gap] = decode(await stream.next());
+    expect(gap?.event).toBe(REMOTE_STREAM_GAP);
+    expect(JSON.parse(gap?.data ?? '')).toEqual({ afterSeq: 9000, firstSeq: 2 });
+
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 2), { profileId: 'prof-a' });
+    const [live] = decode(await stream.next());
+    expect(live?.id).toBe('2');
+    await stream.close();
+  });
+
+  it('does not replay this feed’s events to a cursor another feed counted', async () => {
+    // The case a bare number cannot catch: this feed has already counted past
+    // the stale cursor, so `since(2)` has an answer — for a question nobody
+    // asked. Events 3 to 5 here are not what the client missed after *its* 2.
+    const feed = createPushFeed({ epoch: 'this-process' });
+    for (let i = 1; i <= 5; i += 1) {
+      feed.publish('artemis:push:agent-event', agentEvent('run-a', i), { profileId: 'prof-a' });
+    }
+    const stream = await openStream(
+      { feed },
+      { 'last-event-id': '2' },
+      `${REMOTE_EVENTS_PATH}?epoch=the-last-process`,
+    );
+
+    expect(decode(await stream.next())[0]?.event).toBe(REMOTE_STREAM_HELLO);
+    const [gap] = decode(await stream.next());
+    expect(JSON.parse(gap?.data ?? '')).toEqual({ afterSeq: 2, firstSeq: 6 });
+
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 6), { profileId: 'prof-a' });
+    const [live] = decode(await stream.next());
+    expect(live?.id).toBe('6');
+    await stream.close();
+  });
+
+  it('replays as it always did for a client naming this feed', async () => {
+    const feed = createPushFeed({ epoch: 'this-process' });
+    for (let i = 1; i <= 4; i += 1) {
+      feed.publish('artemis:push:agent-event', agentEvent('run-a', i), { profileId: 'prof-a' });
+    }
+    const stream = await openStream(
+      { feed },
+      { 'last-event-id': '2' },
+      `${REMOTE_EVENTS_PATH}?epoch=this-process`,
+    );
+
+    expect(decode(await stream.next())[0]?.event).toBe(REMOTE_STREAM_HELLO);
+    expect(decode(await stream.next())[0]?.id).toBe('3');
+    expect(decode(await stream.next())[0]?.id).toBe('4');
+    await stream.close();
+  });
+
   it('keeps another account\'s events out of a narrowed stream', async () => {
     const feed = createPushFeed();
     const stream = await openStream({ feed }, asNarrow);
