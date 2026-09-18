@@ -81,6 +81,8 @@ import type {
   ServerModel,
   ServerModelsBody,
   ServerConnection,
+  ServerCommandsAccount,
+  ServerCommandsBody,
   ServerProfile,
   ServerProfileCreatedBody,
   ServerProfilesBody,
@@ -267,6 +269,8 @@ export interface ServerContext {
   readonly ledger?: SessionLedger;
   /** How to read each account's plan gauge. Absent answers 501. */
   readonly usage?: UsageSource;
+  /** How to enumerate an account's slash commands. Absent answers 501. */
+  readonly commands?: CommandSource;
   /** How to read stored sessions. Required alongside {@link ledger}. */
   readonly sessions?: SessionSource;
   /**
@@ -433,6 +437,28 @@ export interface UsageSource {
   read(query: {
     readonly profileIds: readonly string[];
   }): Promise<readonly { readonly profileId: string; readonly label: string; readonly usage: PlanUsage }[]>;
+}
+
+/**
+ * The host's slash-command reads: what a session on one account would offer.
+ *
+ * A method rather than a list, for the reason {@link UsageSource} is: the
+ * answer costs a provider control call per account — the CLI is opened and
+ * asked, never prompted — so the host decides what "fresh enough" means and
+ * answers from its own cache. `cwd` is the directory a turn on the asking
+ * connection would run in, when the connection has one; the host substitutes
+ * somewhere that exists when it does not. `undefined` marks a host that
+ * cannot enumerate commands at all, and the route answers 501.
+ *
+ * Resolves rather than rejects, on the contract `ProviderAdapter.listCommands`
+ * states: an account whose CLI is away answers an empty list.
+ */
+export interface CommandSource {
+  list(query: {
+    readonly profileId: string;
+    readonly providerId: string;
+    readonly cwd?: string;
+  }): Promise<readonly string[]>;
 }
 
 /**
@@ -1035,6 +1061,70 @@ export async function handleServerRequest(
     return answer(body);
   }
 
+  /*
+   * The slash commands a session here would offer, asked before there is one.
+   *
+   * What a remote composer's menu is filled from. The serving machine's own
+   * skills and commands reach a served run through the same content bridge a
+   * local run gets, so the names in this list are the names that machine
+   * would honour — and a client holding the token learns them here rather
+   * than keeping a copy of every skill on its own disk. One reading per
+   * visible account, because a skill under one profile's directory reaches
+   * that account alone; the union is what a menu wants before a route is
+   * picked, and the per-account rows are what a person debugging a missing
+   * skill wants. `?profile=<slug|id>` narrows to one account.
+   */
+  if (path === `${apiPrefix}/commands`) {
+    if (context.commands === undefined) {
+      return fail(
+        501,
+        'invalid_request_error',
+        'not_implemented',
+        'This Artemis build cannot enumerate slash commands.',
+      );
+    }
+    const source = context.commands;
+    const wanted = url.searchParams.get('profile');
+    const profiles = (await visibleProfiles()).filter(
+      (profile) => wanted === null || profile.slug === wanted || String(profile.id) === wanted,
+    );
+    if (wanted !== null && profiles.length === 0) {
+      return fail(
+        404,
+        'invalid_request_error',
+        'profile_not_found',
+        `No account is served as "${wanted}". List them at ${apiPrefix}/profiles.`,
+      );
+    }
+    // Where a turn on this connection would run, when that is a real
+    // directory. A scratch workspace is made per session and there is no
+    // session here, so the host picks somewhere that exists instead.
+    const cwd = connection.workspace.kind === 'directory' ? connection.workspace.path : undefined;
+    const accounts: readonly ServerCommandsAccount[] = await Promise.all(
+      profiles.map(async (profile) => ({
+        profileId: profile.id,
+        profileSlug: profile.slug,
+        profileLabel: profile.label,
+        providerId: profile.provider.id,
+        // The seam's contract is that it resolves; a host that breaks it
+        // costs the reader one account's rows, not the whole menu.
+        commands: await source
+          .list({
+            profileId: String(profile.id),
+            providerId: profile.provider.id,
+            ...(cwd === undefined ? {} : { cwd }),
+          })
+          .catch((): readonly string[] => []),
+      })),
+    );
+    const body: ServerCommandsBody = {
+      object: 'artemis.commands',
+      commands: [...new Set(accounts.flatMap((account) => account.commands))],
+      accounts,
+    };
+    return answer(body);
+  }
+
   if (path === `${apiPrefix}/sessions`) {
     if (context.ledger === undefined || context.sessions === undefined) {
       return fail(
@@ -1186,6 +1276,18 @@ function indexBody(context: ServerContext, connection: ServerConnection): Record
         path: `${apiPrefix}/models/{profile}/{model}`,
         description: 'One route, in full.',
       },
+      // Named only when this build has the seam — the index's rule is that
+      // every path on it actually answers.
+      ...(context.commands === undefined
+        ? []
+        : [
+            {
+              method: 'GET',
+              path: `${apiPrefix}/commands`,
+              description:
+                'The slash commands a session here would offer, the skills installed on this machine among them. Filter with ?profile=<slug>.',
+            },
+          ]),
       // The remote bridge surface, named only when this build serves it —
       // the index's rule is that every path on it actually answers.
       ...(context.runs?.listRuns === undefined
@@ -1461,6 +1563,8 @@ export interface ArtemisServerOptions {
   readonly routines?: ServerRoutineStore;
   /** How to read each account's plan gauge. Absent answers 501. */
   readonly usage?: UsageSource;
+  /** How to enumerate an account's slash commands. Absent answers 501. */
+  readonly commands?: CommandSource;
   /** See {@link ServerContext.allowedHosts}. */
   readonly allowedHosts?: readonly string[] | 'any';
   /** See {@link ServerContext.feed}. */
@@ -1599,6 +1703,7 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
           ...(options.sessions === undefined ? {} : { sessions: options.sessions }),
           ...(options.routines === undefined ? {} : { routines: options.routines }),
           ...(options.usage === undefined ? {} : { usage: options.usage }),
+          ...(options.commands === undefined ? {} : { commands: options.commands }),
           ...(options.allowedHosts === undefined ? {} : { allowedHosts: options.allowedHosts }),
           ...(options.feed === undefined ? {} : { feed: options.feed }),
           ...(options.remoteStream === undefined ? {} : { remoteStream: options.remoteStream }),
