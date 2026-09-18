@@ -221,14 +221,32 @@ export function applyPlanLimit(
     reading.utilization !== undefined && reading.utilization !== current?.utilization;
   if (!statusChanged && !utilizationMoved) return null;
 
+  /*
+    What the held window still says about itself — which is nothing at all once
+    it has rolled over.
+
+    The merged window is stamped with the verdict's clock, because the verdict
+    is what was just observed. That stamp is also what tells `currentWindow`
+    the reading is from *after* the rollover, so a percentage inherited across
+    one would be re-dated into the new period and drawn as its number. A window
+    rolling over mid-session arrives as exactly this — an `ok` naming a window
+    whose reset has just passed, carrying a verdict and no figure — and the
+    honest output there is the dash, not the 97 the old period ended on.
+  */
+  const inherited =
+    current !== null && currentWindow(current, fetchedAt, existing?.fetchedAt ?? fetchedAt) !== null
+      ? current
+      : null;
+
   const window: PlanUsageWindow = {
     id: windowId,
     // The polled label wins: it is the vocabulary the rest of the UI already
     // shows, and a reading's label is a fallback for a window the poll has
-    // never reported.
+    // never reported. A label survives a rollover — it is the window's name,
+    // not a measurement of it.
     label: current?.label ?? reading.label ?? windowId.replace(/_/g, ' '),
-    utilization: reading.utilization ?? current?.utilization ?? null,
-    resetsAt: reading.resetsAt ?? current?.resetsAt ?? null,
+    utilization: reading.utilization ?? inherited?.utilization ?? null,
+    resetsAt: reading.resetsAt ?? inherited?.resetsAt ?? null,
     status: reading.status,
     at: fetchedAt,
   };
@@ -281,6 +299,33 @@ function observedAt(window: PlanUsageWindow, snapshot: PlanUsage): number {
 }
 
 /**
+ * The oldest thing in a reading — when *everything* in it was last observed.
+ *
+ * The question {@link PlanUsage.fetchedAt} cannot answer. That stamp is the
+ * *newest* observation in the snapshot, so a live `plan.limit` verdict about one
+ * window moves it without a single percentage having been re-read: a run
+ * reporting its limits on every response would hold a whole gauge "fresh" while
+ * the numbers behind it aged without bound.
+ *
+ * So anything deciding "does this need re-reading" asks this instead — the
+ * serving desktop's cache, and the rule that lets a failed read blank a good
+ * reading. Anything deciding "which of these two is newer" still asks
+ * `fetchedAt`, which is the right question for that.
+ *
+ * Falls back to `fetchedAt` for a snapshot with no windows, which is every
+ * `available: false` reading, and for one whose windows carry no stamps — every
+ * reading written before {@link PlanUsageWindow.at} existed.
+ */
+export function oldestObservation(usage: PlanUsage): number {
+  let oldest = usage.fetchedAt;
+  for (const window of usage.windows) {
+    const at = window.at ?? usage.fetchedAt;
+    if (at < oldest) oldest = at;
+  }
+  return oldest;
+}
+
+/**
  * Do these two describe the same window in the same state?
  *
  * Field by field rather than by identity, because the same reading commonly
@@ -323,13 +368,38 @@ function sameWindow(a: PlanUsageWindow, b: PlanUsageWindow): boolean {
  * Ties go to `incoming`: two readings describing the same instant are the same
  * fact, and preferring either is arbitrary.
  *
- * ## Absence is not news
+ * ## Which windows a plan has is the newer snapshot's answer
  *
- * An `available: false` answer — "no plan limits apply", but also "the CLI could
- * not be spawned" and "this token cannot read the usage endpoint" — replaces a
- * good reading only when it is *strictly* newer. A transient failure must not
- * blank a gauge that was right a moment ago, and the two are indistinguishable
- * on the wire.
+ * The *set* is the newer side's; only the contents of each window are decided
+ * per window. A window the newer side does not mention is dropped rather than
+ * carried, and that is sound because `fetchedAt` is the newest observation in a
+ * snapshot: a window only the older side knows about cannot have been observed
+ * after the newer snapshot was taken. The two kinds of snapshot that exist both
+ * behave — a fold by {@link applyPlanLimit} carries every window its holder knew,
+ * so it never omits one, and a poll is the authority on what windows there are.
+ *
+ * Without this a per-model bucket a plan change removed would live forever: the
+ * windows beside it keep the snapshot's stamp current, so its last percentage
+ * would go on being drawn as a fresh reading — the exact failure this file exists
+ * to prevent, arriving from the other direction. It is also what stops a poll
+ * that lands late from resurrecting a window a newer one had already dropped.
+ *
+ * ## A failure does not blank a reading that is still worth trusting
+ *
+ * An `available: false` answer is ambiguous on the wire. It is how an API-key,
+ * Bedrock or Vertex profile correctly reports that it is metered rather than
+ * capped — and it is also what a wedged CLI, a scope-limited token and a
+ * momentarily unreachable provider come back as. Taking it on arrival would let
+ * one failed read blank an account's gauge, and since a refresh is now broadcast
+ * to every window, blank it everywhere at once.
+ *
+ * So it replaces a good reading only once that reading has aged past
+ * {@link PLAN_USAGE_MAX_AGE_MS} — three missed poll cycles, measured from the
+ * oldest thing in it. Inside that window the held numbers are better evidence
+ * than a failure; past it nobody was trusting them anyway, so the honest answer
+ * is whatever the provider is saying now. A profile that genuinely switches to
+ * metered billing therefore takes a few minutes to say so, which is the right
+ * side to be wrong on.
  *
  * ## The same object when nothing moved
  *
@@ -349,50 +419,51 @@ export function mergePlanUsage(
   if (held === incoming) return held;
 
   if (!incoming.available) {
-    // Strictly newer, and only then. See "Absence is not news" above.
-    return incoming.fetchedAt > held.fetchedAt ? incoming : held;
+    if (!held.available) return incoming.fetchedAt > held.fetchedAt ? incoming : held;
+    // A failure does not blank a reading that is still worth trusting — see the
+    // section under that name above. Measured from the oldest thing in the held
+    // reading, because a live verdict moves its snapshot stamp without re-reading
+    // a single percentage.
+    const age = incoming.fetchedAt - oldestObservation(held);
+    return age > PLAN_USAGE_MAX_AGE_MS ? incoming : held;
   }
   if (!held.available) return incoming.fetchedAt >= held.fetchedAt ? incoming : held;
 
   /*
-    Display order comes from the newer side, which is the one whose account of
-    what windows this plan has is current. Windows only the older side knows
-    about follow in its own order rather than being dropped — a snapshot that
-    omits a window is not evidence that the window is gone.
+    The window set, and the display order, come from the newer side — the one
+    whose account of what this plan meters is current. See the section above
+    for why a window it omits is a window that is gone rather than one it
+    happened not to mention.
   */
   const newer = incoming.fetchedAt >= held.fetchedAt ? incoming : held;
-  const older = newer === incoming ? held : incoming;
 
   const windows: PlanUsageWindow[] = [];
   const seen = new Set<string>();
-  for (const source of [newer, older]) {
-    for (const window of source.windows) {
-      if (seen.has(window.id)) continue;
-      seen.add(window.id);
-      const mine = held.windows.find((w) => w.id === window.id);
-      const theirs = incoming.windows.find((w) => w.id === window.id);
-      if (mine === undefined) windows.push(window);
-      else if (theirs === undefined) windows.push(mine);
-      else if (sameWindow(mine, theirs)) {
-        /*
-          Identical readings, so which object is kept is arbitrary — and `held`
-          is the one that makes the answer below come out as "no news". These
-          two arrive as separate objects routinely: one reading reaches a window
-          both as the reply to the refresh it asked for and as the broadcast
-          that refresh caused, and every IPC hop clones. Taking `incoming` would
-          rebuild the snapshot and redraw every meter to show what they already
-          showed.
-        */
-        windows.push(mine);
-      } else {
-        windows.push(
-          observedAt(theirs, incoming) >= observedAt(mine, held) ? theirs : mine,
-        );
-      }
+  for (const window of newer.windows) {
+    if (seen.has(window.id)) continue;
+    seen.add(window.id);
+    const mine = held.windows.find((w) => w.id === window.id);
+    const theirs = incoming.windows.find((w) => w.id === window.id);
+    if (mine === undefined) windows.push(window);
+    else if (theirs === undefined) windows.push(mine);
+    else if (sameWindow(mine, theirs)) {
+      /*
+        Identical readings, so which object is kept is arbitrary — and `held`
+        is the one that makes the answer below come out as "no news". These two
+        arrive as separate objects routinely: one reading reaches a window both
+        as the reply to the refresh it asked for and as the broadcast that
+        refresh caused, and every IPC hop clones. Taking `incoming` would
+        rebuild the snapshot and redraw every meter to show what they already
+        showed.
+      */
+      windows.push(mine);
+    } else {
+      windows.push(observedAt(theirs, incoming) >= observedAt(mine, held) ? theirs : mine);
     }
   }
 
   const fetchedAt = Math.max(held.fetchedAt, incoming.fetchedAt);
+  const older = newer === incoming ? held : incoming;
   const subscriptionType = newer.subscriptionType ?? older.subscriptionType;
 
   /*

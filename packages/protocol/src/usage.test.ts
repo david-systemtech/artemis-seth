@@ -22,6 +22,7 @@ import {
   applyPlanLimit,
   bindingWindow,
   mergePlanUsage,
+  oldestObservation,
   PLAN_USAGE_MAX_AGE_MS,
   planHeadroom,
   recommendProfile,
@@ -850,6 +851,52 @@ describe('a window keeps the clock it was read on', () => {
     expect(merged?.fetchedAt).toBe(2_000);
   });
 
+  it('does not carry a pre-reset number across a rollover a verdict announces', () => {
+    /*
+      A 5-hour window rolling over mid-session arrives as an `ok` on a window
+      marked `rejected` — a verdict, with no percentage of its own. Merged
+      naively the new window inherits the old period's 97 and is stamped with
+      the verdict's clock, which puts it *after* the rollover — so the figure
+      the old period ended on is drawn as the new period's number until the next
+      poll, which is the thing this whole file is about.
+
+      The verdict is real and the number is not, so the number goes.
+    */
+    const RESET = 10_000;
+    const spent = snapshot([
+      { id: 'five_hour', label: '5 hours', utilization: 97, resetsAt: RESET, at: 9_000, status: 'rejected' },
+    ]);
+
+    const merged = applyPlanLimit(spent, { status: 'ok', windowId: 'five_hour' }, RESET + 1);
+    const window = merged?.windows.find((w) => w.id === 'five_hour');
+
+    expect(window?.status).toBe('ok');
+    expect(window?.utilization).toBeNull();
+    // And the reset time with it: the one it carried has been and gone, and the
+    // verdict did not say when the next one is.
+    expect(window?.resetsAt).toBeNull();
+    // Drawn as the dash rather than as 97 or as 0.
+    expect(planMeterSlots(merged, RESET + 1)[0]?.window.utilization).toBeNull();
+  });
+
+  it('keeps a number the verdict brought with it across the same rollover', () => {
+    // The provider says 4% of the new window is gone. That is a measurement of
+    // the period that has just started, and it stands.
+    const RESET = 10_000;
+    const spent = snapshot([
+      { id: 'five_hour', label: '5 hours', utilization: 97, resetsAt: RESET, at: 9_000, status: 'rejected' },
+    ]);
+
+    const merged = applyPlanLimit(
+      spent,
+      { status: 'ok', windowId: 'five_hour', utilization: 4, resetsAt: RESET + 5 * 3_600_000 },
+      RESET + 1,
+    );
+
+    expect(merged?.windows[0]?.utilization).toBe(4);
+    expect(merged?.windows[0]?.resetsAt).toBe(RESET + 5 * 3_600_000);
+  });
+
   it('gives an unstamped window the snapshot it came in on', () => {
     // A reading from a peer, a disk seed, or a version older than `at`. It is
     // pinned on the way through rather than left to inherit the new stamp.
@@ -879,16 +926,50 @@ describe('mergePlanUsage', () => {
     expect(merged.fetchedAt).toBe(3_000);
   });
 
-  it('takes a window either side has and the other has never heard of', () => {
-    // A snapshot that omits a window is not evidence the window is gone — a
-    // verdict-built one names exactly one, and a poll may add a new bucket.
-    const held = snapshot([window_('five_hour', 30, 1_000)]);
-    const incoming = snapshot([window_('model_scoped:Fable', 8, 2_000)]);
+  it('takes its list of windows from the newer reading', () => {
+    /*
+      The newer side is the current account of what this plan meters. A window
+      it does not mention has been dropped by the provider — a per-model bucket
+      a plan change removed — and keeping it would leave a percentage nothing
+      will ever refresh being drawn under a snapshot stamp the windows beside it
+      keep current. Sound because `fetchedAt` is the newest observation in a
+      snapshot: a window only the older side knows cannot postdate it.
+    */
+    const held = snapshot([window_('five_hour', 30, 1_000), window_('model_scoped:Opus', 8, 1_000)]);
+    const poll = snapshot([window_('five_hour', 31, 2_000), window_('seven_day', 4, 2_000)]);
 
-    expect(mergePlanUsage(held, incoming).windows.map((w) => w.id)).toEqual([
-      'model_scoped:Fable',
+    expect(mergePlanUsage(held, poll).windows.map((w) => w.id)).toEqual([
       'five_hour',
+      'seven_day',
     ]);
+  });
+
+  it('does not let a poll that lands late bring a dropped window back', () => {
+    // The same rule from the other side: the held reading is the newer one, so
+    // its list stands and the stale reply adds nothing to it.
+    const held = snapshot([window_('five_hour', 31, 2_000)]);
+    const late = snapshot([window_('five_hour', 30, 1_000), window_('model_scoped:Opus', 8, 1_000)]);
+
+    const merged = mergePlanUsage(held, late);
+    expect(merged.windows.map((w) => w.id)).toEqual(['five_hour']);
+    expect(merged).toBe(held);
+  });
+
+  it('keeps a verdict folded onto a window an older poll also read', () => {
+    /*
+      A fold carries every window its holder knew, so it never shortens the
+      list — which is what makes "the newer side's list wins" safe. Here the
+      fold is the newer side and the poll behind it must not undo the verdict.
+    */
+    const held = snapshot([
+      window_('five_hour', 30, 1_000),
+      { id: 'seven_day', label: 'seven_day', utilization: 40, resetsAt: null, at: 3_000, status: 'rejected' },
+    ]);
+    const poll = snapshot([window_('five_hour', 33, 2_000), window_('seven_day', 41, 2_000)]);
+
+    const merged = mergePlanUsage(held, poll);
+    expect(merged.windows.find((w) => w.id === 'five_hour')?.utilization).toBe(33);
+    expect(merged.windows.find((w) => w.id === 'seven_day')?.status).toBe('rejected');
   });
 
   it('gives a tie to the incoming reading', () => {
@@ -934,18 +1015,46 @@ describe('mergePlanUsage', () => {
     expect(mergePlanUsage(undefined, incoming)).toBe(incoming);
   });
 
-  it('does not let an unavailable answer blank a newer good reading', () => {
+  it('does not let one failed read blank a gauge that was right a moment ago', () => {
     /*
       "No plan limits" is what a wedged CLI, a scope-limited token and a genuine
-      API-key profile all report, and they are indistinguishable here. Only a
-      strictly newer one is allowed to replace a reading that was right.
+      API-key profile all report, and they are indistinguishable here. A failure
+      is stamped on arrival, so it is always the newer of the two — ordering
+      alone would blank the account, and since a refresh is broadcast to every
+      window it would blank it in all of them at once.
+
+      So it has to outlast the held reading's usefulness, not merely postdate it.
     */
     const good = snapshot([window_('five_hour', 30, 5_000)]);
-    const blank: PlanUsage = { available: false, windows: [], fetchedAt: 4_000 };
+    const blank = (fetchedAt: number): PlanUsage => ({ available: false, windows: [], fetchedAt });
 
-    expect(mergePlanUsage(good, blank)).toBe(good);
-    expect(mergePlanUsage(good, { ...blank, fetchedAt: 5_000 })).toBe(good);
-    expect(mergePlanUsage(good, { ...blank, fetchedAt: 6_000 }).available).toBe(false);
+    expect(mergePlanUsage(good, blank(4_000))).toBe(good);
+    expect(mergePlanUsage(good, blank(5_000 + 60_000))).toBe(good);
+    expect(mergePlanUsage(good, blank(5_000 + PLAN_USAGE_MAX_AGE_MS))).toBe(good);
+  });
+
+  it('shows a failure once nobody was trusting the numbers anyway', () => {
+    // Past the staleness bar the held figures are not evidence about now, and
+    // "the provider is not answering" is the better thing to say. It is also
+    // how a profile that has genuinely moved to metered billing gets to say so.
+    const good = snapshot([window_('five_hour', 30, 5_000)]);
+    const late: PlanUsage = { available: false, windows: [], fetchedAt: 5_001 + PLAN_USAGE_MAX_AGE_MS };
+
+    expect(mergePlanUsage(good, late).available).toBe(false);
+  });
+
+  it('ages a held reading from its oldest window, not from its stamp', () => {
+    // A verdict about one window moves the snapshot's stamp without re-reading
+    // a percentage. Aged from the stamp, a gauge on a chatty run could never go
+    // stale and so could never be corrected by a failure.
+    const held = snapshot([
+      window_('five_hour', 30, 1_000),
+      { id: 'seven_day', label: 'seven_day', utilization: 40, resetsAt: null, at: 9_000, status: 'rejected' },
+    ]);
+    expect(held.fetchedAt).toBe(9_000);
+
+    const blank: PlanUsage = { available: false, windows: [], fetchedAt: 1_001 + PLAN_USAGE_MAX_AGE_MS };
+    expect(mergePlanUsage(held, blank).available).toBe(false);
   });
 
   it('lets a plan reappear on an account that had reported none', () => {
@@ -988,6 +1097,37 @@ describe('mergePlanUsage', () => {
     expect(settled.windows.find((w) => w.id === 'five_hour')?.utilization).toBe(2);
     // And the verdict about the weekly window, which nothing has superseded.
     expect(settled.windows.find((w) => w.id === 'seven_day')?.status).toBe('warning');
+  });
+});
+
+describe('oldestObservation', () => {
+  it('is the oldest window, not the snapshot stamp', () => {
+    /*
+      The distinction the served cache and the blanking rule both turn on. A
+      live verdict moves `fetchedAt` without a percentage having been re-read,
+      so a run reporting its limits on every response would hold a whole gauge
+      "fresh" while the numbers behind it aged without bound.
+    */
+    const held = snapshot([
+      window_('five_hour', 30, 1_000),
+      { id: 'seven_day', label: 'seven_day', utilization: 40, resetsAt: null, at: 9_000 },
+    ]);
+
+    expect(held.fetchedAt).toBe(9_000);
+    expect(oldestObservation(held)).toBe(1_000);
+  });
+
+  it('falls back to the stamp where there is nothing else to go on', () => {
+    // An unavailable reading has no windows, and a reading written before
+    // windows carried their own clock has no stamps inside it.
+    expect(oldestObservation({ available: false, windows: [], fetchedAt: 500 })).toBe(500);
+    expect(
+      oldestObservation({
+        available: true,
+        fetchedAt: 500,
+        windows: [{ id: 'five_hour', label: '5 hours', utilization: 3, resetsAt: null }],
+      }),
+    ).toBe(500);
   });
 });
 

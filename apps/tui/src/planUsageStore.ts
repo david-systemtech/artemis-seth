@@ -25,6 +25,7 @@
 import {
   PLAN_USAGE_MAX_AGE_MS,
   mergePlanUsage,
+  oldestObservation,
   type PlanUsage,
   type ProfileId,
 } from '@rx-artemis/protocol';
@@ -58,15 +59,21 @@ export interface PlanUsageStore {
  * cycles, the same one the desktop holds a recommendation to. Past it there is
  * nothing honest to draw, and a blank second is the correct answer: a 5-hour
  * window may have rolled over twice since.
+ *
+ * Aged from whichever is older, when it was written to disk or the oldest thing
+ * inside it. What gets written is the merged gauge, which may carry a window a
+ * live verdict refreshed beside percentages nobody has re-read — so the file's
+ * own timestamp is not on its own evidence that everything in it is current.
  */
 export function seedablePlanUsage(
   remembered: { readonly at: number; readonly value: PlanUsage } | undefined,
   now: number = Date.now(),
 ): PlanUsage | null {
   if (remembered === undefined) return null;
+  const observed = Math.min(remembered.at, oldestObservation(remembered.value));
   // Clamped at zero, as `recommendProfile` clamps it: a reading from the future
   // is a clock disagreeing with itself, not an infinitely stale reading.
-  return Math.max(0, now - remembered.at) < PLAN_USAGE_MAX_AGE_MS ? remembered.value : null;
+  return Math.max(0, now - observed) < PLAN_USAGE_MAX_AGE_MS ? remembered.value : null;
 }
 
 /** Build a {@link PlanUsageStore}. One per process; exported for tests. */

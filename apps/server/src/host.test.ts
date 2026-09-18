@@ -741,20 +741,26 @@ describe('the usage cache', () => {
     expect(handle.runId).toBeDefined();
   });
 
-  it('retries an account whose read failed rather than remembering the failure', async () => {
-    // A rejection cached for a minute is an account answered "no" by the memory
-    // of a CLI that was away for one request.
+  it('caches a CLI that would not answer as the answer it is, for the usual minute', async () => {
+    /*
+      A control call that fails does not reject here: the adapter's contract is
+      to degrade to `available: false` with a reason rather than break a status
+      widget. So what lands in the cache is a *reading*, held for the same
+      minute as any other — which is the point, since an account whose CLI is
+      wedged must not be probed again on every request.
+
+      The eviction path in `remember` is for the other case, where the promise
+      genuinely rejects — an unknown profile, a provider with no gauge at all —
+      and there is nothing to remember.
+    */
     installQuery();
     usageReply = () => Promise.reject(new Error('control channel closed'));
     const failed = await host.usageSource.read({ profileIds: ['prof_work'] });
-    // The adapter degrades rather than throwing, so the row exists and says so.
     expect(failed[0]?.usage.available).toBe(false);
 
     usageReply = () => Promise.resolve(limits(5, 6));
-    const retried = await host.usageSource.read({ profileIds: ['prof_work'] });
-    // Still cached — `available: false` is an answer, and a minute old is the
-    // tolerance every other reading gets.
-    expect(retried[0]?.usage.available).toBe(false);
+    const again = await host.usageSource.read({ profileIds: ['prof_work'] });
+    expect(again[0]?.usage.available).toBe(false);
     expect(usageCalls).toBe(1);
   });
 });

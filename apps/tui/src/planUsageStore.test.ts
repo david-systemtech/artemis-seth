@@ -260,6 +260,20 @@ describe('a reading remembered from the last launch', () => {
     expect(seedablePlanUsage(undefined, NOW)).toBeNull();
   });
 
+  it('is aged from the oldest thing in it, not from when the file was written', () => {
+    /*
+      What gets written is the merged gauge, which can carry a window a live
+      verdict refreshed seconds ago beside percentages nobody has re-read in an
+      hour. The file's own timestamp would call all of it current.
+    */
+    const stale = snapshot(
+      [window_('five_hour', 40, NOW - 60 * 60_000), window_('seven_day', 9, NOW)],
+      NOW,
+    );
+
+    expect(seedablePlanUsage({ at: NOW, value: stale }, NOW)).toBeNull();
+  });
+
   it('survives a clock that disagrees with itself', () => {
     // A reading stamped in the future is a clock skew, not an ancient reading.
     expect(seedablePlanUsage({ at: NOW + 60_000, value: remembered }, NOW)).toBe(remembered);

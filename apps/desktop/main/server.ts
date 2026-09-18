@@ -60,6 +60,7 @@ import {
   SERVER_HOST,
   isValidServerPort,
   normalizeWorkspace,
+  oldestObservation,
   serverUrl,
   type ProfileId,
   type ServerAllowance,
@@ -100,13 +101,15 @@ const log = createLogger('server');
 export const SERVER_CONFIG_FILE = 'server.json';
 
 /**
- * How old the engine's cached gauge may be before a served request re-reads it.
+ * How old every number in the engine's cached gauge may be before a served
+ * request re-reads it.
  *
  * A minute, which is the tolerance the headless server extends to its own
  * accounts and shorter than the poller's own sweep — so on a desktop with a
  * window open this almost never spawns anything, and on one whose poller is
  * idling (no window, macOS) it still refuses to serve a figure from ten minutes
- * ago as if it were current.
+ * ago as if it were current. Measured with `oldestObservation`; see the call
+ * site for why the snapshot's own stamp will not do.
  */
 const SERVED_USAGE_MAX_AGE_MS = 60_000;
 
@@ -350,8 +353,18 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       for (const profileId of query.profileIds) {
         try {
           const cached = options.engine.require().cachedPlanUsage(profileId as never);
+          /*
+            Aged from the *oldest* thing in the reading rather than from its own
+            stamp. A live `plan.limit` verdict moves `fetchedAt` without
+            re-reading a percentage, and the provider states one on every API
+            response — so measuring the stamp would leave a run's own chatter
+            holding this cache open indefinitely while the numbers behind it
+            aged, which is precisely the case this guard is here for.
+          */
+          const fresh =
+            cached !== null && Date.now() - oldestObservation(cached) < SERVED_USAGE_MAX_AGE_MS;
           const usage =
-            cached !== null && Date.now() - cached.fetchedAt < SERVED_USAGE_MAX_AGE_MS
+            cached !== null && fresh
               ? cached
               : await options.engine.require().refreshPlanUsage({ profileId: profileId as never });
           rows.push({ profileId, label: labels.get(profileId) ?? profileId, usage });
