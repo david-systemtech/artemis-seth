@@ -196,6 +196,38 @@ const PLUGIN_NAME = BRIDGED_SKILL_PLUGIN;
 const BRIDGES_DIR = 'content-bridges';
 
 /**
+ * Is `target` somewhere beneath `root`?
+ *
+ * Asked of `relative`, not of the two strings: this used to be
+ * `startsWith(root + '/')`, which is never true on Windows, where `resolve`
+ * writes backslashes. The cost was quiet and specific — a Codex link that had
+ * become redundant was taken for somebody else's and left in place, so the
+ * skill was listed twice. Found the first time this module's suite ran there.
+ */
+function isInside(root: string, target: string): boolean {
+  const within = relative(resolve(root), resolve(target));
+  return within.length > 0 && !within.startsWith('..') && !isAbsolute(within);
+}
+
+/**
+ * The kind of link laid down for a directory: a junction on Windows.
+ *
+ * For the reason `profiles/xdgFarm.ts` gives at length. A directory symlink
+ * on Windows needs a privilege an ordinary user does not hold, so `symlink`
+ * raises `EPERM` — and every caller in this module treats a link that cannot
+ * be written as "the run continues without it", which is the right trade for
+ * one odd skill and the wrong one for all of them: on a stock Windows machine
+ * no skill was ever bridged, and nothing said so but a line in a log.
+ *
+ * A junction needs no privilege. `lstat` and `readlink` report it as the
+ * symlink it stands in for, and its target reads back exactly as it was
+ * written — pinned on Windows by the farm's own tests, which is why the
+ * comparisons below need no Windows spelling of their own. It can only point
+ * at a directory on the same machine, which is all that is ever linked here.
+ */
+const DIR_LINK = process.platform === 'win32' ? 'junction' : 'dir';
+
+/**
  * The vendor-neutral skills directory, relative to `$HOME`.
  *
  * Codex reads this on its own; Claude does not. Included in the Claude bridge's
@@ -348,7 +380,7 @@ async function reconcileOwnedDir(dir: string, skills: readonly DiscoveredSkill[]
     await rm(join(dir, name), { force: true, recursive: true });
   }
 
-  for (const [name, target] of wanted) await symlink(target, join(dir, name), 'dir');
+  for (const [name, target] of wanted) await symlink(target, join(dir, name), DIR_LINK);
 }
 
 /**
@@ -386,7 +418,7 @@ async function relink(link: string, target: string | null): Promise<void> {
   const current = await readlink(link).catch(() => null);
   if (current === target) return;
   await rm(link, { force: true, recursive: true });
-  if (target !== null) await symlink(target, link, 'dir');
+  if (target !== null) await symlink(target, link, DIR_LINK);
 }
 
 export interface ContentBridgeOptions {
@@ -930,14 +962,12 @@ export async function linkSkillsIntoCodexHome(options: CodexSkillLinkOptions): P
         .catch(() => false));
       // Any of the folders this function links from — the user's Codex skills
       // or a synced source — so a skill that left one of them leaves here too.
-      const fromSource =
-        target !== null &&
-        managed.some((root) => resolve(target).startsWith(`${resolve(root)}/`));
+      const fromSource = target !== null && managed.some((root) => isInside(root, target));
       if (dangling || fromSource) await rm(at, { force: true, recursive: true });
       else wanted.delete(name);
     }
 
-    for (const [name, target] of wanted) await symlink(target, join(destDir, name), 'dir');
+    for (const [name, target] of wanted) await symlink(target, join(destDir, name), DIR_LINK);
   } catch (error) {
     options.onWarning?.(`Could not link Codex skills into ${destDir}; the run continues without them`, error);
   }

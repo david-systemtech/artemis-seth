@@ -25,8 +25,11 @@
  *    the same directory this links into, and a user may install a skill there by
  *    hand. Four tests pin down what must survive contact with the linker.
  *
- * Skipped on Windows, where an unprivileged `symlink` fails and the desktop app
- * is not shipped.
+ * Run on Windows too. It was skipped there once, on the grounds that an
+ * unprivileged `symlink` fails and the desktop app was not shipped; the app
+ * ships there now, and the bridge lays down junctions, which need no
+ * privilege. The fixtures link the same way, so the suite passes for a
+ * developer without Developer Mode as it does on a runner that has it.
  */
 
 import {
@@ -52,7 +55,8 @@ import {
   resolveContentPlugins,
 } from './bridge.js';
 
-const describeIfSymlinks = process.platform === 'win32' ? describe.skip : describe;
+/** How a fixture links a directory: the bridge's own choice. See `DIR_LINK` in `bridge.ts`. */
+const DIR_LINK = process.platform === 'win32' ? 'junction' : 'dir';
 
 const sandboxes: string[] = [];
 
@@ -104,7 +108,7 @@ function listSkills(skillsDir: string): readonly string[] {
   return readdirSync(skillsDir).sort();
 }
 
-describeIfSymlinks('buildContentBridge (Claude)', () => {
+describe('buildContentBridge (Claude)', () => {
   it('bridges the skills in a config directory', async () => {
     const { configDir, dataDir, home } = sandbox();
     seedSkill(path.join(configDir, 'skills'), 'use-railway');
@@ -131,7 +135,7 @@ describeIfSymlinks('buildContentBridge (Claude)', () => {
     // user's own directory, so discovery resolves through two hops.
     const real = path.join(home, '.claude', 'skills');
     seedSkill(real, 'use-railway');
-    symlinkSync(real, path.join(configDir, 'skills'), 'dir');
+    symlinkSync(real, path.join(configDir, 'skills'), DIR_LINK);
 
     const [plugin] = await buildContentBridge({ configDir, dataDir, home });
 
@@ -332,7 +336,7 @@ describeIfSymlinks('buildContentBridge (Claude)', () => {
   });
 });
 
-describeIfSymlinks('discoverMarketplacePlugins', () => {
+describe('discoverMarketplacePlugins', () => {
   /**
    * Write the two files a `/plugin install` leaves behind.
    *
@@ -498,7 +502,7 @@ describeIfSymlinks('discoverMarketplacePlugins', () => {
   });
 });
 
-describeIfSymlinks('linkSkillsIntoCodexHome', () => {
+describe('linkSkillsIntoCodexHome', () => {
   /** Where Codex reads a profile's skills from. */
   const codexSkills = (configDir: string): string => path.join(configDir, 'skills');
 
@@ -550,7 +554,7 @@ describeIfSymlinks('linkSkillsIntoCodexHome', () => {
     symlinkSync(
       path.join(dotfiles, 'use-railway'),
       path.join(codexSkills(configDir), 'use-railway'),
-      'dir',
+      DIR_LINK,
     );
 
     await linkSkillsIntoCodexHome({ configDir, home });
@@ -606,7 +610,7 @@ describeIfSymlinks('linkSkillsIntoCodexHome', () => {
     const { configDir, home } = sandbox();
     seedSkill(path.join(home, '.codex', 'skills'), 'use-railway');
     mkdirSync(codexSkills(configDir), { recursive: true });
-    symlinkSync(path.join(home, 'gone'), path.join(codexSkills(configDir), 'stale'), 'dir');
+    symlinkSync(path.join(home, 'gone'), path.join(codexSkills(configDir), 'stale'), DIR_LINK);
 
     await linkSkillsIntoCodexHome({ configDir, home });
 
@@ -658,7 +662,7 @@ describeIfSymlinks('linkSkillsIntoCodexHome', () => {
  * a skill from inside it. The bridge is a directory Artemis assembles, so the
  * bridge is what yields.
  */
-describeIfSymlinks('resolveContentPlugins', () => {
+describe('resolveContentPlugins', () => {
   /**
    * A skill the plugin *publishes*, nested and declared the way a real one is.
    *
@@ -914,7 +918,7 @@ describeIfSymlinks('resolveContentPlugins', () => {
  * merge: last, so a skill a person installed by hand keeps its name over the
  * copy that arrived by subscription.
  */
-describeIfSymlinks('extra skill folders (synced sources)', () => {
+describe('extra skill folders (synced sources)', () => {
   it('offers a Claude session the skills in an extra folder', async () => {
     const { configDir, dataDir, home } = sandbox();
     const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
