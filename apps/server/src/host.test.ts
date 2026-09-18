@@ -10,7 +10,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -73,6 +73,12 @@ class FakeQuery {
   async setModel(): Promise<void> {}
   async setPermissionMode(): Promise<void> {}
   async applyFlagSettings(): Promise<void> {}
+  /** The control call `fetchClaudeCommands` makes: a fixed list, since the plugins it was given are what is under test. */
+  supportedCommands(): Promise<{ name: string; description: string; argumentHint: string }[]> {
+    return Promise.resolve(
+      ['compact', 'artemis-skills:unslop'].map((name) => ({ name, description: '', argumentHint: '' })),
+    );
+  }
   close(): void {
     this.closed = true;
     this.messages.close();
@@ -477,5 +483,85 @@ describe('the memory banks this machine carries', () => {
     // bank is among them, because there is no bank.
     const directories = (query.options()['additionalDirectories'] ?? []) as readonly string[];
     expect(directories.some((directory) => directory.startsWith(join(root, 'bank-')))).toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The skills this machine carries                                            */
+/* -------------------------------------------------------------------------- */
+
+describe('the skills this machine carries', () => {
+  /*
+   * The bridge also reads `~/.agents/skills`, and by default that is the
+   * *developer's*. Pointed at this test's scratch directory so a machine that
+   * really carries skills neither leaks them into these assertions nor has
+   * its links reconciled by a test.
+   */
+  const home: { HOME?: string; USERPROFILE?: string } = {};
+  beforeEach(async () => {
+    home.HOME = process.env['HOME'];
+    home.USERPROFILE = process.env['USERPROFILE'];
+    const scratch = join(root, 'home');
+    await mkdir(scratch, { recursive: true });
+    process.env['HOME'] = scratch;
+    process.env['USERPROFILE'] = scratch;
+  });
+  afterEach(() => {
+    if (home.HOME === undefined) delete process.env['HOME'];
+    else process.env['HOME'] = home.HOME;
+    if (home.USERPROFILE === undefined) delete process.env['USERPROFILE'];
+    else process.env['USERPROFILE'] = home.USERPROFILE;
+  });
+
+  /** A skill under one account's config directory, where the bridge looks. */
+  async function installSkill(configDir: string, name: string): Promise<string> {
+    const dir = join(configDir, 'skills', name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: A test skill\n---\n\nDo the thing.\n`);
+    return dir;
+  }
+
+  const pluginsOf = (query: ReturnType<typeof installQuery>): readonly { readonly path: string }[] =>
+    (query.options()['plugins'] ?? []) as readonly { readonly path: string }[];
+
+  it('bridges an account’s skills into its served runs as a plugin, and into no other account’s', async () => {
+    const skill = await installSkill(configDirs.work, 'unslop');
+    const query = installQuery();
+
+    await host.runSource.startRun(started());
+    const plugins = pluginsOf(query);
+    expect(plugins).toHaveLength(1);
+    expect(plugins[0]?.path.startsWith(join(dataDir, 'content-bridges'))).toBe(true);
+    // The bridge is a directory of this process's own, holding one link per
+    // skill — the same arrangement the desktop builds. See core's `content/bridge.ts`.
+    expect(await readlink(join(plugins[0]!.path, 'skills', 'unslop'))).toBe(skill);
+
+    // The other account has no skills, so its run carries no plugin at all:
+    // an empty list would still initialise the SDK's plugin machinery.
+    await host.runSource.startRun(started({ profileId: 'prof_personal' }));
+    expect(query.options()['plugins']).toBeUndefined();
+  });
+
+  it('lists the commands a run would offer, asked with the same plugins, and answers from memory for a while', async () => {
+    const skill = await installSkill(configDirs.work, 'unslop');
+    let opened = 0;
+    const query = installQuery(() => {
+      opened += 1;
+    });
+
+    const first = await host.commandSource.list({ profileId: 'prof_work', providerId: 'claude', cwd });
+    expect(first).toEqual(['compact', 'artemis-skills:unslop']);
+    // The CLI was asked in the run's directory, with the bridge a run gets.
+    expect(query.options()['cwd']).toBe(cwd);
+    expect(await readlink(join(pluginsOf(query)[0]!.path, 'skills', 'unslop'))).toBe(skill);
+
+    const second = await host.commandSource.list({ profileId: 'prof_work', providerId: 'claude', cwd });
+    expect(second).toEqual(first);
+    expect(opened).toBe(1);
+  });
+
+  it('answers nothing for a provider that cannot enumerate commands', async () => {
+    installQuery();
+    expect(await host.commandSource.list({ profileId: 'prof_work', providerId: 'llamacpp', cwd })).toEqual([]);
   });
 });

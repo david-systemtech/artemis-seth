@@ -117,7 +117,7 @@ import type {
   SessionTranscript,
 } from '../types.js';
 import { splitEvents } from '../local/stream.js';
-import { parseServerModels } from './catalogue.js';
+import { parseServerCommands, parseServerModels } from './catalogue.js';
 import { guardRemoteDecision } from './permissions.js';
 import { ServedWork } from './liveWork.js';
 import { readServerLine, type ServerStreamDelta } from './stream.js';
@@ -126,6 +126,13 @@ export const ARTEMIS_PROVIDER_ID: ProviderId = 'artemis';
 
 /** The server's own API, versioned the way `server/http.ts` builds it. */
 const API_PREFIX = `/api/${SERVER_API_VERSION}`;
+
+/**
+ * How long `listCommands` waits on the server. Longer than the catalogue's
+ * five seconds because a cold answer opens the provider's CLI once per served
+ * account, and a menu that fills late beats one that never fills.
+ */
+const COMMAND_LIST_TIMEOUT_MS = 20_000;
 
 /**
  * What driving a remote Artemis can honestly claim.
@@ -1805,6 +1812,36 @@ export function createArtemisAdapter(
         /* fall through to the not-confirmed answer */
       }
       return { models: [], live: false };
+    },
+
+    /**
+     * Ask the server which slash commands a session there would offer.
+     *
+     * The skills and commands a served run gets are the *serving machine's*:
+     * they reach the run through that machine's content bridge, and nothing
+     * on this disk travels. So the menu has to be filled from the server's
+     * answer, or it names things the run cannot do and misses the ones it
+     * can. `cwd` is not sent, for the reason `listSessions` gives: turns run
+     * in the connection's workspace, fixed when the token was minted.
+     *
+     * Never rejects, on the contract `listCommands` states. A server that is
+     * away, refusing, or too old for the route (a 404) answers an empty list
+     * — the menu staying shut, which is exactly what it did before the route
+     * existed. The timeout is generous because a cold answer opens one
+     * provider CLI per served account.
+     */
+    async listCommands(query) {
+      const root = baseUrl(query.env ?? {});
+      try {
+        const response = await fetch(`${root}${API_PREFIX}/commands`, {
+          headers: authHeaders(query.env ?? {}),
+          signal: AbortSignal.timeout(COMMAND_LIST_TIMEOUT_MS),
+        });
+        if (response.ok) return parseServerCommands(await response.json());
+      } catch {
+        /* fall through to the empty answer */
+      }
+      return [];
     },
 
     /**

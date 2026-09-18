@@ -175,6 +175,7 @@ async function serve(): Promise<void> {
     sessions: host.sessionSource,
     routines: host.routines,
     usage: host.usageSource,
+    commands: host.commandSource,
     feed: host.feed,
     guard: host.guard,
     onRemoteAccess: host.recordAccess,

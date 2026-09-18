@@ -114,3 +114,24 @@ function readThinkingLevelIds(value: unknown): readonly string[] | undefined {
   }
   return ids;
 }
+
+/**
+ * Map a `ServerCommandsBody` onto the names the composer's menu offers.
+ *
+ * The union the server already computed, read back as leniently as the model
+ * rows are and for the same reason: the server may be a newer or older build,
+ * and an entry that is not a name is dropped rather than failing the list.
+ * Duplicates are folded here too, so a server that did not fold them costs
+ * nothing.
+ */
+export function parseServerCommands(body: unknown): readonly string[] {
+  const record = asRecord(body);
+  const commands = record === undefined ? undefined : record['commands'];
+  if (!Array.isArray(commands)) return [];
+  const names: string[] = [];
+  for (const raw of commands) {
+    const name = asString(raw);
+    if (name !== undefined && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
