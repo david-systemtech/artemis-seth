@@ -82,10 +82,28 @@ export class SecretLeakError extends Error {
  *
  * The `sk-` rule is the one named in Artemis's security brief; the rest are
  * defence in depth for the Bedrock / Vertex / Foundry backends.
+ *
+ * ## `sk-` has to *start* something
+ *
+ * Both `sk-` rules open on a word boundary, and that is a fix rather than
+ * tidiness. Without it the rule matched inside ordinary words: `task-`, `disk-`,
+ * `risk-` and `mask-` all end in `sk-`, and a kebab-case name runs on for well
+ * over twenty key-legal characters. A memory called
+ * `gamingpc-hidden-task-needs-conhost-headless` read as a credential —
+ * `sk-needs-conhost-headless` — and because a memory bank's index rides along
+ * on the prompt library's response, one slug in a team's bank refused the whole
+ * Instructions pane with a credential-safety error about nothing. The same
+ * pattern scrubs log lines, so it was also redacting file names out of them.
+ *
+ * A real key is never the tail of a longer word: it follows a quote, an equals
+ * sign, a colon, a space, a slash or the start of the string, and every one of
+ * those is a boundary. What this gives up is a key glued to a preceding letter,
+ * digit or underscore, which is not a shape any provider issues or any config
+ * format writes.
  */
 const SECRET_VALUE_RULES: readonly { readonly rule: string; readonly pattern: RegExp }[] = [
-  { rule: 'anthropic-style api key (sk-…)', pattern: /sk-[A-Za-z0-9_-]{20,}/ },
-  { rule: 'anthropic api key (sk-ant-…)', pattern: /sk-ant-[A-Za-z0-9_-]{10,}/ },
+  { rule: 'anthropic-style api key (sk-…)', pattern: /\bsk-[A-Za-z0-9_-]{20,}/ },
+  { rule: 'anthropic api key (sk-ant-…)', pattern: /\bsk-ant-[A-Za-z0-9_-]{10,}/ },
   { rule: 'aws access key id', pattern: /\bAKIA[0-9A-Z]{16}\b/ },
   { rule: 'aws session/secret key assignment', pattern: /\bAWS_(SECRET_ACCESS_KEY|SESSION_TOKEN)\s*[=:]/i },
   { rule: 'google api key', pattern: /\bAIza[0-9A-Za-z_-]{35}\b/ },
@@ -309,6 +327,26 @@ export const RESPONSE_SCAN_POLICY: ScanPolicy = {
  */
 export const EVENT_SCAN_POLICY: ScanPolicy = {
   forbiddenKeys: new Set(PROFILE_LEAK_KEYS),
+  /*
+   * The last four are what a permission prompt is made of, and they were
+   * missing: `question` is the interview the agent wants answered (its text,
+   * its headers, its options), `plan` is the plan it wants approved, and
+   * `answers` and `note` are what the person said back. All model prose or the
+   * user's own, exactly like `text`.
+   *
+   * They matter more than any other key here, because of what a drop costs. A
+   * dropped delta is a gap in a transcript. A dropped `permission.request` is a
+   * run parked on a prompt that was never drawn: the agent asked, nothing
+   * appeared, and the wait ended as a refusal the user never gave. That is how
+   * this was found — a question that *quoted* the false positive described on
+   * `SECRET_VALUE_RULES` was itself refused, twice, and the person it was
+   * addressed to saw only that an event had been dropped.
+   *
+   * Marking the container rather than each leaf is deliberate: `question` and
+   * `answers` exempt everything under them from the value patterns, including
+   * option labels and previews added later, while the forbidden-key check
+   * still runs at every depth beneath.
+   */
   contentKeys: new Set([
     'text',
     'resulttext',
@@ -320,6 +358,10 @@ export const EVENT_SCAN_POLICY: ScanPolicy = {
     'firstprompt',
     'summary',
     'blockedpath',
+    'question',
+    'plan',
+    'answers',
+    'note',
   ]),
   // Tool inputs and tool results are provider data, unbounded in size and
   // shape. Walking them would cost real time on every delta for no benefit.
@@ -409,6 +451,38 @@ const MEMORY_BANK_SCAN_POLICY: ScanPolicy = {
 };
 
 /**
+ * Scan policy for the prompt library — its listing and the echo of a save,
+ * which carry the same document.
+ *
+ * Two fields on that response are prose Artemis did not write, and both were
+ * being read as though it had:
+ *
+ *  - **`markdown`** is a standing prompt: the user's own instructions to their
+ *    agents, which is exactly where someone writes "send it as `Authorization:
+ *    Bearer …`" or quotes the shape of the key a tool expects. It is the same
+ *    kind of thing as a routine's `instructions`, which the strict policy
+ *    already exempts with the argument that applies here word for word —
+ *    refusing to list the prompts because one mentions a token shape hides
+ *    exactly the row the user needs to edit. Worse here than there: a save
+ *    answers with the document too, so the prompt was stored, the save looked
+ *    like it failed, and the pane could never be opened again to take the
+ *    sentence back out.
+ *  - **`text`** is a memory bank's index, which rides along so the pane can
+ *    preview the built-in prompt. It is a list of a team's memory names and
+ *    descriptions off the bank's reviewed main branch — the same argument as
+ *    {@link MEMORY_BANK_SCAN_POLICY}'s `body`, and the bank's own validator has
+ *    already refused credential-shaped strings on the way in.
+ *
+ * Structure stays strict: no profile field at any depth, and every string
+ * Artemis itself assembled around those two — ids, slugs, paths — is still
+ * matched against the value rules.
+ */
+const AGENT_PROMPTS_SCAN_POLICY: ScanPolicy = {
+  ...RESPONSE_SCAN_POLICY,
+  contentKeys: new Set([...RESPONSE_SCAN_POLICY.contentKeys, 'markdown', 'text']),
+};
+
+/**
  * Scan a payload carrying replayed {@link import('@rx-artemis/protocol').AgentEvent}s.
  *
  * Each event is scanned exactly as the live push path scans it: same policy,
@@ -480,6 +554,12 @@ export function assertResponseSafe(value: unknown, channel: IpcChannel): void {
     // Team-authored memory bodies, already gated by the bank's own validator.
     case IPC.memoryBankMemories:
       return assertNoSecrets(value, channel, MEMORY_BANK_SCAN_POLICY);
+
+    // The user's own standing prompts, and the bank index that previews one.
+    // A save answers with the same document, so it is scanned the same way.
+    case IPC.agentPromptsList:
+    case IPC.agentPromptsSave:
+      return assertNoSecrets(value, channel, AGENT_PROMPTS_SCAN_POLICY);
 
     default:
       return assertNoSecrets(value, channel, RESPONSE_SCAN_POLICY);

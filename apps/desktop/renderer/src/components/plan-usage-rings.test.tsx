@@ -240,6 +240,64 @@ describe('the status bar rings', () => {
     );
   });
 
+  it('shows a dash for a window that has reset since it was read', async () => {
+    /*
+      The reported symptom, on the surface it was seen on: a 5-hour window that
+      had rolled over an hour ago, still drawn at the number it held before. A
+      percentage is a statement about a period, and once that period is over the
+      old figure is worse than no figure — it reads as current.
+
+      The slot stays rather than disappearing: the two rings beside it would
+      slide sideways at exactly the moment the user is watching for the reset,
+      and "this plan has a 5-hour limit, unread since it came back" is what a
+      dash already means here.
+    */
+    seed();
+    const now = Date.now();
+    answer = {
+      available: true,
+      fetchedAt: now - 2 * 60 * 60_000,
+      windows: [
+        {
+          id: 'five_hour',
+          label: '5 hours',
+          utilization: 100,
+          resetsAt: now - 60 * 60_000,
+          at: now - 2 * 60 * 60_000,
+        },
+        window_('seven_day', '7 days', 23),
+      ],
+    };
+    mount();
+
+    await waitFor(() => expect(meter().textContent).toContain('Week'));
+    expect(meter().textContent).toBe('5hr—Week23');
+    expect(meter().getAttribute('aria-label')).toBe('Plan usage — 5hr unknown, Week 23%');
+  });
+
+  it('keeps a number the provider read after the reset', async () => {
+    // The complement: 3% of the *new* window is gone, and the clock does not
+    // get to overrule the provider just because the reset time has passed.
+    seed();
+    const now = Date.now();
+    answer = {
+      available: true,
+      fetchedAt: now - 60_000,
+      windows: [
+        {
+          id: 'five_hour',
+          label: '5 hours',
+          utilization: 3,
+          resetsAt: now - 30 * 60_000,
+          at: now - 60_000,
+        },
+      ],
+    };
+    mount();
+
+    await waitFor(() => expect(meter().textContent).toBe('5hr3'));
+  });
+
   it('draws no arc at all on a window at zero', async () => {
     seed();
     answer = {

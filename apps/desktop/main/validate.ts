@@ -42,6 +42,11 @@ import { readSchedule } from './routines.js';
 import {
   AGENT_PROMPTS_VERSION,
   AGENT_PROMPT_LIMITS,
+  DEFAULT_SKILL_SOURCE_SUBDIR,
+  SKILL_LIBRARY_VERSION,
+  SKILL_LIMITS,
+  skillSourceSubdirProblem,
+  skillSourceUrlProblem,
   AttachmentError,
   configDirProblem,
   BUILT_IN_PROMPT_IDS,
@@ -70,6 +75,14 @@ import {
   type AgentPromptScope,
   type AgentPromptsListRequest,
   type AgentPromptsSaveRequest,
+  type SkillsListRequest,
+  type SkillsSaveRequest,
+  type SkillsSourceAddRequest,
+  type SkillsSourceRemoveRequest,
+  type SkillsSourceSyncRequest,
+  type ServerSkillsSourceAddRequest,
+  type ServerSkillsSourceRemoveRequest,
+  type ServerSkillsSourceSyncRequest,
   type Attachment,
   type BuiltInPromptId,
   type MemoryBankAddRequest,
@@ -2647,6 +2660,124 @@ export function validateAgentPromptsSave(raw: unknown): AgentPromptsSaveRequest 
         : { dismissedBuiltIns: dismissed as BuiltInPromptId[] }),
     },
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Skills                                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** Empty; the skills are this machine's folders and main knows where they are. */
+export function validateSkillsList(raw: unknown): SkillsListRequest {
+  requireRequest(raw);
+  return {};
+}
+
+/**
+ * The always-on choices, rebuilt entry by entry.
+ *
+ * Names and scopes and nothing else: there is no field here a renderer could
+ * use to name a directory, which is the property that matters. What an
+ * always-on skill *says* is read by main from a folder main found, so the most
+ * a renderer can do with this channel is switch on a skill that is already on
+ * the machine — never point a run's system prompt at a file of its choosing.
+ *
+ * A name is a folder name, so a path separator in one is refused outright
+ * rather than resolved: it could only ever be an attempt to reach outside the
+ * skills folders.
+ */
+export function validateSkillsSave(raw: unknown): SkillsSaveRequest {
+  const request = requireRequest(raw);
+  const document = requireObject(request['document'], 'document');
+
+  const rawEntries = document['alwaysOn'];
+  if (!Array.isArray(rawEntries)) {
+    throw new ValidationError('document.alwaysOn', 'must be an array');
+  }
+  if (rawEntries.length > SKILL_LIMITS.count) {
+    throw new ValidationError('document.alwaysOn', `must hold at most ${SKILL_LIMITS.count} skills`);
+  }
+
+  return {
+    document: {
+      version: SKILL_LIBRARY_VERSION,
+      alwaysOn: rawEntries.map((value, index) => {
+        const field = `document.alwaysOn[${index}]`;
+        const entry = requireObject(value, field);
+        const name = requireString(entry['name'], `${field}.name`, SKILL_LIMITS.name);
+        if (name.includes('/') || name.includes('\\') || name === '.' || name === '..') {
+          throw new ValidationError(`${field}.name`, 'must be a skill name, not a path');
+        }
+        return { name, scope: validateAgentPromptScope(entry['scope'], `${field}.scope`) };
+      }),
+    },
+  };
+}
+
+/**
+ * A repository to subscribe to.
+ *
+ * The one string on this surface that becomes an argument to a program: main
+ * hands it to `git clone`. The rule is the protocol's, so the pane's disabled
+ * Add button and this refusal cannot drift — three transports, no leading
+ * hyphen, no credential in the URL — and the message is the rule's own, which
+ * is written to be shown.
+ */
+export function validateSkillsSourceAdd(raw: unknown): SkillsSourceAddRequest {
+  const request = requireRequest(raw);
+  const url = requireString(request['url'], 'url', SKILL_LIMITS.url).trim();
+  const urlProblem = skillSourceUrlProblem(url);
+  if (urlProblem !== null) throw new ValidationError('url', urlProblem);
+
+  const subdir = (optionalString(request['subdir'], 'subdir', SKILL_LIMITS.subdir) ?? DEFAULT_SKILL_SOURCE_SUBDIR).trim();
+  const subdirProblem = skillSourceSubdirProblem(subdir);
+  if (subdirProblem !== null) throw new ValidationError('subdir', subdirProblem);
+
+  return { url, subdir };
+}
+
+/**
+ * A source id names a folder main will delete, so it is held to the alphabet
+ * `skillSourceIdFor` writes and nothing wider. Main still looks the id up in
+ * its own list before acting; this is the first of the two checks, not the only.
+ */
+function requireSkillSourceId(value: unknown, field: string): string {
+  const id = requireString(value, field, 120);
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) {
+    throw new ValidationError(field, 'must be a skill source id');
+  }
+  return id;
+}
+
+export function validateSkillsSourceRemove(raw: unknown): SkillsSourceRemoveRequest {
+  const request = requireRequest(raw);
+  return { id: requireSkillSourceId(request['id'], 'id') };
+}
+
+export function validateSkillsSourceSync(raw: unknown): SkillsSourceSyncRequest {
+  const request = requireRequest(raw);
+  return request['id'] === undefined ? {} : { id: requireSkillSourceId(request['id'], 'id') };
+}
+
+/**
+ * The same three, aimed at an Artemis server through one of its profiles.
+ *
+ * Held to exactly the rules above, and on purpose before the request leaves:
+ * the server refuses the same URLs in the same words, but a URL refused here
+ * never crosses a network at all.
+ */
+export function validateServerSkillsSourceAdd(raw: unknown): ServerSkillsSourceAddRequest {
+  const request = requireRequest(raw);
+  return { profileId: requireId(request['profileId'], 'profileId'), ...validateSkillsSourceAdd(raw) };
+}
+
+export function validateServerSkillsSourceRemove(raw: unknown): ServerSkillsSourceRemoveRequest {
+  const request = requireRequest(raw);
+  return { profileId: requireId(request['profileId'], 'profileId'), ...validateSkillsSourceRemove(raw) };
+}
+
+export function validateServerSkillsSourceSync(raw: unknown): ServerSkillsSourceSyncRequest {
+  const request = requireRequest(raw);
+  return { profileId: requireId(request['profileId'], 'profileId'), ...validateSkillsSourceSync(raw) };
 }
 
 /* -------------------------------------------------------------------------- */

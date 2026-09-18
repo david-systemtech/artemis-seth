@@ -823,6 +823,13 @@ class ArtemisRun implements Run {
         ...(this.#input.systemPrompt?.kind === 'append'
           ? { systemPrompt: this.#input.systemPrompt.text }
           : {}),
+        // The always-on skills, as names: the server reads the bodies off its
+        // own disk, because a skill's text may point at files beside it and a
+        // served run can only open the server's. An older server drops the
+        // field and the run starts without them, which is what it did before.
+        ...(this.#input.alwaysOnSkills === undefined || this.#input.alwaysOnSkills.length === 0
+          ? {}
+          : { alwaysOnSkills: this.#input.alwaysOnSkills }),
         /*
          * The files and images this prompt is about, carried whole. The server
          * stages them into a directory of its own and names them to the agent
@@ -1152,10 +1159,20 @@ class ArtemisRun implements Run {
      * it is the failure the capability flag exists to prevent. The user's cure
      * is on the picker: an account whose provider can take instructions.
      */
-    if (extensions?.ignored?.includes('artemis.systemPrompt') === true && !this.#instructionsDropped) {
+    // The always-on skills ride the same capability and are dropped with them,
+    // so one notice names whichever of the two this run actually went without.
+    const droppedPrompts = extensions?.ignored?.includes('artemis.systemPrompt') === true;
+    const droppedSkills = extensions?.ignored?.includes('artemis.alwaysOnSkills') === true;
+    if ((droppedPrompts || droppedSkills) && !this.#instructionsDropped) {
       this.#instructionsDropped = true;
+      const without =
+        droppedPrompts && droppedSkills
+          ? 'your prompt library or your always-on skills'
+          : droppedPrompts
+            ? 'your prompt library'
+            : 'your always-on skills';
       this.#notice(
-        "The serving account's provider cannot take standing instructions, so this run started without your prompt library. Pick an account on a provider that can (Claude, or a local model) to have them apply.",
+        `The serving account's provider cannot take standing instructions, so this run started without ${without}. Pick an account on a provider that can (Claude, or a local model) to have them apply.`,
       );
     }
     /*
@@ -1403,7 +1420,7 @@ class ArtemisRun implements Run {
   }
 
   /** The address of a native route on this run, or the reason there is none yet. */
-  #runRoute(action: 'messages' | 'interrupt' | 'permission'): string {
+  #runRoute(action: 'messages' | 'interrupt' | 'permission' | 'stop-task'): string {
     const runId = this.#remoteRunId;
     if (runId === undefined) {
       throw adapterError(
@@ -1492,6 +1509,24 @@ class ArtemisRun implements Run {
     }
     this.#abort.abort();
     return { stillQueued: [] };
+  }
+
+  /**
+   * Stop one piece of delegated work on the server's run.
+   *
+   * The server has taken `POST /api/v0/runs/{id}/stop-task` on its bridge
+   * surface since the delegated-work rows first crossed the wire, and the
+   * rows themselves arrive here as `artemis.tasks` — so the pane drew a stop
+   * button on every one of them, and every press ended in the registry's
+   * "cannot stop delegated tasks", because this run never had the method the
+   * registry looks for (reported 2026-09-18: a served session waiting on a
+   * task that had already finished, with nothing to press). Not gated on the
+   * run being active, for the reason the Claude turn's is not: the task worth
+   * stopping is the one that outlived the turn that launched it.
+   */
+  async stopTask(taskId: string): Promise<void> {
+    const response = await this.#post(this.#runRoute('stop-task'), { taskId });
+    if (!response.ok) throw await runRouteError(response, 'stop this task');
   }
 
   async respondToPermission(

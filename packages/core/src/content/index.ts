@@ -6,6 +6,14 @@
  * this module builds the one channel that lets exactly the wanted surfaces
  * through, for every host — the desktop, the terminal, the server — from one
  * implementation. `bridge.ts` says why each provider needs a different shape.
+ * `skills.ts` reads what those skills *are* — for the pane that lists them, and
+ * for the ones a user has switched always-on. `skillSources.ts` keeps the
+ * repositories a user subscribed to cloned and current, on every host, and
+ * `skillSourceRegistry.ts` is where a host with no settings pane keeps the
+ * list of them.
  */
 
 export * from './bridge.js';
+export * from './skills.js';
+export * from './skillSources.js';
+export * from './skillSourceRegistry.js';

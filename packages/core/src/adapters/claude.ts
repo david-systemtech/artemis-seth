@@ -1994,7 +1994,10 @@ export function createClaudeAdapter(options?: ClaudeAdapterOptions): ProviderAda
             settingSources: [],
           },
         });
-        return await readPlanUsage(sdkQuery, now());
+        // The clock itself, not a reading of it: `readPlanUsage` spans the CLI
+        // spawn and the control call, and the reading is true as of when the
+        // provider answered rather than when it was asked. See its header.
+        return await readPlanUsage(sdkQuery, now);
       } catch (cause) {
         // Spawning the CLI can fail for all the ordinary reasons — a bad cwd, a
         // missing runtime. None of them justify breaking the caller, which is a
@@ -2486,6 +2489,17 @@ const QUEUED_TURN_GRACE_MS = 5_000;
 const DELIVERY_POLL_MS = 800;
 
 /**
+ * How often the fold watch may go looking for a transcript that is not where
+ * the working directory says it should be.
+ *
+ * The derived path costs a `stat`; finding the file any other way costs a
+ * `readdir` of every project folder, which a poll that runs faster than once a
+ * second has no business paying each time. So the search is rationed, and its
+ * answer is cached the moment it succeeds. See `#deliveryPath`.
+ */
+const DELIVERY_SCAN_INTERVAL_MS = 10_000;
+
+/**
  * How much of the transcript's tail the first delivery poll is willing to read.
  *
  * The watch starts at send time and the fold strictly follows it, so anything
@@ -2909,6 +2923,8 @@ class ClaudeProcess {
   #deliveryRemainder = '';
   /** The transcript path once found, so the candidate walk runs once. */
   #deliveryFile: string | undefined;
+  /** When the project folders were last searched for the transcript. See `#deliveryPath`. */
+  #deliveryScanAt = 0;
   /**
    * Deliveries noticed while no turn could carry them.
    *
@@ -4118,7 +4134,26 @@ class ClaudeProcess {
         return file;
       }
     }
-    return undefined;
+
+    /*
+     * Not where the working directory says it should be.
+     *
+     * A conversation's file stays in the folder it was *begun* in. One whose
+     * directory changes part-way — relocated, or resumed from somewhere else —
+     * goes on appending to that first folder while `#input.cwd` names the new
+     * one, and the derived path then points at a file that will never exist.
+     * Seen 2026-09-18: a served session wrote 34 records under a second
+     * directory into the first directory's file, and for those four minutes
+     * every fold went unnoticed. Found by its id instead, which is unique
+     * across folders — but rationed, because unlike the `stat`s above this one
+     * reads a directory, and this method is on a sub-second poll.
+     */
+    const now = Date.now();
+    if (now - this.#deliveryScanAt < DELIVERY_SCAN_INTERVAL_MS) return undefined;
+    this.#deliveryScanAt = now;
+    const elsewhere = await findSessionTranscript(configDir, undefined, sessionId);
+    if (elsewhere !== undefined) this.#deliveryFile = elsewhere;
+    return elsewhere;
   }
 
   /**
@@ -5396,11 +5431,21 @@ class ClaudeTurn implements Run {
  * `$CLAUDE_CONFIG_DIR/projects/<cwd with every non-alphanumeric turned into
  * a dash>/<sessionId>.jsonl`, exactly as `#deliveryPath` resolves it for the
  * fold watch — the CLI munges its *resolved* directory, so the real path is a
- * candidate too. Without a directory to derive the key from, the project
- * folders are scanned for the file: a history read is allowed to cost a
- * `readdir`, which the fold watch's per-second poll is not.
+ * candidate too.
+ *
+ * When that misses — or there is no directory to derive the key from — the
+ * project folders are searched for the file by its id. A miss used to be final
+ * whenever a directory *was* given, on the reasoning that the directory is
+ * authoritative. It is not: a conversation's file stays in the folder it was
+ * begun in, so one whose directory changed part-way is filed under a key its
+ * current directory does not produce, and every queued message in it vanished
+ * from the replayed history. A history read is allowed to cost a `readdir`;
+ * the fold watch's sub-second poll is not, which is why `#deliveryPath` rations
+ * the same search rather than sharing this one's freedom.
+ *
+ * Exported for its test.
  */
-async function findSessionTranscript(
+export async function findSessionTranscript(
   configDir: string | undefined,
   cwd: string | undefined,
   sessionId: string,
@@ -5417,7 +5462,6 @@ async function findSessionTranscript(
       const file = join(root, dir.replace(/[^a-zA-Z0-9]/g, '-'), `${sessionId}.jsonl`);
       if (await isFile(file)) return file;
     }
-    return undefined;
   }
 
   const projects = await readdir(root).catch(() => [] as string[]);

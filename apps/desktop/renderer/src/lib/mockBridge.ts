@@ -30,6 +30,10 @@ import type {
   ProviderDescriptor,
   ProviderModelOption,
   RunEndReason,
+  SkillInfo,
+  SkillLibraryDocument,
+  ServerSkillsResponse,
+  SkillsListResponse,
   RunHandle,
   RunSuggestion,
   Routine,
@@ -65,6 +69,9 @@ import {
   SHARED_ENTRIES,
   normalizeProfileColor,
   parseAgentPromptsDocument,
+  parseSkillLibraryDocument,
+  withoutSkillSource,
+  withSkillSource,
   type BrowserEvent,
   type BrowserInfo,
   type BrowserState,
@@ -753,6 +760,109 @@ let mockBankMemories: MemoryBankMemory[] = [
     file: 'memory/sessions/artemis-agent-harness.md',
   },
 ];
+
+/**
+ * The dev mock's skills: one of each shape the Skills pane has to draw — chosen
+ * by the model or typed, typed only, an account's own, and one nobody
+ * described — with one already always-on so the populated state is what a
+ * developer meets first.
+ */
+const MOCK_SKILLS: readonly SkillInfo[] = [
+  {
+    name: 'code-review',
+    description: 'Review a diff for correctness bugs before it is proposed.',
+    origin: { kind: 'machine' },
+    dir: '/Users/demo/.agents/skills/code-review',
+    modelInvocable: true,
+    userInvocable: true,
+    bodyChars: 5_200,
+  },
+  {
+    name: 'release',
+    description: 'Cut a release: gates, tag, and the notes that go with it.',
+    origin: { kind: 'profile', profileIds: ['demo-personal' as ProfileId] },
+    dir: '/Users/demo/.claude/skills/release',
+    modelInvocable: false,
+    userInvocable: true,
+    bodyChars: 2_100,
+  },
+  {
+    name: 'scratch',
+    description: '',
+    origin: { kind: 'machine' },
+    dir: '/Users/demo/.agents/skills/scratch',
+    modelInvocable: true,
+    userInvocable: true,
+    bodyChars: 340,
+  },
+  {
+    name: 'unslop',
+    description: 'Remove AI writing patterns from prose. Use for docs, READMEs and anything that should sound human.',
+    origin: { kind: 'machine' },
+    dir: '/Users/demo/.agents/skills/unslop',
+    modelInvocable: true,
+    userInvocable: true,
+    bodyChars: 3_900,
+  },
+];
+
+let mockSkillLibrary: SkillLibraryDocument = parseSkillLibraryDocument({
+  version: 1,
+  alwaysOn: [{ name: 'unslop', scope: { kind: 'all' } }],
+  sources: [{ url: 'https://github.com/demo/agent-skills.git', subdir: 'skills' }],
+});
+
+/** The whole skills state, with every mock source drawn as cloned and current. */
+function mockSkillsState(): SkillsListResponse {
+  return {
+    skills: MOCK_SKILLS,
+    document: mockSkillLibrary,
+    sources: (mockSkillLibrary.sources ?? []).map((source) => ({
+      source,
+      cloned: true,
+      head: 'a1b2c3d',
+      syncedAt: Date.now() - 12 * 60_000,
+      skillCount: 2,
+    })),
+  };
+}
+
+/**
+ * What the mock's Artemis server carries: one skill this machine has too, and
+ * one it does not, so the pane's two interesting rows are both on show.
+ */
+let mockServerSkillSources: SkillLibraryDocument = parseSkillLibraryDocument({
+  version: 1,
+  alwaysOn: [],
+  sources: [{ url: 'https://github.com/demo/agent-skills.git', subdir: 'skills' }],
+});
+
+function mockServerSkillsState(): ServerSkillsResponse {
+  return {
+    available: true,
+    manage: true,
+    skills: [
+      MOCK_SKILLS[3]!,
+      {
+        name: 'deploy-checklist',
+        description: 'The steps this server’s deploys follow, in order.',
+        origin: { kind: 'machine' },
+        dir: '/data/agent/.agents/skills/deploy-checklist',
+        modelInvocable: true,
+        userInvocable: true,
+        bodyChars: 1_800,
+      },
+    ],
+    sources: (mockServerSkillSources.sources ?? []).map((source) => ({
+      source,
+      cloned: true,
+      head: 'a1b2c3d',
+      syncedAt: Date.now() - 4 * 60_000,
+      skillCount: 1,
+    })),
+    accounts: mockRemoteAccounts.map((account) => ({ id: account.id, slug: account.slug, label: account.label })),
+  };
+}
 
 /**
  * The prompt library, in memory.
@@ -2139,6 +2249,23 @@ export function createMockBridge(): ArtemisBridge {
       },
     },
 
+    skills: {
+      list: async () => ok(mockSkillsState()),
+      save: async (request) => {
+        mockSkillLibrary = parseSkillLibraryDocument({ ...request.document, sources: mockSkillLibrary.sources });
+        return ok({ document: mockSkillLibrary });
+      },
+      addSource: async (request) => {
+        mockSkillLibrary = withSkillSource(mockSkillLibrary, request.url, request.subdir);
+        return ok(mockSkillsState());
+      },
+      removeSource: async (request) => {
+        mockSkillLibrary = withoutSkillSource(mockSkillLibrary, request.id);
+        return ok(mockSkillsState());
+      },
+      syncSources: async () => ok(mockSkillsState()),
+    },
+
     /*
      * No file to read and no custom scheme to serve it from, so the mock frames
      * a `data:` page instead of an `artemis-preview:` one. That substitution is
@@ -2616,6 +2743,19 @@ export function createMockBridge(): ArtemisBridge {
     },
 
     /** The server's banks, and which of its accounts each one reaches. */
+    serverSkills: {
+      list: async () => ok(mockServerSkillsState()),
+      addSource: async (request) => {
+        mockServerSkillSources = withSkillSource(mockServerSkillSources, request.url, request.subdir);
+        return ok(mockServerSkillsState());
+      },
+      removeSource: async (request) => {
+        mockServerSkillSources = withoutSkillSource(mockServerSkillSources, request.id);
+        return ok(mockServerSkillsState());
+      },
+      syncSources: async () => ok(mockServerSkillsState()),
+    },
+
     serverMemoryBanks: {
       list: async () =>
         ok({

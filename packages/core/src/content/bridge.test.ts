@@ -25,11 +25,15 @@
  *    the same directory this links into, and a user may install a skill there by
  *    hand. Four tests pin down what must survive contact with the linker.
  *
- * Skipped on Windows, where an unprivileged `symlink` fails and the desktop app
- * is not shipped.
+ * Run on Windows too. It was skipped there once, on the grounds that an
+ * unprivileged `symlink` fails and the desktop app was not shipped; the app
+ * ships there now, and the bridge lays down junctions, which need no
+ * privilege. The fixtures link the same way, so the suite passes for a
+ * developer without Developer Mode as it does on a runner that has it.
  */
 
 import {
+  existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -47,9 +51,12 @@ import {
   buildContentBridge,
   discoverMarketplacePlugins,
   linkSkillsIntoCodexHome,
+  marketplaceSkillOffers,
+  resolveContentPlugins,
 } from './bridge.js';
 
-const describeIfSymlinks = process.platform === 'win32' ? describe.skip : describe;
+/** How a fixture links a directory: the bridge's own choice. See `DIR_LINK` in `bridge.ts`. */
+const DIR_LINK = process.platform === 'win32' ? 'junction' : 'dir';
 
 const sandboxes: string[] = [];
 
@@ -101,7 +108,7 @@ function listSkills(skillsDir: string): readonly string[] {
   return readdirSync(skillsDir).sort();
 }
 
-describeIfSymlinks('buildContentBridge (Claude)', () => {
+describe('buildContentBridge (Claude)', () => {
   it('bridges the skills in a config directory', async () => {
     const { configDir, dataDir, home } = sandbox();
     seedSkill(path.join(configDir, 'skills'), 'use-railway');
@@ -128,7 +135,7 @@ describeIfSymlinks('buildContentBridge (Claude)', () => {
     // user's own directory, so discovery resolves through two hops.
     const real = path.join(home, '.claude', 'skills');
     seedSkill(real, 'use-railway');
-    symlinkSync(real, path.join(configDir, 'skills'), 'dir');
+    symlinkSync(real, path.join(configDir, 'skills'), DIR_LINK);
 
     const [plugin] = await buildContentBridge({ configDir, dataDir, home });
 
@@ -329,7 +336,7 @@ describeIfSymlinks('buildContentBridge (Claude)', () => {
   });
 });
 
-describeIfSymlinks('discoverMarketplacePlugins', () => {
+describe('discoverMarketplacePlugins', () => {
   /**
    * Write the two files a `/plugin install` leaves behind.
    *
@@ -495,7 +502,7 @@ describeIfSymlinks('discoverMarketplacePlugins', () => {
   });
 });
 
-describeIfSymlinks('linkSkillsIntoCodexHome', () => {
+describe('linkSkillsIntoCodexHome', () => {
   /** Where Codex reads a profile's skills from. */
   const codexSkills = (configDir: string): string => path.join(configDir, 'skills');
 
@@ -547,7 +554,7 @@ describeIfSymlinks('linkSkillsIntoCodexHome', () => {
     symlinkSync(
       path.join(dotfiles, 'use-railway'),
       path.join(codexSkills(configDir), 'use-railway'),
-      'dir',
+      DIR_LINK,
     );
 
     await linkSkillsIntoCodexHome({ configDir, home });
@@ -603,7 +610,7 @@ describeIfSymlinks('linkSkillsIntoCodexHome', () => {
     const { configDir, home } = sandbox();
     seedSkill(path.join(home, '.codex', 'skills'), 'use-railway');
     mkdirSync(codexSkills(configDir), { recursive: true });
-    symlinkSync(path.join(home, 'gone'), path.join(codexSkills(configDir), 'stale'), 'dir');
+    symlinkSync(path.join(home, 'gone'), path.join(codexSkills(configDir), 'stale'), DIR_LINK);
 
     await linkSkillsIntoCodexHome({ configDir, home });
 
@@ -639,5 +646,359 @@ describeIfSymlinks('linkSkillsIntoCodexHome', () => {
     writeFileSync(path.join(configDir, 'skills'), 'not a directory');
 
     await expect(linkSkillsIntoCodexHome({ configDir, home })).resolves.toBeUndefined();
+  });
+});
+
+/**
+ * One skill, offered once.
+ *
+ * Reported as a skill appearing in the composer's menu twice — under
+ * `artemis-skills:` and again under its author's plugin. The two are the same
+ * files reached two ways: the user installed a marketplace plugin *and* has
+ * its skills copied into `~/.agents/skills`, which the bridge links.
+ *
+ * Only one side can give way. A marketplace plugin is handed to the run whole
+ * — that is the departure the header argues for — so nothing here can remove
+ * a skill from inside it. The bridge is a directory Artemis assembles, so the
+ * bridge is what yields.
+ */
+describe('resolveContentPlugins', () => {
+  /**
+   * A skill the plugin *publishes*, nested and declared the way a real one is.
+   *
+   * `mattpocock-skills` files its skills under a category and names each one in
+   * its manifest's `skills` list, because the CLI reads a plugin's `skills/`
+   * one level deep and would otherwise find none of them. The fixture does
+   * both halves; {@link seedUnpublishedSkill} does only the first.
+   */
+  function seedPluginSkill(installPath: string, category: string, name: string): void {
+    seedUnpublishedSkill(installPath, category, name);
+    const manifestFile = path.join(installPath, '.claude-plugin', 'plugin.json');
+    const manifest = JSON.parse(readFileSync(manifestFile, 'utf8')) as { skills?: string[] };
+    manifest.skills = [...(manifest.skills ?? []), `./skills/${category}/${name}`];
+    writeFileSync(manifestFile, JSON.stringify(manifest));
+  }
+
+  /** A skill that sits in the plugin's checkout and that its manifest never names. */
+  function seedUnpublishedSkill(
+    installPath: string,
+    category: string,
+    name: string,
+    declaredName: string | null = name,
+  ): string {
+    const dir = path.join(installPath, 'skills', category, name);
+    mkdirSync(dir, { recursive: true });
+    const nameLine = declaredName === null ? '' : `name: ${declaredName}\n`;
+    writeFileSync(path.join(dir, 'SKILL.md'), `---\n${nameLine}description: From the plugin.\n---\n`);
+    return dir;
+  }
+
+  function rewriteManifest(installPath: string, change: (manifest: Record<string, unknown>) => void): void {
+    const manifestFile = path.join(installPath, '.claude-plugin', 'plugin.json');
+    const manifest = JSON.parse(readFileSync(manifestFile, 'utf8')) as Record<string, unknown>;
+    change(manifest);
+    writeFileSync(manifestFile, JSON.stringify(manifest));
+  }
+
+  function pluginAt(home: string): string {
+    return path.join(home, '.claude', 'plugins', 'cache', 'mattpocock', '1.2.3');
+  }
+
+  async function bridgedBy(options: Parameters<typeof resolveContentPlugins>[0]): Promise<readonly string[]> {
+    const plugins = await resolveContentPlugins(options);
+    const bridge = plugins.find((plugin) => plugin.path.startsWith(options.dataDir));
+    return bridge === undefined ? [] : listSkills(path.join(bridge.path, 'skills'));
+  }
+
+  function seedEnabledPlugin(configDir: string, home: string, installPath: string): void {
+    const key = 'mattpocock-skills@claude-plugins-official';
+    mkdirSync(path.join(installPath, '.claude-plugin'), { recursive: true });
+    writeFileSync(
+      path.join(installPath, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'mattpocock-skills', version: '1.2.3' }),
+    );
+    const record = path.join(configDir, 'plugins', 'installed_plugins.json');
+    mkdirSync(path.dirname(record), { recursive: true });
+    writeFileSync(
+      record,
+      JSON.stringify({ version: 2, plugins: { [key]: [{ scope: 'user', installPath, version: '1.2.3' }] } }),
+    );
+    const settings = path.join(home, '.claude', 'settings.json');
+    mkdirSync(path.dirname(settings), { recursive: true });
+    writeFileSync(settings, JSON.stringify({ enabledPlugins: { [key]: true } }));
+  }
+
+  it('does not bridge a skill an enabled marketplace plugin already provides', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const installPath = path.join(home, '.claude', 'plugins', 'cache', 'mattpocock', '1.2.3');
+    seedEnabledPlugin(configDir, home, installPath);
+    seedPluginSkill(installPath, 'engineering', 'tdd');
+    // The user's own copy of the plugin's skill, and one that is theirs alone.
+    seedSkill(path.join(configDir, 'skills'), 'tdd');
+    seedSkill(path.join(configDir, 'skills'), 'ask-matt');
+
+    const plugins = await resolveContentPlugins({ configDir, dataDir, home });
+
+    const bridge = plugins.find((plugin) => plugin.path.startsWith(dataDir));
+    expect(bridge).toBeDefined();
+    // `tdd` is the plugin's to offer; `ask-matt` is nobody else's.
+    expect(listSkills(path.join(bridge?.path ?? '', 'skills'))).toEqual(['ask-matt']);
+    // And the plugin itself is still handed over, whole.
+    expect(plugins.map((plugin) => plugin.path)).toContain(installPath);
+  });
+
+  it('offers every skill it offered before, each of them once', async () => {
+    // The point of the de-duplication is that it removes an *offering*, never
+    // a skill: whatever was reachable before has to still be reachable, under
+    // one name instead of two.
+    const { configDir, dataDir, home } = sandbox();
+    const installPath = path.join(home, '.claude', 'plugins', 'cache', 'mattpocock', '1.2.3');
+    seedEnabledPlugin(configDir, home, installPath);
+    seedPluginSkill(installPath, 'engineering', 'tdd');
+    seedPluginSkill(installPath, 'productivity', 'grilling');
+    seedSkill(path.join(configDir, 'skills'), 'tdd');
+    seedSkill(path.join(configDir, 'skills'), 'ask-matt');
+
+    const plugins = await resolveContentPlugins({ configDir, dataDir, home });
+    const bridge = plugins.find((plugin) => plugin.path.startsWith(dataDir));
+    const bridged = bridge === undefined ? [] : listSkills(path.join(bridge.path, 'skills'));
+    const fromPlugin = ['tdd', 'grilling'];
+
+    expect([...bridged, ...fromPlugin].sort()).toEqual(['ask-matt', 'grilling', 'tdd']);
+  });
+
+  it('bridges everything when no marketplace plugin is enabled', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedSkill(path.join(configDir, 'skills'), 'tdd');
+    seedSkill(path.join(configDir, 'skills'), 'ask-matt');
+
+    const plugins = await resolveContentPlugins({ configDir, dataDir, home });
+
+    expect(plugins).toHaveLength(1);
+    expect(listSkills(path.join(plugins[0]?.path ?? '', 'skills'))).toEqual(['ask-matt', 'tdd']);
+  });
+
+  it('stops bridging a skill once the plugin that provides it is installed', async () => {
+    // The bridge is reconciled per run, so a name that stops being ours has to
+    // leave the directory rather than linger from the launch before.
+    const { configDir, dataDir, home } = sandbox();
+    seedSkill(path.join(configDir, 'skills'), 'tdd');
+    const first = await resolveContentPlugins({ configDir, dataDir, home });
+    expect(listSkills(path.join(first[0]?.path ?? '', 'skills'))).toEqual(['tdd']);
+
+    const installPath = path.join(home, '.claude', 'plugins', 'cache', 'mattpocock', '1.2.3');
+    seedEnabledPlugin(configDir, home, installPath);
+    seedPluginSkill(installPath, 'engineering', 'tdd');
+
+    const after = await resolveContentPlugins({ configDir, dataDir, home });
+    const bridge = after.find((plugin) => plugin.path.startsWith(dataDir));
+    // Nothing of the user's own is left to bridge, so there may be no bridge
+    // at all — either way it offers `tdd` no longer.
+    const offered = bridge === undefined ? [] : listSkills(path.join(bridge.path, 'skills'));
+    expect(offered).toEqual([]);
+  });
+
+  /*
+   * What a plugin offers, as the CLI reads it. Each rule below was measured
+   * with `supportedCommands()` against a plugin built for the purpose; the
+   * direction of every one of them is the same, and deliberate: a name missed
+   * is a skill offered twice, a name wrongly collected is a skill nobody offers.
+   */
+
+  it('keeps bridging a skill the plugin carries in its checkout but does not publish', async () => {
+    // The real case: `mattpocock-skills` publishes `skills/engineering/*` and
+    // leaves `skills/in-progress/*` and `skills/misc/*` out of its manifest. A
+    // hand-installed `setup-pre-commit` exists nowhere else.
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedPluginSkill(pluginAt(home), 'engineering', 'tdd');
+    seedUnpublishedSkill(pluginAt(home), 'misc', 'setup-pre-commit');
+    seedSkill(path.join(home, '.agents', 'skills'), 'tdd');
+    seedSkill(path.join(home, '.agents', 'skills'), 'setup-pre-commit');
+
+    expect(await bridgedBy({ configDir, dataDir, home })).toEqual(['setup-pre-commit']);
+  });
+
+  it('counts a skill directly under the plugin\u2019s skills folder with no manifest entry', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedSkill(path.join(pluginAt(home), 'skills'), 'review');
+    seedSkill(path.join(configDir, 'skills'), 'review');
+    seedSkill(path.join(configDir, 'skills'), 'ask-matt');
+
+    expect(await bridgedBy({ configDir, dataDir, home })).toEqual(['ask-matt']);
+  });
+
+  it('reads a declared folder of skills one level deep, and still reads the default one', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedUnpublishedSkill(pluginAt(home), 'engineering', 'tdd');
+    seedUnpublishedSkill(pluginAt(home), path.join('engineering', 'deeper'), 'buried');
+    seedSkill(path.join(pluginAt(home), 'skills'), 'review');
+    // A single string is the other form the field takes.
+    rewriteManifest(pluginAt(home), (manifest) => {
+      manifest['skills'] = './skills/engineering';
+    });
+    for (const name of ['tdd', 'buried', 'review']) seedSkill(path.join(configDir, 'skills'), name);
+
+    // `tdd` by the declared folder, `review` by the default one, and `buried`
+    // by neither: two levels down is not somewhere the CLI looks.
+    expect(await bridgedBy({ configDir, dataDir, home })).toEqual(['buried']);
+  });
+
+  it('knows a skill by the name its frontmatter gives, on both sides', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    // Published from a folder called `tdd-v2`, offered as `tdd`.
+    seedUnpublishedSkill(pluginAt(home), 'engineering', 'tdd-v2', 'tdd');
+    // Published with no `name` at all, so offered under its folder's.
+    seedUnpublishedSkill(pluginAt(home), 'engineering', 'grilling', null);
+    rewriteManifest(pluginAt(home), (manifest) => {
+      manifest['skills'] = ['./skills/engineering/tdd-v2', './skills/engineering/grilling'];
+    });
+    // The person's copies: one in a folder of another name, offered as `tdd`.
+    seedSkill(path.join(configDir, 'skills'), 'my-tdd');
+    writeFileSync(
+      path.join(configDir, 'skills', 'my-tdd', 'SKILL.md'),
+      '---\nname: tdd\ndescription: Mine.\n---\n',
+    );
+    seedSkill(path.join(configDir, 'skills'), 'grilling');
+    seedSkill(path.join(configDir, 'skills'), 'tdd-v2');
+
+    // `my-tdd` and `grilling` would each be offered twice. `tdd-v2` would not:
+    // nothing is offered under that name, whatever the plugin's folder is called.
+    expect(await bridgedBy({ configDir, dataDir, home })).toEqual(['tdd-v2']);
+  });
+
+  it('does not count a manifest path that leaves the plugin, or is not written as one', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedSkill(path.join(home, 'elsewhere'), 'outside');
+    seedUnpublishedSkill(pluginAt(home), 'engineering', 'bare');
+    rewriteManifest(pluginAt(home), (manifest) => {
+      manifest['skills'] = ['./../../../../../elsewhere', 'skills/engineering', 7, './'];
+    });
+    seedSkill(path.join(configDir, 'skills'), 'outside');
+    seedSkill(path.join(configDir, 'skills'), 'bare');
+
+    expect(await bridgedBy({ configDir, dataDir, home })).toEqual(['bare', 'outside']);
+  });
+
+  it('applies to a synced source\u2019s skills as it does to a hand-installed one', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedPluginSkill(pluginAt(home), 'engineering', 'tdd');
+    const source = path.join(dataDir, 'skill-sources', 'agent-skills', 'skills');
+    seedSkill(source, 'tdd');
+    seedSkill(source, 'unslop');
+
+    expect(await bridgedBy({ configDir, dataDir, home, extraSkillDirs: [source] })).toEqual(['unslop']);
+  });
+
+  it('says which plugin offers which name, for the settings pane', async () => {
+    const { configDir, home } = sandbox();
+    seedEnabledPlugin(configDir, home, pluginAt(home));
+    seedPluginSkill(pluginAt(home), 'engineering', 'tdd');
+    seedUnpublishedSkill(pluginAt(home), 'misc', 'setup-pre-commit');
+
+    const offers = await marketplaceSkillOffers({ configDir, home });
+
+    expect([...offers]).toEqual([['tdd', 'mattpocock-skills']]);
+  });
+
+  it('offers nothing for an account with no plugins', async () => {
+    const { configDir, home } = sandbox();
+    expect((await marketplaceSkillOffers({ configDir, home })).size).toBe(0);
+  });
+});
+
+/**
+ * Folders beyond the account's own and the machine's — in practice the
+ * repositories Artemis keeps cloned. What matters is where they sit in the
+ * merge: last, so a skill a person installed by hand keeps its name over the
+ * copy that arrived by subscription.
+ */
+describe('extra skill folders (synced sources)', () => {
+  it('offers a Claude session the skills in an extra folder', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    seedSkill(path.join(configDir, 'skills'), 'supacode-cli');
+
+    const [plugin] = await buildContentBridge({ configDir, dataDir, home, extraSkillDirs: [source] });
+
+    expect(listSkills(path.join(plugin!.path, 'skills'))).toEqual(['supacode-cli', 'unslop']);
+  });
+
+  it('lets a skill installed by hand win its name over the synced copy', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop', 'synced-copy');
+    seedSkill(path.join(home, '.agents', 'skills'), 'unslop', 'hand-installed');
+
+    const [plugin] = await buildContentBridge({ configDir, dataDir, home, extraSkillDirs: [source] });
+
+    const bridged = path.join(plugin!.path, 'skills');
+    expect(listSkills(bridged)).toEqual(['unslop']);
+    expect(readFileSync(path.join(bridged, 'unslop', 'SKILL.md'), 'utf8')).toContain('hand-installed');
+  });
+
+  it('bridges a profile whose only skills are synced ones, and tolerates a source not cloned yet', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    const notYet = path.join(dataDir, 'skill-sources', 'pending', 'skills');
+
+    const [plugin] = await buildContentBridge({ configDir, dataDir, home, extraSkillDirs: [notYet, source] });
+
+    expect(listSkills(path.join(plugin!.path, 'skills'))).toEqual(['unslop']);
+  });
+
+  it('stops offering a synced skill when its source is removed', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    seedSkill(path.join(configDir, 'skills'), 'supacode-cli');
+    await buildContentBridge({ configDir, dataDir, home, extraSkillDirs: [source] });
+
+    const [plugin] = await buildContentBridge({ configDir, dataDir, home });
+
+    expect(listSkills(path.join(plugin!.path, 'skills'))).toEqual(['supacode-cli']);
+  });
+
+  it('links a synced skill into a Codex profile, which has no reason to read Artemis’s data folder', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    seedSkill(path.join(home, '.codex', 'skills'), 'codex-own');
+
+    await linkSkillsIntoCodexHome({ configDir, home, extraSkillDirs: [source] });
+
+    expect(listSkills(path.join(configDir, 'skills'))).toEqual(['codex-own', 'unslop']);
+  });
+
+  it('takes a synced skill back out of a Codex profile when it leaves the source', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    seedSkill(source, 'tdd');
+    await linkSkillsIntoCodexHome({ configDir, home, extraSkillDirs: [source] });
+
+    rmSync(path.join(source, 'tdd'), { recursive: true, force: true });
+    await linkSkillsIntoCodexHome({ configDir, home, extraSkillDirs: [source] });
+
+    expect(listSkills(path.join(configDir, 'skills'))).toEqual(['unslop']);
+  });
+
+  it('does not link into Codex a synced skill it already reads from ~/.agents/skills', async () => {
+    const { configDir, dataDir, home } = sandbox();
+    const source = path.join(dataDir, 'skill-sources', 'team', 'skills');
+    seedSkill(source, 'unslop');
+    seedSkill(path.join(home, '.agents', 'skills'), 'unslop');
+
+    await linkSkillsIntoCodexHome({ configDir, home, extraSkillDirs: [source] });
+
+    // Codex would otherwise list it twice: once natively, once by this link.
+    expect(existsSync(path.join(configDir, 'skills', 'unslop'))).toBe(false);
   });
 });

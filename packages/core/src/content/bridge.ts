@@ -154,9 +154,12 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
+
+import { BRIDGED_SKILL_PLUGIN } from '@rx-artemis/protocol';
 
 import type { LocalPlugin } from '../adapters/types.js';
+import { parseFrontmatter } from '../memorybanks/frontmatter.js';
 
 /**
  * Where a warning goes. Injected rather than imported: this module lives in
@@ -183,11 +186,46 @@ export type ContentWarning = (message: string, error: unknown) => void;
  *
  * Codex needs no equivalent — its links land in a directory it already reads, so
  * those skills keep their bare names.
+ *
+ * The value lives in the protocol, beside the command the settings pane draws
+ * with it, so what a person is told to type cannot drift from what is served.
  */
-const PLUGIN_NAME = 'artemis-skills';
+const PLUGIN_NAME = BRIDGED_SKILL_PLUGIN;
 
 /** Where all Claude bridges live, under Artemis's own data directory. */
 const BRIDGES_DIR = 'content-bridges';
+
+/**
+ * Is `target` somewhere beneath `root`?
+ *
+ * Asked of `relative`, not of the two strings: this used to be
+ * `startsWith(root + '/')`, which is never true on Windows, where `resolve`
+ * writes backslashes. The cost was quiet and specific — a Codex link that had
+ * become redundant was taken for somebody else's and left in place, so the
+ * skill was listed twice. Found the first time this module's suite ran there.
+ */
+function isInside(root: string, target: string): boolean {
+  const within = relative(resolve(root), resolve(target));
+  return within.length > 0 && !within.startsWith('..') && !isAbsolute(within);
+}
+
+/**
+ * The kind of link laid down for a directory: a junction on Windows.
+ *
+ * For the reason `profiles/xdgFarm.ts` gives at length. A directory symlink
+ * on Windows needs a privilege an ordinary user does not hold, so `symlink`
+ * raises `EPERM` — and every caller in this module treats a link that cannot
+ * be written as "the run continues without it", which is the right trade for
+ * one odd skill and the wrong one for all of them: on a stock Windows machine
+ * no skill was ever bridged, and nothing said so but a line in a log.
+ *
+ * A junction needs no privilege. `lstat` and `readlink` report it as the
+ * symlink it stands in for, and its target reads back exactly as it was
+ * written — pinned on Windows by the farm's own tests, which is why the
+ * comparisons below need no Windows spelling of their own. It can only point
+ * at a directory on the same machine, which is all that is ever linked here.
+ */
+const DIR_LINK = process.platform === 'win32' ? 'junction' : 'dir';
 
 /**
  * The vendor-neutral skills directory, relative to `$HOME`.
@@ -262,6 +300,21 @@ async function readSource(sourceDir: string): Promise<readonly DiscoveredSkill[]
 }
 
 /**
+ * {@link readSource}, for `skills.ts`.
+ *
+ * Exported so that the list a person is shown and the set a run is offered are
+ * decided by one test of "is this folder a skill" rather than by two that agree
+ * today. Under a name that says what it is, because `export *` puts it on
+ * core's surface.
+ */
+export const skillFoldersIn = readSource;
+
+/** `~/.agents/skills` for a given home — the folder both providers read. */
+export function neutralSkillsDir(home: string = homedir()): string {
+  return join(home, ...NEUTRAL_SKILLS);
+}
+
+/**
  * Merge sources into one skill per name, earlier sources winning.
  *
  * The de-duplication that makes a single bridge the right shape — see the header.
@@ -327,7 +380,7 @@ async function reconcileOwnedDir(dir: string, skills: readonly DiscoveredSkill[]
     await rm(join(dir, name), { force: true, recursive: true });
   }
 
-  for (const [name, target] of wanted) await symlink(target, join(dir, name), 'dir');
+  for (const [name, target] of wanted) await symlink(target, join(dir, name), DIR_LINK);
 }
 
 /**
@@ -365,7 +418,7 @@ async function relink(link: string, target: string | null): Promise<void> {
   const current = await readlink(link).catch(() => null);
   if (current === target) return;
   await rm(link, { force: true, recursive: true });
-  if (target !== null) await symlink(target, link, 'dir');
+  if (target !== null) await symlink(target, link, DIR_LINK);
 }
 
 export interface ContentBridgeOptions {
@@ -375,6 +428,25 @@ export interface ContentBridgeOptions {
   readonly dataDir: string;
   /** Stand-in for `$HOME`. Overridden only by tests. */
   readonly home?: string;
+  /**
+   * Skill names already provided by something else in the same run, which
+   * this bridge must therefore not offer a second time. See
+   * {@link resolveContentPlugins}.
+   *
+   * Matched against the name a skill is *offered* under — its frontmatter
+   * `name`, and its folder's only when it has none — because that is the name
+   * a person sees twice.
+   */
+  readonly exclude?: ReadonlySet<string>;
+  /**
+   * More folders of skills, read after the account's own and the machine's.
+   *
+   * In practice the repositories Artemis keeps cloned — see `skillSources.ts`.
+   * Last in the merge on purpose: a skill a person put on this machine by hand,
+   * in either of the folders above, is the more deliberate act, and it should
+   * win the name over the copy that arrived by subscription.
+   */
+  readonly extraSkillDirs?: readonly string[];
   readonly onWarning?: ContentWarning;
 }
 
@@ -389,14 +461,19 @@ export async function buildContentBridge(
   options: ContentBridgeOptions,
 ): Promise<readonly LocalPlugin[]> {
   const home = options.home ?? homedir();
-  const skillSources = [join(options.configDir, 'skills'), join(home, ...NEUTRAL_SKILLS)];
+  const skillSources = [
+    join(options.configDir, 'skills'),
+    join(home, ...NEUTRAL_SKILLS),
+    ...(options.extraSkillDirs ?? []),
+  ];
   const commandsDir = join(options.configDir, 'commands');
 
   try {
-    const [skills, commands] = await Promise.all([
+    const [discovered, commands] = await Promise.all([
       discoverSkills(skillSources),
       hasCommands(commandsDir),
     ]);
+    const skills = await withoutOffered(discovered, options.exclude);
     if (skills.length === 0 && !commands) return [];
 
     const bridgeDir = join(options.dataDir, BRIDGES_DIR, bridgeKey(options.configDir));
@@ -594,6 +671,195 @@ export async function discoverMarketplacePlugins(
   }
 }
 
+/**
+ * The name a skill is offered under: its frontmatter `name`, else its folder's.
+ *
+ * Measured against the CLI (2026-09-18, `supportedCommands()` over a plugin
+ * built for the purpose): a skill in `skills/dir-name` whose `SKILL.md` says
+ * `name: other` is offered as `<plugin>:other`, and one with no `name` at all
+ * as `<plugin>:dir-name`. The bridge is a plugin too, so the same holds for a
+ * person's own skills — which is why both sides of the comparison below are
+ * read the same way, rather than one by folder and one by file.
+ */
+async function offeredSkillName(dir: string): Promise<string> {
+  const raw = await readFile(join(dir, 'SKILL.md'), 'utf8').catch(() => null);
+  return offeredNameOf(raw === null ? undefined : parseFrontmatter(raw).data?.['name'], basename(dir));
+}
+
+/**
+ * {@link offeredSkillName}'s rule, for a caller that has already parsed the
+ * file. Exported so `skills.ts` decides it the same way.
+ */
+export function offeredNameOf(declaredName: unknown, folderName: string): string {
+  return typeof declaredName === 'string' && declaredName.trim().length > 0
+    ? declaredName.trim()
+    : folderName;
+}
+
+/** Is this directory itself a skill? The test `readSource` applies to a child. */
+async function isSkillDir(dir: string): Promise<boolean> {
+  return stat(join(dir, 'SKILL.md'))
+    .then((info) => info.isFile())
+    .catch(() => false);
+}
+
+/**
+ * Drop the skills something else in the run already offers.
+ *
+ * Nothing is read when nothing is excluded, which is every run on a machine
+ * with no marketplace plugin enabled.
+ */
+async function withoutOffered(
+  skills: readonly DiscoveredSkill[],
+  exclude: ReadonlySet<string> | undefined,
+): Promise<readonly DiscoveredSkill[]> {
+  if (exclude === undefined || exclude.size === 0) return skills;
+  const kept: DiscoveredSkill[] = [];
+  for (const skill of skills) {
+    if (!exclude.has(await offeredSkillName(skill.dir))) kept.push(skill);
+  }
+  return kept;
+}
+
+/**
+ * Every skill the enabled marketplace plugins offer, by the name it is offered
+ * under, and the plugin that offers it.
+ *
+ * ## What a plugin offers is not what its folder holds
+ *
+ * A plugin's install directory is its whole repository, and a repository can
+ * carry skills its plugin does not publish. `mattpocock-skills` is the worked
+ * example: its manifest names twenty-five skills under `skills/engineering`
+ * and `skills/productivity`, and the same checkout holds thirteen more under
+ * `skills/in-progress` and `skills/misc` that the plugin never offers. A
+ * person who has one of those thirteen installed by hand has it from nowhere
+ * else, so counting it as the plugin's would not remove a duplicate: it would
+ * remove the skill.
+ *
+ * So this reads what the CLI reads, measured rather than assumed (same date
+ * and method as {@link offeredSkillName}):
+ *
+ *  - the plugin's own `skills/`, **one level deep** — `skills/tdd` is offered,
+ *    `skills/engineering/tdd` is not;
+ *  - plus every path the manifest's `skills` field names, which *adds to* the
+ *    default folder rather than replacing it. A path that is itself a skill is
+ *    that one skill; any other is a folder of skills, again one level deep.
+ *
+ * Erring here has a safe side, and it is this one. A name missed is a skill
+ * offered twice, which is where things stood before. A name wrongly collected
+ * is a skill offered by nobody.
+ *
+ * The first plugin to offer a name is the one recorded. Two plugins offering
+ * one name is theirs to sort out; the bridge yields either way.
+ */
+async function pluginSkillOffers(
+  plugins: readonly LocalPlugin[],
+): Promise<ReadonlyMap<string, string>> {
+  const offers = new Map<string, string>();
+  for (const plugin of plugins) {
+    const manifest = await readJson(join(plugin.path, '.claude-plugin', 'plugin.json'));
+    const declaredName = manifest?.['name'];
+    const pluginName =
+      typeof declaredName === 'string' && declaredName.length > 0 ? declaredName : basename(plugin.path);
+
+    const roots = [join(plugin.path, 'skills'), ...declaredSkillPaths(plugin.path, manifest?.['skills'])];
+    for (const root of new Set(roots)) {
+      const dirs = (await isSkillDir(root))
+        ? [root]
+        : (await readSource(root)).map((skill) => skill.dir);
+      for (const dir of dirs) {
+        const name = await offeredSkillName(dir);
+        if (!offers.has(name)) offers.set(name, pluginName);
+      }
+    }
+  }
+  return offers;
+}
+
+/**
+ * The manifest's `skills` field, as directories inside the plugin.
+ *
+ * A string or a list of them, each relative to the plugin's root and written
+ * with a leading `./` — the form the plugin reference requires, and the only
+ * one counted, for the reason {@link pluginSkillOffers} gives about which way
+ * to err. A path that climbs out of the plugin is dropped for the same reason:
+ * whatever it names, it is not something this plugin can be said to offer.
+ */
+function declaredSkillPaths(pluginPath: string, declared: unknown): readonly string[] {
+  const listed = typeof declared === 'string' ? [declared] : Array.isArray(declared) ? declared : [];
+  const paths: string[] = [];
+  for (const entry of listed) {
+    if (typeof entry !== 'string' || !entry.startsWith('./')) continue;
+    const absolute = resolve(pluginPath, entry);
+    const within = relative(pluginPath, absolute);
+    if (within.length === 0 || within.startsWith('..') || isAbsolute(within)) continue;
+    paths.push(absolute);
+  }
+  return paths;
+}
+
+/**
+ * What the enabled marketplace plugins of one account offer: skill name to the
+ * plugin offering it.
+ *
+ * For the settings pane, which lists a person's own skills and has to say
+ * when one of them reaches an account under a plugin's name instead of
+ * Artemis's. The same reading {@link resolveContentPlugins} acts on, so the
+ * list and the run cannot disagree. Empty for an account with no plugins,
+ * which includes every Codex account.
+ */
+export async function marketplaceSkillOffers(
+  options: MarketplacePluginOptions,
+): Promise<ReadonlyMap<string, string>> {
+  try {
+    return await pluginSkillOffers(await discoverMarketplacePlugins(options));
+  } catch (error) {
+    options.onWarning?.(`Could not read what the marketplace plugins of ${options.configDir} offer`, error);
+    return new Map();
+  }
+}
+
+/**
+ * Everything a Claude run should load on the user's behalf, each thing once.
+ *
+ * The two sources are independent but not unrelated, and the relation is the
+ * reason this exists rather than each caller doing both: a user who installed
+ * a marketplace plugin *and* has its skills sitting in `~/.agents/skills` is
+ * offered every one of them twice, under `artemis-skills:` and again under the
+ * author's own name. That was reported from the composer's menu, but the menu
+ * is only where it shows — the model is handed the same skill twice too.
+ *
+ * The marketplace plugin wins, because it is the one that cannot lose: it is
+ * passed to the run whole, so nothing here can take a skill out of it. The
+ * bridge is a directory Artemis assembles, so the bridge is what yields — and
+ * a skill dropped from it is not a skill lost, it is the same skill under the
+ * name its author gave it. That last claim is only as good as the reading of
+ * what the plugin offers, which is why {@link pluginSkillOffers} is as
+ * careful as it is.
+ *
+ * "The same skill" means the same *name*. A person's own skill that happens
+ * to share a name with a plugin's yields too, and the settings pane says so
+ * on its row, which is where someone wondering where their skill went looks.
+ *
+ * A reading that fails excludes nothing: the run gets the bridge it would have
+ * had, and a duplicate rather than a gap.
+ */
+export async function resolveContentPlugins(
+  options: Omit<ContentBridgeOptions, 'exclude'>,
+): Promise<readonly LocalPlugin[]> {
+  const marketplace = await discoverMarketplacePlugins({
+    configDir: options.configDir,
+    ...(options.home === undefined ? {} : { home: options.home }),
+    ...(options.onWarning === undefined ? {} : { onWarning: options.onWarning }),
+  });
+  const offers = await pluginSkillOffers(marketplace).catch((error: unknown) => {
+    options.onWarning?.(`Could not read what the marketplace plugins of ${options.configDir} offer`, error);
+    return new Map<string, string>();
+  });
+  const bridged = await buildContentBridge({ ...options, exclude: new Set(offers.keys()) });
+  return [...bridged, ...marketplace];
+}
+
 /* -------------------------------------------------------------------------- */
 /* Codex: links into a directory Codex also owns                              */
 /* -------------------------------------------------------------------------- */
@@ -603,6 +869,14 @@ export interface CodexSkillLinkOptions {
   readonly configDir: string;
   /** Stand-in for `$HOME`. Overridden only by tests. */
   readonly home?: string;
+  /**
+   * More folders of skills to link in, after `~/.codex/skills`.
+   *
+   * The repositories Artemis keeps cloned live under its own data directory,
+   * which Codex has no reason to read, so they reach a Codex account the way
+   * `~/.codex/skills` does: as links. See `ContentBridgeOptions.extraSkillDirs`.
+   */
+  readonly extraSkillDirs?: readonly string[];
   readonly onWarning?: ContentWarning;
 }
 
@@ -647,7 +921,8 @@ export async function linkSkillsIntoCodexHome(options: CodexSkillLinkOptions): P
     const native = new Set(
       (await readSource(join(home, ...NEUTRAL_SKILLS))).map((skill) => skill.name),
     );
-    const skills = (await discoverSkills([sourceDir])).filter((skill) => !native.has(skill.name));
+    const managed = [sourceDir, ...(options.extraSkillDirs ?? [])];
+    const skills = (await discoverSkills(managed)).filter((skill) => !native.has(skill.name));
 
     // Nothing to link and no directory to tidy: leave the filesystem untouched,
     // so a profile whose Codex has never started stays exactly as it was. When
@@ -685,12 +960,14 @@ export async function linkSkillsIntoCodexHome(options: CodexSkillLinkOptions): P
       const dangling = !(await stat(at)
         .then(() => true)
         .catch(() => false));
-      const fromSource = target !== null && resolve(target).startsWith(`${resolve(sourceDir)}/`);
+      // Any of the folders this function links from — the user's Codex skills
+      // or a synced source — so a skill that left one of them leaves here too.
+      const fromSource = target !== null && managed.some((root) => isInside(root, target));
       if (dangling || fromSource) await rm(at, { force: true, recursive: true });
       else wanted.delete(name);
     }
 
-    for (const [name, target] of wanted) await symlink(target, join(destDir, name), 'dir');
+    for (const [name, target] of wanted) await symlink(target, join(destDir, name), DIR_LINK);
   } catch (error) {
     options.onWarning?.(`Could not link Codex skills into ${destDir}; the run continues without them`, error);
   }

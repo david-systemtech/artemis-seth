@@ -60,6 +60,7 @@ import {
   SERVER_HOST,
   isValidServerPort,
   normalizeWorkspace,
+  oldestObservation,
   serverUrl,
   type ProfileId,
   type ServerAllowance,
@@ -98,6 +99,19 @@ const log = createLogger('server');
 
 /** Beside `profiles.json` and `prefs.json`, and named the way they are. */
 export const SERVER_CONFIG_FILE = 'server.json';
+
+/**
+ * How old every number in the engine's cached gauge may be before a served
+ * request re-reads it.
+ *
+ * A minute, which is the tolerance the headless server extends to its own
+ * accounts and shorter than the poller's own sweep — so on a desktop with a
+ * window open this almost never spawns anything, and on one whose poller is
+ * idling (no window, macOS) it still refuses to serve a figure from ten minutes
+ * ago as if it were current. Measured with `oldestObservation`; see the call
+ * site for why the snapshot's own stamp will not do.
+ */
+const SERVED_USAGE_MAX_AGE_MS = 60_000;
 
 /** What persists across launches. Everything else about the server is live state. */
 interface StoredConfig {
@@ -316,6 +330,13 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
    * The gauges for a desktop that serves. The engine's own cache answers —
    * the same numbers this machine's windows read — with a refresh for a
    * profile nobody local has looked at lately.
+   *
+   * It did not, until now: every request re-read every asked-for account,
+   * which is one CLI spawn per profile per client poll, and left a remote
+   * client watching a gauge the local windows had never seen. The cache is
+   * kept current by the poller, the run-end settle read and the live
+   * `plan.limit` fold, so answering from it is both cheaper and the only way
+   * the two ends of the same account agree.
    */
   const usageSource = {
     read: async (query: { readonly profileIds: readonly string[] }) => {
@@ -331,7 +352,21 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
       );
       for (const profileId of query.profileIds) {
         try {
-          const usage = await options.engine.require().refreshPlanUsage({ profileId: profileId as never });
+          const cached = options.engine.require().cachedPlanUsage(profileId as never);
+          /*
+            Aged from the *oldest* thing in the reading rather than from its own
+            stamp. A live `plan.limit` verdict moves `fetchedAt` without
+            re-reading a percentage, and the provider states one on every API
+            response — so measuring the stamp would leave a run's own chatter
+            holding this cache open indefinitely while the numbers behind it
+            aged, which is precisely the case this guard is here for.
+          */
+          const fresh =
+            cached !== null && Date.now() - oldestObservation(cached) < SERVED_USAGE_MAX_AGE_MS;
+          const usage =
+            cached !== null && fresh
+              ? cached
+              : await options.engine.require().refreshPlanUsage({ profileId: profileId as never });
           rows.push({ profileId, label: labels.get(profileId) ?? profileId, usage });
         } catch {
           // Unreadable gauge: no row, account untouched.
@@ -366,6 +401,9 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         ...(input.systemPrompt === undefined
           ? {}
           : { systemPrompt: { kind: 'append', text: input.systemPrompt } as const }),
+        // The client's always-on skills, by name. The engine reads the bodies
+        // off this machine's disk, beside this machine's own always-on choice.
+        ...(input.alwaysOnSkills === undefined ? {} : { alwaysOnSkills: input.alwaysOnSkills }),
         // Read and bounded by the route before it got here; the registry checks
         // them again against this profile's provider.
         ...(input.attachments === undefined ? {} : { attachments: input.attachments }),

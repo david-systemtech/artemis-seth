@@ -244,4 +244,66 @@ describe('queued-message delivery from the transcript', () => {
     fake.close();
     await reading;
   });
+
+  /*
+   * A conversation's file stays in the folder it was begun in. One whose
+   * directory changes part-way goes on appending there while the run names the
+   * new one, so the path derived from the run's directory points at a file
+   * that will never exist — and the watch used to stop at that, leaving every
+   * fold in such a conversation unnoticed and its message marked queued until
+   * the turn ended. Seen on a served session, 2026-09-18.
+   */
+  it('finds the transcript by its id when the run’s directory is not where it is filed', async () => {
+    const { configDir, cwd } = makeRoots();
+    const { cwd: begunIn } = makeRoots();
+    const file = transcriptFile(configDir, begunIn);
+    writeFileSync(file, '');
+
+    const { harness } = installQuery();
+    const input: ResolvedRunInput = {
+      runId: 'run-fold-3',
+      providerId: 'claude',
+      profileId: 'prof-1',
+      cwd,
+      prompt: 'work on something slow',
+      env: { CLAUDE_CONFIG_DIR: configDir },
+    };
+    const run = await createClaudeAdapter().createRun(input);
+    const fake = harness();
+    fake.messages.push(initMessage(cwd));
+
+    const events: AgentEvent[] = [];
+    const reading = (async () => {
+      for await (const event of run.events) events.push(event);
+    })();
+
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === 'session.started')).toBe(true);
+    });
+
+    const text = 'this one is filed somewhere else';
+    await run.send(text, undefined, 'msg-fold-3' as MessageId);
+
+    appendFileSync(
+      file,
+      row({
+        type: 'attachment',
+        uuid: 'row-uuid-3',
+        timestamp: new Date().toISOString(),
+        attachment: { type: 'queued_command', prompt: text, source_uuid: 'whatever' },
+      }),
+    );
+
+    await vi.waitFor(
+      () => {
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: 'message.delivered', messageId: 'msg-fold-3' }),
+        );
+      },
+      { timeout: 5_000 },
+    );
+
+    fake.close();
+    await reading;
+  });
 });

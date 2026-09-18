@@ -28,6 +28,7 @@
 import {
   MODEL_LOAD,
   PLAN_USAGE_MAX_AGE_MS,
+  currentWindow,
   isModelScoped,
   isSameModel,
   modelIdentity,
@@ -85,13 +86,21 @@ function windowNamesModel(windowOption: ProviderModelOption, model: ProviderMode
  * apart here: all three mean "this model has no bucket of its own to report".
  * An unnamed `model_scoped` window is skipped rather than guessed at; a
  * verdict that cannot be attached to a model must not disable one.
+ *
+ * A bucket whose reset has passed since it was read is skipped as well — see
+ * `currentWindow`. Its percentage and its verdict are both about a period that
+ * is over, and this is the function that would otherwise strike a model
+ * through as "limit reached" for up to a poll cycle after the limit came back.
  */
 export function modelScopedWindow(
   model: ProviderModelOption,
   usage: PlanUsage | null | undefined,
+  now: number = Date.now(),
 ): PlanUsageWindow | null {
   if (!usage?.available) return null;
-  for (const window of usage.windows) {
+  for (const raw of usage.windows) {
+    const window = currentWindow(raw, now, usage.fetchedAt);
+    if (window === null) continue;
     if (!isModelScoped(window.id)) continue;
     const named = windowAsOption(window.id);
     if (named === null) continue;
@@ -125,7 +134,7 @@ export function modelExhaustion(
   usage: PlanUsage | null | undefined,
   now: number,
 ): ModelExhaustion | null {
-  const window = modelScopedWindow(model, usage);
+  const window = modelScopedWindow(model, usage, now);
   if (window === null || window.status !== 'rejected') return null;
   const reset = describeReset(window.resetsAt, now);
   return {
@@ -184,12 +193,17 @@ export interface ModelPressure {
 export function modelPressure(
   model: ProviderModelOption,
   usage: PlanUsage | null | undefined,
+  now: number = Date.now(),
 ): ModelPressure | null {
   if (!usage?.available) return null;
 
-  // Shared windows bind every model; other models' buckets bind only them.
-  const candidates: PlanUsageWindow[] = usage.windows.filter((w) => !isModelScoped(w.id));
-  const own = modelScopedWindow(model, usage);
+  // Shared windows bind every model; other models' buckets bind only them. A
+  // window whose reset has passed since it was read binds nothing: the rule
+  // `bindingWindow` follows, applied here because this scans for itself.
+  const candidates: PlanUsageWindow[] = usage.windows.filter(
+    (w) => !isModelScoped(w.id) && currentWindow(w, now, usage.fetchedAt) !== null,
+  );
+  const own = modelScopedWindow(model, usage, now);
   if (own !== null) candidates.push(own);
 
   let worst: PlanUsageWindow | null = null;

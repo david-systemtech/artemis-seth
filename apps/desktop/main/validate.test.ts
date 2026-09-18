@@ -3,6 +3,13 @@ import { describe, expect, it } from 'vitest';
 import { ValidationError } from './errors.js';
 import {
   validateAgentPromptsSave,
+  validateSkillsSave,
+  validateSkillsSourceAdd,
+  validateSkillsSourceRemove,
+  validateSkillsSourceSync,
+  validateServerSkillsSourceAdd,
+  validateServerSkillsSourceRemove,
+  validateServerSkillsSourceSync,
   validatePreviewOpen,
   validateProfilesCreate,
   validateProfilesSuggestDir,
@@ -1508,6 +1515,112 @@ describe('validateAgentPromptsSave', () => {
   });
 });
 
+/**
+ * The always-on choices, at the boundary.
+ *
+ * What an always-on skill *says* is read by main from a folder main found, so
+ * the property worth pinning is that nothing on this channel can name a place:
+ * a name is a folder's name and never a path, and the document is rebuilt from
+ * the fields the contract names rather than passed through.
+ */
+describe('validateSkillsSave', () => {
+  const save = (alwaysOn: unknown) => validateSkillsSave({ document: { alwaysOn } });
+
+  it('rebuilds the document from names and scopes, and nothing else', () => {
+    const saved = save([
+      { name: 'unslop', scope: { kind: 'all' }, dir: '/etc', body: 'forged' },
+      { name: 'tdd', scope: { kind: 'profiles', profileIds: ['p1'] } },
+    ]);
+
+    expect(saved).toEqual({
+      document: {
+        version: 1,
+        alwaysOn: [
+          { name: 'unslop', scope: { kind: 'all' } },
+          { name: 'tdd', scope: { kind: 'profiles', profileIds: ['p1'] } },
+        ],
+      },
+    });
+  });
+
+  it('refuses a name that is a path, in either spelling', () => {
+    for (const name of ['../../etc/passwd', 'skills/unslop', 'C:\\Users\\me\\skill', '..', '.']) {
+      expect(() => save([{ name, scope: { kind: 'all' } }]), name).toThrow(ValidationError);
+    }
+  });
+
+  it('refuses a document that is not a list of entries', () => {
+    expect(() => save('unslop')).toThrow(ValidationError);
+    expect(() => save([{ scope: { kind: 'all' } }])).toThrow(ValidationError);
+    expect(() => save([{ name: 'unslop', scope: { kind: 'some' } }])).toThrow(ValidationError);
+    expect(() => validateSkillsSave({})).toThrow(ValidationError);
+  });
+
+  it('accepts an empty list, which is every skill switched off', () => {
+    expect(save([]).document.alwaysOn).toEqual([]);
+  });
+
+  it('keeps a name exactly as it was sent, because it is a folder’s name', () => {
+    // The store and the pane match by equality; a name tidied here would split
+    // one skill into a row that reads "off" and a phantom that reads "missing".
+    expect(save([{ name: ' notes ', scope: { kind: 'all' } }]).document.alwaysOn[0]?.name).toBe(' notes ');
+  });
+
+  it('carries no sources, whatever the renderer sent with the switches', () => {
+    // A source is a URL main will clone. It has a channel and a validator of
+    // its own, and cannot ride in on a save about switches.
+    //
+    // A well-formed source on purpose: a malformed one is dropped by any
+    // parser, and would pass here whether or not this validator strips them.
+    for (const url of ['https://github.com/demo/agent-skills', 'ext::sh -c boom']) {
+      const saved = validateSkillsSave({
+        document: { alwaysOn: [], sources: [{ id: 'x', url, subdir: 'skills' }] },
+      });
+      expect('sources' in saved.document).toBe(false);
+    }
+  });
+});
+
+/**
+ * A repository to subscribe to: the one string on this surface that becomes an
+ * argument to a program. The rule is the protocol's and is tested there; what
+ * is pinned here is that the boundary applies it, and answers with its words.
+ */
+describe('the skill source validators', () => {
+  it('accepts a forge URL, trims it, and defaults the folder', () => {
+    expect(validateSkillsSourceAdd({ url: '  https://github.com/david-systemtech/agent-skills.git ' })).toEqual({
+      url: 'https://github.com/david-systemtech/agent-skills.git',
+      subdir: 'skills',
+    });
+    expect(validateSkillsSourceAdd({ url: 'git@github.com:a/b.git', subdir: 'packs/skills' }).subdir).toBe('packs/skills');
+  });
+
+  it('refuses what git must never be handed, in the rule’s own words', () => {
+    for (const url of ['ext::sh -c boom', '--upload-pack=x', 'file:///etc', '/home/me/skills']) {
+      expect(() => validateSkillsSourceAdd({ url }), url).toThrow(ValidationError);
+    }
+    expect(() => validateSkillsSourceAdd({ url: 'https://me:token-value@github.com/a/b.git' })).toThrow(
+      /git credentials/,
+    );
+    expect(() => validateSkillsSourceAdd({ url: 'https://github.com/a/b.git', subdir: '../outside' })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('holds a source id to the alphabet ids are written in, since it names a folder main deletes', () => {
+    expect(validateSkillsSourceRemove({ id: 'github-com-a-b-0a1b2c3d' })).toEqual({ id: 'github-com-a-b-0a1b2c3d' });
+    for (const id of ['../x', 'a/b', 'A-B', '', 'a--b', '-a']) {
+      expect(() => validateSkillsSourceRemove({ id }), id).toThrow(ValidationError);
+    }
+  });
+
+  it('pulls everything when no source is named', () => {
+    expect(validateSkillsSourceSync({})).toEqual({});
+    expect(validateSkillsSourceSync({ id: 'github-com-a-b-0a1b2c3d' })).toEqual({ id: 'github-com-a-b-0a1b2c3d' });
+    expect(() => validateSkillsSourceSync({ id: '../x' })).toThrow(ValidationError);
+  });
+});
+
 /* -------------------------------------------------------------------------- */
 /* Key managers                                                               */
 /* -------------------------------------------------------------------------- */
@@ -1882,5 +1995,32 @@ describe('validateWorkspaceCreateWorktree', () => {
       cwd: '/somewhere/else',
     });
     expect(request).toEqual({ path: ROOT, branch: 'task/x' });
+  });
+});
+
+describe('a server’s skill repositories', () => {
+  const profileId = 'prof_server';
+
+  it('holds a URL bound for a server to the rules a local one is held to', () => {
+    expect(
+      validateServerSkillsSourceAdd({ profileId, url: ' https://github.com/demo/agent-skills ' }),
+    ).toEqual({ profileId, url: 'https://github.com/demo/agent-skills', subdir: 'skills' });
+    // Refused here, so it never crosses a network to be refused there.
+    expect(() =>
+      validateServerSkillsSourceAdd({ profileId, url: 'https://user:token@github.com/demo/agent-skills' }),
+    ).toThrow(/username and token/);
+    expect(() => validateServerSkillsSourceAdd({ profileId, url: '--upload-pack=x' })).toThrow();
+    expect(() => validateServerSkillsSourceAdd({ url: 'https://github.com/demo/agent-skills' })).toThrow(/profileId/);
+  });
+
+  it('takes a source id only in the alphabet ids are written in, and needs the server named', () => {
+    expect(validateServerSkillsSourceRemove({ profileId, id: 'github-com-demo-agent-skills-1a2b3c4d' })).toEqual({
+      profileId,
+      id: 'github-com-demo-agent-skills-1a2b3c4d',
+    });
+    expect(() => validateServerSkillsSourceRemove({ profileId, id: '../etc' })).toThrow();
+    expect(validateServerSkillsSourceSync({ profileId })).toEqual({ profileId });
+    expect(validateServerSkillsSourceSync({ profileId, id: 'abc-123' })).toEqual({ profileId, id: 'abc-123' });
+    expect(() => validateServerSkillsSourceSync({ id: 'abc-123' })).toThrow(/profileId/);
   });
 });

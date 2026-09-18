@@ -508,20 +508,34 @@ describe('parseThreadList', () => {
 });
 
 describe('parseRateLimitWindows', () => {
+  /** When the provider answered, which is what every window is stamped with. */
+  const READ_AT = 1_700_000_000_000;
+
   it('reads the windows a real free-plan account reported', () => {
-    const windows = parseRateLimitWindows({
-      primary: { usedPercent: 12, windowDurationMins: 43200, resetsAt: 1789003989 },
-      planType: 'free',
-    });
+    const windows = parseRateLimitWindows(
+      {
+        primary: { usedPercent: 12, windowDurationMins: 43200, resetsAt: 1789003989 },
+        planType: 'free',
+      },
+      READ_AT,
+    );
 
     expect(windows).toEqual([
-      { id: 'primary', label: '30 days', utilization: 12, resetsAt: 1789003989 * 1000 },
+      {
+        id: 'primary',
+        label: '30 days',
+        utilization: 12,
+        resetsAt: 1789003989 * 1000,
+        // See `PlanUsageWindow.at`: a live verdict folded in later must not be
+        // able to re-date a percentage nobody re-read.
+        at: READ_AT,
+      },
     ]);
   });
 
   it('labels windows by their duration', () => {
     const label = (windowDurationMins: number): string =>
-      parseRateLimitWindows({ primary: { windowDurationMins } })[0]?.label ?? '';
+      parseRateLimitWindows({ primary: { windowDurationMins } }, READ_AT)[0]?.label ?? '';
 
     expect(label(300)).toBe('5 hours');
     expect(label(60)).toBe('1 hour');
@@ -534,14 +548,17 @@ describe('parseRateLimitWindows', () => {
   it('reports a missing utilization as null rather than zero', () => {
     // Zero means "none used"; null means "not reported". Conflating them would
     // show a full-looking gauge as empty.
-    expect(parseRateLimitWindows({ primary: { windowDurationMins: 60 } })[0]?.utilization).toBeNull();
+    expect(parseRateLimitWindows({ primary: { windowDurationMins: 60 } }, READ_AT)[0]?.utilization).toBeNull();
   });
 
   it('reads both windows when the plan has two, under the ids every plan shares', () => {
-    const windows = parseRateLimitWindows({
-      primary: { usedPercent: 10, windowDurationMins: 300 },
-      secondary: { usedPercent: 40, windowDurationMins: 10080 },
-    });
+    const windows = parseRateLimitWindows(
+      {
+        primary: { usedPercent: 10, windowDurationMins: 300 },
+        secondary: { usedPercent: 40, windowDurationMins: 10080 },
+      },
+      READ_AT,
+    );
 
     // A five-hour window is the 5-hour limit and a week-long one the weekly,
     // so a readout draws them beside Claude's under the same names.
@@ -549,16 +566,19 @@ describe('parseRateLimitWindows', () => {
   });
 
   it('keeps its own ids for a duration no other plan meters', () => {
-    const windows = parseRateLimitWindows({
-      primary: { usedPercent: 10, windowDurationMins: 1440 },
-      secondary: { usedPercent: 40, windowDurationMins: 43200 },
-    });
+    const windows = parseRateLimitWindows(
+      {
+        primary: { usedPercent: 10, windowDurationMins: 1440 },
+        secondary: { usedPercent: 40, windowDurationMins: 43200 },
+      },
+      READ_AT,
+    );
 
     expect(windows.map((w) => w.id)).toEqual(['primary', 'secondary']);
   });
 
   it('returns nothing when no windows are present', () => {
-    expect(parseRateLimitWindows({ planType: 'free' })).toEqual([]);
+    expect(parseRateLimitWindows({ planType: 'free' }, READ_AT)).toEqual([]);
   });
 });
 

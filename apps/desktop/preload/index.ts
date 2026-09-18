@@ -86,6 +86,14 @@ import {
   type SessionsListRequest,
   type AgentPromptsListRequest,
   type AgentPromptsSaveRequest,
+  type SkillsListRequest,
+  type SkillsSaveRequest,
+  type SkillsSourceAddRequest,
+  type SkillsSourceRemoveRequest,
+  type SkillsSourceSyncRequest,
+  type ServerSkillsSourceAddRequest,
+  type ServerSkillsSourceRemoveRequest,
+  type ServerSkillsSourceSyncRequest,
   type MemoryBankAddRequest,
   type MemoryBankForgetRequest,
   type MemoryBankMemoriesRequest,
@@ -767,6 +775,23 @@ const bridge: ArtemisBridge = Object.freeze({
   agentPrompts: Object.freeze({
     list: (request: AgentPromptsListRequest) => invoke(IPC.agentPromptsList, request),
     save: (request: AgentPromptsSaveRequest) => invoke(IPC.agentPromptsSave, request),
+  }),
+
+  /** This machine's skills, and which are always on. Same two verbs; see {@link IPC}. */
+  skills: Object.freeze({
+    list: (request: SkillsListRequest) => invoke(IPC.skillsList, request),
+    save: (request: SkillsSaveRequest) => invoke(IPC.skillsSave, request),
+    addSource: (request: SkillsSourceAddRequest) => invoke(IPC.skillsSourceAdd, request),
+    removeSource: (request: SkillsSourceRemoveRequest) => invoke(IPC.skillsSourceRemove, request),
+    syncSources: (request: SkillsSourceSyncRequest) => invoke(IPC.skillsSourceSync, request),
+  }),
+
+  serverSkills: Object.freeze({
+    list: (request: ServerAccountsRequest) => invoke(IPC.serverSkillsList, request),
+    addSource: (request: ServerSkillsSourceAddRequest) => invoke(IPC.serverSkillsSourceAdd, request),
+    removeSource: (request: ServerSkillsSourceRemoveRequest) =>
+      invoke(IPC.serverSkillsSourceRemove, request),
+    syncSources: (request: ServerSkillsSourceSyncRequest) => invoke(IPC.serverSkillsSourceSync, request),
   }),
 
   preview: Object.freeze({

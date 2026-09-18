@@ -76,6 +76,9 @@ import type {
   RoutineDraft,
   RoutinePatch,
   RoutineSnapshot,
+  SkillInfo,
+  SkillLibraryDocument,
+  SkillSourceStatus,
   ToolServerConfig,
 } from '@rx-artemis/protocol';
 
@@ -103,6 +106,11 @@ import {
   readRemoteAccounts,
   readRemoteMemoryBanks,
   setRemoteMemoryBankScope,
+  readRemoteSkills,
+  addRemoteSkillSource,
+  removeRemoteSkillSource,
+  syncRemoteSkillSources,
+  type RemoteSkills,
   readRemoteUsage,
   readRemoteSignIn,
   resolveEnv,
@@ -126,21 +134,33 @@ import {
   type SessionListScope,
   type SessionNamingPlan,
   type SignInShell,
-  buildContentBridge,
-  discoverMarketplacePlugins,
+  createSkillSources,
+  resolveContentPlugins,
   linkSkillsIntoCodexHome,
+  listSkills,
+  resolveSkills,
+  skillRootsFor,
   takesHostToolServers,
 } from '@rx-artemis/core';
 import {
+  alwaysOnSkillNames,
   applyPlanLimit,
   composeAgentPrompts,
+  composeAlwaysOnSkills,
   enabledToolServers,
   lowestTierModel,
+  mergePlanUsage,
+  planAlwaysOnSkills,
+  skillSourceIdFor,
+  skillSourceLimitProblem,
+  withoutSkillSource,
+  withSkillSource,
 } from '@rx-artemis/protocol';
 
 import { AgentPromptStore } from './agentPrompts.js';
+import { SkillLibraryStore } from './skillLibrary.js';
 import { anyBankAvailable, banksForRun, configureMemoryBanks, isMasterEnabled, promptBanks, syncMemoryBanksInBackground } from './memoryBanks.js';
-import { EngineUnavailableError, ValidationError } from './errors.js';
+import { EngineUnavailableError, ValidationError, WorkspaceError } from './errors.js';
 import { createLogger } from './log.js';
 import { ensureSignInForwarder, stopSignInForwarder } from './signInLoopback.js';
 import { createMemoryBankSecrets } from './memoryBankSecrets.js';
@@ -415,6 +435,40 @@ export interface ArtemisEngine {
   /** Replace the library. Answers with what was actually stored. */
   writeAgentPrompts(document: AgentPromptsDocument): Promise<AgentPromptsDocument>;
 
+  /**
+   * Every skill a session on this machine would be offered.
+   *
+   * On the host for the reason the prompt library is: the same folders are read
+   * again on the path of a run, to compose the always-on ones, and the list a
+   * person is shown has to come from the same reading of the disk.
+   */
+  listSkills(): Promise<readonly SkillInfo[]>;
+  /**
+   * Which skills are always on, as stored. For the pane: rejects when the
+   * file cannot be read, rather than handing it a guess it would save over.
+   */
+  readSkillLibrary(): Promise<SkillLibraryDocument>;
+  /**
+   * Replace those choices. Answers with what was actually stored.
+   *
+   * The *choices*, and only them: the document also lists this machine's skill
+   * sources, which the pane never writes. A URL there is one main will clone,
+   * so it arrives by {@link addSkillSource} and its own validator, never on the
+   * back of a save about switches.
+   */
+  writeSkillLibrary(document: SkillLibraryDocument): Promise<SkillLibraryDocument>;
+  /** The repositories kept cloned on this machine, and how each copy is doing. */
+  listSkillSources(): Promise<readonly SkillSourceStatus[]>;
+  /**
+   * Subscribe to a repository of skills and clone it now. Resolves once the
+   * first sync has been tried, so the pane can show the skills or the reason.
+   */
+  addSkillSource(url: string, subdir: string): Promise<void>;
+  /** Unsubscribe, and delete the copy. Always-on choices are left alone. */
+  removeSkillSource(id: string): Promise<void>;
+  /** Pull now: one source, or all of them. Not throttled; a person asked. */
+  syncSkillSources(id?: string): Promise<void>;
+
   startRun(input: RunInput): Promise<RunHandle>;
   sendToRun(
     runId: RunId,
@@ -537,6 +591,15 @@ export interface ArtemisEngine {
    * rescope one. The client half of `/api/v0/memory-banks`.
    */
   remoteMemoryBanks(profileId: ProfileId): Promise<RemoteMemoryBanks>;
+  /**
+   * The skills an Artemis server carries, and the repositories it keeps
+   * cloned, asked through one of its profiles. The writes need that profile's
+   * token to hold the administrative grant; the server says so when it does not.
+   */
+  remoteSkills(profileId: ProfileId): Promise<RemoteSkills>;
+  addRemoteSkillSource(profileId: ProfileId, url: string, subdir: string): Promise<RemoteSkills>;
+  removeRemoteSkillSource(profileId: ProfileId, id: string): Promise<RemoteSkills>;
+  syncRemoteSkillSources(profileId: ProfileId, id?: string): Promise<RemoteSkills>;
   /** Attach one of the server's banks to every account there, or to exactly these. */
   setRemoteMemoryBankScope(
     profileId: ProfileId,
@@ -898,6 +961,18 @@ function createEngine(options: EngineOptions): ArtemisEngine {
   const profiles = new ProfileStore({ userDataDir, managedEnvKeys: managed, secrets });
 
   const agentPrompts = new AgentPromptStore({ userDataDir });
+  const skillLibrary = new SkillLibraryStore({ userDataDir });
+  /*
+   * The repositories of skills this machine subscribes to, kept cloned under
+   * `userData`. Synced behind every run start, throttled — see core's
+   * `skillSources.ts` for why a sync never stands between a person and a run.
+   */
+  const skillSources = createSkillSources({
+    dataDir: userDataDir,
+    onWarning: (message) => log.warn(message),
+  });
+  /** The synced folders, for everything that reads skills off this disk. */
+  const skillSourceRoots = async () => skillSources.roots((await skillLibrary.read()).sources ?? []);
 
   /*
    * The key managers, before the memory banks — because a bank may hold a
@@ -994,6 +1069,71 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     } catch (error) {
       log.warn('Could not compose the agent prompt library; starting without it', error);
       return input;
+    }
+  };
+
+  /**
+   * Append the skills the user switched always-on, after the standing prompts.
+   *
+   * The same two refusals {@link withAgentPrompts} makes, for the same reasons:
+   * nothing is sent to a provider that cannot take an append, and nothing here
+   * can fail a run. After the prompts rather than before, because the prompts
+   * are the user's own words about how to work and a skill is a procedure to
+   * follow while doing it.
+   *
+   * ## Composed from the run's own account, at the moment it starts
+   *
+   * The names are resolved against the folders *this* account is offered skills
+   * from — its own `skills/`, then the machine's — which is the precedence the
+   * content bridge uses, so the always-on text is the text of the very skill
+   * the session could also be asked to run. And it is read now, not cached: a
+   * skill a synced source updated overnight is the updated skill this morning.
+   *
+   * A local model gets these too. It has no skill mechanism of its own, which
+   * makes this the *only* way it is ever told what a skill says.
+   *
+   * Which runs this applies to, and how, is {@link planAlwaysOnSkills}.
+   */
+  const withAlwaysOnSkills = async (input: RunInput): Promise<RunInput> => {
+    let capabilities;
+    try {
+      capabilities = providers.require(input.providerId).capabilities;
+    } catch {
+      return input;
+    }
+    // Names a served caller sent are for this function alone: whatever it
+    // decides, no adapter below is handed a list it has no use for — except
+    // the one that carries it on to the machine the run executes on.
+    const { alwaysOnSkills: asked, ...rest } = input;
+    const bare: RunInput = asked === undefined ? input : rest;
+    if (!capabilities.systemPromptAppend) return bare;
+
+    try {
+      const plan = planAlwaysOnSkills({
+        providerId: input.providerId,
+        systemPromptAppend: capabilities.systemPromptAppend,
+        own: alwaysOnSkillNames(await skillLibrary.read(), input.profileId),
+        ...(asked === undefined ? {} : { asked }),
+      });
+      if (plan.kind === 'none') return bare;
+      /*
+       * A run on an Artemis server executes there, with the server's skills,
+       * and a skill's text may point at files beside it — so the choice
+       * crosses as names and the server reads the bodies off its own disk.
+       * The memory banks' arrangement, for the same reason.
+       */
+      if (plan.kind === 'send') return { ...bare, alwaysOnSkills: plan.names };
+
+      const names = plan.names;
+      const configDir = profileConfigDir(await profiles.require(input.profileId));
+      const skills = await resolveSkills(
+        names,
+        skillRootsFor({ profileId: input.profileId, configDir }, undefined, await skillSourceRoots()),
+      );
+      return withSystemPromptAppended(bare, composeAlwaysOnSkills(skills));
+    } catch (error) {
+      log.warn('Could not compose the always-on skills; starting without them', error);
+      return bare;
     }
   };
 
@@ -1157,17 +1297,23 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     const configDir = profileConfigDir(await profiles.require(profileId));
 
     if (providerId === 'codex') {
-      await linkSkillsIntoCodexHome({ configDir, onWarning: (message, error) => log.warn(message, error) });
+      await linkSkillsIntoCodexHome({
+        configDir,
+        extraSkillDirs: (await skillSourceRoots()).map((root) => root.dir),
+        onWarning: (message, error) => log.warn(message, error),
+      });
       return [];
     }
 
-    // Concurrent, and independent: one assembles a directory, the other only
-    // reads two files to find directories that already exist.
-    const [bridged, marketplace] = await Promise.all([
-      buildContentBridge({ configDir, dataDir: options.userDataDir, onWarning: (message, error) => log.warn(message, error) }),
-      discoverMarketplacePlugins({ configDir, onWarning: (message, error) => log.warn(message, error) }),
-    ]);
-    return [...bridged, ...marketplace];
+    // One call, because the two sources overlap: a skill the user's own
+    // marketplace plugin provides must not also be bridged under Artemis's
+    // name. See `resolveContentPlugins`.
+    return resolveContentPlugins({
+      configDir,
+      dataDir: options.userDataDir,
+      extraSkillDirs: (await skillSourceRoots()).map((root) => root.dir),
+      onWarning: (message, error) => log.warn(message, error),
+    });
   };
 
   /**
@@ -1346,6 +1492,12 @@ function createEngine(options: EngineOptions): ArtemisEngine {
    * dropped. `applyPlanLimit` decides what counts as news; anything that is
    * none returns `null` and nothing is pushed, which is what keeps a chatty
    * event stream from becoming a chatty push channel.
+   *
+   * The fold goes back through `mergePlanUsage` before it is stored, so a
+   * verdict that arrives while a poll of the same account is in flight loses
+   * to that poll on every window the poll actually re-read. What is broadcast
+   * is the cache's value rather than this fold's — one reading per account,
+   * and every window sees the same one.
    */
   const foldPlanLimit = (event: AgentEvent): void => {
     if (event.type !== 'plan.limit') return;
@@ -1354,8 +1506,12 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     const run = runs.get(event.runId);
     if (run === undefined) return;
 
-    const merged = applyPlanLimit(planUsageCache.get(run.profileId) ?? null, event.limit, Date.now());
-    if (merged === null) return;
+    const held = planUsageCache.get(run.profileId) ?? null;
+    const folded = applyPlanLimit(held, event.limit, Date.now());
+    if (folded === null) return;
+
+    const merged = mergePlanUsage(held, folded);
+    if (merged === held) return;
 
     planUsageCache.set(run.profileId, merged);
     const push: PlanUsagePush = { profileId: run.profileId, usage: merged };
@@ -1556,6 +1712,47 @@ function createEngine(options: EngineOptions): ArtemisEngine {
     readAgentPrompts: () => agentPrompts.read(),
     writeAgentPrompts: (document) => agentPrompts.write(document),
 
+    listSkills: async () => {
+      // The accounts that have a skills folder of their own. Every other kind
+      // of account is still offered the machine-wide ones, which are listed
+      // whoever is asking.
+      const accounts = (await profiles.list())
+        .filter((profile) => profile.providerId === 'claude' || profile.providerId === 'codex')
+        .map((profile) => ({ profileId: profile.id, configDir: profileConfigDir(profile) }));
+      return listSkills({ accounts, sources: await skillSourceRoots() });
+    },
+    readSkillLibrary: () => skillLibrary.load(),
+    writeSkillLibrary: (document) =>
+      skillLibrary.update((current) => ({ ...current, alwaysOn: document.alwaysOn })),
+    listSkillSources: async () => skillSources.status((await skillLibrary.load()).sources ?? []),
+    addSkillSource: async (url, subdir) => {
+      const next = await skillLibrary.update((current) => {
+        // Inside the update, so it is decided against what is stored at this
+        // call's turn and not against a copy read before another add landed.
+        const full = skillSourceLimitProblem(current, url);
+        // A sentence written to be shown, which is what this error is for.
+        if (full !== null) throw new WorkspaceError(full);
+        return withSkillSource(current, url, subdir);
+      });
+      const added = next.sources?.find((source) => source.id === skillSourceIdFor(url));
+      // Tried now rather than left to the next run, so the pane that asked
+      // shows either the skills or git's own reason for their absence.
+      if (added !== undefined) await skillSources.sync(added, { force: true });
+    },
+    removeSkillSource: async (id) => {
+      const source = (await skillLibrary.load()).sources?.find((entry) => entry.id === id);
+      await skillLibrary.update((current) => withoutSkillSource(current, id));
+      if (source !== undefined) await skillSources.remove(source);
+    },
+    syncSkillSources: async (id) => {
+      const sources = (await skillLibrary.load()).sources ?? [];
+      await Promise.all(
+        sources
+          .filter((source) => id === undefined || source.id === id)
+          .map((source) => skillSources.sync(source, { force: true })),
+      );
+    },
+
     startRun: async (input) => {
       // The banks' own `SessionStart` hook cannot run under `settingSources:
       // []`, so Artemis keeps the banks turning itself. The install half is
@@ -1585,7 +1782,13 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       // they record what the user asked for — the prompt to name the session
       // by, the account to attribute it to — and neither is a fact about the
       // system prompt or the bank directories the run happened to carry.
-      const handle = await runs.start(await withAgentPrompts(withBanks));
+      // Behind the run, never before it: a run reads whatever copy of a source
+      // is on disk, and the sync is throttled, so a busy hour is one fetch.
+      void skillLibrary
+        .read()
+        .then((library) => skillSources.syncInBackground(library.sources ?? []))
+        .catch(() => undefined);
+      const handle = await runs.start(await withAlwaysOnSkills(await withAgentPrompts(withBanks)));
       namer.noteRun(input, handle.runId);
       owners.noteRun(input, handle.runId);
       return handle;
@@ -1728,23 +1931,25 @@ function createEngine(options: EngineOptions): ArtemisEngine {
       });
 
       /*
-        Never let the cache go backwards.
+        Never let the cache go backwards — and never answer from anything but
+        the cache either.
 
-        Two reads of one account overlap routinely — the poll's sweep and the
-        targeted read a run's end asks for — and each takes as long as a CLI
-        spawn, so the one that started first can finish last. Storing whichever
-        answered most recently would leave `cachedPlanUsage` describing an
-        earlier moment than the reading it replaced, which is then what every
-        newly-opened window seeds itself from.
+        Two reads of one account overlap routinely: the poll's sweep, the
+        targeted read a run's end asks for, a popover being opened in each of
+        two windows. Each takes as long as a CLI spawn, so the one that started
+        first can finish last, and each learns a slightly different slice of the
+        truth once live verdicts are folded in beside them.
 
-        The caller still gets what *this* read learned; it is only the shared
-        cache that insists on moving forward.
+        `mergePlanUsage` settles both at once. Every window is decided on its
+        own observation time, so a fresh percentage is never thrown away because
+        something *else* about the held reading was newer; and what is returned
+        is the merged cache value rather than this read's own, so the caller
+        that asked cannot end up holding a different number from the window next
+        to it. There is one reading per account in this process, and this is it.
       */
-      const previous = planUsageCache.get(query.profileId);
-      if (previous === undefined || usage.fetchedAt >= previous.fetchedAt) {
-        planUsageCache.set(query.profileId, usage);
-      }
-      return usage;
+      const merged = mergePlanUsage(planUsageCache.get(query.profileId) ?? null, usage);
+      planUsageCache.set(query.profileId, merged);
+      return merged;
     },
 
     suggestConfigDir: (label) => profiles.suggestConfigDir(label),
@@ -1777,6 +1982,13 @@ function createEngine(options: EngineOptions): ArtemisEngine {
      */
     remoteAccounts: async (profileId) => readRemoteAccounts(await remoteEnvFor(profileId)),
     remoteMemoryBanks: async (profileId) => readRemoteMemoryBanks(await remoteEnvFor(profileId)),
+    remoteSkills: async (profileId) => readRemoteSkills(await remoteEnvFor(profileId)),
+    addRemoteSkillSource: async (profileId, url, subdir) =>
+      addRemoteSkillSource(await remoteEnvFor(profileId), { url, subdir }),
+    removeRemoteSkillSource: async (profileId, id) =>
+      removeRemoteSkillSource(await remoteEnvFor(profileId), id),
+    syncRemoteSkillSources: async (profileId, id) =>
+      syncRemoteSkillSources(await remoteEnvFor(profileId), id),
     setRemoteMemoryBankScope: async (profileId, slug, scope) =>
       (await setRemoteMemoryBankScope(await remoteEnvFor(profileId), slug, scope)).bank,
 

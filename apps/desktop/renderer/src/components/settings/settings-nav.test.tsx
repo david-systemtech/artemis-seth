@@ -59,10 +59,13 @@ describe('the two-band nav', () => {
 
   it('holds the sections in their argued order', () => {
     expect(SETTINGS_NAV.map((band) => band.sections.map((s) => s.id))).toEqual([
-      // Memory banks directly under Instructions: the same question answered
-      // by a repository rather than by a paragraph, and the pane the built-in
+      // The three panes about what an agent is told run together, from the
+      // user's own words outward: Instructions is prose they wrote, Skills is
+      // procedure someone else wrote that the agent loads when it applies (and
+      // that a switch can make as standing as an instruction), and Memory banks
+      // is what the agents keep for themselves — still the pane the built-in
       // prompt in Instructions sends people to.
-      ['profiles', 'models', 'runs', 'agents', 'memory-banks', 'permissions', 'appearance'],
+      ['profiles', 'models', 'runs', 'agents', 'skills', 'memory-banks', 'permissions', 'appearance'],
       // Key managers opens the second band because it is what the first one
       // reaches for: Instructions offers a bank "from a key manager", and this
       // is the pane behind that offer. Remote directly under Server: the same

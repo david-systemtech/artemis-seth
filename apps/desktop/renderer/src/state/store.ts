@@ -42,6 +42,7 @@ import {
   isProfileAutoSelectable,
   isProfileEnabled,
   isSameModel,
+  mergePlanUsage,
   NO_CAPABILITIES,
   recommendProfile,
   isSuggestedTaskTarget,
@@ -128,8 +129,10 @@ import { isAbsolutePath, lastSegment } from '../lib/paths';
 import { newId } from '../lib/id';
 import {
   entriesFiling,
+  moveGroup,
   sessionKey,
   type CustomGroup,
+  type GroupEdge,
   type GroupMembership,
 } from '../lib/sessionGroups';
 import {
@@ -226,6 +229,7 @@ export type SettingsSection =
   | 'browser'
   | 'permissions'
   | 'agents'
+  | 'skills'
   | 'cerebro'
   | 'memory-banks'
   | 'secrets'
@@ -261,6 +265,7 @@ const SETTINGS_SECTION_HOMES: Readonly<Record<SettingsSection, SettingsSection>>
   browser: 'permissions',
   permissions: 'permissions',
   agents: 'agents',
+  skills: 'skills',
   cerebro: 'memory-banks',
   'memory-banks': 'memory-banks',
   secrets: 'secrets',
@@ -1173,7 +1178,7 @@ export interface AppState {
    */
   readonly pinnedCollapsed: boolean;
   /**
-   * The groups the user has made in the sidebar, in the order they were made.
+   * The groups the user has made in the sidebar, in the order they are drawn.
    *
    * The third way a session can leave its project heading, after the pin and
    * the archive, and the only one whose sections a person names themselves. See
@@ -1187,9 +1192,15 @@ export interface AppState {
    * about the transcripts. It rides in `prefs.json` beside
    * {@link pinnedSessions} for exactly that reason.
    *
-   * Creation order rather than name order, and no reordering control: the list
-   * is meant to be a handful of shelves, and the one thing worse than a shelf
-   * in the wrong place is a shelf that moves when you rename it. `collapsed`
+   * The order is the user's own. A new group starts at the bottom of the stack
+   * and is moved from there by dragging its heading, or a step at a time from
+   * the heading's menu — see {@link reorderSessionGroup}. It is never *derived*,
+   * from names least of all: the one thing worse than a shelf in the wrong
+   * place is a shelf that moves when you rename it. (The first version had no
+   * reordering at all, on the argument that a handful of shelves does not need
+   * it. A handful is exactly when the order gets noticed: the group made last
+   * week for the work that matters most sat under three older ones for good.)
+   * `collapsed`
    * lives on the record instead of in a parallel set like
    * {@link collapsedProjects}, because a group has an id to hang it on and
    * deleting the group then takes its fold state with it rather than leaving an
@@ -1555,6 +1566,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   'browser',
   'permissions',
   'agents',
+  'skills',
   'cerebro',
   'secrets',
   'server',
@@ -6498,38 +6510,41 @@ async function adoptTerminals(pane: Pane): Promise<void> {
 }
 
 /**
- * Take a reading, unless it describes an older moment than the one already held.
+ * Fold a reading into the one this window holds for that account.
  *
- * Two writers land in this map — the poll's push, and the read taken a few
- * seconds after a run ends — and neither can see the other's timing. Both spawn
- * a provider CLI that takes a second or two, so their *replies* can arrive in
- * the opposite order to the readings they describe: the settle read starts
- * later, answers first, and then the poll's older cycle overwrites it. On screen
- * that is a percentage that climbs and then falls back with nothing having
- * reset — 77% to 67% on a five-hour window that is only ever filling — which
- * reads as the gauge being wrong rather than merely late.
+ * This map is the *only* place a local account's gauge lives in this renderer.
+ * Every meter, ring, footer, menu row, handoff picker and recommendation reads
+ * it, and every reading — the poll's push, the read taken a few seconds after a
+ * run ends, a popover's own refresh — arrives here. That is what makes the
+ * number under one pane the same as the number under the next one.
  *
- * `fetchedAt` is stamped when the provider was asked, so it orders the readings
- * themselves rather than the order their replies happened to land in. Equal
- * stamps take the newcomer: the two describe the same moment, so preferring
- * either is arbitrary.
+ * Several writers land here and none can see another's timing. Each spawns a
+ * provider CLI that takes a second or two, so their *replies* can arrive in the
+ * opposite order to the readings they describe: the settle read starts later,
+ * answers first, and then the poll's older cycle overwrites it. On screen that
+ * is a percentage that climbs and then falls back with nothing having reset —
+ * 77% to 67% on a five-hour window that is only ever filling — which reads as
+ * the gauge being wrong rather than merely late.
  *
- * This is the same rule `newerReading` applies in the meter when it weighs its
- * own read against this map. That guard could not save the display on its own,
- * because both racing writers are on *this* side of it: once the older reading
- * is in the map, it is simply what the map says.
+ * `mergePlanUsage` settles it per *window* rather than per snapshot, which is
+ * the correction: a snapshot is not all one age once live verdicts are folded
+ * into it, and ordering whole snapshots threw away a freshly-reset five-hour
+ * percentage because a verdict about the weekly limit had been stamped a second
+ * later. See its header.
  *
- * Returns whether the map moved, so a caller does not act on a discarded read.
+ * Returns whether the map moved — by identity, which `mergePlanUsage` promises
+ * — so a caller does not act on a reading that told it nothing.
  */
-function acceptPlanUsage(profileId: ProfileId, usage: PlanUsage): boolean {
+export function acceptPlanUsage(profileId: ProfileId, usage: PlanUsage): boolean {
   let accepted = false;
   useApp.setState((s) => {
     const held = s.planUsageByProfile[profileId];
+    const merged = mergePlanUsage(held ?? null, usage);
     // Returning nothing leaves the map's identity alone as well as its contents,
-    // so a rejected reading costs no re-render anywhere downstream.
-    if (held !== undefined && usage.fetchedAt < held.fetchedAt) return {};
+    // so a reading that was no news costs no re-render anywhere downstream.
+    if (merged === held) return {};
     accepted = true;
-    return { planUsageByProfile: { ...s.planUsageByProfile, [profileId]: usage } };
+    return { planUsageByProfile: { ...s.planUsageByProfile, [profileId]: merged } };
   });
   return accepted;
 }
@@ -6560,18 +6575,23 @@ export function installPlanUsageFeed(): () => void {
     if (accountId !== undefined) {
       useApp.setState((s) => {
         /*
-         * Never backwards, same as `acceptPlanUsage` below: the poll's sweep
-         * and the meter's explicit refresh are two in-flight fan-outs, and
-         * the one that started first can land last. `fetchedAt` is the
-         * serving host's own stamp, so it orders readings from both.
+         * Merged per window, same as `acceptPlanUsage` below: the poll's sweep
+         * and the meter's explicit refresh are two in-flight fan-outs, and the
+         * one that started first can land last. The serving host stamps each
+         * window when it observed it, so the merge orders the two readings
+         * without either being able to drag the other's numbers backwards.
          */
         const key = `${profileId}/${accountId}`;
         const previous = s.planUsageByServerAccount[key];
-        if (previous !== undefined && usage.fetchedAt < previous.usage.fetchedAt) return s;
+        const merged = mergePlanUsage(previous?.usage ?? null, usage);
+        const label = accountLabel ?? accountId;
+        if (previous !== undefined && merged === previous.usage && label === previous.label) {
+          return s;
+        }
         return {
           planUsageByServerAccount: {
             ...s.planUsageByServerAccount,
-            [key]: { usage, label: accountLabel ?? accountId },
+            [key]: { usage: merged, label },
           },
         };
       });
@@ -7157,9 +7177,30 @@ async function seedPlanUsage(profiles: readonly ProfileMetadata[]): Promise<void
   }
   if (Object.keys(seeded).length === 0) return;
 
-  // Merged *under* what is already there: a push that landed while these reads
-  // were in flight is newer than the cache they came from.
-  useApp.setState((s) => ({ planUsageByProfile: { ...seeded, ...s.planUsageByProfile } }));
+  /*
+    Merged per account, not layered by object-spread.
+
+    Spreading `{ ...seeded, ...held }` assumed the held side was always the
+    newer one, which is only true if nothing arrived between the first of these
+    reads and the last — and these are a serial round of IPC calls with a poll
+    push landing in the middle of them. Whichever window the truth came in
+    through, both sides are readings of one account and `mergePlanUsage` knows
+    which parts of each are newer. Writing one entry at a time also means a
+    window opening mid-sweep cannot stick on an older number for an account the
+    seed happened to reach late.
+  */
+  useApp.setState((s) => {
+    const next: Record<ProfileId, PlanUsage> = { ...s.planUsageByProfile };
+    let moved = false;
+    for (const [profileId, usage] of Object.entries(seeded)) {
+      const held = next[profileId];
+      const merged = mergePlanUsage(held ?? null, usage);
+      if (merged === held) continue;
+      next[profileId] = merged;
+      moved = true;
+    }
+    return moved ? { planUsageByProfile: next } : {};
+  });
 }
 
 export async function bootstrap(): Promise<void> {
@@ -8979,9 +9020,9 @@ const NEW_GROUP_NAME = 'New group';
  * just created. Returning the id is what makes that one call instead of
  * creating a group and then guessing which of them is new.
  *
- * Appended rather than prepended: the list is in creation order and stays that
- * way (see {@link AppState.sessionGroups}), so a new group appears at the
- * bottom of the group stack rather than displacing the ones above it.
+ * Appended rather than prepended: a new group appears at the bottom of the
+ * group stack rather than displacing the ones above it, and is the user's to
+ * move from there — see {@link reorderSessionGroup}.
  */
 export function createSessionGroup(name: string = NEW_GROUP_NAME): string {
   const id = newId('grp');
@@ -9063,6 +9104,26 @@ export function toggleSessionGroupCollapsed(id: string): void {
       return { ...group, collapsed: true };
     }),
   }));
+  savePrefs();
+}
+
+/**
+ * Move a group to sit directly before or after another.
+ *
+ * The order of {@link AppState.sessionGroups} is the order the headings are
+ * drawn in, and it is the user's to arrange: by dragging a heading, or a step
+ * at a time from the heading's menu. Both name an anchor and a side rather than
+ * a position, and `moveGroup` in `sessionGroups.ts` says why.
+ *
+ * Nothing is written when nothing moved — an unknown id, a group dropped on
+ * itself, one dropped where it already sits — so a drag that ends where it
+ * began does not touch the preferences file.
+ */
+export function reorderSessionGroup(id: string, anchorId: string, edge: GroupEdge): void {
+  const current = useApp.getState().sessionGroups;
+  const next = moveGroup(current, id, anchorId, edge);
+  if (next === current) return;
+  useApp.setState({ sessionGroups: next });
   savePrefs();
 }
 

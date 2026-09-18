@@ -10,11 +10,13 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdir, mkdtemp, readdir, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import type { AgentEvent, ProviderId, RoutineDraft, ServerConnection } from '@rx-artemis/protocol';
 import type { SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
@@ -61,6 +63,11 @@ vi.mock(sdk.path, () => ({
 const { createHeadlessHost } = await import('./host.js');
 const { AsyncQueue, REGISTRY_V2_FILE, projectKey, workspaceKeyFor } = await import('@rx-artemis/core');
 
+/** How many plan-usage control calls the provider has been asked for. */
+let usageCalls = 0;
+/** What the next one answers. Replaced per test; gated where timing is the subject. */
+let usageReply: () => Promise<unknown> = () => Promise.resolve({ rate_limits_available: false });
+
 class FakeQuery {
   readonly messages = new AsyncQueue<SDKMessage>();
   closed = false;
@@ -78,6 +85,19 @@ class FakeQuery {
     return Promise.resolve(
       ['compact', 'artemis-skills:unslop'].map((name) => ({ name, description: '', argumentHint: '' })),
     );
+  }
+  /**
+   * The control call a plan-usage read makes.
+   *
+   * On the query object rather than on a second hook, because both a run and a
+   * gauge reach the provider through the same `query()` — so one installed hook
+   * has to answer both. What it answers, and how long it takes to, is
+   * {@link usageReply}; the count is how the cache's in-flight sharing is
+   * observed at all.
+   */
+  usage(): Promise<unknown> {
+    usageCalls += 1;
+    return usageReply();
   }
   close(): void {
     this.closed = true;
@@ -241,6 +261,8 @@ const profile = (id: string, label: string, configDir: string) => ({
 });
 
 beforeEach(async () => {
+  usageCalls = 0;
+  usageReply = () => Promise.resolve({ rate_limits_available: false });
   root = await mkdtemp(join(tmpdir(), 'artemis-served-settle-'));
   dataDir = join(root, 'data');
   cwd = join(root, 'work');
@@ -542,6 +564,33 @@ describe('the skills this machine carries', () => {
     expect(query.options()['plugins']).toBeUndefined();
   });
 
+  it('offers a skill once when an enabled marketplace plugin publishes the same name', async () => {
+    // The desktop's rule, reached through the same core call: the plugin is
+    // handed over whole, so the bridge is the side that yields.
+    const installPath = join(root, 'plugin-cache', 'pstack');
+    const key = 'pstack@claude-plugins-official';
+    await mkdir(join(installPath, '.claude-plugin'), { recursive: true });
+    await writeFile(join(installPath, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'pstack' }));
+    await mkdir(join(installPath, 'skills', 'unslop'), { recursive: true });
+    await writeFile(join(installPath, 'skills', 'unslop', 'SKILL.md'), '---\nname: unslop\n---\n\nTheirs.\n');
+    await mkdir(join(configDirs.work, 'plugins'), { recursive: true });
+    await writeFile(
+      join(configDirs.work, 'plugins', 'installed_plugins.json'),
+      JSON.stringify({ version: 2, plugins: { [key]: [{ scope: 'user', installPath }] } }),
+    );
+    await writeFile(join(configDirs.work, 'settings.json'), JSON.stringify({ enabledPlugins: { [key]: true } }));
+    await installSkill(configDirs.work, 'unslop');
+    await installSkill(configDirs.work, 'house-rules');
+    const query = installQuery();
+
+    await host.runSource.startRun(started());
+
+    const plugins = pluginsOf(query);
+    expect(plugins.map((plugin) => plugin.path)).toContain(installPath);
+    const bridge = plugins.find((plugin) => plugin.path.startsWith(join(dataDir, 'content-bridges')));
+    expect(await readdir(join(bridge!.path, 'skills'))).toEqual(['house-rules']);
+  });
+
   it('lists the commands a run would offer, asked with the same plugins, and answers from memory for a while', async () => {
     const skill = await installSkill(configDirs.work, 'unslop');
     let opened = 0;
@@ -560,8 +609,285 @@ describe('the skills this machine carries', () => {
     expect(opened).toBe(1);
   });
 
+  it('reads a caller’s always-on skills off its own disk, after the caller’s instructions', async () => {
+    await installSkill(configDirs.work, 'unslop');
+    const query = installQuery();
+
+    await host.runSource.startRun(
+      started({ systemPrompt: 'Follow the house style.', alwaysOnSkills: ['unslop', 'not-carried-here'] }),
+    );
+
+    const append = query.append();
+    // The server's copy of the body, under the heading a local run gives it…
+    expect(append).toContain('# Always-on skill: unslop');
+    expect(append).toContain('Do the thing.');
+    // …after what the person wrote, and with nothing for a name it does not carry.
+    expect(append.indexOf('Follow the house style.')).toBeLessThan(append.indexOf('# Always-on skill: unslop'));
+    expect(append).not.toContain('not-carried-here');
+  });
+
+  it('lists what it carries, and keeps a repository it is given cloned, bridged and removable', async () => {
+    await installSkill(configDirs.work, 'house-rules');
+    // A real repository, reached the way a server reaches one: by URL.
+    const upstream = join(root, 'upstream');
+    await mkdir(join(upstream, 'skills', 'unslop'), { recursive: true });
+    await writeFile(
+      join(upstream, 'skills', 'unslop', 'SKILL.md'),
+      '---\nname: unslop\ndescription: De-slop prose.\n---\n\nEdit.\n',
+    );
+    for (const args of [
+      ['init', '-q', '-b', 'main'],
+      ['add', '-A'],
+      ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'skills'],
+    ]) {
+      execFileSync('git', args, { cwd: upstream });
+    }
+    // Named by an https URL, as a real one is — the only kind the registry
+    // keeps — and pointed at the scratch repository by git's own rewrite rule,
+    // so nothing here touches the network.
+    const url = 'https://skills.test/agent-skills';
+    const gitConfig = {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: `url.${pathToFileURL(upstream).href}.insteadOf`,
+      GIT_CONFIG_VALUE_0: url,
+    };
+    Object.assign(process.env, gitConfig);
+    onTestFinished(() => {
+      for (const key of Object.keys(gitConfig)) delete process.env[key];
+    });
+
+    expect(await host.skillsAdmin.addSource({ url, subdir: 'skills' })).toBeNull();
+
+    const listed = await host.skillsAdmin.list({ profileIds: ['prof_work', 'prof_personal'] });
+    expect(listed.skills.map((skill) => [skill.name, skill.origin.kind])).toEqual([
+      ['house-rules', 'profile'],
+      ['unslop', 'source'],
+    ]);
+    expect(listed.sources).toMatchObject([{ source: { url, subdir: 'skills' }, cloned: true, skillCount: 1 }]);
+
+    // A served run on either account is offered the synced skill.
+    const query = installQuery();
+    await host.runSource.startRun(started({ profileId: 'prof_personal' }));
+    expect(await readdir(join(pluginsOf(query)[0]!.path, 'skills'))).toEqual(['unslop']);
+
+    const id = listed.sources[0]!.source.id;
+    expect(await host.skillsAdmin.syncSources(id)).toBe(true);
+    expect(await host.skillsAdmin.syncSources('no-such-source')).toBe(false);
+    expect(await host.skillsAdmin.removeSource(id)).toBe(true);
+    expect(await host.skillsAdmin.removeSource(id)).toBe(false);
+    expect((await host.skillsAdmin.list({ profileIds: [] })).skills).toEqual([]);
+  }, 60_000);
+
+  it('refuses a twenty-first repository in a sentence, and stores nothing for it', async () => {
+    // Written straight into the registry: twenty clones would prove nothing
+    // about the limit and take a minute doing it.
+    await writeFile(
+      join(dataDir, 'skills.json'),
+      JSON.stringify({
+        version: 1,
+        alwaysOn: [],
+        sources: Array.from({ length: 20 }, (_, index) => ({
+          url: `https://skills.test/repo-${String(index)}`,
+          subdir: 'skills',
+        })),
+      }),
+    );
+
+    const refused = await host.skillsAdmin.addSource({ url: 'https://skills.test/one-more', subdir: 'skills' });
+
+    expect(refused).toMatch(/at most 20 skill repositories/);
+    const kept = (await host.skillsAdmin.list({ profileIds: [] })).sources.map((status) => status.source.url);
+    expect(kept).toHaveLength(20);
+    expect(kept).not.toContain('https://skills.test/one-more');
+  });
+
   it('answers nothing for a provider that cannot enumerate commands', async () => {
     installQuery();
     expect(await host.commandSource.list({ profileId: 'prof_work', providerId: 'llamacpp', cwd })).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The gauges this machine serves                                             */
+/* -------------------------------------------------------------------------- */
+
+/** A rate-limits payload, in the provider's own vocabulary. */
+const limits = (fiveHour: number, sevenDay: number): unknown => ({
+  subscription_type: 'max',
+  rate_limits_available: true,
+  rate_limits: {
+    five_hour: { utilization: fiveHour },
+    seven_day: { utilization: sevenDay },
+  },
+});
+
+/** The provider's live verdict on one window, as a run's stream carries it. */
+const rateLimited = (windowId: string, utilization: number): SDKMessage =>
+  ({
+    type: 'rate_limit_event',
+    rate_limit_info: { status: 'rejected', rateLimitType: windowId, utilization },
+    uuid: `rl-${windowId}`,
+    session_id: SESSION,
+  }) as unknown as SDKMessage;
+
+/** The window of one served row, by id. */
+const windowOf = (
+  rows: readonly { readonly usage: { readonly windows: readonly { readonly id: string }[] } }[],
+  id: string,
+) => rows[0]?.usage.windows.find((w) => w.id === id) as
+  | { utilization: number | null; status?: string }
+  | undefined;
+
+/**
+ * What a remote client is told about an account's plan, and who decides it.
+ *
+ * A reading is a CLI control call per account, so it is cached for a minute —
+ * and everything below is about that cache being one account's *reading* rather
+ * than a race between whoever last wrote to it. Concurrent clients used to
+ * spawn one CLI each and the later reply won regardless of which had seen the
+ * later truth; a verdict the provider stated mid-run reached the desktop's own
+ * cache and never this one, so a served gauge could read 97% on an account this
+ * very process was being refused on.
+ */
+describe('the usage cache', () => {
+  it('spawns one read when two clients ask for the same account at once', async () => {
+    installQuery();
+    let release: () => void = () => undefined;
+    usageReply = () =>
+      new Promise((resolve) => {
+        release = () => resolve(limits(10, 20));
+      });
+
+    // Both asked before either answered — the shape a pair of clients polling a
+    // second apart makes, and the one that used to cost two subprocesses and
+    // resolve to whichever finished last.
+    const both = Promise.all([
+      host.usageSource.read({ profileIds: ['prof_work'] }),
+      host.usageSource.read({ profileIds: ['prof_work'] }),
+    ]);
+    await vi.waitFor(() => expect(usageCalls).toBe(1));
+    release();
+    const [first, second] = await both;
+
+    expect(usageCalls).toBe(1);
+    expect(windowOf(first, 'five_hour')?.utilization).toBe(10);
+    expect(second).toEqual(first);
+  });
+
+  it('does not let a slow read undo what was learned while it was out', async () => {
+    /*
+      A read takes a CLI spawn — a second or two — and the provider states a
+      verdict on every API response, so a run on the same account routinely says
+      something while a read of it is still in flight. Written by whoever
+      finished last, the read lands on top and the refusal the server had
+      already been told about is gone until the cache next expires: a served
+      gauge reading 97% on an account this machine is being refused on.
+
+      Here the verdict arrives *during* the read, and both have to survive it —
+      the verdict on the window it named, the read's numbers on the rest.
+    */
+    const query = installQuery();
+    let release: () => void = () => undefined;
+    usageReply = () =>
+      new Promise((resolve) => {
+        release = () => resolve(limits(40, 55));
+      });
+
+    const reading = host.usageSource.read({ profileIds: ['prof_work'] });
+    await vi.waitFor(() => expect(usageCalls).toBe(1));
+
+    // A run on the same account, refused on its weekly window, while the read
+    // above is still waiting on the CLI.
+    await host.runs.start({
+      providerId: 'claude',
+      profileId: 'prof_work' as never,
+      cwd,
+      prompt: 'spend something',
+      permissionMode: 'default',
+    } as never);
+    await query.prompts().next();
+    const fake = query.fake();
+    fake.messages.push(INIT(cwd));
+    fake.messages.push(rateLimited('seven_day', 97));
+
+    release();
+    const answered = await reading;
+
+    /*
+      The client that *caused* the read is told about the refusal too. It is the
+      one client that cannot be served from the cache — it is the reason there
+      is one — so without following the cache forward it would be the only
+      client shown the un-corrected gauge, which is the symptom in miniature.
+    */
+    expect(windowOf(answered, 'seven_day')?.status).toBe('rejected');
+    expect(windowOf(answered, 'five_hour')?.utilization).toBe(40);
+
+    const rows = await host.usageSource.read({ profileIds: ['prof_work'] });
+    expect(windowOf(rows, 'seven_day')?.status).toBe('rejected');
+    expect(windowOf(rows, 'five_hour')?.utilization).toBe(40);
+    // One CLI for the whole exchange: the correction cost nothing.
+    expect(usageCalls).toBe(1);
+  });
+
+  it('corrects a cached gauge from a served run\'s own limit verdict', async () => {
+    /*
+      The provider states what it is doing with requests on every API response,
+      and on this machine those responses belong to runs this process drives. A
+      client polling `/usage` would otherwise be shown a minute-old percentage
+      while this server was being refused outright — the same "97% but out" the
+      desktop's fold exists to correct, one process further away.
+    */
+    const query = installQuery();
+    usageReply = () => Promise.resolve(limits(40, 97));
+
+    const before = await host.usageSource.read({ profileIds: ['prof_work'] });
+    expect(windowOf(before, 'seven_day')?.status).toBeUndefined();
+
+    const handle = await host.runs.start({
+      providerId: 'claude',
+      profileId: 'prof_work' as never,
+      cwd,
+      prompt: 'spend something',
+      permissionMode: 'default',
+    } as never);
+    await query.prompts().next();
+    const fake = query.fake();
+    fake.messages.push(INIT(cwd));
+    fake.messages.push(rateLimited('seven_day', 97));
+
+    await vi.waitFor(async () => {
+      const rows = await host.usageSource.read({ profileIds: ['prof_work'] });
+      expect(windowOf(rows, 'seven_day')?.status).toBe('rejected');
+    });
+
+    // From the cache, not from a second CLI: the correction is free.
+    expect(usageCalls).toBe(1);
+    // And the window the verdict said nothing about keeps its polled number.
+    const after = await host.usageSource.read({ profileIds: ['prof_work'] });
+    expect(windowOf(after, 'five_hour')?.utilization).toBe(40);
+    expect(handle.runId).toBeDefined();
+  });
+
+  it('caches a CLI that would not answer as the answer it is, for the usual minute', async () => {
+    /*
+      A control call that fails does not reject here: the adapter's contract is
+      to degrade to `available: false` with a reason rather than break a status
+      widget. So what lands in the cache is a *reading*, held for the same
+      minute as any other — which is the point, since an account whose CLI is
+      wedged must not be probed again on every request.
+
+      The eviction path in `remember` is for the other case, where the promise
+      genuinely rejects — an unknown profile, a provider with no gauge at all —
+      and there is nothing to remember.
+    */
+    installQuery();
+    usageReply = () => Promise.reject(new Error('control channel closed'));
+    const failed = await host.usageSource.read({ profileIds: ['prof_work'] });
+    expect(failed[0]?.usage.available).toBe(false);
+
+    usageReply = () => Promise.resolve(limits(5, 6));
+    const again = await host.usageSource.read({ profileIds: ['prof_work'] });
+    expect(again[0]?.usage.available).toBe(false);
+    expect(usageCalls).toBe(1);
   });
 });

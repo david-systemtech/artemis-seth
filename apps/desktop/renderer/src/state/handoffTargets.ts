@@ -94,7 +94,7 @@ export function handoffTargetBlock(facts: HandoffTargetFacts): HandoffTargetBloc
   // collapse the trigger makes, because both mean the same thing here: no
   // claim about right now can be made for this account.
   if (!actionable(usage, now)) return { kind: 'stale-reading' };
-  const binding = bindingWindow(usage);
+  const binding = bindingWindow(usage, now);
   if (binding?.status === 'rejected') {
     const reset = describeReset(binding.resetsAt, now);
     return {
@@ -135,7 +135,7 @@ export function describeBindingLimit(
   usage: PlanUsage | null | undefined,
   now: number,
 ): string | null {
-  const binding = bindingWindow(usage);
+  const binding = bindingWindow(usage, now);
   if (binding === null) return null;
   const reset = describeReset(binding.resetsAt, now);
   const state =

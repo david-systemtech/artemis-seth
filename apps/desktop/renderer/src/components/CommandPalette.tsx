@@ -555,6 +555,18 @@ function RootPage({
           Instructions and standing prompts…
         </CommandItem>
         {/*
+          "slash" and "command" are in the keywords because that is what someone
+          hunting for a skill is thinking about: they want to know what they can
+          type, and this is the pane that lists it.
+        */}
+        <CommandItem
+          value="settings skills slash commands always on procedures agent skills"
+          onSelect={() => openSettings('skills')}
+        >
+          <SparklesIcon />
+          Skills…
+        </CommandItem>
+        {/*
           The banks' own pane. "cerebro" stays in the keywords because it is
           still what people type — the CLI's name outlived the pane it named —
           and the historical id still resolves for anyone deep-linking it, but

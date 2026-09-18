@@ -34,6 +34,7 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type {
+  AgentEvent,
   PlanUsage,
   ProfileId,
   ProviderId,
@@ -43,9 +44,16 @@ import type {
   ServerMemoryBankScope,
   SessionDelegatedWork,
 } from '@rx-artemis/protocol';
+import { applyPlanLimit, mergePlanUsage } from '@rx-artemis/protocol';
+import {
+  composeAlwaysOnSkills,
+  skillSourceIdFor,
+  skillSourceLimitProblem,
+  withSkillSource,
+  withoutSkillSource,
+} from '@rx-artemis/protocol';
 import {
   RunError,
-  buildContentBridge,
   checkAuthStatus,
   createCatalogue,
   createDefaultProviderRegistry,
@@ -53,14 +61,19 @@ import {
   createRemoteRunGuard,
   createServerRoutineStore,
   createSessionLedger,
+  createSkillSourceRegistry,
+  createSkillSources,
   createWorkspaceResolver,
-  discoverMarketplacePlugins,
   joinSystemPromptAppends,
   linkSkillsIntoCodexHome,
+  listSkills,
   machineBankPrompt,
   managedEnvKeys,
   memoryToolServer,
   registryPath,
+  resolveContentPlugins,
+  resolveSkills,
+  skillRootsFor,
   MEMORY_TOOL_SERVER,
   DuplicateProfileLabelError,
   ProfileStore,
@@ -72,6 +85,7 @@ import {
   type CommandSource,
   type MemoryBankAdmin,
   type ProfileAdmin,
+  type SkillsAdmin,
   type ProviderRegistry,
   type PushFeed,
   type RemoteAccessEvent,
@@ -146,6 +160,11 @@ export interface HeadlessHost {
    * read and rescoped over the wire. See `memoryBanks.ts`.
    */
   readonly memoryBankAdmin: MemoryBankAdmin;
+  /**
+   * What the skills routes act through: the skills this machine carries, and
+   * the repositories it keeps cloned to get them. See `skillsAdmin` below.
+   */
+  readonly skillsAdmin: SkillsAdmin;
   /** Every push the server can stream to a remote client. See `server/feed.ts`. */
   readonly feed: PushFeed;
   /** Interrupt-on-disconnect for bridge-started runs. See `server/guard.ts`. */
@@ -254,18 +273,36 @@ export function createHeadlessHost(
   const onContentWarning = (message: string, error: unknown): void => {
     process.stderr.write(`${message}: ${error instanceof Error ? error.message : String(error)}\n`);
   };
+  /**
+   * The repositories of skills this machine keeps cloned.
+   *
+   * The same arrangement the desktop has — a list in `<data dir>/skills.json`,
+   * a clone of each under `<data dir>/skill-sources` — because the point of a
+   * source is to have the same skills on every machine, and a server is the
+   * one machine nobody sits at to install them by hand. The list is changed
+   * over the wire, by a connection holding the administrative grant; see
+   * `skillsAdmin`.
+   */
+  const skillRegistry = createSkillSourceRegistry(join(dataDir, 'skills.json'));
+  const skillSources = createSkillSources({
+    dataDir,
+    onWarning: (message) => process.stderr.write(`${message}\n`),
+  });
+  const skillSourceRoots = async () => skillSources.roots(await skillRegistry.sources());
+
   const contentPluginsFor = async (profileId: ProfileId, providerId: ProviderId) => {
     if (providerId !== 'claude' && providerId !== 'codex') return [];
     const configDir = profiles.configDirFor(await profiles.require(profileId));
+    const extraSkillDirs = (await skillSourceRoots()).map((root) => root.dir);
     if (providerId === 'codex') {
-      await linkSkillsIntoCodexHome({ configDir, onWarning: onContentWarning });
+      await linkSkillsIntoCodexHome({ configDir, extraSkillDirs, onWarning: onContentWarning });
       return [];
     }
-    const [bridged, marketplace] = await Promise.all([
-      buildContentBridge({ configDir, dataDir, onWarning: onContentWarning }),
-      discoverMarketplacePlugins({ configDir, onWarning: onContentWarning }),
-    ]);
-    return [...bridged, ...marketplace];
+    // One call, because the two sources overlap: a skill an enabled
+    // marketplace plugin offers must not also be bridged under Artemis's name.
+    // `GET /api/v0/commands` reads through here too, so the menu a client
+    // draws and the run it starts agree. See `resolveContentPlugins`.
+    return resolveContentPlugins({ configDir, dataDir, extraSkillDirs, onWarning: onContentWarning });
   };
 
   const runs = new RunRegistry({
@@ -475,35 +512,124 @@ export function createHeadlessHost(
   };
 
   /**
-   * The gauges, read where the accounts are and cached where they are read.
+   * The gauges, read where the accounts are and held once per account.
    *
    * A reading is a CLI control call per account, so one is allowed to be a
    * minute old — the same tolerance the desktop's own poller extends to an
-   * idle profile. Failures cache too, briefly, so an account whose CLI is
+   * idle profile. Failures are held too, briefly, so an account whose CLI is
    * wedged does not get probed on every request.
+   *
+   * Three things this is careful about, and it used to be careful about none
+   * of them. All three produce the same symptom at the far end — two clients
+   * on one account reading two different numbers — which is why they are one
+   * cache rather than three fixes.
+   *
+   * **In-flight reads are shared.** The entry holds the *promise*, exactly as
+   * `commandCache` below does. Two clients polling `/usage` a moment apart
+   * otherwise each spawned a CLI for every account they asked about, and then
+   * the one that answered last won regardless of which had the later truth.
+   *
+   * **Readings merge.** `mergePlanUsage` settles two accounts of one gauge per
+   * window rather than per snapshot, so a slow read cannot undo a fast one and
+   * a live `plan.limit` verdict cannot undo a poll that has since re-read the
+   * window it was about.
+   *
+   * **A served run's verdicts land here.** The provider states a limit on every
+   * API response, and those responses are this machine's runs — so the gauge a
+   * remote client is shown is corrected within seconds of the provider deciding
+   * something, rather than at the next cache expiry. See the subscription below.
    */
   const USAGE_CACHE_MS = 60_000;
-  const usageCache = new Map<string, { at: number; row: { profileId: string; label: string; usage: PlanUsage } }>();
+  /** One account's reading, and the label the row carries it under. */
+  type UsageRow = { readonly label: string; readonly usage: PlanUsage };
+  /** Per account: when the read behind it started, and what it resolves to. */
+  const usageCache = new Map<string, { readonly at: number; readonly value: Promise<UsageRow> }>();
+
+  /**
+   * Publish an account's reading, and drop it again if it turns out to fail.
+   *
+   * A rejection is not cached: an account whose CLI was away for one request
+   * must not be answered "no" for the rest of the minute by the memory of it.
+   * The identity check is what makes that safe when several of these overlap —
+   * only the entry this call put there is removed.
+   */
+  const remember = (profileId: string, at: number, value: Promise<UsageRow>): Promise<UsageRow> => {
+    usageCache.set(profileId, { at, value });
+    value.catch(() => {
+      if (usageCache.get(profileId)?.value === value) usageCache.delete(profileId);
+    });
+    return value;
+  };
+
+  /** Start one read, publish its promise, and merge what it learns on the way out. */
+  const readUsage = (profileId: string): Promise<UsageRow> => {
+    const held = usageCache.get(profileId);
+    return remember(
+      profileId,
+      Date.now(),
+      (async () => {
+        const profile = await profiles.require(profileId as ProfileId);
+        const adapter = providers.get(profile.providerId);
+        if (adapter?.fetchPlanUsage === undefined) {
+          throw new Error(`${String(profile.providerId)} does not report plan usage.`);
+        }
+        const usage = await adapter.fetchPlanUsage({
+          profileId: profile.id,
+          env: await envFor(profile.id, profile.providerId),
+        } as never);
+        /*
+          Against whatever was held when this started rather than replacing it:
+          a `plan.limit` folded in while this CLI was running is newer about its
+          own window and older about every other, which is exactly the judgement
+          `mergePlanUsage` makes window by window. A failed previous read is not
+          evidence of anything and is merged against as an absence.
+        */
+        const previous = await held?.value.catch(() => undefined);
+        return { label: profile.label, usage: mergePlanUsage(previous?.usage ?? null, usage) };
+      })(),
+    );
+  };
+
+  /**
+   * How many times a read will follow the cache forward before answering.
+   *
+   * Each hop is a merge that landed while the caller was waiting — in practice
+   * one, from a verdict folded in mid-read. The cap is there because the loop
+   * reads a map that other requests are writing, and a bound is cheaper to
+   * reason about than an argument that it cannot go round for ever.
+   */
+  const USAGE_CHAIN_HOPS = 8;
+
   const usageSource: UsageSource = {
     read: async (query) => {
       const rows: { profileId: string; label: string; usage: PlanUsage }[] = [];
       for (const profileId of query.profileIds) {
         const cached = usageCache.get(profileId);
-        if (cached !== undefined && Date.now() - cached.at < USAGE_CACHE_MS) {
-          rows.push(cached.row);
-          continue;
-        }
+        const fresh = cached !== undefined && Date.now() - cached.at < USAGE_CACHE_MS;
         try {
-          const profile = await profiles.require(profileId as ProfileId);
-          const adapter = providers.get(profile.providerId);
-          if (adapter?.fetchPlanUsage === undefined) continue;
-          const usage = await adapter.fetchPlanUsage({
-            profileId: profile.id,
-            env: await envFor(profile.id, profile.providerId),
-          } as never);
-          const row = { profileId, label: profile.label, usage };
-          usageCache.set(profileId, { at: Date.now(), row });
-          rows.push(row);
+          let awaited = fresh && cached !== undefined ? cached.value : readUsage(profileId);
+          let row = await awaited;
+          /*
+            The cache, not the read — the same rule the desktop's refresh handler
+            answers by, and for the same reason.
+
+            A verdict folded in while this read was out replaces the entry with a
+            promise chained off the one being awaited here, so what the caller
+            was waiting on is a reading the cache has already superseded. Without
+            this the client whose request *caused* the read would be the one
+            client shown the un-corrected gauge — a served account refusing
+            requests, reported at its polled percentage, to exactly the client
+            that asked. Every entry this follows is either chained off the
+            promise just resolved or belongs to a later read, so neither can be
+            waiting on this caller.
+          */
+          for (let hop = 0; hop < USAGE_CHAIN_HOPS; hop += 1) {
+            const current = usageCache.get(profileId);
+            if (current === undefined || current.value === awaited) break;
+            awaited = current.value;
+            row = await awaited;
+          }
+          rows.push({ profileId, label: row.label, usage: row.usage });
         } catch {
           // An unreadable gauge is a row that does not appear; the account
           // itself is untouched, and the next request past the cache retries.
@@ -512,6 +638,49 @@ export function createHeadlessHost(
       return rows;
     },
   };
+
+  /**
+   * Fold a served run's live limit verdict into that account's cached gauge.
+   *
+   * The provider states what it is doing with requests on every API response,
+   * and on this machine those responses belong to runs this process is driving.
+   * Without this the served gauge was polled-only: a remote client could be told
+   * "97%" by a cache a few seconds old while this server was being refused
+   * outright on that account — the same "97% but out" the desktop's own fold
+   * exists to correct, one process further away.
+   *
+   * Only an account something has already been read for. A verdict names one
+   * window and rarely carries a percentage, so a gauge built from one alone
+   * would be a nearly-empty reading occupying the cache for a minute and
+   * suppressing the real read behind it.
+   *
+   * The cache's stamp is deliberately *not* moved: a verdict is a correction to
+   * a reading, not a reading, and pushing the expiry out on every API response
+   * would mean the numbers were never re-read at all.
+   */
+  const foldPlanLimit = (event: AgentEvent): void => {
+    if (event.type !== 'plan.limit') return;
+    const profileId = runs.get(event.runId)?.profileId;
+    if (profileId === undefined) return;
+    const held = usageCache.get(String(profileId));
+    if (held === undefined) return;
+    remember(
+      String(profileId),
+      held.at,
+      held.value.then((previous) => {
+        const folded = applyPlanLimit(previous.usage, event.limit, Date.now());
+        if (folded === null) return previous;
+        return { label: previous.label, usage: mergePlanUsage(previous.usage, folded) };
+      }),
+    );
+  };
+
+  /*
+   * Its own subscription rather than a second job for the feed's, which has to
+   * stay exactly one publisher — see the note on `feed` above, where a second
+   * subscription would number every event twice. This one publishes nothing.
+   */
+  runs.subscribe(foldPlanLimit);
 
   /**
    * The slash commands a session on one account would offer, for the route.
@@ -678,8 +847,39 @@ export function createHeadlessHost(
       : { ...withPrompt, additionalDirectories: directories };
   };
 
+  /**
+   * The caller's always-on skills, as the text a run is given.
+   *
+   * The names arrive on the request; the bodies are read here, off this
+   * machine's disk, from the folders a run on that account is offered skills
+   * from — so what a name resolves to is the skill the session could also be
+   * asked to run by command. A name this machine does not carry contributes
+   * nothing, which is how a client's choice survives a server that has not
+   * pulled the repository yet.
+   *
+   * Never throws: a skill that cannot be read is a run that starts without it.
+   */
+  const alwaysOnSkillsPrompt = async (run: {
+    readonly profileId: string;
+    readonly alwaysOnSkills?: readonly string[];
+  }): Promise<string | undefined> => {
+    const names = run.alwaysOnSkills ?? [];
+    if (names.length === 0) return undefined;
+    try {
+      const profileId = run.profileId as ProfileId;
+      const configDir = profiles.configDirFor(await profiles.require(profileId));
+      const roots = skillRootsFor({ profileId, configDir }, undefined, await skillSourceRoots());
+      return composeAlwaysOnSkills(await resolveSkills(names, roots));
+    } catch (error) {
+      process.stderr.write(
+        `skills: could not compose the always-on skills: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return undefined;
+    }
+  };
+
   const runSource: RunSource = {
-    startRun: (input) => {
+    startRun: async (input) => {
       const permissionMode = clampMode(input.providerId as ProviderId, input.permissionMode);
       /*
        * The banks this account carries, installed for this project before the
@@ -693,16 +893,21 @@ export function createHeadlessHost(
 
       /*
        * What the run is told, on top of the serving provider's preset: the
-       * client's own standing instructions (the route has already set the
-       * field aside for a provider that cannot append), then this machine's
-       * memory-bank prompt, scoped to the account the turn bills.
+       * client's own standing instructions, then the skills it keeps always
+       * on (the route has already set both aside for a provider that cannot
+       * append), then this machine's memory-bank prompt, scoped to the account
+       * the turn bills. The desktop's order for a local run, for the same
+       * reason: what the person wrote comes first.
        *
        * The wire and the adapter both refuse a replacement, so an append is
        * the only shape that reaches here.
        */
       const instructions = canAppend(input.providerId)
-        ? joinSystemPromptAppends(input.systemPrompt, bankPrompt(input))
+        ? joinSystemPromptAppends(input.systemPrompt, await alwaysOnSkillsPrompt(input), bankPrompt(input))
         : undefined;
+      // Pulled in the background and at most every so often: the run starts on
+      // the copies already here, and the next one gets whatever this fetched.
+      void skillRegistry.sources().then((sources) => skillSources.syncInBackground(sources));
       return runs.start({
         providerId: input.providerId as ProviderId,
         profileId: input.profileId as ProfileId,
@@ -963,6 +1168,56 @@ export function createHeadlessHost(
     commandSource,
     routines,
     profileAdmin,
+    skillsAdmin: {
+      list: async ({ profileIds }) => {
+        const sources = await skillRegistry.sources();
+        const accounts = [];
+        for (const profileId of profileIds) {
+          const profile = await profiles.get(profileId as ProfileId);
+          if (profile === undefined) continue;
+          // Skills are a Claude and Codex affair; no other account has a folder.
+          if (profile.providerId !== 'claude' && profile.providerId !== 'codex') continue;
+          accounts.push({ profileId: profile.id, configDir: profiles.configDirFor(profile) });
+        }
+        return {
+          skills: await listSkills({ accounts, sources: skillSources.roots(sources) }),
+          sources: await skillSources.status(sources),
+        };
+      },
+      addSource: async ({ url, subdir }) => {
+        // Decided inside the update, against what is stored at this call's
+        // turn: the parser would otherwise keep the first twenty and drop the
+        // one just added, and the reply would call that a success.
+        let full: string | null = null;
+        const document = await skillRegistry.update((current) => {
+          full = skillSourceLimitProblem(current, url);
+          return full === null ? withSkillSource(current, url, subdir) : current;
+        });
+        if (full !== null) return full;
+        const added = (document.sources ?? []).find((source) => source.id === skillSourceIdFor(url));
+        // Cloned before answering, so the reply lists what it brought — and a
+        // clone that fails is reported against the row, not as a failed request.
+        if (added !== undefined) await skillSources.sync(added, { force: true });
+        commandCache.clear();
+        return null;
+      },
+      removeSource: async (id) => {
+        const source = (await skillRegistry.sources()).find((entry) => entry.id === id);
+        if (source === undefined) return false;
+        await skillRegistry.update((current) => withoutSkillSource(current, id));
+        await skillSources.remove(source);
+        commandCache.clear();
+        return true;
+      },
+      syncSources: async (id) => {
+        const sources = await skillRegistry.sources();
+        const wanted = id === undefined ? sources : sources.filter((source) => source.id === id);
+        if (id !== undefined && wanted.length === 0) return false;
+        await Promise.all(wanted.map((source) => skillSources.sync(source, { force: true })));
+        commandCache.clear();
+        return true;
+      },
+    },
     memoryBankAdmin: {
       // Synchronous underneath — the registry is one small file — and promised
       // here because the seam is shaped for a host whose store is not.

@@ -1,0 +1,208 @@
+# A cheap model reads the pull request before we do.
+# ============================================================================
+#
+# It leaves one comment, ending in a JSON block: the prose is for whichever of
+# us reviews the pull request, the JSON for an agent that re-checks the findings
+# before anyone acts on them. The comment is written when the pull request opens
+# and rewritten when someone asks - see "When it runs" below. A finding is a lead,
+# never a verdict - the model costs about a cent a review and is wrong often
+# enough that acting on it unchecked would be worse than not running it. It
+# approves nothing and is not a required check.
+#
+# The work is `.github/scripts/ai_review.py`. This file says when it runs,
+# with what, and what it is told about the project.
+#
+# ## Why this can never fail a pull request
+#
+# A rate-limited provider, a malformed answer or a model that runs out of time
+# all end in a logged line, a comment that says there is no review, and a green
+# check. A red X that means "the robot was busy" teaches people to ignore red
+# Xs, and the next one is `pnpm test`.
+#
+# ## Why `pull_request_target`, and why that is safe here
+#
+# The reason `request-review.yml` gives, and one more: under `pull_request` a
+# fork's pull request gets a read-only token and none of the repository's
+# secrets, so the review could neither call the model nor post what it said.
+#
+# `_target` is dangerous for a workflow that runs the pull request's code with
+# those in hand. This one never does. It checks out the BASE commit, so the
+# script, its prompt and the rules it quotes are code already on the trunk, and
+# the pull request's changes arrive as text through the API. Nothing from the
+# pull request executes, and nothing in it can rewrite the rules it is judged
+# by. The flip side: a pull request that changes this file or the script is
+# reviewed by the version already merged - and the one that adds them, not at
+# all.
+#
+# ## When it runs: once, and then when asked
+#
+# When a pull request opens, reopens or leaves draft - and after that only when
+# somebody adds the `ai-review` label. The label comes off again after every
+# run that found it on, so that it can be added a second time; see the job at
+# the bottom of this file for why that is more careful than it sounds.
+#
+# It used to run on every push. A review of a large diff takes the model most
+# of half an hour, and a pull request that is being worked on is pushed to many
+# times: the 2.18.0 skills pull requests each sat behind a fresh review after
+# every follow-up commit, including the commits that answered the review
+# before. Most pushes do not want a second opinion; the one that does can ask.
+#
+# The label, rather than a comment command or a manual dispatch, because it
+# keeps the run inside the `pull_request_target` event this file is built
+# around - the base commit to check out, the author's association, the draft
+# flag are all on it - and because only someone who can triage the repository
+# can add one, which is the rule the next section is about.
+#
+# ## Why only maintainers' pull requests
+#
+# Every review is paid for, through an OpenRouter key one of us funds, and on a
+# public repository `pull_request_target` would let anyone's pull request spend
+# it. So a review runs when the author owns the repository or collaborates on
+# it - which, while CONTRIBUTING.md keeps the door closed, is everyone whose
+# pull request can be merged. `author_association` is GitHub's statement of
+# that, not something an author can set.
+
+name: AI review
+
+on:
+  pull_request_target:
+    # `ready_for_review` is what makes skipping drafts safe: a draft gets no
+    # review (see the job's `if`), and the moment it is marked ready this fires
+    # and it gets one - without waiting for another push.
+    #
+    # No `synchronize`: a push does not re-run the review. `labeled` is how one
+    # is asked for - see "When it runs" above, and the job's `if` for which
+    # label counts.
+    types: [opened, reopened, ready_for_review, labeled]
+
+# Read the code, write one comment.
+permissions:
+  contents: read
+  pull-requests: write
+
+# Two requests for a review should not leave two reviews racing to rewrite one
+# comment: the newer one cancels the older.
+#
+# Subscribing to `labeled` means this workflow now also wakes for every OTHER
+# label anyone adds, and a run that wakes only to find it has nothing to do
+# must not cancel a review on its way out. So those runs get a group of their
+# own, which cancels nothing but each other.
+concurrency:
+  group: >-
+    ai-review-${{ github.event.pull_request.number }}-${{
+    (github.event.action == 'labeled' && github.event.label.name != 'ai-review') && 'some-other-label' || 'review' }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Drafts are unfinished by declaration; `no-ai-review` is the escape hatch
+    # for the pull request where the review would only be noise. Of all the
+    # labels a pull request can be given, only `ai-review` is a request for one.
+    if: >-
+      !github.event.pull_request.draft &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      !contains(github.event.pull_request.labels.*.name, 'no-ai-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ai-review')
+    # GitHub-hosted, and it must stay that way: this job holds a secret while it
+    # reads pull requests from forks, and a machine of our own is no place for
+    # that. Hosted minutes are free on a public repository. Ubuntu ships the
+    # Python 3 the script needs, and the script needs nothing else.
+    runs-on: ubuntu-latest
+    # A backstop only. The script abandons a review at REVIEW_DEADLINE_S on its
+    # own and exits green, and the step has a timeout of its own under
+    # `continue-on-error`. This is the one timeout here that turns the check
+    # red, which is why it must never be the one that fires.
+    timeout-minutes: 55
+    steps:
+      # The base commit, never the head - see the top of this file. Pinned to a
+      # commit rather than a tag, because this job holds a secret.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      # The script swallows its own failures and exits 0; `continue-on-error`
+      # swallows the interpreter's.
+      - name: Review the diff
+        continue-on-error: true
+        # Longer than the script's own deadline, shorter than the job's.
+        timeout-minutes: 50
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_MODEL: z-ai/glm-5.3-flash
+          # max, high or low - the only three this model accepts. max was the
+          # one level that reliably found the bugs needing real thought (6 of 8
+          # planted, against 1 of 6 at high), and on a fast provider it takes
+          # about a minute and a half for an ordinary pull request.
+          REVIEW_EFFORT: max
+          # Seconds before the script gives up, says so on the pull request,
+          # and exits green. This is the ceiling: the script sizes its own
+          # deadline to the diff - twelve minutes for an ordinary pull request,
+          # up to this for one large enough to need the model's whole
+          # 131k-token budget.
+          REVIEW_DEADLINE_S: 2700
+          # What the model is told the project is. The rules below tell it how
+          # the project holds itself.
+          REVIEW_PROJECT: >-
+            Artemis, an open-source Electron desktop UI for agentic coding CLIs
+            (Claude, Codex and OpenCode). A pnpm monorepo: packages/protocol is
+            the shared contract and typed IPC surface, packages/core the
+            headless engine (provider adapters, env resolution, sessions, the
+            HTTP server), packages/transcript the transcript model every front
+            end shares, packages/sdk a typed client for the server;
+            apps/desktop is the Electron main process, preload and React
+            renderer, apps/server the headless server, apps/tui the terminal
+            front end.
+          # Read from the base commit. A change that breaks one of these rules
+          # is a better finding than anything generic.
+          REVIEW_RULES: CONTRIBUTING.md SECURITY.md CONTEXT.md
+          # Noise here in particular, on top of the lockfile, images and fonts
+          # the script always leaves out: the design mockups are explorations,
+          # not code, and the release notes restate a change in prose.
+          REVIEW_SKIP: docs/design/* .github/RELEASE_NOTES.md
+        run: python3 .github/scripts/ai_review.py
+
+  # The label is a button, not a state, and a button that stays pressed cannot
+  # be pressed again: GitHub sends `labeled` only when a label goes ON, so
+  # adding one a pull request already carries does nothing at all, silently.
+  # So the label comes off after every run that found it on - whatever the
+  # event was, and whether or not the review above ran. That second half is the
+  # reason this is a job of its own and not a last step of `review`: a request
+  # made of a draft, of a pull request marked `no-ai-review`, or of an outside
+  # contributor's, is declined by that job's `if`, and a label left behind by a
+  # declined request would look armed and be dead.
+  #
+  # `needs` only so it waits for the review; `always()` so it runs when the
+  # review was skipped or failed.
+  take-the-request-label-off:
+    needs: review
+    # Not for some other label being added: that run has nothing to do with a
+    # request, and one may be in flight whose label is not this run's to take.
+    if: >-
+      always() &&
+      contains(github.event.pull_request.labels.*.name, 'ai-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ai-review')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Tried three times, and green even then, by this file's one rule: a red
+      # X that means "the robot's housekeeping failed" teaches people to ignore
+      # red Xs. What a failure does cost is said where it will be read - a
+      # warning on the run - and the way out is the one a person would try
+      # anyway: take the label off by hand, then add it.
+      - name: Take the label off
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL_URL: repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/ai-review
+        run: |
+          for attempt in 1 2 3; do
+            if out=$(gh api -X DELETE "$LABEL_URL" 2>&1); then exit 0; fi
+            # Already gone - somebody took it off by hand - is the same success.
+            case "$out" in *"Label does not exist"*|*"HTTP 404"*) exit 0 ;; esac
+            sleep $((attempt * 10))
+          done
+          echo "::warning::The ai-review label could not be removed. Remove it by hand, then add it again to ask for a review."

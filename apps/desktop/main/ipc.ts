@@ -42,6 +42,7 @@ import {
 } from 'electron';
 
 import {
+  DEFAULT_SKILL_SOURCE_SUBDIR,
   IPC,
   IPC_CHANNELS,
   IPC_PUSH,
@@ -55,11 +56,12 @@ import {
   type IpcRequest,
   type IpcResponse,
   type RunSuggestion,
+  type ServerSkillsResponse,
   type Unsubscribe,
   type WorkspacePickDirectoryRequest,
 } from '@rx-artemis/protocol';
 
-import { checkWorkingDirectory, createWorktree, describeWorkspace } from '@rx-artemis/core';
+import { checkWorkingDirectory, createWorktree, describeWorkspace, type RemoteSkills } from '@rx-artemis/core';
 
 import {
   addMemoryBank,
@@ -178,6 +180,9 @@ import {
   validateServerAccountSignIn,
   validateServerAccountSubmitCode,
   validateServerMemoryBanksSetProfiles,
+  validateServerSkillsSourceAdd,
+  validateServerSkillsSourceRemove,
+  validateServerSkillsSourceSync,
   validateServerRoutines,
   validateServerRoutinesCreate,
   validateServerRoutinesUpdate,
@@ -185,6 +190,11 @@ import {
   validateServerRoutinesRunNow,
   validateAgentPromptsList,
   validateAgentPromptsSave,
+  validateSkillsList,
+  validateSkillsSave,
+  validateSkillsSourceAdd,
+  validateSkillsSourceRemove,
+  validateSkillsSourceSync,
   validateMemoryBankAdd,
   validateMemoryBankForget,
   validateMemoryBankMemories,
@@ -291,6 +301,32 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
   const withoutServerSessions = <T extends { readonly id: string }>(
     sessions: readonly T[],
   ): readonly T[] => sessions.filter((session) => !server.isServerSession(session.id));
+
+  /**
+   * Everything the Skills pane draws, read in one go: the skills on this disk,
+   * the always-on choices, and the sources with how each copy is doing.
+   */
+  const skillsState = async () => {
+    const host = engine.require();
+    const [skills, document, sources] = await Promise.all([
+      host.listSkills(),
+      host.readSkillLibrary(),
+      host.listSkillSources(),
+    ]);
+    return { skills, document, sources };
+  };
+
+  /**
+   * A server's skills, in the pane's words. `profiles` on the wire, `accounts`
+   * here, for the reason the server memory-bank list renames them.
+   */
+  const serverSkillsReply = (remote: RemoteSkills): ServerSkillsResponse => ({
+    available: remote.available,
+    manage: remote.manage,
+    skills: remote.skills,
+    sources: remote.sources,
+    accounts: remote.profiles,
+  });
 
   const handlers: ChannelHandlers = {
     /* ---------------------------------------------------------------- */
@@ -778,6 +814,55 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       }),
     },
 
+    /*
+     * Through the engine for the prompt library's reason: the always-on choices
+     * are read on the path of every run, so the one store `startRun` composes
+     * from has to be the one the pane writes to. The skills themselves are read
+     * off the disk on every list rather than cached, so a skill installed — or
+     * pulled — while the pane is open is there the next time it is opened.
+     */
+    [IPC.skillsList]: {
+      validate: validateSkillsList,
+      handle: () => skillsState(),
+    },
+
+    [IPC.skillsSave]: {
+      validate: validateSkillsSave,
+      handle: async (request) => ({
+        document: await engine.require().writeSkillLibrary(request.document),
+      }),
+    },
+
+    /*
+     * The three that change which skills exist answer with the whole state —
+     * the list, the choices and the sources — because each of them changes the
+     * list, and a pane that patched its own copy would be guessing at what a
+     * clone had just put on the disk.
+     */
+    [IPC.skillsSourceAdd]: {
+      validate: validateSkillsSourceAdd,
+      handle: async (request) => {
+        await engine.require().addSkillSource(request.url, request.subdir ?? 'skills');
+        return skillsState();
+      },
+    },
+
+    [IPC.skillsSourceRemove]: {
+      validate: validateSkillsSourceRemove,
+      handle: async (request) => {
+        await engine.require().removeSkillSource(request.id);
+        return skillsState();
+      },
+    },
+
+    [IPC.skillsSourceSync]: {
+      validate: validateSkillsSourceSync,
+      handle: async (request) => {
+        await engine.require().syncSkillSources(request.id);
+        return skillsState();
+      },
+    },
+
     /* ---------------------------------------------------------------- */
     /* Server                                                           */
     /* ---------------------------------------------------------------- */
@@ -1209,6 +1294,16 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
      * The expensive half: spawns a provider subprocess. Costs no model tokens
      * — see the adapter's `fetchPlanUsage` — but takes a second or two, which
      * is exactly why it is a separate channel from the cached read.
+     *
+     * **Whoever asked, everyone hears.** A reading is a fact about an account,
+     * not about the window that happened to press refresh, so both branches
+     * below broadcast through `broadcastPlanUsageReading` — the same push every
+     * poll cycle makes, to every window. This used to be true only of the
+     * server branch: a local refresh answered the caller and told nobody, so a
+     * second pane, the navigator's footer, the profile menu and the handoff
+     * picker all kept the older number until the poll came round up to two
+     * minutes later. That is the same account reading two different numbers on
+     * one screen, which is the whole complaint.
      */
     [IPC.usagePlanRefresh]: {
       validate: validateUsagePlan,
@@ -1237,9 +1332,17 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
           }
           return { usage: null };
         }
-        return {
-          usage: await engine.require().refreshPlanUsage({ profileId: request.profileId }),
-        };
+        /*
+         * Failures propagate, unlike the server branch's: a local provider
+         * that cannot be read is a real error for the window that asked, and
+         * the meter has a place to say so. An unknown profile falls through to
+         * the engine, which is where "no such profile" is worded properly.
+         */
+        await broadcastPlanUsageReading(engine, request.profileId, profile?.providerId ?? 'claude');
+        // The cache, not the read: the push carried the merged value, and an
+        // invoke reply that disagreed with the push it just caused would put
+        // this window one reading out of step with every other one.
+        return { usage: engine.require().cachedPlanUsage(request.profileId) };
       },
     },
 
@@ -1308,6 +1411,33 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
           accounts: remote.profiles,
         };
       },
+    },
+
+    [IPC.serverSkillsList]: {
+      validate: validateServerAccounts,
+      handle: async (request) => serverSkillsReply(await engine.require().remoteSkills(request.profileId)),
+    },
+
+    [IPC.serverSkillsSourceAdd]: {
+      validate: validateServerSkillsSourceAdd,
+      handle: async (request) =>
+        serverSkillsReply(
+          await engine
+            .require()
+            .addRemoteSkillSource(request.profileId, request.url, request.subdir ?? DEFAULT_SKILL_SOURCE_SUBDIR),
+        ),
+    },
+
+    [IPC.serverSkillsSourceRemove]: {
+      validate: validateServerSkillsSourceRemove,
+      handle: async (request) =>
+        serverSkillsReply(await engine.require().removeRemoteSkillSource(request.profileId, request.id)),
+    },
+
+    [IPC.serverSkillsSourceSync]: {
+      validate: validateServerSkillsSourceSync,
+      handle: async (request) =>
+        serverSkillsReply(await engine.require().syncRemoteSkillSources(request.profileId, request.id)),
     },
 
     [IPC.serverMemoryBanksSetProfiles]: {

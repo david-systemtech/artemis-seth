@@ -165,8 +165,8 @@ function inWords(
 }
 
 /** The short name, as the meter under the composer draws it. */
-function inMeter(usage: PlanUsage, window: PlanUsageWindow): string {
-  return planMeterSlots(usage).find((slot) => slot.window.id === window.id)?.label ?? window.label;
+function inMeter(usage: PlanUsage, window: PlanUsageWindow, now: number): string {
+  return planMeterSlots(usage, now).find((slot) => slot.window.id === window.id)?.label ?? window.label;
 }
 
 /**
@@ -202,11 +202,11 @@ export function failoverReason(
    * several, so asking it is both the right question and the one the meter
    * beside this line is drawn from.
    */
-  const binding = bindingWindow(usage);
+  const binding = bindingWindow(usage, now);
   if (binding !== null && binding.status === 'rejected') {
     return {
       kind: 'rejected',
-      window: inMeter(usage, binding),
+      window: inMeter(usage, binding, now),
       windowInWords: inWords(usage, binding, thresholds),
       ...(binding.utilization === null ? {} : { utilization: Math.round(binding.utilization) }),
       ...(binding.resetsAt === null ? {} : { resetsAt: binding.resetsAt }),
@@ -221,7 +221,7 @@ export function failoverReason(
   if (trigger === null) return null;
   return {
     kind: 'near',
-    window: inMeter(usage, trigger.window),
+    window: inMeter(usage, trigger.window, now),
     windowInWords: trigger.threshold.label,
     utilization: trigger.utilization,
     ...(trigger.window.resetsAt === null ? {} : { resetsAt: trigger.window.resetsAt }),
@@ -229,8 +229,8 @@ export function failoverReason(
 }
 
 /** Every window an account is metered on, in the meter's own vocabulary. */
-function pressureOf(usage: PlanUsage | null | undefined): string | undefined {
-  const slots = planMeterSlots(usage);
+function pressureOf(usage: PlanUsage | null | undefined, now: number): string | undefined {
+  const slots = planMeterSlots(usage, now);
   if (slots.length === 0) return undefined;
   return slots
     .map((slot) => {
@@ -242,8 +242,8 @@ function pressureOf(usage: PlanUsage | null | undefined): string | undefined {
 }
 
 /** How full the window that would stop this account is, 0–100. */
-function loadOf(usage: PlanUsage | null | undefined): number | undefined {
-  const binding = bindingWindow(usage);
+function loadOf(usage: PlanUsage | null | undefined, now: number): number | undefined {
+  const binding = bindingWindow(usage, now);
   if (binding === null) return undefined;
   // A rejected window is full whatever its stale percentage reads — the same
   // correction `planHeadroom` makes at the other end of the same arithmetic.
@@ -280,7 +280,7 @@ function blockFor(args: {
   // from here — so both wear the same word.
   if (meta === undefined || row.disabled || !row.available || meta.hasApiKey === true) return 'unavailable';
   if (row.auth?.loggedIn === false) return 'signed out';
-  const binding = bindingWindow(usage);
+  const binding = bindingWindow(usage, now);
   if (binding?.status === 'rejected') return 'rejected';
   if (!reachable) return 'cannot reach this conversation';
   /*
@@ -318,8 +318,8 @@ export function failoverCandidates(
       const { id } = row;
       const usage = usageByProfile.get(id) ?? null;
       const block = blockFor({ row, meta: keyed.get(id), usage, reachable: reachable(id), now });
-      const pressure = pressureOf(usage);
-      const load = loadOf(usage);
+      const pressure = pressureOf(usage, now);
+      const load = loadOf(usage, now);
       return {
         id,
         label: row.label,

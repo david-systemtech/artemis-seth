@@ -17,6 +17,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mergePlanUsage, type PlanUsage } from '@rx-artemis/protocol';
 
 /** How many windows the app thinks are open. Reassigned per test. */
 let openWindows = 1;
@@ -283,5 +284,50 @@ describe('broadcastPlanUsageReading', () => {
     await broadcastPlanUsageReading(remoteEngine(), 'server-1', 'artemis', () => true);
     await broadcastPlanUsageReading(remoteEngine(), 'p1', 'claude', () => true);
     expect(broadcasts).toEqual([]);
+  });
+
+  it('pushes what the engine cache says, not what this read alone learned', async () => {
+    /*
+      `refreshPlanUsage` answers with the *merged* cache — this read folded into
+      everything else learned about the account since it started, window by
+      window. Pushing the read's own result instead would broadcast a reading
+      the cache had already superseded, so every window would hold a number the
+      process that serves them does not.
+
+      Here the cache knows a `seven_day` verdict that arrived while this read
+      was in flight, and the read knows a `five_hour` percentage the cache does
+      not. Both have to be in the push.
+    */
+    const held: PlanUsage = {
+      available: true,
+      fetchedAt: 20,
+      windows: [
+        { id: 'five_hour', label: '5 hours', utilization: 100, resetsAt: null, at: 10 },
+        { id: 'seven_day', label: '7 days', utilization: 40, resetsAt: null, at: 20, status: 'warning' },
+      ],
+    };
+    const read: PlanUsage = {
+      available: true,
+      fetchedAt: 15,
+      windows: [
+        { id: 'five_hour', label: '5 hours', utilization: 2, resetsAt: null, at: 15 },
+        { id: 'seven_day', label: '7 days', utilization: 41, resetsAt: null, at: 15 },
+      ],
+    };
+    const engine = {
+      ready: true,
+      require: () => ({
+        refreshPlanUsage: ({ profileId }: { profileId: string }) => {
+          reads.push(profileId);
+          return Promise.resolve(mergePlanUsage(held, read));
+        },
+      }),
+    } as never;
+
+    await broadcastPlanUsageReading(engine, 'p1', 'claude');
+
+    const pushed = (broadcasts[0]?.payload as { usage: PlanUsage }).usage;
+    expect(pushed.windows.find((w) => w.id === 'five_hour')?.utilization).toBe(2);
+    expect(pushed.windows.find((w) => w.id === 'seven_day')?.status).toBe('warning');
   });
 });

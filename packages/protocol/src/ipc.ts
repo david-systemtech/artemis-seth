@@ -28,6 +28,7 @@
 import type { AgentPromptsDocument,
   MemoryBankPromptInfo,
 } from './agentPrompts.js';
+import type { SkillInfo, SkillLibraryDocument, SkillSourceStatus } from './skills.js';
 import type { RepositoryOrigin } from './forge.js';
 import type { PullRequestRef, PullRequestResult } from './github.js';
 import type { AgentEvent, BackgroundTask } from './events.js';
@@ -576,6 +577,37 @@ export const IPC = {
    */
   agentPromptsList: 'artemis:agent-prompts:list',
   agentPromptsSave: 'artemis:agent-prompts:save',
+
+  /**
+   * The skills this machine offers a session, and which are always on.
+   *
+   * The same two verbs as the prompt library, for the same reason: the choices
+   * are one small document, edited as one, and the answer to a save is what
+   * landed. The *skills* are not part of what is saved — they are folders on
+   * disk, read fresh on every list, so a skill installed while the pane is
+   * open is there the next time it is asked.
+   */
+  skillsList: 'artemis:skills:list',
+  skillsSave: 'artemis:skills:save',
+
+  /**
+   * The repositories of skills this machine keeps cloned.
+   *
+   * Their own channels rather than part of the save, and the split is the
+   * security boundary of the feature: a source is a URL the main process will
+   * hand to `git clone`, so it crosses IPC through a validator written for a
+   * URL, on a channel that does nothing else — never as a field a save about
+   * switches happened to carry. All three answer with the whole skills state,
+   * because each of them changes what the list holds.
+   */
+  skillsSourceAdd: 'artemis:skills:source:add',
+  skillsSourceRemove: 'artemis:skills:source:remove',
+  skillsSourceSync: 'artemis:skills:source:sync',
+  /** The skills an Artemis server carries, read through one of its profiles. */
+  serverSkillsList: 'artemis:server-skills:list',
+  serverSkillsSourceAdd: 'artemis:server-skills:source:add',
+  serverSkillsSourceRemove: 'artemis:server-skills:source:remove',
+  serverSkillsSourceSync: 'artemis:server-skills:source:sync',
 
   /**
    * The machine's key managers.
@@ -3033,6 +3065,91 @@ export interface AgentPromptsSaveResponse {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Skills                                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** Empty; the skills are this machine's and main knows where they are. */
+export type SkillsListRequest = Record<string, never>;
+
+/**
+ * What a session here would be offered, and the stored always-on choices.
+ *
+ * Two things rather than one joined list, because they have different sources
+ * of truth and can disagree honestly: a choice can name a skill that is not on
+ * this machine right now (see `SkillLibraryDocument`), and the pane has to be
+ * able to show that row as "on, and missing" rather than lose it.
+ */
+export interface SkillsListResponse {
+  readonly skills: readonly SkillInfo[];
+  readonly document: SkillLibraryDocument;
+  /** The repositories kept cloned here, and how each copy is doing. */
+  readonly sources: readonly SkillSourceStatus[];
+}
+
+/** Subscribe to a repository of skills. Cloned before the answer comes back. */
+export interface SkillsSourceAddRequest {
+  /** `https://…`, `ssh://…` or `git@host:path`. See `skillSourceUrlProblem`. */
+  readonly url: string;
+  /** The folder inside it that holds the skills. Defaults to `skills`. */
+  readonly subdir?: string;
+}
+
+/** Unsubscribe, and delete this machine's copy. */
+export interface SkillsSourceRemoveRequest {
+  readonly id: string;
+}
+
+/** Pull now: the named source, or every one when none is named. */
+export interface SkillsSourceSyncRequest {
+  readonly id?: string;
+}
+
+/**
+ * What an Artemis server carries, as its pane draws it.
+ *
+ * A served conversation runs on the server, with the server's skills, so this
+ * is the list the always-on switches are resolved against there — by name, on
+ * the machine the run executes on. Every write on this surface answers with
+ * the same shape, read after the write.
+ *
+ * `accounts` rather than the wire's `profiles`, for the reason the server
+ * memory-bank list renames them: "profile" means a local one everywhere else.
+ */
+export interface ServerSkillsResponse {
+  /** False for a server too old to list its skills, or one that carries none. */
+  readonly available: boolean;
+  /** This profile's token may add, pull and remove the server's repositories. */
+  readonly manage: boolean;
+  readonly skills: readonly SkillInfo[];
+  readonly sources: readonly SkillSourceStatus[];
+  readonly accounts: readonly ServerMemoryBankAccount[];
+}
+
+/** Have a server clone a repository. `profileId` names the connection to ask through. */
+export interface ServerSkillsSourceAddRequest extends ServerAccountsRequest {
+  readonly url: string;
+  readonly subdir?: string;
+}
+
+export interface ServerSkillsSourceRemoveRequest extends ServerAccountsRequest {
+  readonly id: string;
+}
+
+export interface ServerSkillsSourceSyncRequest extends ServerAccountsRequest {
+  readonly id?: string;
+}
+
+/** Replace the always-on choices. */
+export interface SkillsSaveRequest {
+  readonly document: SkillLibraryDocument;
+}
+
+/** What landed, which may differ: main rebuilds the document on the way in. */
+export interface SkillsSaveResponse {
+  readonly document: SkillLibraryDocument;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Server                                                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -3305,6 +3422,15 @@ export type IpcRequestMap = {
   [IPC.secretsRefTest]: SecretsRefTestRequest;
   [IPC.agentPromptsList]: AgentPromptsListRequest;
   [IPC.agentPromptsSave]: AgentPromptsSaveRequest;
+  [IPC.skillsList]: SkillsListRequest;
+  [IPC.skillsSave]: SkillsSaveRequest;
+  [IPC.skillsSourceAdd]: SkillsSourceAddRequest;
+  [IPC.skillsSourceRemove]: SkillsSourceRemoveRequest;
+  [IPC.skillsSourceSync]: SkillsSourceSyncRequest;
+  [IPC.serverSkillsList]: ServerAccountsRequest;
+  [IPC.serverSkillsSourceAdd]: ServerSkillsSourceAddRequest;
+  [IPC.serverSkillsSourceRemove]: ServerSkillsSourceRemoveRequest;
+  [IPC.serverSkillsSourceSync]: ServerSkillsSourceSyncRequest;
   [IPC.serverStatus]: ServerStatusRequest;
   [IPC.serverStart]: ServerStartRequest;
   [IPC.serverStop]: ServerStopRequest;
@@ -3418,6 +3544,15 @@ export type IpcResponseMap = {
   [IPC.secretsRefTest]: SecretsRefTestResponse;
   [IPC.agentPromptsList]: AgentPromptsListResponse;
   [IPC.agentPromptsSave]: AgentPromptsSaveResponse;
+  [IPC.skillsList]: SkillsListResponse;
+  [IPC.skillsSave]: SkillsSaveResponse;
+  [IPC.skillsSourceAdd]: SkillsListResponse;
+  [IPC.skillsSourceRemove]: SkillsListResponse;
+  [IPC.skillsSourceSync]: SkillsListResponse;
+  [IPC.serverSkillsList]: ServerSkillsResponse;
+  [IPC.serverSkillsSourceAdd]: ServerSkillsResponse;
+  [IPC.serverSkillsSourceRemove]: ServerSkillsResponse;
+  [IPC.serverSkillsSourceSync]: ServerSkillsResponse;
   [IPC.serverStatus]: ServerStateResponse;
   [IPC.serverStart]: ServerStateResponse;
   [IPC.serverStop]: ServerStateResponse;
@@ -3754,6 +3889,40 @@ export interface ArtemisBridge {
     list(request: AgentPromptsListRequest): Promise<IpcResult<AgentPromptsListResponse>>;
     /** Replace the library. Answers with what landed, which may differ. */
     save(request: AgentPromptsSaveRequest): Promise<IpcResult<AgentPromptsSaveResponse>>;
+  };
+
+  /**
+   * The skills this machine offers, and the ones switched always-on.
+   *
+   * Read and write, and nothing that starts a run — the same division the
+   * prompt library keeps. An always-on skill is composed into a run where runs
+   * start, in main, from the folder as it is at that moment.
+   */
+  readonly skills: {
+    /** Every skill a session here would be offered, and the stored choices. */
+    list(request: SkillsListRequest): Promise<IpcResult<SkillsListResponse>>;
+    /** Replace the always-on choices. Answers with what landed. */
+    save(request: SkillsSaveRequest): Promise<IpcResult<SkillsSaveResponse>>;
+    /** Subscribe to a repository of skills. Answers once the clone was tried. */
+    addSource(request: SkillsSourceAddRequest): Promise<IpcResult<SkillsListResponse>>;
+    /** Unsubscribe and delete the copy. */
+    removeSource(request: SkillsSourceRemoveRequest): Promise<IpcResult<SkillsListResponse>>;
+    /** Pull now. */
+    syncSources(request: SkillsSourceSyncRequest): Promise<IpcResult<SkillsListResponse>>;
+  };
+
+  /**
+   * The skills an Artemis server carries, reached through one of its profiles.
+   *
+   * A served conversation is offered the server's skills and no one else's, so
+   * this is where a person sees what those are, and — with the administrative
+   * grant — keeps the same repositories cloned there as here.
+   */
+  readonly serverSkills: {
+    list(request: ServerAccountsRequest): Promise<IpcResult<ServerSkillsResponse>>;
+    addSource(request: ServerSkillsSourceAddRequest): Promise<IpcResult<ServerSkillsResponse>>;
+    removeSource(request: ServerSkillsSourceRemoveRequest): Promise<IpcResult<ServerSkillsResponse>>;
+    syncSources(request: ServerSkillsSourceSyncRequest): Promise<IpcResult<ServerSkillsResponse>>;
   };
 
   /**
