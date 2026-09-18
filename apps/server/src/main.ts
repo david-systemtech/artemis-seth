@@ -9,6 +9,9 @@
  *   artemis-server connection create ...       — mint a token (prints it once)
  *   artemis-server connection list|revoke ...  — inspect and retract grants
  *
+ * and `artemis-server --version`, which prints the Artemis release this is —
+ * the same number `/health` reports. See `version.ts`.
+ *
  * Configuration is environment-first, because the process is built to live in
  * a container:
  *
@@ -94,6 +97,7 @@ import {
   newConnectionToken,
 } from './config.js';
 import { createHeadlessHost } from './host.js';
+import { serverVersion } from './version.js';
 
 function dataDir(): string {
   const declared = process.env['ARTEMIS_DATA_DIR'];
@@ -167,7 +171,9 @@ async function serve(): Promise<void> {
     port,
     host: bindHost(),
     connections: readConnections,
-    version: '0.1.0-headless',
+    // The Artemis release this is, so `/health` and the index answer "which
+    // version is the server on" without a trip to the host. See `version.ts`.
+    version: serverVersion(),
     catalogue: host.catalogue,
     runs: host.runSource,
     workspaces: host.workspaces,
@@ -472,6 +478,10 @@ async function connectionRevoke(args: readonly string[]): Promise<void> {
 
 async function main(): Promise<void> {
   const [, , verb, noun, ...rest] = process.argv;
+  if (verb === '--version' || verb === 'version') {
+    process.stdout.write(`${serverVersion()}\n`);
+    return;
+  }
   if (verb === undefined || verb === 'serve') return serve();
   if (verb === 'profile' && noun === 'add') return profileAdd(rest);
   if (verb === 'profile' && noun === 'list') return profileList();
@@ -479,7 +489,7 @@ async function main(): Promise<void> {
   if (verb === 'connection' && noun === 'list') return connectionList();
   if (verb === 'connection' && noun === 'revoke') return connectionRevoke(rest);
   fail(
-    'Usage: artemis-server [serve] | profile add|list | connection create|list|revoke\n' +
+    'Usage: artemis-server [serve] | profile add|list | connection create|list|revoke | --version\n' +
       '  connection create --label <name> [--directory <path> | --ephemeral] [--manage-profiles]\n' +
       `Data directory: ${dataDir()} (set ARTEMIS_DATA_DIR to move it)`,
   );
