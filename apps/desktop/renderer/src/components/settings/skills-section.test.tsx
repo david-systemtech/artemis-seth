@@ -448,7 +448,7 @@ describe('always on', () => {
     // The switch reaches no run, so no run pays for it - and the row says so
     // rather than quoting a price nobody is charged.
     expect(screen.queryByText(/loaded into every prompt/)).toBeNull();
-    expect(screen.getByText(/None of the accounts it reaches is told/)).toBeTruthy();
+    expect(screen.getByText(/None of the accounts it reaches can take a skill in every prompt/)).toBeTruthy();
   });
 
   it('says plainly which conversations the switch does not reach', async () => {
@@ -663,7 +663,7 @@ describe('an Artemis server', () => {
     withServer();
     server = { ...server, available: false };
     await renderPane();
-    expect(screen.getByText(/too old to read always-on skills/)).toBeTruthy();
+    expect(screen.getByText(/too old to load them into every prompt/)).toBeTruthy();
 
     cleanup();
     serverFails = 'Could not reach the Artemis server at https://home.example.';

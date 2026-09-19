@@ -170,7 +170,7 @@ function SkillRow({
             ? ' Its file has no instructions in it, so loading it into every prompt would add nothing.'
             : told
               ? ` Switched on, it is loaded into every prompt, not only when it applies: about ${approximateTokens(skill.bodyChars)} tokens each time.`
-              : ' None of the accounts it reaches is told its always-on skills, so the switch adds nothing to a run.'}
+              : ' None of the accounts it reaches can take a skill in every prompt, so the switch adds nothing to a run.'}
         </ItemDescription>
         {/* Who wrote it, when the mirror it was copied through says so. The
             command above names Artemis's bridge, which is how it is typed, not
@@ -442,7 +442,7 @@ function ServerSkillsGroup({
     return (
       <SettingsGroup label={`On ${label}`} anchor={anchor}>
         <p className="px-3 py-2.5 text-2xs leading-relaxed text-ink-faint">
-          This server does not list its skills, so it is too old to read always-on skills either.
+          This server does not list its skills, so it is too old to load them into every prompt either.
           Conversations there start without them until it is updated.
         </p>
       </SettingsGroup>
