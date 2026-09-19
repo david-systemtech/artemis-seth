@@ -104,6 +104,7 @@ import {
   type MemoryBankVerifyRemoteRequest,
   type MemoryBankWireClaudeCodeRequest,
   type MemoryBanksPreflightRequest,
+  type MemoryBanksSetFollowUpsAsIssuesRequest,
   type MemoryBanksSetMasterEnabledRequest,
   type SecretsConnectionDeleteRequest,
   type SecretsConnectionSaveRequest,
@@ -747,6 +748,8 @@ const bridge: ArtemisBridge = Object.freeze({
       invoke(IPC.memoryBankWireClaudeCode, request),
     forget: (request: MemoryBankForgetRequest) => invoke(IPC.memoryBankForget, request),
     setMasterEnabled: (request: MemoryBanksSetMasterEnabledRequest) => invoke(IPC.memoryBanksSetMasterEnabled, request),
+    setFollowUpsAsIssues: (request: MemoryBanksSetFollowUpsAsIssuesRequest) =>
+      invoke(IPC.memoryBanksSetFollowUpsAsIssues, request),
   }),
 
   /**

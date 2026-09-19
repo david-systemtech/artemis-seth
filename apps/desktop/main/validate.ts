@@ -96,6 +96,7 @@ import {
   type MemoryBankVerifyRemoteRequest,
   type MemoryBankWireClaudeCodeRequest,
   type MemoryBanksPreflightRequest,
+  type MemoryBanksSetFollowUpsAsIssuesRequest,
   type MemoryBanksSetMasterEnabledRequest,
   type MemoryBanksStatusRequest,
   type SecretCredentialInput,
@@ -2338,6 +2339,16 @@ export function validateMemoryBankWireClaudeCode(raw: unknown): MemoryBankWireCl
 export function validateMemoryBankForget(raw: unknown): MemoryBankForgetRequest {
   const request = requireRequest(raw);
   return { slug: requireBankSlug(request['slug'], 'slug') };
+}
+
+/** The briefing line, strict for the same reason as the gate below. */
+export function validateMemoryBanksSetFollowUpsAsIssues(
+  raw: unknown,
+): MemoryBanksSetFollowUpsAsIssuesRequest {
+  const request = requireRequest(raw);
+  const enabled = optionalBoolean(request['enabled'], 'enabled');
+  if (enabled === undefined) throw new ValidationError('enabled', 'is required');
+  return { enabled };
 }
 
 /** The master gate, strict for `validateMemoryBankSetEnabled`'s reason. */

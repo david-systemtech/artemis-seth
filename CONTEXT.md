@@ -38,11 +38,18 @@ conversation, not to the window.
 
 **Pane** — a slot in the window's grid displaying one conversation.
 
-**Suggested task** — follow-up work an agent *offers* at the end of a turn, drawn
+**Suggested task** — further work an agent *offers* at the end of a turn, drawn
 as a chip under its answer. Deliberately not a "task": the Tasks surface holds
 *delegated work*, which is running, and a suggested task has not started and may
 never. Offering is never doing — where a chosen one runs (this session, a new
 one, a worktree, a server) is the user's choice.
+
+**Follow-up** — work that is still *owed*: a deferred change, an unexplained
+finding, a decision waiting on a person. Recorded as an issue in the repository
+it belongs to, never as a memory — a memory says what is *true*, an issue says
+what is owed. Not a suggested task: that is work an agent offers to do next,
+which may never start and lives for one turn, while a follow-up outlives the
+conversation that found it and is owed by whoever picks the repository up.
 
 **Seed** — the small set of values (canvas, accent) from which a theme's full
 token ramp is derived.

@@ -49,6 +49,13 @@
  * because what it writes is *another program's* setup and folding it into the
  * bank's switch would edit files the user never asked Artemis to touch.
  *
+ * The briefing switches are the other exception, and for the same underlying
+ * reason the buttons exist: what makes a toggle a lie is having to animate
+ * back. "Raise follow-ups as issues" writes one boolean to one local file and
+ * changes what the *next* run is told — nothing is installed, nothing is
+ * spawned, nothing can be half-done — so its position after the click is
+ * always the truth. A button there would imply a cost it does not have.
+ *
  * The profile checkboxes are the exception that proves the rule: they are
  * checkboxes because ticking three of five profiles is a *list* being built,
  * and a list of buttons that each take a second to answer is not a list. They
@@ -102,6 +109,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
+import { Switch } from '@/components/ui/switch';
 
 /**
  * The pane.
@@ -425,7 +433,52 @@ function MasterGroup({ pane }: { readonly pane: MemoryBanksPane }): ReactElement
           {working ? (on ? 'Turning off…' : 'Turning on…') : on ? 'Turn off' : 'Turn on'}
         </Button>
       </div>
+      <FollowUpsRow pane={pane} masterOn={on} />
     </SettingsGroup>
+  );
+}
+
+/**
+ * Whether the briefing also says where unfinished work goes.
+ *
+ * Under the gate rather than beside it, because it is a line *of* the briefing
+ * and means nothing when there is no briefing — which is why it is disabled,
+ * not hidden, when the gate is off: hiding it would make a setting the user
+ * had deliberately turned off disappear without trace, and they would have no
+ * way to find it again except by turning the gate back on.
+ */
+function FollowUpsRow({
+  pane,
+  masterOn,
+}: {
+  readonly pane: MemoryBanksPane;
+  readonly masterOn: boolean;
+}): ReactElement {
+  // Absent status reads as on, which is what an unconfigured machine would do.
+  const on = pane.status?.followUpsAsIssues !== false;
+  return (
+    <div className="flex items-start gap-3 border-t border-hairline px-3 py-2.5">
+      <div className="min-w-0 flex-1">
+        <label
+          htmlFor="memory-banks-follow-ups"
+          className="text-2xs font-medium text-ink"
+        >
+          Raise follow-ups as issues
+        </label>
+        <p className="mt-0.5 text-2xs leading-relaxed text-ink-muted">
+          {masterOn
+            ? 'Agents are told that a memory records what is true and an issue records what is owed, so a deferred change or an unexplained finding is filed in the bank repository rather than written up as a fact. Turn it off if your follow-ups live somewhere Artemis cannot see.'
+            : 'Takes effect when memory banks are on for Artemis — it is one line of the briefing, and there is no briefing yet.'}
+        </p>
+      </div>
+      <Switch
+        id="memory-banks-follow-ups"
+        aria-label="Tell agents to raise follow-ups as issues"
+        checked={on}
+        disabled={!masterOn || pane.busy !== null || pane.reading}
+        onCheckedChange={(next) => pane.setFollowUpsAsIssues(next)}
+      />
+    </div>
   );
 }
 

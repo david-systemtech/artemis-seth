@@ -911,7 +911,7 @@ export function createRemoteBridge(
 
     memoryBanks: {
       status: async () =>
-        ok({ cliAvailable: false, masterEnabled: false, banks: [], profiles: [] }),
+        ok({ cliAvailable: false, masterEnabled: false, followUpsAsIssues: true, banks: [], profiles: [] }),
       memories: async () => absent(LOCAL_SETTINGS_REASON),
       preflight: async () =>
         ok({
@@ -942,6 +942,7 @@ export function createRemoteBridge(
       wireClaudeCode: async () => absent(LOCAL_SETTINGS_REASON),
       forget: async () => absent(LOCAL_SETTINGS_REASON),
       setMasterEnabled: async () => absent(LOCAL_SETTINGS_REASON),
+      setFollowUpsAsIssues: async () => absent(LOCAL_SETTINGS_REASON),
     },
 
     /*

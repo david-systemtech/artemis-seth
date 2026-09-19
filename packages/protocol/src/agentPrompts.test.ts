@@ -312,6 +312,57 @@ describe('the bank the prompt names', () => {
     expect(text).toContain('cerebro draft');
   });
 
+  /*
+   * Where unfinished work goes.
+   *
+   * The rule is on by default because the alternative is worse in a specific
+   * way: an agent told only how to record facts writes a deferred change as a
+   * memory, and a memory that says what is owed reads, six weeks later, as a
+   * statement that it is so.
+   */
+  describe('follow-ups as issues', () => {
+    const RULE = '**Work that is still owed is an issue, not a memory.**';
+
+    it('is taught by default, with no option passed', () => {
+      expect(renderMemoryBanksPrompt([bank('cortex', true)])).toContain(RULE);
+    });
+
+    it('stays on when the option is explicitly true', () => {
+      expect(
+        renderMemoryBanksPrompt([bank('cortex', true)], { followUpsAsIssues: true }),
+      ).toContain(RULE);
+    });
+
+    it('is the only thing that goes when it is turned off', () => {
+      // Off must cost exactly one rule. A switch that also dropped the write
+      // rules around it would be a different feature wearing this one's label.
+      const on = renderMemoryBanksPrompt([bank('cortex', true)]);
+      const off = renderMemoryBanksPrompt([bank('cortex', true)], {
+        followUpsAsIssues: false,
+      });
+      expect(off).not.toContain(RULE);
+      expect(off).toContain('**Record what you learn, unprompted.**');
+      expect(off).toContain('**House style**');
+      expect(off.length).toBeLessThan(on.length);
+    });
+
+    it('is not taught to a run that can only read', () => {
+      // Filing an issue is a write, and a bank this machine cannot write to is
+      // one whose tracker it has no standing in either.
+      const text = renderMemoryBanksPrompt([
+        { slug: 'client-docs', isDefault: true, readonly: true, cli: '/d/bin/cerebro' },
+      ]);
+      expect(text).not.toContain(RULE);
+    });
+
+    it('rides the render options through promptText, so the pane matches the run', () => {
+      const row = prompt({ id: CEREBRO, builtIn: CEREBRO, markdown: '' });
+      const banks = [bank('cortex', true)];
+      expect(promptText(row, banks)).toContain(RULE);
+      expect(promptText(row, banks, { followUpsAsIssues: false })).not.toContain(RULE);
+    });
+  });
+
   it('is the built-in prompt users are shown before they add one', () => {
     expect(BUILT_IN_AGENT_PROMPTS['builtin:cerebro'].markdown).toContain(
       TEAM_BANK_NAME_PLACEHOLDER,

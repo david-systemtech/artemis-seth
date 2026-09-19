@@ -45,6 +45,7 @@ import type {
   ArtemisBridge,
   BuiltInPromptId,
   MemoryBankPromptInfo,
+  RenderMemoryBanksOptions,
 } from '@rx-artemis/protocol';
 import { AGENT_PROMPTS_VERSION, withBuiltInRemoved, withBuiltInRestored } from '@rx-artemis/protocol';
 
@@ -84,6 +85,8 @@ export interface AgentPromptsPane {
   readonly dismissedBuiltIns: readonly BuiltInPromptId[];
   /** This machine's banks, for previewing a built-in as it will be sent. */
   readonly memoryBanks: readonly MemoryBankPromptInfo[];
+  /** And the options it would render them with, for the same reason. */
+  readonly memoryBanksOptions: RenderMemoryBanksOptions;
   readonly saveState: SaveState;
   /**
    * Replace the list.
@@ -117,6 +120,7 @@ export function useAgentPrompts(): AgentPromptsPane {
    * are facts about the machine, not part of the library.
    */
   const [memoryBanks, setMemoryBanks] = useState<readonly MemoryBankPromptInfo[]>([]);
+  const [memoryBanksOptions, setMemoryBanksOptions] = useState<RenderMemoryBanksOptions>({});
   const [saveState, setSaveState] = useState<SaveState>({ kind: 'idle' });
 
   /**
@@ -182,6 +186,7 @@ export function useAgentPrompts(): AgentPromptsPane {
       setLocalPrompts(result.value.document.prompts);
       setDismissedBuiltIns(result.value.document.dismissedBuiltIns ?? []);
       setMemoryBanks(result.value.memoryBanks);
+      setMemoryBanksOptions(result.value.memoryBanksOptions);
     })();
 
     return () => {
@@ -251,6 +256,7 @@ export function useAgentPrompts(): AgentPromptsPane {
     prompts,
     dismissedBuiltIns,
     memoryBanks,
+    memoryBanksOptions,
     saveState,
     setPrompts,
     removeBuiltIn,

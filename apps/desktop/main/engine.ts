@@ -159,7 +159,7 @@ import {
 
 import { AgentPromptStore } from './agentPrompts.js';
 import { SkillLibraryStore } from './skillLibrary.js';
-import { anyBankAvailable, banksForRun, configureMemoryBanks, isMasterEnabled, promptBanks, syncMemoryBanksInBackground } from './memoryBanks.js';
+import { anyBankAvailable, banksForRun, configureMemoryBanks, isFollowUpsAsIssues, isMasterEnabled, promptBanks, syncMemoryBanksInBackground } from './memoryBanks.js';
 import { EngineUnavailableError, ValidationError, WorkspaceError } from './errors.js';
 import { createLogger } from './log.js';
 import { ensureSignInForwarder, stopSignInForwarder } from './signInLoopback.js';
@@ -1061,7 +1061,10 @@ function createEngine(options: EngineOptions): ArtemisEngine {
                 input.cwd,
                 bankToolsAvailable(input.providerId),
               ),
-              memoryBanksOptions: { inlineIndex: inlineBankIndex(input.providerId) },
+              memoryBanksOptions: {
+                inlineIndex: inlineBankIndex(input.providerId),
+                followUpsAsIssues: isFollowUpsAsIssues(),
+              },
             }
           : {}),
       });
