@@ -372,6 +372,56 @@ describe('replayStoredSession', () => {
     expect(events.every((e) => (e as { messageId: string }).messageId === 'shared')).toBe(true);
     expect(events.map((e) => (e as { blockIndex: number }).blockIndex)).toEqual([0, 1]);
   });
+
+  /** One block of a streamed reply, filed the way the CLI files it: a record each. */
+  function block(id: string, content: unknown, uuid: string): StoredMessage {
+    return { type: 'assistant', uuid, message: { id, role: 'assistant', content: [content] } };
+  }
+
+  it('numbers a reply filed one block per record by its place in the reply', () => {
+    // The live mapper keys the answer after some thinking as block 1. Read
+    // back as block 0, a turn that is replayed and live at once — a pane
+    // reopened mid-turn — drew its answer twice.
+    const events = replayStoredSession(
+      [
+        block('msg_01', { type: 'thinking', thinking: 'Weighing it up.' }, 'a1'),
+        block('msg_01', { type: 'text', text: 'The answer is 42.' }, 'a2'),
+        block('msg_01', { type: 'tool_use', id: 't1', name: 'Bash', input: {} }, 'a3'),
+        toolResult('r1'),
+        block('msg_02', { type: 'text', text: 'Done.' }, 'a4'),
+      ],
+      ctx(),
+    );
+
+    const keyed = events
+      .filter((e) => e.type === 'thinking.delta' || e.type === 'text.complete')
+      .map((e) => {
+        const event = e as { type: string; messageId: string; blockIndex: number };
+        return [event.type, event.messageId, event.blockIndex];
+      });
+    expect(keyed).toEqual([
+      ['thinking.delta', 'msg_01', 0],
+      ['text.complete', 'msg_01', 1],
+      ['text.complete', 'msg_02', 0],
+    ]);
+  });
+
+  it('keeps counting a reply across a record filed between its blocks', () => {
+    const events = replayStoredSession(
+      [
+        block('msg_01', { type: 'thinking', thinking: '' }, 'a1'),
+        prompt('sent while it was thinking', 'q1'),
+        block('msg_01', { type: 'text', text: 'Answer.' }, 'a2'),
+      ],
+      ctx(),
+    );
+
+    const answer = events.find(
+      (e) => e.type === 'text.complete' && (e as { text: string }).text === 'Answer.',
+    );
+    // The empty thinking block is not drawn, but it is still block 0.
+    expect(answer).toMatchObject({ messageId: 'msg_01', blockIndex: 1 });
+  });
 });
 
 import { resolveRewindPoint } from '../history.js';
