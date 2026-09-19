@@ -536,6 +536,75 @@ describe('a reply streamed block by block', () => {
     const completes = events.filter((e): e is TextCompleteEvent => e.type === 'text.complete');
     expect(completes.map((c) => c.messageId)).toEqual(['msg_02', 'uuid-third']);
   });
+
+  it('lends the id to no message once the block it streamed has completed', () => {
+    // A stream cut off after its block completed, with no `message_stop`: the
+    // next message with no id is not part of that reply and must not land on
+    // its key.
+    const state = makeState();
+    const events = run(state, [
+      messageStart('msg_01'),
+      blockStart(0, 'text'),
+      textDelta(0, 'partial'),
+      assistantMessage({ content: [{ type: 'text', text: 'partial' }] }),
+      assistantMessage({ id: '', uuid: 'uuid-next', content: [{ type: 'text', text: 'next' }] }),
+    ]);
+
+    const completes = events.filter((e): e is TextCompleteEvent => e.type === 'text.complete');
+    expect(completes.map((c) => [c.messageId, c.blockIndex])).toEqual([
+      ['msg_01', 0],
+      ['uuid-next', 0],
+    ]);
+  });
+
+  it('keeps streaming later blocks when the completed blocks carry no id', () => {
+    const state = makeState();
+    const events = run(state, [
+      messageStart('msg_01'),
+      blockStart(0, 'thinking'),
+      thinkingDelta(0, 'Weighing it up.'),
+      assistantMessage({ id: '', content: [{ type: 'thinking', thinking: 'Weighing it up.', signature: 's' }] }),
+      blockStop(0),
+      blockStart(1, 'text'),
+      textDelta(1, 'Streamed '),
+      textDelta(1, 'anyway.'),
+      assistantMessage({ id: '', content: [{ type: 'text', text: 'Streamed anyway.' }] }),
+      blockStop(1),
+      messageStop(),
+    ]);
+
+    const deltas = events.filter((e): e is TextDeltaEvent => e.type === 'text.delta');
+    expect(deltas.map((d) => [d.text, d.messageId, d.blockIndex])).toEqual([
+      ['Streamed ', 'msg_01', 1],
+      ['anyway.', 'msg_01', 1],
+    ]);
+    const completes = events.filter((e): e is TextCompleteEvent => e.type === 'text.complete');
+    expect(completes.map((c) => [c.messageId, c.blockIndex])).toEqual([['msg_01', 1]]);
+    expect(events.filter((e) => e.type === 'thinking.delta')).toHaveLength(1);
+  });
+
+  it('lets go of the anchor when a tool result arrives', () => {
+    const state = makeState();
+    const events = run(state, [
+      messageStart('msg_01'),
+      blockStart(0, 'text'),
+      textDelta(0, 'cut off mid-block'),
+      {
+        type: 'user',
+        parent_tool_use_id: null,
+        uuid: 'uuid-tr',
+        session_id: 'sess-abc',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }],
+        },
+      },
+      assistantMessage({ id: '', uuid: 'uuid-after', content: [{ type: 'text', text: 'after' }] }),
+    ]);
+
+    const completes = events.filter((e): e is TextCompleteEvent => e.type === 'text.complete');
+    expect(completes.map((c) => c.messageId)).toEqual(['uuid-after']);
+  });
 });
 
 /* -------------------------------------------------------------------------- */
