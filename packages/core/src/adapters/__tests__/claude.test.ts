@@ -2056,6 +2056,58 @@ describe('a turn that ends while work is still running', () => {
     }
   });
 
+  it('keeps it through whichever queued turn opens first, until the turns stop', async () => {
+    /*
+     * The turn about the work is not necessarily the next to open: a message
+     * typed mid-turn is queued the same way, and two settled tasks can be
+     * answered as two turns. None of them can be told apart from the stream,
+     * so every turn that ends while the settle is owed holds the process for
+     * the grace, and only a grace with no turn opening releases it. With a
+     * continuation listener, as the desktop and the server both have, so the
+     * CLI's own turns are adopted rather than refused.
+     */
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const adopted: Run[] = [];
+      let n = 0;
+      const adapter = createClaudeAdapter({
+        onContinuation: (continuation) => adopted.push(continuation),
+        newRunId: () => `run-c${String(++n)}` as RunId,
+      });
+      const { harness } = installQuery();
+      const run = await adapter.createRun(BASE_INPUT);
+      const { fake } = harness();
+
+      fake.messages.push(INIT_MESSAGE);
+      fake.messages.push(tasksChanged(busyTask));
+      fake.messages.push(tasksChanged([]));
+      await vi.waitFor(() => expect(fake.closed).toBe(false));
+      await vi.advanceTimersByTimeAsync(7_000);
+      fake.messages.push(RESULT_MESSAGE);
+      await drain(run.events);
+
+      // A queued message's turn opens first and ends. The turn about the work
+      // is still queued behind it.
+      fake.messages.push(INIT_MESSAGE);
+      fake.messages.push(RESULT_MESSAGE);
+      await vi.waitFor(() => expect(adopted).toHaveLength(1));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fake.closed).toBe(false);
+
+      // Then the turn about the work, and after it nothing more.
+      fake.messages.push(INIT_MESSAGE);
+      fake.messages.push(RESULT_MESSAGE);
+      await vi.waitFor(() => expect(adopted).toHaveLength(2));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fake.closed).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(fake.closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('still releases it a grace after that turn when nothing about the work follows', async () => {
     // The notification can also be read inside the running turn, at its next
     // tool call, and then no turn follows at all. Counting from the turn's end
