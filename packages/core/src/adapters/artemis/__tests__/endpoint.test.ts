@@ -14,7 +14,9 @@
  *    server did not confirm. The local adapter's placeholder trick would, with
  *    `resumeSession: true`, poison the pane's resume target on any stream that
  *    died early — see the adapter's class comment.
- *  - **The activity report becomes settled tool rows**, after the text.
+ *  - **Tool calls become rows as they happen**, and the activity report
+ *    becomes settled rows after the text for whatever the stream did not
+ *    already show.
  *  - **A vanished stream is an error, not a completion.**
  */
 
@@ -1861,5 +1863,250 @@ describe('two answer blocks on one stream', () => {
       { blockIndex: 2, text: '**Probe complete.**' },
       { blockIndex: 2, text: '\n\nAnd a footnote.' },
     ]);
+  });
+});
+
+/**
+ * Tool calls, drawn while the remote agent makes them.
+ *
+ * The report on the final chunk used to be the only word of any call, so a
+ * served pane sat still through a tool-heavy turn — a probe saw 241 bare
+ * cursor chunks and not one row in thirteen minutes — and then drew every
+ * call at once under the answer. A server that sends `artemis.tool` puts each
+ * of the agent's own calls on the stream as it starts and as it ends; what is
+ * pinned here is that each becomes a row at that moment, in the block order a
+ * local run would give it, exactly once, and that the report still draws what
+ * the stream did not show.
+ */
+describe('tool calls drawn as they happen', () => {
+  const READ = { id: 'call-1', tool: 'read', summary: 'src/a.ts', at: 5 };
+  const BASH = { id: 'call-2', tool: 'bash', summary: 'pnpm test', at: 6 };
+
+  /** What a transcript draws from each event, without the run's bookends. */
+  const story = (events: readonly AgentEvent[]) =>
+    events
+      .filter((event) => event.type !== 'session.started' && event.type !== 'run.end')
+      .map((event) => {
+        const fields = event as unknown as Record<string, unknown>;
+        return Object.fromEntries(
+          ['type', 'blockIndex', 'text', 'toolCallId', 'name', 'title', 'status', 'resultText']
+            .filter((field) => fields[field] !== undefined)
+            .map((field) => [field, fields[field]]),
+        );
+      });
+  /** The tool rows alone. */
+  const rows = (events: readonly AgentEvent[]) =>
+    story(events.filter((event) => event.type === 'tool.start' || event.type === 'tool.end'));
+
+  it('draws each call as it starts and as it ends, closing the answer in progress first', async () => {
+    const { origin } = await serve((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      response.write(sse(chunk({ role: 'assistant' }, { artemis: { runId: 'srv-t', sessionId: 'sess-t' } })));
+      response.write(sse(chunk({ content: 'Reading the file.' }, { artemis: { seq: 1 } })));
+      response.write(sse(chunk({}, { artemis: { tool: READ, seq: 2 } })));
+      response.write(sse(chunk({}, { artemis: { tool: { ...READ, ok: true }, seq: 3 } })));
+      // The server parts the answer blocks either side of the call with a
+      // paragraph break, which separates nothing at the head of a fresh row.
+      response.write(sse(chunk({ content: '\n\nIt is fine.' }, { artemis: { seq: 4 } })));
+      response.write(
+        sse(
+          chunk(
+            {},
+            {
+              finish_reason: 'stop',
+              artemis: { sessionId: 'sess-t', activity: [{ ...READ, ok: true }], endReason: 'completed', seq: 5 },
+            },
+          ),
+        ),
+      );
+      response.write(sse('[DONE]'));
+      response.end();
+    });
+
+    const events = await drive(origin);
+    // The answer before the call is closed and finalised before the row
+    // lands, so the answer after it opens a block of its own below the row
+    // instead of being written back into the one above it. And the report
+    // draws nothing: its one call is already on screen.
+    expect(story(events)).toEqual([
+      { type: 'text.delta', blockIndex: 0, text: 'Reading the file.' },
+      { type: 'text.complete', blockIndex: 0, text: 'Reading the file.' },
+      { type: 'tool.start', toolCallId: 'run-1-tool-call-1', name: 'read', title: 'src/a.ts' },
+      { type: 'tool.end', toolCallId: 'run-1-tool-call-1', name: 'read', status: 'ok', resultText: 'src/a.ts' },
+      { type: 'text.delta', blockIndex: 1, text: 'It is fine.' },
+      { type: 'text.complete', blockIndex: 1, text: 'It is fine.' },
+    ]);
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed', sessionId: 'sess-t' });
+  });
+
+  it('draws from the report only what the stream did not show, and ends a row left running', async () => {
+    // A subagent's calls never cross live, so the report is their only
+    // account. A row whose ending never crossed takes its outcome from the
+    // report, rather than spinning under an ended run.
+    const GREP = { id: 'sub-1', tool: 'grep', summary: 'TODO', at: 7 };
+    const { origin } = await serve((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      response.write(sse(chunk({ role: 'assistant' }, { artemis: { runId: 'srv-t' } })));
+      response.write(sse(chunk({}, { artemis: { tool: READ, seq: 1 } })));
+      response.write(sse(chunk({}, { artemis: { tool: BASH, seq: 2 } })));
+      response.write(sse(chunk({}, { artemis: { tool: { ...READ, ok: true }, seq: 3 } })));
+      response.write(
+        sse(
+          chunk(
+            {},
+            {
+              finish_reason: 'stop',
+              artemis: {
+                activity: [
+                  { ...READ, ok: true },
+                  { ...GREP, ok: true },
+                  { ...BASH, ok: false },
+                ],
+                endReason: 'completed',
+                seq: 9,
+              },
+            },
+          ),
+        ),
+      );
+      response.write(sse('[DONE]'));
+      response.end();
+    });
+
+    const events = await drive(origin);
+    expect(story(events)).toEqual([
+      { type: 'tool.start', toolCallId: 'run-1-tool-call-1', name: 'read', title: 'src/a.ts' },
+      { type: 'tool.start', toolCallId: 'run-1-tool-call-2', name: 'bash', title: 'pnpm test' },
+      { type: 'tool.end', toolCallId: 'run-1-tool-call-1', name: 'read', status: 'ok', resultText: 'src/a.ts' },
+      // The run is over: the row still running takes the report's outcome.
+      { type: 'tool.end', toolCallId: 'run-1-tool-call-2', name: 'bash', status: 'error', resultText: 'pnpm test' },
+      // The subagent's call, settled, under the id its place in the report gives it.
+      { type: 'tool.start', toolCallId: 'run-1-act-1', name: 'grep', title: 'TODO' },
+      { type: 'tool.end', toolCallId: 'run-1-act-1', name: 'grep', status: 'ok', resultText: 'TODO' },
+    ]);
+  });
+
+  it('draws an older server’s report exactly as it always has', async () => {
+    // No rows on the stream and no ids in the report: every entry is drawn,
+    // settled, after the answer, under the ids a report's rows always took.
+    const { origin } = await serve((_request, response) => happyStream(response));
+
+    const events = await drive(origin);
+    expect(story(events)).toEqual([
+      { type: 'text.delta', blockIndex: 0, text: 'Hel' },
+      { type: 'text.delta', blockIndex: 0, text: 'lo.' },
+      { type: 'text.complete', blockIndex: 0, text: 'Hello.' },
+      { type: 'tool.start', toolCallId: 'run-1-act-0', name: 'read', title: 'src/index.ts' },
+      { type: 'tool.end', toolCallId: 'run-1-act-0', name: 'read', status: 'ok', resultText: 'src/index.ts' },
+      { type: 'tool.start', toolCallId: 'run-1-act-1', name: 'bash', title: 'pnpm test' },
+      { type: 'tool.end', toolCallId: 'run-1-act-1', name: 'bash', status: 'error', resultText: 'pnpm test' },
+    ]);
+  });
+
+  describe('across a stream that dies', () => {
+    const FAST = { reconnect: { backoffMs: [10], watchdogMs: 100 } };
+
+    function resumable(script: {
+      readonly first: (response: ServerResponse) => void;
+      readonly resume: (response: ServerResponse) => void;
+    }) {
+      return serve((request, response) => {
+        if (request.url === '/v1/chat/completions') {
+          response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+          script.first(response);
+          return;
+        }
+        if (request.url?.startsWith('/api/v0/runs/run-x/stream')) {
+          script.resume(response);
+          return;
+        }
+        response.writeHead(404).end();
+      });
+    }
+
+    it('never draws a row twice when a replay carries it again', async () => {
+      const { origin, seen } = await resumable({
+        first: (response) => {
+          response.write(sse(chunk({}, { artemis: { runId: 'run-x', sessionId: 'sess-x', seq: 0 } })));
+          response.write(sse(chunk({}, { artemis: { tool: READ, seq: 1 } })));
+          setTimeout(() => response.destroy(), 20);
+        },
+        resume: (response) => {
+          response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+          response.write(sse(chunk({}, { artemis: { runId: 'run-x' } })));
+          // The call's start again, and its ending twice: one row, one ending.
+          response.write(sse(chunk({}, { artemis: { tool: READ, seq: 1 } })));
+          response.write(sse(chunk({}, { artemis: { tool: { ...READ, ok: true }, seq: 2 } })));
+          response.write(sse(chunk({}, { artemis: { tool: { ...READ, ok: true }, seq: 2 } })));
+          // An ending whose start this run never saw still gets its row.
+          response.write(sse(chunk({}, { artemis: { tool: { ...BASH, ok: true }, seq: 4 } })));
+          response.write(
+            sse(
+              chunk(
+                {},
+                {
+                  finish_reason: 'stop',
+                  artemis: {
+                    sessionId: 'sess-x',
+                    activity: [
+                      { ...READ, ok: true },
+                      { ...BASH, ok: true },
+                    ],
+                    endReason: 'completed',
+                    seq: 5,
+                  },
+                },
+              ),
+            ),
+          );
+          response.write(sse('[DONE]'));
+          response.end();
+        },
+      });
+
+      const events = await drive(origin, {}, FAST);
+      expect(seen.map((request) => request.url)).toEqual([
+        '/v1/chat/completions',
+        '/api/v0/runs/run-x/stream?after=1',
+      ]);
+      expect(rows(events)).toEqual([
+        { type: 'tool.start', toolCallId: 'run-1-tool-call-1', name: 'read', title: 'src/a.ts' },
+        { type: 'tool.end', toolCallId: 'run-1-tool-call-1', name: 'read', status: 'ok', resultText: 'src/a.ts' },
+        { type: 'tool.start', toolCallId: 'run-1-tool-call-2', name: 'bash', title: 'pnpm test' },
+        { type: 'tool.end', toolCallId: 'run-1-tool-call-2', name: 'bash', status: 'ok', resultText: 'pnpm test' },
+      ]);
+      expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+    });
+
+    it('ends a row still running as cancelled when the run cannot be picked back up', async () => {
+      // The event contract: every start gets an ending, a run that stops
+      // early included. This side can no longer hear how the call came out.
+      const { origin } = await resumable({
+        first: (response) => {
+          response.write(sse(chunk({}, { artemis: { runId: 'run-x', seq: 0 } })));
+          response.write(sse(chunk({}, { artemis: { tool: BASH, seq: 1 } })));
+          setTimeout(() => response.destroy(), 20);
+        },
+        resume: (response) => {
+          response.writeHead(404, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ error: { message: 'No such run for this connection.' } }));
+        },
+      });
+
+      const events = await drive(origin, {}, FAST);
+      expect(rows(events)).toEqual([
+        { type: 'tool.start', toolCallId: 'run-1-tool-call-2', name: 'bash', title: 'pnpm test' },
+        {
+          type: 'tool.end',
+          toolCallId: 'run-1-tool-call-2',
+          name: 'bash',
+          status: 'cancelled',
+          resultText: 'pnpm test',
+        },
+      ]);
+      expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'error' });
+      // The ending lands before the run's own.
+      expect(events.at(-2)).toMatchObject({ type: 'tool.end', status: 'cancelled' });
+    });
   });
 });
