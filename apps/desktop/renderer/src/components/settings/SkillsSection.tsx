@@ -74,6 +74,7 @@ import {
   skillSourceLabel,
   skillSourceSubdirProblem,
   skillSourceUrlProblem,
+  skillUpstreamUrl,
   type SkillInfo,
   type SkillLibraryDocument,
   type SkillSourceStatus,
@@ -94,6 +95,7 @@ import {
 } from '@/components/ui/item';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 
 /**
@@ -146,8 +148,10 @@ function SkillRow({
     skill.origin.kind === 'profile'
       ? `Only on ${skill.origin.profileIds.map(profileLabel).join(', ')}`
       : skill.origin.kind === 'source'
-        ? `${everyAccount}, from ${sourceLabel(skill.origin.sourceId)}`
+        ? `${everyAccount}, synced from ${sourceLabel(skill.origin.sourceId)}`
         : everyAccount;
+  const switchId =
+    remote === undefined ? `settings-skill-${skill.name}` : `settings-skill-${remote.id}-${skill.name}`;
 
   return (
     <Item size="sm" className="items-start">
@@ -163,11 +167,29 @@ function SkillRow({
         <ItemDescription className="line-clamp-none text-2xs leading-relaxed text-ink-faint">
           {reach(skill)} {where}.
           {skill.bodyChars === 0
-            ? ' Its file has no instructions in it, so always on would add nothing.'
+            ? ' Its file has no instructions in it, so loading it into every prompt would add nothing.'
             : told
-              ? ` Always on adds about ${approximateTokens(skill.bodyChars)} tokens to every run.`
-              : ' None of the accounts it reaches is told its always-on skills, so the switch adds nothing to a run.'}
+              ? ` Switched on, it is loaded into every prompt, not only when it applies: about ${approximateTokens(skill.bodyChars)} tokens each time.`
+              : ' None of the accounts it reaches can take a skill in every prompt, so the switch adds nothing to a run.'}
         </ItemDescription>
+        {/* Who wrote it, when the mirror it was copied through says so. The
+            command above names Artemis's bridge, which is how it is typed, not
+            where it came from. */}
+        {skill.upstream !== undefined ? (
+          <ItemDescription className="line-clamp-none text-2xs leading-relaxed text-ink-faint">
+            From{' '}
+            <a
+              href={skillUpstreamUrl(skill.upstream)}
+              target="_blank"
+              rel="noreferrer"
+              className="font-mono text-ink-muted underline decoration-hairline underline-offset-2 hover:text-ink"
+            >
+              {skill.upstream.repo}
+            </a>
+            {skill.upstream.license === undefined ? '' : ` · ${skill.upstream.license}`}
+            {skill.upstream.commit === undefined ? '' : ` · copied at ${skill.upstream.commit.slice(0, 7)}`}
+          </ItemDescription>
+        ) : null}
         {/* A session is handed an enabled marketplace plugin whole, so where one
             offers this name Artemis leaves its own copy out rather than offer
             the skill twice. Said here because the command above is then not
@@ -179,16 +201,24 @@ function SkillRow({
           >
             On {offer.profileIds.map(profileLabel).join(', ')} the {offer.plugin} plugin offers a skill of this
             name, so sessions there get that one and it is typed as{' '}
-            <code className="font-mono text-2xs text-ink-muted">{offer.command}</code>. Always on still uses
-            your copy.
+            <code className="font-mono text-2xs text-ink-muted">{offer.command}</code>. Every prompt still
+            loads your copy.
           </ItemDescription>
         ))}
       </ItemContent>
-      <ItemActions>
+      <ItemActions className="gap-2">
+        {/* Said beside the switch, because a bare switch on a list of skills
+            reads as "enable this skill" — and every skill here is already
+            available on request. What it adds is loading one into every prompt. */}
+        <Label htmlFor={switchId} className="text-2xs font-normal text-ink-muted">
+          Every prompt
+        </Label>
         <Switch
-          id={remote === undefined ? `settings-skill-${skill.name}` : `settings-skill-${remote.id}-${skill.name}`}
+          id={switchId}
           aria-label={
-            remote === undefined ? `Always on: ${skill.name}` : `Always on: ${skill.name}, on ${remote.label}`
+            remote === undefined
+              ? `Load into every prompt: ${skill.name}`
+              : `Load into every prompt: ${skill.name}, on ${remote.label}`
           }
           checked={on}
           onCheckedChange={onToggle}
@@ -412,7 +442,7 @@ function ServerSkillsGroup({
     return (
       <SettingsGroup label={`On ${label}`} anchor={anchor}>
         <p className="px-3 py-2.5 text-2xs leading-relaxed text-ink-faint">
-          This server does not list its skills, so it is too old to read always-on skills either.
+          This server does not list its skills, so it is too old to load them into every prompt either.
           Conversations there start without them until it is updated.
         </p>
       </SettingsGroup>
@@ -539,7 +569,7 @@ export function SkillsSection(): ReactElement {
   return (
     <SettingsPane
       title="Skills"
-      description="Procedures your agents can load: what a conversation on this machine is offered, and which ones always apply."
+      description="Procedures your agents can load. Every skill here is available on request; switch one to Every prompt and it is loaded into every conversation, the way a standing instruction is."
     >
       {pane.error !== null ? (
         <p role="alert" className="text-2xs leading-relaxed text-danger-text">
@@ -589,7 +619,7 @@ export function SkillsSection(): ReactElement {
       ) : null}
 
       {missing.length > 0 ? (
-        <SettingsGroup label={servers.length > 0 ? 'Always on, but not installed anywhere' : 'Always on, but not on this machine'} anchor="skills-missing">
+        <SettingsGroup label={servers.length > 0 ? 'On for every prompt, but not installed anywhere' : 'On for every prompt, but not on this machine'} anchor="skills-missing">
           <ItemGroup className="gap-0 divide-y divide-hairline">
             {missing.map((entry) => (
               <Item key={entry.name} size="sm" className="items-start">
@@ -602,10 +632,13 @@ export function SkillsSection(): ReactElement {
                     takes effect again the moment the skill is back.
                   </ItemDescription>
                 </ItemContent>
-                <ItemActions>
+                <ItemActions className="gap-2">
+                  <Label htmlFor={`settings-skill-${entry.name}`} className="text-2xs font-normal text-ink-muted">
+                    Every prompt
+                  </Label>
                   <Switch
                     id={`settings-skill-${entry.name}`}
-                    aria-label={`Always on: ${entry.name}`}
+                    aria-label={`Load into every prompt: ${entry.name}`}
                     checked
                     onCheckedChange={(on) => pane.setAlwaysOn(entry.name, on)}
                   />
@@ -663,11 +696,14 @@ export function SkillsSection(): ReactElement {
       {pane.skills.length > 0 || missing.length > 0 ? (
         <p className="text-2xs leading-relaxed text-ink-faint">
           Type <code className="font-mono">/</code> and the skill&rsquo;s own name in a conversation: the menu
-          finds it and fills in the full command. <em>Always on</em> appends the skill to the system prompt,
+          finds it and fills in the full command. <em>Every prompt</em> appends the skill to the system prompt,
           the way a standing instruction is, so it reaches Claude accounts and local models. A Codex or
           OpenCode account cannot take an appended prompt and is not told. A conversation on an Artemis
           Server runs on the server: the switch travels with it by name, and the server adds its own copy of
-          the skill, so one that is not installed there adds nothing.
+          the skill, so one that is not installed there adds nothing. The command begins{' '}
+          <code className="font-mono">artemis-skills:</code> because that is the plugin Artemis delivers your
+          skills through; where a skill was written is the <em>From</em> line on its row, when the repository
+          it was copied from records it.
         </p>
       ) : null}
     </SettingsPane>

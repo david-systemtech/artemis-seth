@@ -343,3 +343,54 @@ describe('synced sources', () => {
     expect(skills).toEqual([]);
   });
 });
+
+describe('where a copied skill was written', () => {
+  const MANIFEST = {
+    version: 1,
+    skills: {
+      tdd: { repo: 'mattpocock/skills', path: 'skills/engineering/tdd', sha: '74ca5fe', license: 'MIT' },
+    },
+  };
+
+  it('reads the manifest above a skills folder the mirror’s installer linked into place', async () => {
+    // The agent-skills installer: ~/.agents/skills -> <clone>/skills, with the
+    // manifest at <clone>/skills.json.
+    const clone = join(root, 'skills-repo');
+    await skill(join(clone, 'skills'), 'tdd', '---\ndescription: TDD.\n---\nBody.\n');
+    await skill(join(clone, 'skills'), 'mine', '---\ndescription: Not in the manifest.\n---\nBody.\n');
+    await writeFile(join(clone, 'skills.json'), JSON.stringify(MANIFEST));
+    await mkdir(join(home, '.agents'), { recursive: true });
+    await symlink(join(clone, 'skills'), join(home, '.agents', 'skills'), process.platform === 'win32' ? 'junction' : 'dir');
+
+    const listed = await listSkills({ accounts: [], home });
+
+    expect(listed.find((entry) => entry.name === 'tdd')?.upstream).toEqual({
+      repo: 'mattpocock/skills',
+      path: 'skills/engineering/tdd',
+      commit: '74ca5fe',
+      license: 'MIT',
+    });
+    expect(listed.find((entry) => entry.name === 'mine')).not.toHaveProperty('upstream');
+  });
+
+  it('reads it beside the skills too, and for a synced source', async () => {
+    const source = join(root, 'data', 'skill-sources', 'agent-skills', 'skills');
+    await skill(source, 'tdd', '---\ndescription: TDD.\n---\nBody.\n');
+    await writeFile(join(source, 'skills.json'), JSON.stringify(MANIFEST));
+
+    const [row] = await listSkills({ accounts: [], home, sources: [{ id: 'agent-skills', dir: source }] });
+
+    expect(row?.upstream?.repo).toBe('mattpocock/skills');
+  });
+
+  it('says nothing for a folder of skills nobody recorded, or a file that is not a manifest', async () => {
+    await skill(join(work, 'skills'), 'house-rules', '---\ndescription: Ours.\n---\nBody.\n');
+    // The profile folder's parent holds a skills.json that is Artemis's own
+    // library document, not a mirror's manifest.
+    await writeFile(join(work, 'skills.json'), JSON.stringify({ version: 1, alwaysOn: [] }));
+
+    const [row] = await listSkills({ accounts: [{ profileId: WORK, configDir: work }], home });
+
+    expect(row).not.toHaveProperty('upstream');
+  });
+});

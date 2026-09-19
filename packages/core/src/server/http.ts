@@ -4027,12 +4027,12 @@ const HEARTBEAT = Symbol('heartbeat');
  * Pull from a generator, and say something when it has nothing to say.
  *
  * An SSE stream that is silent for minutes — an agent inside a long tool call
- * produces no chunk, because activity is reported on the final chunk rather
- * than streamed — is indistinguishable, from the client's side, from a
- * connection that has died. The bridge's feed solved this with a heartbeat
- * comment; the completions stream had none, so a client could not tell a
- * working agent from a dead socket, and a NAT or relay with an idle timeout
- * could cut a quiet stream without either side noticing until the next write.
+ * produces no chunk between the call's start and its end — is
+ * indistinguishable, from the client's side, from a connection that has died.
+ * The bridge's feed solved this with a heartbeat comment; the completions
+ * stream had none, so a client could not tell a working agent from a dead
+ * socket, and a NAT or relay with an idle timeout could cut a quiet stream
+ * without either side noticing until the next write.
  * This is the same heartbeat for this stream: while the source has no next
  * value within `heartbeatMs`, a comment is yielded instead and the source's
  * pending `next()` is raced again — never called twice.
@@ -4159,11 +4159,16 @@ function chunkFor(
         ...stamped({ gap: { afterSeq: event.afterSeq, firstSeq: event.firstSeq } }),
       });
 
-    // `activity` is not streamed as its own event: an OpenAI client parses
-    // every `data:` line as a chunk, and one it cannot parse is a hard error
-    // in most SDKs. It rides on the final chunk instead.
+    // One of the agent's own tool calls, as it starts and again as it ends,
+    // on the same empty delta: an OpenAI client appends nothing, an Artemis
+    // client draws the row while the call runs. A well-formed chunk and not a
+    // line of its own, because an OpenAI client parses every `data:` line as
+    // a chunk and one it cannot parse is a hard error in most SDKs. The whole
+    // report still rides the final chunk, which is all an older client reads;
+    // until this, that was the only place a call appeared, so a served turn
+    // sat still for minutes and then drew every call at once.
     case 'activity':
-      return undefined;
+      return chatChunk({ ...frame, delta: {}, ...stamped({ tool: event.activity }) });
 
     // What the run has delegated, on an empty delta: an OpenAI client appends
     // nothing, an Artemis client redraws its rows. The whole set each time,

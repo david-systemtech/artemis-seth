@@ -478,10 +478,32 @@ interface StreamState {
 }
 
 /**
+ * A tool row drawn as its call happened: what its ending is drawn with, and
+ * whether it has had one.
+ */
+interface LiveToolRow {
+  readonly name: string;
+  readonly summary: string | undefined;
+  ended: boolean;
+}
+
+/**
  * One turn against a remote Artemis.
  *
- * Opens one streamed completion and renders it: deltas as they arrive, then
- * the final chunk's activity report as settled tool rows, then `run.end`.
+ * Opens one streamed completion and renders it: deltas and tool calls as they
+ * arrive, then whatever of the final chunk's activity report the stream did
+ * not already show, as settled tool rows, then `run.end`.
+ *
+ * ## Tool calls are drawn as they happen
+ *
+ * A server that sends them puts each of the serving agent's own calls on the
+ * stream twice, as it starts and as it ends, and each becomes a row here at
+ * that moment. Before servers sent them, the report on the final chunk was
+ * the only word of any call, and a served turn sat still for minutes before
+ * drawing every row at once. A row is a block boundary, like a parked ask:
+ * the block in progress closes before it. The report is then drawn only for
+ * what the stream did not show — a subagent's calls, which never cross live,
+ * or every call from a server too old to send any.
  *
  * ## The session id is never guessed
  *
@@ -575,6 +597,16 @@ class ArtemisRun implements Run {
    * unmatched id here is the one it means. See `artemis.delivered`.
    */
   readonly #steered: MessageId[] = [];
+  /**
+   * The tool rows drawn live, by the server's id for the call.
+   *
+   * Keyed rather than trusted to arrive once, so a row the stream carries
+   * again — a replay that reaches back past what was already drawn — lands on
+   * the row already there instead of beside it. And what the report at the
+   * end is read against: a call drawn here is not drawn a second time as a
+   * settled copy under the answer.
+   */
+  readonly #liveTools = new Map<string, LiveToolRow>();
   /** Where the adapter keeps what the stream said the run delegated. */
   readonly #onTasks: ArtemisRunHooks['onTasks'];
   /**
@@ -754,6 +786,51 @@ class ArtemisRun implements Run {
     } as never);
   }
 
+  /**
+   * Draw one of the serving agent's tool calls the moment the stream says it
+   * moved: a running row when it starts, its ending when it ends.
+   *
+   * An ending whose start this run never drew opens the row and settles it at
+   * once, so an ending always has a row to land on. A row already drawn is
+   * never drawn again, and an ending already drawn is never sent twice.
+   *
+   * Opening a row closes the block in progress first. That is the rule a
+   * parked ask follows, for the same reason: the transcript keys a block by
+   * (message, index) and settles every streaming block when a tool row lands,
+   * so an answer that went on after the call under the index it had before
+   * would be written back into the row above the tool.
+   */
+  #drawTool(call: ArtemisActivity & { readonly id: string }, stream: StreamState): void {
+    let row = this.#liveTools.get(call.id);
+    if (row === undefined) {
+      stream.close();
+      row = { name: call.tool, summary: call.summary, ended: false };
+      this.#liveTools.set(call.id, row);
+      this.#emit({
+        type: 'tool.start',
+        toolCallId: liveToolCallId(this.runId, call.id),
+        name: row.name,
+        input: {},
+        ...(row.summary === undefined ? {} : { title: row.summary }),
+      } as never);
+    }
+    if (call.ok !== undefined && !row.ended) this.#endLiveTool(call.id, call.ok ? 'ok' : 'error');
+  }
+
+  /** Settle a row {@link #drawTool} opened. */
+  #endLiveTool(id: string, status: 'ok' | 'error' | 'cancelled'): void {
+    const row = this.#liveTools.get(id);
+    if (row === undefined || row.ended) return;
+    row.ended = true;
+    this.#emit({
+      type: 'tool.end',
+      toolCallId: liveToolCallId(this.runId, id),
+      name: row.name,
+      status,
+      ...(row.summary === undefined ? {} : { resultText: row.summary }),
+    } as never);
+  }
+
   async #drive(): Promise<void> {
     try {
       // A resumed turn knows its session before the first byte arrives — unless
@@ -901,12 +978,28 @@ class ArtemisRun implements Run {
       stream.close();
 
       /*
-       * The activity report, rendered as settled tool rows. It arrives whole
-       * on the final chunk, so these rows land after the text — a summary of
-       * what the remote agent did, not a live feed of it doing so. Each entry
-       * is already summarised to a target, never contents.
+       * A row drawn live whose ending never crossed is ended here, with the
+       * outcome the report gives it — or as a success when the report has no
+       * word of it, which is a resumed stream whose server no longer held the
+       * call's start. The run is over, so nothing it did is still running,
+       * and a row left spinning under the ending could never be cleared.
+       */
+      for (const [id, row] of this.#liveTools) {
+        if (row.ended) continue;
+        const reported = stream.activity.find((entry) => entry.id === id);
+        this.#endLiveTool(id, reported?.ok === false ? 'error' : 'ok');
+      }
+
+      /*
+       * The activity report, rendered as settled tool rows, for every call the
+       * stream did not already draw: a subagent's, which never cross live, or
+       * all of them from a server too old to send any. It arrives whole on the
+       * final chunk, so these rows land after the text — a summary of what the
+       * remote agent did, not a live feed of it doing so. Each entry is
+       * already summarised to a target, never contents.
        */
       stream.activity.forEach((entry, index) => {
+        if (entry.id !== undefined && this.#liveTools.has(entry.id)) return;
         const toolCallId = `${this.runId}-act-${index}` as ToolCallId;
         this.#emit({
           type: 'tool.start',
@@ -945,6 +1038,12 @@ class ArtemisRun implements Run {
     } catch (error) {
       const aborted = this.#abort.signal.aborted;
       this.#status = 'ended';
+      // Every row drawn live gets its ending before the run's does, as the
+      // event contract asks of any run that stops early: cancelled, because
+      // this side can no longer hear how the call came out.
+      for (const [id, row] of this.#liveTools) {
+        if (!row.ended) this.#endLiveTool(id, 'cancelled');
+      }
       // The tokens were spent whether or not the turn was let finish, so the
       // last reading rides the card exactly as it does on a clean ending;
       // without it a stopped turn showed no accounting at all.
@@ -1220,6 +1319,9 @@ class ArtemisRun implements Run {
       if (extensions.permission.status === 'requested') stream.close();
       this.#notePermission(extensions.permission);
     }
+    // One of the serving agent's own calls, as it starts or ends — a boundary
+    // of the same weight as the park above. See `#drawTool`.
+    if (extensions?.tool !== undefined) this.#drawTool(extensions.tool, stream);
     // The whole live set, re-stamped onto this run so the renderer files the
     // rows under the conversation it is drawing. Remembered on the adapter
     // too, keyed by session, so the rows outlive the turn — see
@@ -1550,6 +1652,15 @@ class ArtemisRun implements Run {
     this.#queue.close();
     return Promise.resolve();
   }
+}
+
+/**
+ * The id a tool row drawn live is filed under: the run's, then the server's
+ * own id for the call. Apart from the `-act-` ids the report's rows take,
+ * which number entries by position because an older server sends no ids.
+ */
+function liveToolCallId(runId: RunId, id: string): ToolCallId {
+  return `${runId}-tool-${id}` as ToolCallId;
 }
 
 /** The three outcomes a resolution carries; read one back safely. */

@@ -803,6 +803,7 @@ const MOCK_SKILLS: readonly SkillInfo[] = [
     modelInvocable: true,
     userInvocable: true,
     bodyChars: 3_900,
+    upstream: { repo: 'theclaymethod/unslop', commit: '17ed39c9d0b522f44190ff0c6233867eadee192a', license: 'MIT' },
   },
 ];
 

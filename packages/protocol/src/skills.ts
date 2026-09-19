@@ -119,6 +119,12 @@ export interface SkillInfo {
    */
   readonly offeredAs?: string;
   /**
+   * Where the skill was written, when a manifest beside its folder says so —
+   * `mattpocock/skills`, not the mirror it was copied through. See
+   * {@link parseSkillProvenance}. Absent for a skill nobody recorded.
+   */
+  readonly upstream?: SkillUpstream;
+  /**
    * Accounts that get a skill of this name from a marketplace plugin instead.
    *
    * A Claude run is handed an enabled marketplace plugin whole, so when one
@@ -130,6 +136,112 @@ export interface SkillInfo {
    * Always-on is untouched by this: that reads the person's own copy by name.
    */
   readonly pluginOffers?: readonly SkillPluginOffer[];
+}
+
+/* -------------------------------------------------------------------------- */
+/* Provenance: which repository a copied skill was written in                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The repository a skill was written in, as a mirror that copied it records.
+ *
+ * A skill reaches a machine as a folder, and a folder does not say whose it
+ * is. A repository that vendors other people's skills — the way
+ * `david-systemtech/agent-skills` does — can: it keeps a `skills.json` naming,
+ * for each skill, the GitHub repository and folder it was copied from and the
+ * commit it was copied at. That is what a person wants to see beside a skill,
+ * and it is the mirror's word, read and shown, never trusted for anything else.
+ */
+export interface SkillUpstream {
+  /** `owner/name` on GitHub. */
+  readonly repo: string;
+  /** The skill's folder inside that repository, when recorded. */
+  readonly path?: string;
+  /** The commit it was copied at, when recorded. Full or abbreviated hex. */
+  readonly commit?: string;
+  /** The licence the mirror recorded for it, as written there (`MIT`). */
+  readonly license?: string;
+}
+
+/** The name of the manifest a mirror keeps beside, or just above, its skills folder. */
+export const SKILL_PROVENANCE_FILE = 'skills.json';
+
+const GITHUB_SEGMENT = /^[A-Za-z0-9_.-]{1,100}$/;
+const COMMIT = /^[0-9a-f]{7,64}$/i;
+
+/** `owner/name`, each part something GitHub would accept, and nothing else. */
+function githubRepo(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const parts = value.trim().split('/');
+  if (parts.length !== 2) return null;
+  const [owner = '', name = ''] = parts;
+  if (!GITHUB_SEGMENT.test(owner) || !GITHUB_SEGMENT.test(name)) return null;
+  if (owner.startsWith('.') || name.startsWith('.')) return null;
+  return `${owner}/${name}`;
+}
+
+/** A relative folder inside a repository: no `..`, no leading slash, nothing odd. */
+function repoPath(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const path = value.trim().replace(/^\.\//, '').replace(/\/+$/, '');
+  if (path.length === 0 || path.length > 300) return null;
+  const segments = path.split('/');
+  return segments.every((segment) => GITHUB_SEGMENT.test(segment) && segment !== '.' && segment !== '..')
+    ? path
+    : null;
+}
+
+/**
+ * Read a mirror's `skills.json` into skill name → where it was written.
+ *
+ * The shape `david-systemtech/agent-skills` writes, read as narrowly as the
+ * pane needs: `{ "skills": { "<folder name>": { "repo": "owner/name",
+ * "path": "...", "sha": "...", "license": "..." } } }`. A value that is not
+ * that shape is no provenance at all, never an error — which is also what
+ * keeps a different file of the same name, like the skill library Artemis
+ * itself keeps in its data folder, from being mistaken for one. An entry
+ * whose repository is not a plain `owner/name` is dropped, because the pane
+ * turns it into a link; its other fields are dropped one by one if malformed.
+ */
+export function parseSkillProvenance(value: unknown): ReadonlyMap<string, SkillUpstream> {
+  const found = new Map<string, SkillUpstream>();
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return found;
+  const skills = (value as Record<string, unknown>)['skills'];
+  if (typeof skills !== 'object' || skills === null || Array.isArray(skills)) return found;
+
+  for (const [name, entry] of Object.entries(skills as Record<string, unknown>)) {
+    if (name.length === 0 || name.length > SKILL_LIMITS.name) continue;
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    const repo = githubRepo(record['repo']);
+    if (repo === null) continue;
+    const path = repoPath(record['path']);
+    const commit = typeof record['sha'] === 'string' && COMMIT.test(record['sha']) ? record['sha'].toLowerCase() : null;
+    const license =
+      typeof record['license'] === 'string' && record['license'].trim().length > 0 && record['license'].length <= 80
+        ? record['license'].trim()
+        : null;
+    found.set(name, {
+      repo,
+      ...(path === null ? {} : { path }),
+      ...(commit === null ? {} : { commit }),
+      ...(license === null ? {} : { license }),
+    });
+  }
+  return found;
+}
+
+/**
+ * The page to open for a skill's upstream: its folder at the recorded commit.
+ * A repository that is one skill has no folder, so it opens at the commit; a
+ * skill with no recorded commit opens at the default branch. Always
+ * `https://github.com/`, built only from parts {@link parseSkillProvenance}
+ * let through.
+ */
+export function skillUpstreamUrl(upstream: SkillUpstream): string {
+  const repo = `https://github.com/${upstream.repo}`;
+  if (upstream.path === undefined) return upstream.commit === undefined ? repo : `${repo}/tree/${upstream.commit}`;
+  return `${repo}/tree/${upstream.commit ?? 'HEAD'}/${upstream.path}`;
 }
 
 /** One marketplace plugin offering a skill's name, and the accounts it does so on. */

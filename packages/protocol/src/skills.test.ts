@@ -16,6 +16,8 @@ import {
   defaultSkillLibraryDocument,
   isAlwaysOn,
   parseSkillLibraryDocument,
+  parseSkillProvenance,
+  skillUpstreamUrl,
   planAlwaysOnSkills,
   skillSlashCommand,
   skillSourceIdFor,
@@ -399,5 +401,64 @@ describe('what the review of the first cut found', () => {
     expect(skillSourceLimitProblem(document, 'https://example.com/o/one-more')).toMatch(/at most 20/);
     // Re-adding one already held replaces it, which is never over the limit.
     expect(skillSourceLimitProblem(document, 'https://example.com/o/r3.git')).toBeNull();
+  });
+});
+
+describe('where a copied skill was written', () => {
+  const COMMIT = '74ca5fe077456a0b3b2f5310cf9430999fd0b5fd';
+
+  it('reads the manifest a mirror keeps, one entry per skill', () => {
+    const found = parseSkillProvenance({
+      version: 1,
+      skills: {
+        tdd: { repo: 'mattpocock/skills', path: 'skills/engineering/tdd', ref: 'HEAD', sha: COMMIT, license: 'MIT' },
+        unslop: { repo: 'theclaymethod/unslop', path: '', sha: COMMIT.toUpperCase() },
+      },
+    });
+
+    expect(found.get('tdd')).toEqual({
+      repo: 'mattpocock/skills',
+      path: 'skills/engineering/tdd',
+      commit: COMMIT,
+      license: 'MIT',
+    });
+    // A one-skill repository has no folder, and a commit is kept as lowercase hex.
+    expect(found.get('unslop')).toEqual({ repo: 'theclaymethod/unslop', commit: COMMIT });
+  });
+
+  it('keeps only what it can safely turn into a GitHub link', () => {
+    const found = parseSkillProvenance({
+      skills: {
+        good: { repo: 'owner/name' },
+        url: { repo: 'https://evil.example/owner/name' },
+        deep: { repo: 'a/b/c' },
+        dotted: { repo: '../name' },
+        climbs: { repo: 'owner/name', path: 'skills/../../etc', sha: 'not-hex', license: 7 },
+        notAnEntry: 'owner/name',
+      },
+    });
+
+    expect([...found.keys()]).toEqual(['good', 'climbs']);
+    // The repository stands; the malformed fields beside it are dropped one by one.
+    expect(found.get('climbs')).toEqual({ repo: 'owner/name' });
+  });
+
+  it('reads anything else as no provenance, the skill library Artemis keeps included', () => {
+    expect(parseSkillProvenance({ version: 1, alwaysOn: [{ name: 'tdd', scope: { kind: 'all' } }] }).size).toBe(0);
+    expect(parseSkillProvenance(null).size).toBe(0);
+    expect(parseSkillProvenance({ skills: ['tdd'] }).size).toBe(0);
+  });
+
+  it('links to the folder at the commit it was copied at', () => {
+    expect(skillUpstreamUrl({ repo: 'mattpocock/skills', path: 'skills/engineering/tdd', commit: COMMIT })).toBe(
+      `https://github.com/mattpocock/skills/tree/${COMMIT}/skills/engineering/tdd`,
+    );
+    expect(skillUpstreamUrl({ repo: 'theclaymethod/unslop', commit: COMMIT })).toBe(
+      `https://github.com/theclaymethod/unslop/tree/${COMMIT}`,
+    );
+    expect(skillUpstreamUrl({ repo: 'owner/name', path: 'skills/x' })).toBe(
+      'https://github.com/owner/name/tree/HEAD/skills/x',
+    );
+    expect(skillUpstreamUrl({ repo: 'owner/name' })).toBe('https://github.com/owner/name');
   });
 });
