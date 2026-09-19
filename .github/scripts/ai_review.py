@@ -141,6 +141,17 @@ REASONING_TOKENS = {"max": 10_500, "high": 2_000, "low": 600}
 REASONING_TOKENS_PER_CHAR = {"max": 1.1, "high": 0.1, "low": 0.0}
 
 
+# The share of the ceiling past which the effort asked for is not attempted.
+# An estimate that close to everything the model may write is a review that
+# will not reach its answer: it reasons until the tokens are gone, which at a
+# hundred tokens a second is twenty minutes, and only then does the `high` pass
+# that produces the comment begin. Measured: about 41,000 expected tokens
+# finished (2026-09-18, a 28 kB diff, 335 s); about 83,000 did not (2026-09-19,
+# a 66 kB diff: "all 131072 tokens went on reasoning", then no review at all,
+# because the seventeen minutes it took left `high` nothing to work with).
+NEAR_CEILING = 0.6
+
+
 def expected_tokens(effort: str, diff_chars: int) -> int:
     """About how many tokens this review will generate - never more than it may."""
     base = REASONING_TOKENS.get(effort, REASONING_TOKENS["max"])
@@ -402,7 +413,16 @@ def call_model(api_key: str, model: str, prompt: str, diff_chars: int) -> tuple[
     none, and the comment says which it got.
     """
     wanted = os.environ.get("REVIEW_EFFORT", "max")
-    size_deadline(expected_tokens(wanted, diff_chars))
+    expected = expected_tokens(wanted, diff_chars)
+    if wanted != "high" and expected > NEAR_CEILING * TOKEN_BUDGET_CEILING:
+        log(f"effort {wanted}: about {expected} tokens expected of the {TOKEN_BUDGET_CEILING} it may write; straight to high")
+        size_deadline(expected_tokens("high", diff_chars))
+        result = run_effort(api_key, model, prompt, diff_chars, "high", 0)
+        return result, "high", (
+            f"This diff is too large for a `{wanted}`-effort review to finish inside the model's "
+            f"{TOKEN_BUDGET_CEILING:,}-token limit, so this is a `high` pass."
+        )
+    size_deadline(expected)
     log(
         f"effort {wanted}: up to {token_budget(wanted, diff_chars)} tokens, "
         f"about {expected_tokens(wanted, diff_chars)} expected, {DEADLINE['seconds']} s in all"
