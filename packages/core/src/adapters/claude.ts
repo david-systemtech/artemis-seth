@@ -2778,6 +2778,8 @@ class ClaudeProcess {
   /** A task settled and the turn about it has not arrived yet. See `#awaitSettleTurn`. */
   #settling = false;
   #settleTimer: ReturnType<typeof setTimeout> | undefined;
+  /** It settled while a turn was running, so the grace starts when that turn ends. See `#awaitSettleTurn`. */
+  #settledMidTurn = false;
   /** The turn ended and its predicted next prompt has not arrived yet. See `#awaitSuggestion`. */
   #awaitingSuggestion = false;
   #suggestionTimer: ReturnType<typeof setTimeout> | undefined;
@@ -3079,6 +3081,7 @@ class ClaudeProcess {
   #ensureTurn(): boolean {
     // Whatever opens a turn is what the settle grace was holding the process for.
     this.#settling = false;
+    this.#settledMidTurn = false;
     clearTimeout(this.#settleTimer);
     // And a new turn makes the old one's prediction moot: the user has already
     // said their next thing. Stop waiting; if the prediction still arrives it
@@ -3747,10 +3750,27 @@ class ClaudeProcess {
     this.#queuedTurnTimer.unref?.();
   }
 
-  /** Hold the process briefly for a turn about work that just finished. */
+  /**
+   * Hold the process briefly for a turn about work that just finished.
+   *
+   * The grace is counted from the moment that turn *can* start, which is not
+   * always now. The CLI queues its turn about settled work behind any turn still
+   * running, so work that settles mid-turn is answered only once that turn has
+   * ended. A grace started at the settle then runs out during the turn, the
+   * turn's end finds nothing held, and the transport closes in the same moment
+   * the CLI opens the turn about the work — which then never runs. Seen on
+   * 2026-09-19 in a served session: a watcher's last notification, unanswered
+   * for 52 minutes until the next message resumed the conversation. So while a
+   * turn is running the hold simply lasts, and that turn's end starts the clock
+   * (see {@link #handle}).
+   */
   #awaitSettleTurn(): void {
     this.#settling = true;
     clearTimeout(this.#settleTimer);
+    if (!this.#state.ended) {
+      this.#settledMidTurn = true;
+      return;
+    }
     this.#settleTimer = setTimeout(() => {
       this.#settling = false;
       // Nothing came. Release the way a turn boundary would have, by taking the
@@ -4695,6 +4715,12 @@ class ClaudeProcess {
      * something opens one.
      */
     if (this.#state.ended) {
+      // Work that settled during this turn can have its own turn only from
+      // now, so this is where its grace starts. See `#awaitSettleTurn`.
+      if (this.#settledMidTurn) {
+        this.#settledMidTurn = false;
+        this.#awaitSettleTurn();
+      }
       // A successful ending is the one kind the provider predicts after —
       // it skips errors and interruptions itself, so waiting on those
       // would hold a process for a message that is not coming.
@@ -4795,6 +4821,7 @@ class ClaudeProcess {
         this.#disposing !== undefined ? 'disposed' : this.#stopRequested ? 'interrupted' : 'error',
       );
       this.#settling = false;
+      this.#settledMidTurn = false;
       clearTimeout(this.#settleTimer);
       this.#awaitingSuggestion = false;
       clearTimeout(this.#suggestionTimer);

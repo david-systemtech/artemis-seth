@@ -2017,6 +2017,71 @@ describe('a turn that ends while work is still running', () => {
     }
   });
 
+  it('keeps it for the turn about work that settled while another turn was still running', async () => {
+    /*
+     * Seen on 2026-09-19 in a served session. A background watcher finished
+     * while the agent was still answering, so the CLI queued its notification
+     * until the answer ended; the grace ran out during the answer, the turn
+     * boundary found nothing held, and the transport closed in the same moment
+     * the CLI opened the turn about the finished work. That turn never ran —
+     * the notification sat unanswered in the transcript for 52 minutes, until
+     * the next message resumed the session.
+     *
+     * The turn about settled work cannot start before the running turn ends,
+     * so the grace is counted from that turn's end.
+     */
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { harness } = installQuery();
+      const run = await createClaudeAdapter().createRun(BASE_INPUT);
+      const { fake } = harness();
+
+      fake.messages.push(INIT_MESSAGE);
+      fake.messages.push(tasksChanged(busyTask));
+      // The work settles mid-turn, and the turn runs on well past the grace.
+      fake.messages.push(tasksChanged([]));
+      await vi.waitFor(() => expect(fake.closed).toBe(false));
+      await vi.advanceTimersByTimeAsync(7_000);
+      fake.messages.push(RESULT_MESSAGE);
+      await drain(run.events);
+
+      // The turn is over; the process is still there for the one that follows.
+      expect(fake.closed).toBe(false);
+
+      fake.messages.push(INIT_MESSAGE);
+      fake.messages.push(RESULT_MESSAGE);
+      await vi.waitFor(() => expect(fake.closed).toBe(true));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still releases it a grace after that turn when nothing about the work follows', async () => {
+    // The notification can also be read inside the running turn, at its next
+    // tool call, and then no turn follows at all. Counting from the turn's end
+    // must not become waiting for ever.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { harness } = installQuery();
+      const run = await createClaudeAdapter().createRun(BASE_INPUT);
+      const { fake } = harness();
+
+      fake.messages.push(INIT_MESSAGE);
+      fake.messages.push(tasksChanged(busyTask));
+      fake.messages.push(tasksChanged([]));
+      await vi.waitFor(() => expect(fake.closed).toBe(false));
+      await vi.advanceTimersByTimeAsync(7_000);
+      fake.messages.push(RESULT_MESSAGE);
+      await drain(run.events);
+      expect(fake.closed).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(2_500);
+      expect(fake.closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps it open after a scheduling tool has been called', async () => {
     const { harness } = installQuery();
     const run = await createClaudeAdapter().createRun(BASE_INPUT);
