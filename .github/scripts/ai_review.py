@@ -63,9 +63,17 @@ MAX_DIFF_CHARS = 400_000
 # minutes, nothing to show, and nothing a different provider could have done
 # about it. How much this model thinks grows with how much it is shown - about
 # a token a character on top of ten thousand - so the budget does too, with
-# room to spare, up to what the model can emit at all. That ceiling is its
-# `max_completion_tokens`, not its 1.3M context: the context is what it can
-# read, and reasoning is something it writes.
+# room to spare, up to a ceiling. The ceiling is on what the model WRITES, not
+# its 1M context, which is what it can read: reasoning is output. 131,072 is
+# the `max_completion_tokens` of Z.AI's own endpoint and of about half the
+# others - it is not the model's limit. A dozen providers publish about
+# 943,000 (checked 2026-09-19: CoreWeave, Crusoe, Together, Friendli,
+# Fireworks...), and provider_order() already drops any endpoint that cannot
+# emit the budget, so raising this would steer large reviews to those. It
+# stays here by David's decision of that day: at a hundred tokens a second
+# this many is already eighteen minutes, time is what runs out before tokens
+# do, and nobody has measured whether a review that spent 131,072 on reasoning
+# would have finished with more or only thought for longer.
 TOKEN_BUDGET_FLOOR = 32_000
 TOKEN_BUDGET_CEILING = 131_072
 
@@ -142,7 +150,7 @@ REASONING_TOKENS_PER_CHAR = {"max": 1.1, "high": 0.1, "low": 0.0}
 
 
 # The share of the ceiling past which the effort asked for is not attempted.
-# An estimate that close to everything the model may write is a review that
+# An estimate that close to everything the review may write is a review that
 # will not reach its answer: it reasons until the tokens are gone, which at a
 # hundred tokens a second is twenty minutes, and only then does the `high` pass
 # that produces the comment begin. Measured: about 41,000 expected tokens
@@ -419,8 +427,8 @@ def call_model(api_key: str, model: str, prompt: str, diff_chars: int) -> tuple[
         size_deadline(expected_tokens("high", diff_chars))
         result = run_effort(api_key, model, prompt, diff_chars, "high", 0)
         return result, "high", (
-            f"This diff is too large for a `{wanted}`-effort review to finish inside the model's "
-            f"{TOKEN_BUDGET_CEILING:,}-token limit, so this is a `high` pass."
+            f"This diff is too large for a `{wanted}`-effort review to finish inside the "
+            f"{TOKEN_BUDGET_CEILING:,} tokens a review may write, so this is a `high` pass."
         )
     size_deadline(expected)
     log(
