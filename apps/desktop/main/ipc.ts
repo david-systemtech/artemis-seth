@@ -66,11 +66,11 @@ import { checkWorkingDirectory, createWorktree, describeWorkspace, type RemoteSk
 import {
   addMemoryBank,
   forgetMemoryBank,
+  isFollowUpsAsIssues,
   readMemoryBankMemories,
   readMemoryBanksPreflight,
   readMemoryBanksStatus,
   retireMemoryBankMemory,
-  isFollowUpsAsIssues,
   setFollowUpsAsIssues,
   setMasterEnabled,
   setMemoryBankEnabled,
