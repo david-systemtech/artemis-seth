@@ -43,6 +43,7 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactElement } from '
 import { CheckIcon, MessageCircleQuestionMarkIcon, TriangleAlertIcon } from 'lucide-react';
 import type { Question, QuestionAnswer, QuestionPrompt } from '@rx-artemis/protocol';
 
+import { useAskDraft } from '../hooks/useAskDraft';
 import { respondToPermission } from '../state/store';
 import { usePaneRef } from '../state/paneContext';
 import type { PermissionItem } from '@rx-artemis/transcript';
@@ -79,9 +80,16 @@ export function InlineQuestion({
  *
  * By index rather than by question text because the text is long, arbitrary and
  * model-authored, and nothing here needs it until the answer is sent. The
- * prompt is immutable for the life of the card, so the index is stable.
+ * prompt is immutable for the life of the request, so the index is stable.
+ *
+ * Held against the request in `lib/askDrafts`, not in the card: a session
+ * switch or a minimised strip unmounts the card long before the question is
+ * answered, and the picks have to be there when it is drawn again.
  */
 type Draft = Record<number, { readonly options: readonly string[]; readonly notes: string }>;
+
+/** Nothing picked yet. A constant, because `useAskDraft` needs a stable empty. */
+const NO_ANSWERS: Draft = {};
 
 const EMPTY = { options: [] as readonly string[], notes: '' };
 
@@ -120,7 +128,12 @@ function PendingQuestion({
   readonly item: PermissionItem;
   readonly prompt: QuestionPrompt;
 }): ReactElement {
-  const [draft, setDraft] = useState<Draft>({});
+  // The card answers the run in *its own* column, so a question parked on the
+  // left stays answerable while the user works on the right.
+  const pane = usePaneRef();
+  const requestId = item.request.id;
+
+  const [draft, setDraft] = useAskDraft(requestId, NO_ANSWERS);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -134,11 +147,6 @@ function PendingQuestion({
     card.scrollIntoView({ block: 'nearest' });
     card.focus({ preventScroll: true });
   }, []);
-
-  // The card answers the run in *its own* column, so a question parked on the
-  // left stays answerable while the user works on the right.
-  const pane = usePaneRef();
-  const requestId = item.request.id;
 
   const answered = useMemo(
     () => prompt.questions.some((_, index) => said(draftFor(draft, index))),
@@ -160,9 +168,10 @@ function PendingQuestion({
    * Takes an updater, not a value.
    *
    * A multi-select toggle is read-modify-write on the current selection, and
-   * the reader has to be the one React runs — two boxes ticked inside a single
-   * batch both see the pre-batch value through the closure, and the second
-   * write silently discards the first.
+   * the read has to happen at write time, against the draft as it is stored
+   * then — two boxes ticked inside a single batch both see the pre-batch value
+   * through the closure, and the second write silently discards the first.
+   * `useAskDraft` runs the updater against the stored draft for exactly this.
    */
   const setOptions = (
     index: number,

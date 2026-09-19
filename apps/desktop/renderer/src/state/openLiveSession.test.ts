@@ -37,6 +37,7 @@ import {
 } from './store';
 import { paneState, setPaneState } from './pane';
 import { seedApp } from './testkit';
+import { forgetAskDrafts, recallAskDraft, rememberAskDraft } from '../lib/askDrafts';
 
 const CAPS = {
   interactivePermissions: true,
@@ -71,6 +72,8 @@ let registryReachable = true;
 let registryGate: Promise<void> | null = null;
 /** Runs whose retained events were asked for — evidence of an attach. */
 let eventsAsked: string[] = [];
+/** What each run's retained stream replays on an attach. Empty unless a case says otherwise. */
+let retained: Record<string, readonly unknown[]> = {};
 /** Sessions whose stored transcript was read — evidence of a snapshot. */
 let historyRead: string[] = [];
 /** Run ids that received a mid-turn message. */
@@ -131,7 +134,7 @@ function session(id: string) {
     },
     events: async ({ runId }: { runId: string }) => {
       eventsAsked.push(runId);
-      return { ok: true, value: { runId, events: [], truncated: false } };
+      return { ok: true, value: { runId, events: retained[runId] ?? [], truncated: false } };
     },
     send: async ({ runId }: { runId: string }) => {
       steeredRuns.push(runId);
@@ -252,6 +255,7 @@ beforeEach(() => {
   registryReachable = true;
   registryGate = null;
   eventsAsked = [];
+  retained = {};
   historyRead = [];
   steeredRuns = [];
   startedRuns = [];
@@ -261,6 +265,7 @@ beforeEach(() => {
   announceOnStart = false;
   attachSeam = 0;
   nameless = false;
+  forgetAskDrafts();
 });
 
 afterEach(() => {
@@ -648,5 +653,89 @@ describe('a served pane whose turn ended, re-attached to the turn that followed'
 
     expect(attachedInputs).toHaveLength(1);
     expect(rows()).not.toContain('a stored row');
+  });
+});
+
+describe('a question parked across a re-attach', () => {
+  /*
+   * A re-attach empties the pane's queue twice — `run.end` as the stream under
+   * the parked run ends, then `attachRun` — and the replay parks any request
+   * still open back into it under the same id. Emptying the queue settles
+   * nothing, so a half-given answer has to survive it: a draft is forgotten
+   * only in `dropPermissionRequest`, when a request settles. See
+   * `lib/askDrafts.ts`. These drive the real event and attach rather than
+   * emptying the queue by hand, because how those drain it is the question: a
+   * `run.end` that dropped its requests one by one fails the first case.
+   */
+  const QUESTION = {
+    id: 'r1:perm:1',
+    runId: 'r1',
+    toolName: 'AskUserQuestion',
+    input: {},
+    requestedAt: 1_000,
+    question: {
+      questions: [
+        {
+          question: 'Which one?',
+          header: 'Pick',
+          multiSelect: false,
+          options: [{ label: 'a' }, { label: 'b' }],
+        },
+      ],
+    },
+  };
+  const PARKED = {
+    type: 'permission.request',
+    runId: 'r1',
+    seq: 1,
+    ts: 1_000,
+    requestId: QUESTION.id,
+    request: QUESTION,
+  };
+  const DRAFT = { 0: { options: ['b'], notes: '' } };
+
+  const queue = (): readonly string[] =>
+    paneState(focusedPane()).permissionQueue.map((request) => request.id);
+
+  /** Open the conversation, and pick an answer without sending it. */
+  async function parkAndPick(): Promise<void> {
+    retained = { r1: [PARKED] };
+    mainProcessRuns = [liveRun('r1', 's1')];
+    resumeSession(session('s1'));
+    await vi.waitFor(() => expect(queue()).toEqual([QUESTION.id]));
+    rememberAskDraft(QUESTION.id, DRAFT);
+  }
+
+  /** The stream under the parked run ends while main still holds the run; opening the row again re-attaches. */
+  async function reattach(): Promise<void> {
+    handleAgentEvent({ type: 'run.end', runId: 'r1', seq: 2, ts: 2_000, reason: 'disposed' } as never);
+    expect(queue()).toEqual([]);
+    eventsAsked = [];
+    resumeSession(session('s1'));
+    await vi.waitFor(() => expect(eventsAsked).toContain('r1'));
+  }
+
+  it('keeps the picked answer while the replay parks the same request again', async () => {
+    await parkAndPick();
+
+    await reattach();
+
+    await vi.waitFor(() => expect(queue()).toEqual([QUESTION.id]));
+    expect(recallAskDraft(QUESTION.id)).toEqual(DRAFT);
+  });
+
+  it('forgets it when the replay says the request was answered in the meantime', async () => {
+    await parkAndPick();
+    retained = {
+      r1: [
+        PARKED,
+        { type: 'permission.resolved', runId: 'r1', seq: 2, ts: 1_500, requestId: QUESTION.id, outcome: 'allowed' },
+      ],
+    };
+
+    await reattach();
+
+    await vi.waitFor(() => expect(recallAskDraft(QUESTION.id)).toBeUndefined());
+    expect(queue()).toEqual([]);
   });
 });
