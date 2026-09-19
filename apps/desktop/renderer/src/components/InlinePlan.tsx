@@ -52,6 +52,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactElement } from 
 import { CheckIcon, ClipboardListIcon, PencilLineIcon, TriangleAlertIcon } from 'lucide-react';
 import type { PlanProposal } from '@rx-artemis/protocol';
 
+import { useAskDraft } from '../hooks/useAskDraft';
 import { respondToPermission } from '../state/store';
 import { usePaneRef } from '../state/paneContext';
 import type { PermissionItem } from '@rx-artemis/transcript';
@@ -100,7 +101,9 @@ function PendingPlan({
   readonly item: PermissionItem;
   readonly proposal: PlanProposal;
 }): ReactElement {
-  const [note, setNote] = useState('');
+  // Held against the request, not in this card, so a note half-written before
+  // a session switch is still here afterwards. See `lib/askDrafts.ts`.
+  const [note, setNote] = useAskDraft(item.request.id, '');
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [clipped, setClipped] = useState(false);

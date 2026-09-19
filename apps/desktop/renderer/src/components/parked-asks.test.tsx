@@ -36,6 +36,7 @@ import type { IpcResult, PermissionDecision, PermissionRequest } from '@rx-artem
 
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { forgetParkedAsks } from '@/components/ParkedAsks';
+import { forgetAskDrafts } from '@/lib/askDrafts';
 import { forgetFolds } from '@/lib/foldMemory';
 
 class NoopObserver {
@@ -205,6 +206,8 @@ beforeEach(() => {
   sent = [];
   respond = (decision) => ({ ok: true, value: { requestId: 'perm-1' } });
   forgetFolds();
+  // Drafts are kept per request id, and these cases reuse the same ids.
+  forgetAskDrafts();
   forgetParkedAsks();
   resetRunStreamState();
   appTranscript().reset();

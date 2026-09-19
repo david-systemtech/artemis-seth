@@ -41,6 +41,7 @@ import { CheckIcon, ShieldAlertIcon, TriangleAlertIcon, XIcon } from 'lucide-rea
 import type { PermissionRuleUpdate } from '@rx-artemis/protocol';
 
 import { formatJson } from '@rx-artemis/transcript';
+import { useAskDraft } from '../hooks/useAskDraft';
 import { DEFAULT_DENIAL, activeProfile, respondToPermission } from '../state/store';
 import { usePane, usePaneRef } from '../state/paneContext';
 import type { PermissionItem } from '@rx-artemis/transcript';
@@ -141,7 +142,9 @@ export function InlinePermission({ item }: { readonly item: PermissionItem }): R
 
 function PendingPrompt({ item }: { readonly item: PermissionItem }): ReactElement {
   const request = item.request;
-  const [reason, setReason] = useState('');
+  // Held against the request, not in this card, so a reason half-written
+  // before a session switch is still here afterwards. See `lib/askDrafts.ts`.
+  const [reason, setReason] = useAskDraft(request.id, '');
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const cardRef = useRef<HTMLDivElement>(null);
