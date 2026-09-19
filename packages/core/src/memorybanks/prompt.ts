@@ -60,6 +60,14 @@ export interface MachineBankPromptOptions {
    * serves is worse than one that teaches none.
    */
   readonly toolsAvailable?: boolean;
+  /**
+   * Whether the briefing says where unfinished work goes. On when unset.
+   *
+   * The desktop reads its own switch for this and passes the answer down. The
+   * headless server has no switch to read, so it takes the default, which is
+   * the same answer a machine that has never opened the pane would give.
+   */
+  readonly followUpsAsIssues?: boolean;
 }
 
 const NOTHING: BankRegistryV2 = { version: REGISTRY_V2_VERSION, banks: [], defaultSlug: null };
@@ -126,6 +134,9 @@ export function machineBankPrompt(options: MachineBankPromptOptions): string | u
     // would say everything twice; every other provider would otherwise have to
     // go and read a file outside its working tree, which most cannot.
     inlineIndex: options.providerId !== undefined && options.providerId !== 'claude',
+    ...(options.followUpsAsIssues === undefined
+      ? {}
+      : { followUpsAsIssues: options.followUpsAsIssues }),
   });
 }
 

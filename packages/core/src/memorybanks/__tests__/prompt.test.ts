@@ -97,6 +97,19 @@ describe('machineBankPrompt', () => {
     expect(machineBankPrompt(where)).toBe(claude);
   });
 
+  it('passes the follow-ups rule through, and defaults it on for a server with no switch', () => {
+    // The desktop reads its own switch and hands the answer down. The headless
+    // server has none, so the default is what it sends — and the default has
+    // to be the same "on" a machine that never opened the pane would get.
+    const dataDir = dataDirFor(projectsBank(), 'cortex', { kind: 'all' });
+    const where = { dataDir, cliRegistryPath: NOWHERE, legacyRoot: NOWHERE };
+    const RULE = '**Work that is still owed is an issue, not a memory.**';
+
+    expect(machineBankPrompt(where)).toContain(RULE);
+    expect(machineBankPrompt({ ...where, followUpsAsIssues: true })).toContain(RULE);
+    expect(machineBankPrompt({ ...where, followUpsAsIssues: false })).not.toContain(RULE);
+  });
+
   it('teaches the memory tools when the host says they reach the run, and the CLI when it does not', () => {
     const dataDir = dataDirFor(projectsBank(), 'cortex', { kind: 'all' });
     const where = { dataDir, cliRegistryPath: NOWHERE, legacyRoot: NOWHERE };

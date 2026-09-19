@@ -27,6 +27,7 @@
 
 import type { AgentPromptsDocument,
   MemoryBankPromptInfo,
+  RenderMemoryBanksOptions,
 } from './agentPrompts.js';
 import type { SkillInfo, SkillLibraryDocument, SkillSourceStatus } from './skills.js';
 import type { RepositoryOrigin } from './forge.js';
@@ -562,6 +563,7 @@ export const IPC = {
    * blocks) stays exactly as the per-bank switches left it.
    */
   memoryBanksSetMasterEnabled: 'artemis:memory-banks:set-master-enabled',
+  memoryBanksSetFollowUpsAsIssues: 'artemis:memory-banks:set-follow-ups-as-issues',
   /**
    * The standing-instruction library.
    *
@@ -2622,6 +2624,16 @@ export interface MemoryBanksStatus {
    * context on them. See `IPC.memoryBanksSetMasterEnabled`.
    */
   readonly masterEnabled: boolean;
+  /**
+   * Does the briefing also say where unfinished work goes?
+   *
+   * **On** unless the user turns it off — the opposite of `masterEnabled`,
+   * and for a different question. The gate above decides whether the banks
+   * cost a run any context at all; this decides what that context says, and
+   * by the time it is read the user has already consented to the briefing.
+   * See `IPC.memoryBanksSetFollowUpsAsIssues`.
+   */
+  readonly followUpsAsIssues: boolean;
   readonly banks: readonly MemoryBankInfo[];
   readonly profiles: readonly MemoryBankProfileState[];
 }
@@ -2867,6 +2879,16 @@ export interface MemoryBanksSetMasterEnabledRequest {
 
 export type MemoryBanksSetMasterEnabledResponse = MemoryBankActionResponse;
 
+/**
+ * Whether agents are told to raise follow-ups as issues. See
+ * `MemoryBanksStatus.followUpsAsIssues`.
+ */
+export interface MemoryBanksSetFollowUpsAsIssuesRequest {
+  readonly enabled: boolean;
+}
+
+export type MemoryBanksSetFollowUpsAsIssuesResponse = MemoryBankActionResponse;
+
 /* -------------------------------------------------------------------------- */
 /* Key managers                                                               */
 /* -------------------------------------------------------------------------- */
@@ -3043,6 +3065,15 @@ export interface AgentPromptsListResponse {
    * function, and the wire carries no second copy of the words.
    */
   readonly memoryBanks: readonly MemoryBankPromptInfo[];
+  /**
+   * The options this machine would render those banks with.
+   *
+   * The same reason the banks themselves are here: a setting that changes the
+   * words — `followUpsAsIssues` — would otherwise leave the pane showing a
+   * sentence the runs are not being sent, which is the one thing this response
+   * exists to prevent.
+   */
+  readonly memoryBanksOptions: RenderMemoryBanksOptions;
 }
 
 /** Replace the library. */
@@ -3414,6 +3445,7 @@ export type IpcRequestMap = {
   [IPC.memoryBankWireClaudeCode]: MemoryBankWireClaudeCodeRequest;
   [IPC.memoryBankForget]: MemoryBankForgetRequest;
   [IPC.memoryBanksSetMasterEnabled]: MemoryBanksSetMasterEnabledRequest;
+  [IPC.memoryBanksSetFollowUpsAsIssues]: MemoryBanksSetFollowUpsAsIssuesRequest;
   [IPC.secretsConnectionsList]: SecretsConnectionsListRequest;
   [IPC.secretsConnectionSave]: SecretsConnectionSaveRequest;
   [IPC.secretsConnectionDelete]: SecretsConnectionDeleteRequest;
@@ -3536,6 +3568,7 @@ export type IpcResponseMap = {
   [IPC.memoryBankWireClaudeCode]: MemoryBankWireClaudeCodeResponse;
   [IPC.memoryBankForget]: MemoryBankForgetResponse;
   [IPC.memoryBanksSetMasterEnabled]: MemoryBanksSetMasterEnabledResponse;
+  [IPC.memoryBanksSetFollowUpsAsIssues]: MemoryBanksSetFollowUpsAsIssuesResponse;
   [IPC.secretsConnectionsList]: SecretsConnectionsListResponse;
   [IPC.secretsConnectionSave]: SecretsConnectionSaveResponse;
   [IPC.secretsConnectionDelete]: SecretsConnectionDeleteResponse;
@@ -3875,6 +3908,7 @@ export interface ArtemisBridge {
     forget(request: MemoryBankForgetRequest): Promise<IpcResult<MemoryBankForgetResponse>>;
     /** Artemis's master gate: prompt injection + run-start syncs. */
     setMasterEnabled(request: MemoryBanksSetMasterEnabledRequest): Promise<IpcResult<MemoryBanksSetMasterEnabledResponse>>;
+    setFollowUpsAsIssues(request: MemoryBanksSetFollowUpsAsIssuesRequest): Promise<IpcResult<MemoryBanksSetFollowUpsAsIssuesResponse>>;
   };
   /**
    * Standing instructions, attached to runs by the main process.
