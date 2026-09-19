@@ -291,6 +291,20 @@ export function replayStoredMessage(
  *
  * Only `queued_command`. The CLI files other attachments — a file the model was
  * shown, an editor selection — and none of those is a person's sentence.
+ *
+ * And only the person's `queued_command`. The CLI queues the harness's own
+ * news the same way: a background task or monitor that reports while a turn is
+ * running is fed to the model through this exact record, told apart by
+ * `commandMode` — `prompt` for a message typed mid-turn, `task-notification`
+ * for a task's. Read without the mode, every monitor event and finished
+ * background command came back as a user row holding the raw
+ * `<task-notification>` frame, as though the person had typed it; reported on
+ * 2026-09-19. Measured the same day across the 165 transcripts on one agent
+ * machine: 159 `queued_command` records were task notifications and 41 were
+ * prompts, and nothing else. So the mode is believed when it is given, as the
+ * live mapper believes a turn's `origin`, and only `prompt` is the person. An
+ * absent mode still replays, for transcripts older than the field — through
+ * the same harness-note check a stored user turn gets.
  */
 function replayQueuedCommand(
   stored: StoredMessage,
@@ -299,10 +313,15 @@ function replayQueuedCommand(
 ): AgentEvent | undefined {
   const attachment = stored.attachment;
   if (attachment === null || typeof attachment !== 'object') return undefined;
-  const record = attachment as { readonly type?: unknown; readonly prompt?: unknown };
+  const record = attachment as {
+    readonly type?: unknown;
+    readonly prompt?: unknown;
+    readonly commandMode?: unknown;
+  };
   if (record.type !== 'queued_command') return undefined;
+  if (record.commandMode !== undefined && record.commandMode !== 'prompt') return undefined;
   const text = asString(record.prompt);
-  if (text === undefined) return undefined;
+  if (text === undefined || isHarnessNote(text)) return undefined;
   void ts;
   return {
     ...envelope(),
