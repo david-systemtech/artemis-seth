@@ -444,6 +444,8 @@ function advanceMockSignIn(current: ServerSignInStatus | null): ServerSignInStat
  * profile picker both have something to draw without anyone arranging it.
  */
 let mockMasterEnabled = true;
+/** On by default, as a real machine has it — see `MemoryBanksStatus.followUpsAsIssues`. */
+let mockFollowUpsAsIssues = true;
 let mockBanks: MemoryBankInfo[] = [
   {
     slug: 'team-memory',
@@ -1942,6 +1944,7 @@ export function createMockBridge(): ArtemisBridge {
         ok({
           cliAvailable: true,
           masterEnabled: mockMasterEnabled,
+          followUpsAsIssues: mockFollowUpsAsIssues,
           banks: [...mockBanks],
           profiles: [
             {
@@ -2118,6 +2121,14 @@ export function createMockBridge(): ArtemisBridge {
             : 'Memory banks are off for Artemis: no run-start syncs, no prompt.',
         });
       },
+      setFollowUpsAsIssues: async (request) => {
+        mockFollowUpsAsIssues = request.enabled;
+        return ok({
+          message: request.enabled
+            ? 'Agents will be told to raise follow-ups as issues in the bank repository.'
+            : 'Agents will not be told about issues.',
+        });
+      },
     },
 
     /*
@@ -2243,6 +2254,7 @@ export function createMockBridge(): ArtemisBridge {
             readonly: bank.role === 'readonly',
             cli: `${bank.path}/bin/cerebro`,
           })),
+          memoryBanksOptions: { followUpsAsIssues: mockFollowUpsAsIssues },
         }),
       save: async (request) => {
         mockAgentPrompts = parseAgentPromptsDocument(request.document);

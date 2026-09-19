@@ -389,6 +389,22 @@ export interface RenderMemoryBanksOptions {
    * profile loads the file itself, and inlining would say everything twice.
    */
   readonly inlineIndex?: boolean;
+  /**
+   * Teach the agent that a follow-up belongs in the bank's issue tracker.
+   *
+   * On unless the machine says otherwise, which is the opposite of the master
+   * gate's default and deliberate: the gate decides whether the banks are
+   * described at all, and by the time this option is read that question has
+   * already been answered yes. What is left is whether the description also
+   * says where *unfinished* work goes, and a bank being described without it
+   * teaches the agent that a memory is the only place to put anything — which
+   * is how deferred work becomes a memory that reads like a fact.
+   *
+   * Off is for a team whose follow-ups live somewhere Artemis cannot see: a
+   * separate tracker, a board, a person's list. Telling an agent to file an
+   * issue in a repository nobody reads is worse than saying nothing.
+   */
+  readonly followUpsAsIssues?: boolean;
 }
 
 /** Does the prompt teach this bank's CLI? A legacy bank, or one the caller could not describe. */
@@ -556,6 +572,11 @@ export function renderMemoryBanksPrompt(
         ? "**Scope repo-specific facts** with `applies_to` (a list of full repository directory names). Every memory is installed in every project, but only the repos it names index it into session context — so a fact about one repo does not dilute every other repo's index. Leave it off only when the fact holds across the team's repos."
         : "**Scope repo-specific facts** with `--applies-to <repo-dir-name>` (repeatable, full directory names). Every memory is installed in every project, but only the repos it names index it into session context — so a fact about one repo does not dilute every other repo's index. Leave the flag off only when the fact holds across the team's repos.",
       `**Which memory system gets it.** A fact a teammate would need goes to ${plural ? 'a team memory bank' : "the team's memory bank"}. Your own per-project memory is for what is true only of this user or this machine. When both would fit, choose the bank — it is the copy another person can read. Skip anything that only matters to this conversation.`,
+      ...(options.followUpsAsIssues === false
+        ? []
+        : [
+            '**Work that is still owed is an issue, not a memory.** A memory says what is true; a follow-up — a deferred change, an unexplained finding, a decision waiting on a person — says what is owed, and the two do not belong in the same place. Raise it in the bank repository\'s issue tracker where there is one, with the evidence that found it and a "done when" checklist, and link the memory rather than restating it. Read the open issues when you pick up work in a bank, and close what is done with a note on how it was verified.',
+          ]),
       '**House style**: one fact per memory, absolute dates rather than relative ones ("2026-08-17", never "last week" or "recently"), repos and systems named explicitly, and a description written as a retrieval hook — "when is this relevant?", not a title. `feedback` and `project` memories also need `**Why:**` and `**How to apply:**` lines. Never draft secrets, credentials, or PII.',
       tools
         ? '`memory_draft` validates strictly and refuses on warnings as well as errors, because a memory that merely warns would open a pull request that can never merge. Being refused is ordinary, and the message names what to change — fix the sentence and try again rather than abandoning the memory.'
@@ -871,6 +892,7 @@ export function withBuiltInRestored(
 export function promptText(
   prompt: AgentPrompt,
   memoryBanks?: readonly MemoryBankPromptInfo[],
+  memoryBanksOptions?: RenderMemoryBanksOptions,
 ): string {
   if (prompt.builtIn !== undefined && prompt.overridden !== true) {
     /*
@@ -881,7 +903,7 @@ export function promptText(
      * has a bank, and it is the text their override would start from.
      */
     if (prompt.builtIn === 'builtin:cerebro' && memoryBanks !== undefined) {
-      return renderMemoryBanksPrompt(memoryBanks);
+      return renderMemoryBanksPrompt(memoryBanks, memoryBanksOptions ?? {});
     }
     return BUILT_IN_AGENT_PROMPTS[prompt.builtIn]?.markdown ?? '';
   }

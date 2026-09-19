@@ -66,10 +66,12 @@ import { checkWorkingDirectory, createWorktree, describeWorkspace, type RemoteSk
 import {
   addMemoryBank,
   forgetMemoryBank,
+  isFollowUpsAsIssues,
   readMemoryBankMemories,
   readMemoryBanksPreflight,
   readMemoryBanksStatus,
   retireMemoryBankMemory,
+  setFollowUpsAsIssues,
   setMasterEnabled,
   setMemoryBankEnabled,
   setMemoryBankProfiles,
@@ -204,6 +206,7 @@ import {
   validateMemoryBankSync,
   validateMemoryBankWireClaudeCode,
   validateMemoryBanksPreflight,
+  validateMemoryBanksSetFollowUpsAsIssues,
   validateMemoryBanksSetMasterEnabled,
   validateSecretsConnectionDelete,
   validateSecretsConnectionSave,
@@ -734,6 +737,11 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       handle: async (request) => setMasterEnabled(request),
     },
 
+    [IPC.memoryBanksSetFollowUpsAsIssues]: {
+      validate: validateMemoryBanksSetFollowUpsAsIssues,
+      handle: async (request) => setFollowUpsAsIssues(request),
+    },
+
     /* ---------------------------------------------------------------- */
     /* Key managers                                                     */
     /* ---------------------------------------------------------------- */
@@ -804,6 +812,10 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
       handle: async () => ({
         document: await engine.require().readAgentPrompts(),
         memoryBanks: promptBanks(undefined, undefined, true),
+        // `inlineIndex` stays off: a preview has no provider to ask, and the
+        // index is the one part of the text that is per-run rather than
+        // per-machine. `followUpsAsIssues` is per-machine, so it belongs here.
+        memoryBanksOptions: { followUpsAsIssues: isFollowUpsAsIssues() },
       }),
     },
 
