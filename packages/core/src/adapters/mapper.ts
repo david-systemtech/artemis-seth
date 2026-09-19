@@ -200,6 +200,42 @@ export interface OpenToolCall {
 }
 
 /**
+ * Where one speaker's live stream is: the message its deltas belong to, and
+ * the block that message has open.
+ *
+ * Both halves exist because of how the CLI frames a streamed reply. It sends
+ * one `assistant` message per content *block*, each the moment its block
+ * closes — thinking, then answer, then tool call — all under the one
+ * `message_start` that opened the reply. So the anchor has to outlive every
+ * completed block until `message_stop`, or the deltas of the second block
+ * find nothing to attach to and are dropped. Measured on CLI 2.1.274: a reply
+ * that opened with thinking sent 55 answer deltas and none reached the
+ * transcript; the answer landed whole when its block closed.
+ *
+ * And the completed block has to be numbered by the block that is open, not
+ * by its position in a message that holds only it: the deltas carry the
+ * provider's index (1 for an answer after thinking), a one-block message's
+ * position is always 0, and the renderer keys blocks by (message, index) — so
+ * the two halves would disagree and the answer would render twice.
+ */
+export interface StreamAnchor {
+  readonly messageId: MessageId;
+  /** The provider's index of the block opened last; absent before the first. */
+  blockIndex: number | undefined;
+  /**
+   * A block is in progress: started, or delivering deltas, and not yet
+   * completed. Only an open block's completion may borrow this reply's id
+   * when it arrives without one. Once the block has completed, a message with
+   * no id is some other message, and lending it the id would merge it into
+   * this reply's blocks and overwrite them.
+   */
+  open: boolean;
+}
+
+/** The agent's own key in {@link ClaudeMapperState.streams}. */
+const OWN_STREAM = '';
+
+/**
  * Everything the mapping needs to remember between messages.
  *
  * Handed to {@link mapSdkMessage} and mutated by it. That is the one impurity,
@@ -256,8 +292,12 @@ export interface ClaudeMapperState {
   readonly closedToolCalls: Set<ToolCallId>;
   /** `messageId` → content-block indices already delivered as deltas. */
   readonly streamedBlocks: Map<MessageId, Set<number>>;
-  /** Message id of the assistant message currently streaming. */
-  streamMessageId: MessageId | undefined;
+  /**
+   * The assistant message streaming right now, per speaker: the agent itself
+   * under {@link OWN_STREAM}, each subagent under the id of the call that
+   * spawned it. See {@link StreamAnchor}.
+   */
+  readonly streams: Map<string, StreamAnchor>;
 
   /**
    * A slash command seen but not yet emitted, waiting for its output.
@@ -306,7 +346,7 @@ export function createClaudeMapperState(
     openToolCalls: new Map(),
     closedToolCalls: new Set(),
     streamedBlocks: new Map(),
-    streamMessageId: undefined,
+    streams: new Map(),
     pendingCommand: undefined,
   };
 }
@@ -417,12 +457,18 @@ function mapSdkMessageInner(
       return mapAssistantMessage(message, state);
 
     case 'user':
+      // Whatever this speaker was streaming is over: a tool result, or the
+      // notice of an interrupt, only follows a reply that has ended — and one
+      // cut off without its `message_stop` must not lend its id to what comes
+      // next. See `StreamAnchor`.
+      state.streams.delete(message.parent_tool_use_id ?? OWN_STREAM);
       return mapUserMessage(message, state);
 
     case 'stream_event':
       return mapStreamEvent(message, state);
 
     case 'result':
+      state.streams.clear();
       return mapResultMessage(message, state);
 
     case 'system':
@@ -679,6 +725,13 @@ function mapAssistantMessage(
   state: ClaudeMapperState,
 ): readonly AgentEvent[] {
   const events: AgentEvent[] = [];
+  // Claude does not hand out a subagent id on assistant messages, but the tool
+  // call that spawned the subagent identifies it uniquely and stably — which is
+  // exactly what protocol's `AgentId` is for ("nest a subagent's work under the
+  // tool call that spawned it").
+  const agentId = message.parent_tool_use_id ?? undefined;
+  const streamKey = agentId ?? OWN_STREAM;
+  const stream = state.streams.get(streamKey);
   // Identity has to agree with whatever the stream already published, because
   // the renderer keys blocks by (messageId, blockIndex): disagree, and the
   // completed message opens a *second* block instead of finalising the one the
@@ -686,14 +739,31 @@ function mapAssistantMessage(
   // shared anchor when present; when it is missing, the streamed id is the
   // right fallback and `uuid` — which the stream never saw — is the last
   // resort, for turns that were never streamed at all.
-  const messageId: MessageId = message.message.id || state.streamMessageId || message.uuid;
-  // Claude does not hand out a subagent id on assistant messages, but the tool
-  // call that spawned the subagent identifies it uniquely and stably — which is
-  // exactly what protocol's `AgentId` is for ("nest a subagent's work under the
-  // tool call that spawned it").
-  const agentId = message.parent_tool_use_id ?? undefined;
+  //
+  // The streamed id is lent only to the completion of the block the stream
+  // has open — see `StreamAnchor.open`.
+  const rawId = message.message.id;
+  const lent = !rawId && stream !== undefined && stream.open ? stream.messageId : undefined;
+  const messageId: MessageId = rawId || lent || message.uuid;
   const content = message.message.content ?? [];
   const lastIndex = content.length - 1;
+  const ofStream = stream !== undefined && stream.messageId === messageId;
+  /*
+   * A block of the reply that is streaming: numbered by the block the stream
+   * has open, because a message holding one block says nothing of where that
+   * block sits in the reply. See {@link StreamAnchor}. A message holding
+   * several blocks is a whole reply — unstreamed, or replayed — whose
+   * positions already are the provider's indices.
+   */
+  const streamedIndex = ofStream && content.length === 1 ? stream.blockIndex : undefined;
+  /*
+   * The anchor stays for the reply's later blocks. The block this message
+   * completes is closed; a message with an id of its own that is not the
+   * streaming reply's means the stream has moved on, and lets it go.
+   * `message_stop`, a tool result and the turn's result let it go too.
+   */
+  if (ofStream) stream.open = false;
+  else if (stream !== undefined && rawId) state.streams.delete(streamKey);
 
   if (message.error !== undefined) {
     // No event carries a non-fatal assistant error, but the terminal `run.end`
@@ -705,9 +775,10 @@ function mapAssistantMessage(
     };
   }
 
-  for (let blockIndex = 0; blockIndex < content.length; blockIndex += 1) {
-    const block = content[blockIndex];
+  for (let position = 0; position < content.length; position += 1) {
+    const block = content[position];
     if (block === undefined) continue;
+    const blockIndex = streamedIndex ?? position;
 
     switch (block.type) {
       case 'text': {
@@ -721,7 +792,7 @@ function mapAssistantMessage(
           // The stop reason belongs to the message, so it is attached to the
           // final block rather than repeated on every one.
           stopReason:
-            blockIndex === lastIndex ? mapStopReason(message.message.stop_reason) : undefined,
+            position === lastIndex ? mapStopReason(message.message.stop_reason) : undefined,
           agentId,
         });
         break;
@@ -817,11 +888,6 @@ function mapAssistantMessage(
       usage: { scope: 'delta', tokens: usage, contextTokens },
     });
   }
-
-  // The streamed id belongs to the turn that just closed. Leaving it set would
-  // let a *later* message with no id of its own inherit it and merge into this
-  // message's blocks — the same duplication bug wearing the opposite mask.
-  state.streamMessageId = undefined;
 
   return events;
 }
@@ -1086,24 +1152,38 @@ function mapStreamEvent(
 ): readonly AgentEvent[] {
   const event = message.event;
   const agentId = message.parent_tool_use_id ?? undefined;
+  // Per speaker, so a subagent's reply cannot take over — or let go of — the
+  // anchor the agent's own reply is streaming on.
+  const streamKey = agentId ?? OWN_STREAM;
 
   switch (event.type) {
     case 'message_start': {
       // Anchors every following delta to the id the completed assistant message
       // will carry, so the UI can attach deltas to the right block.
-      state.streamMessageId = event.message.id;
+      state.streams.set(streamKey, {
+        messageId: event.message.id,
+        blockIndex: undefined,
+        open: false,
+      });
       return [];
     }
 
     case 'content_block_start': {
+      const stream = state.streams.get(streamKey);
+      // Remembered for the completed block, which arrives as a message holding
+      // only itself and so cannot say where it sits. See `StreamAnchor`.
+      if (stream !== undefined) {
+        stream.blockIndex = event.index;
+        stream.open = true;
+      }
       const block = event.content_block;
-      if (block.type === 'redacted_thinking' && state.streamMessageId !== undefined) {
-        markStreamed(state, state.streamMessageId, event.index);
+      if (block.type === 'redacted_thinking' && stream !== undefined) {
+        markStreamed(state, stream.messageId, event.index);
         return [
           {
             type: 'thinking.delta',
             ...stamp(state),
-            messageId: state.streamMessageId,
+            messageId: stream.messageId,
             blockIndex: event.index,
             text: '',
             redacted: true,
@@ -1119,12 +1199,17 @@ function mapStreamEvent(
     }
 
     case 'content_block_delta': {
-      const messageId = state.streamMessageId;
-      if (messageId === undefined) {
+      const stream = state.streams.get(streamKey);
+      if (stream === undefined) {
         // A delta before `message_start` — nothing to attach it to. Dropped
         // rather than guessed at; the completed message still carries the text.
         return [];
       }
+      // A delta says which block is in progress even where its start was not
+      // seen, and the completion that follows is numbered by it.
+      stream.blockIndex = event.index;
+      stream.open = true;
+      const messageId = stream.messageId;
 
       const delta = event.delta;
       if (delta.type === 'text_delta') {
@@ -1167,9 +1252,15 @@ function mapStreamEvent(
       return [];
     }
 
+    case 'message_stop':
+      // The reply is over, and with it the anchor: every block it had has
+      // already arrived as a completed message. Whatever this speaker says
+      // next opens a `message_start` of its own.
+      state.streams.delete(streamKey);
+      return [];
+
     case 'content_block_stop':
     case 'message_delta':
-    case 'message_stop':
       // Frame bookkeeping. The completed assistant message and the result
       // message carry everything these would tell us.
       return [];

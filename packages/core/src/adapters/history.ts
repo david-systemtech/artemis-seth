@@ -164,6 +164,13 @@ export function storedTimestamp(stored: StoredMessage): number | undefined {
 export function replayStoredMessage(
   stored: StoredMessage,
   context: ReplayContext,
+  /**
+   * Where this record's first block sits in the reply it belongs to. The CLI
+   * files a streamed reply one block per record, so a record holding only the
+   * answer after some thinking is the reply's block 1, not its block 0 — and
+   * the live mapper numbers it 1. {@link replayStoredSession} counts it.
+   */
+  firstBlockIndex = 0,
 ): readonly AgentEvent[] {
   const events: AgentEvent[] = [];
   // The message's own recorded time, so a reopened conversation reads as the
@@ -197,7 +204,8 @@ export function replayStoredMessage(
   // that was both replayed and live rendered twice.
   const messageId = storedMessageId(stored) ?? stored.uuid;
 
-  contentBlocks(stored.message).forEach((block, blockIndex) => {
+  contentBlocks(stored.message).forEach((block, position) => {
+    const blockIndex = firstBlockIndex + position;
     const type = asString(block.type);
 
     if (type === 'text') {
@@ -367,7 +375,25 @@ export function replayStoredSession(
   context: ReplayContext,
 ): readonly AgentEvent[] {
   const events: AgentEvent[] = [];
-  for (const message of messages) events.push(...replayStoredMessage(message, context));
+  /*
+   * How many blocks of each reply have been read so far, by the provider's
+   * message id. The CLI files one record per block of a streamed reply, and a
+   * record's own positions restart at 0, so the reply's numbering — the one
+   * the live mapper keys on — is only recoverable by counting. Without it a
+   * turn read back while it is also live gets its answer as block 0 here and
+   * block 1 there, and renders twice. By id rather than by adjacency, so a
+   * record that lands between two blocks of one reply — a queued message is
+   * merged in by time — cannot restart the count. The SDK's read drops the
+   * `apiBlockIndex` the CLI writes beside each record, so there is nothing to
+   * read this from instead.
+   */
+  const blocksSeen = new Map<string, number>();
+  for (const message of messages) {
+    const id = message.type === 'assistant' ? storedMessageId(message) : undefined;
+    const first = id === undefined ? 0 : (blocksSeen.get(id) ?? 0);
+    events.push(...replayStoredMessage(message, context, first));
+    if (id !== undefined) blocksSeen.set(id, first + contentBlocks(message.message).length);
+  }
   return events;
 }
 
