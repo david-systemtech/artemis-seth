@@ -2778,6 +2778,12 @@ class ClaudeProcess {
   /** A task settled and the turn about it has not arrived yet. See `#awaitSettleTurn`. */
   #settling = false;
   #settleTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Work settled, and no grace has yet passed without a turn opening. Every turn
+   * that ends while this is set holds the process for the grace again. See
+   * `#awaitSettleTurn`.
+   */
+  #settleOwed = false;
   /** The turn ended and its predicted next prompt has not arrived yet. See `#awaitSuggestion`. */
   #awaitingSuggestion = false;
   #suggestionTimer: ReturnType<typeof setTimeout> | undefined;
@@ -3077,7 +3083,9 @@ class ClaudeProcess {
    * @returns whether there is now a turn that something will receive.
    */
   #ensureTurn(): boolean {
-    // Whatever opens a turn is what the settle grace was holding the process for.
+    // A turn opening ends the settle grace's wait: the turn holds the process
+    // while it runs. It does not settle the debt, because this may not be the
+    // turn about the work — see `#awaitSettleTurn` — so its end re-arms the grace.
     this.#settling = false;
     clearTimeout(this.#settleTimer);
     // And a new turn makes the old one's prediction moot: the user has already
@@ -3747,12 +3755,36 @@ class ClaudeProcess {
     this.#queuedTurnTimer.unref?.();
   }
 
-  /** Hold the process briefly for a turn about work that just finished. */
+  /**
+   * Hold the process briefly for a turn about work that just finished.
+   *
+   * The grace is counted from the moment that turn *can* start, which is not
+   * always now. The CLI queues its turn about settled work behind any turn still
+   * running, so work that settles mid-turn is answered only once that turn has
+   * ended. A grace started at the settle then runs out during the turn, the
+   * turn's end finds nothing held, and the transport closes in the same moment
+   * the CLI opens the turn about the work — which then never runs. Seen on
+   * 2026-09-19 in a served session: a watcher's last notification, unanswered
+   * for 52 minutes until the next message resumed the conversation. So while a
+   * turn is running the hold simply lasts, and that turn's end starts the clock
+   * (see {@link #handle}).
+   *
+   * Nor is the next turn to open necessarily the one about the work. A message
+   * typed mid-turn is queued the same way and can open first, and two tasks
+   * that settle during one turn can be answered as two turns. None of them can
+   * be told apart from the stream — a turn the CLI opens for itself arrives with
+   * no prompt at all — so the debt is kept rather than guessed at: every turn
+   * that ends while it is owed holds the process for the grace again, and only
+   * a grace that passes with no turn opening clears it.
+   */
   #awaitSettleTurn(): void {
+    this.#settleOwed = true;
     this.#settling = true;
     clearTimeout(this.#settleTimer);
+    if (!this.#state.ended) return;
     this.#settleTimer = setTimeout(() => {
       this.#settling = false;
+      this.#settleOwed = false;
       // Nothing came. Release the way a turn boundary would have, by taking the
       // transport down — the pump's own `finally` does the rest. Unless the
       // suggestion grace or a pending queued turn is still holding: their own
@@ -4695,6 +4727,11 @@ class ClaudeProcess {
      * something opens one.
      */
     if (this.#state.ended) {
+      // A turn has just ended while a settle is owed. The turn about the work
+      // can open only from now, and may be queued behind others, so the grace
+      // starts (again) here. Only on the `result` itself: this block also sees
+      // every message that arrives between turns. See `#awaitSettleTurn`.
+      if (this.#settleOwed && message.type === 'result') this.#awaitSettleTurn();
       // A successful ending is the one kind the provider predicts after —
       // it skips errors and interruptions itself, so waiting on those
       // would hold a process for a message that is not coming.
@@ -4795,6 +4832,7 @@ class ClaudeProcess {
         this.#disposing !== undefined ? 'disposed' : this.#stopRequested ? 'interrupted' : 'error',
       );
       this.#settling = false;
+      this.#settleOwed = false;
       clearTimeout(this.#settleTimer);
       this.#awaitingSuggestion = false;
       clearTimeout(this.#suggestionTimer);
