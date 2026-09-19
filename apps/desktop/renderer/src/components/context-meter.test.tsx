@@ -295,17 +295,18 @@ describe('the context ring beside the plan rings', () => {
     expect(planMeter().getAttribute('aria-label') ?? '').toContain('window size unknown');
   });
 
-  it('occupies no width before anything has run', async () => {
+  it('holds its place with a dash before anything has run', async () => {
     /*
-      Absent, not an empty ring. An unfilled ring is indistinguishable from a
-      ring at 0% — the same trap the glyph fallback exists to avoid — and here
-      there is no need for a placeholder at all, because the plan rings already
-      hold the slot.
+      It used to be absent until the first reading, which left a new
+      conversation with three rings where every other shows four — reported as
+      the context ring having gone off the edge of the window. The dash is not
+      an unfilled ring: 0% prints "0", so "not yet" cannot read as "none used".
     */
     seed({ capabilities: PLAN_CAPS, live: false });
     mount();
 
-    expect(planMeter().textContent ?? '').not.toContain('Ctx');
+    expect(planMeter().textContent ?? '').toContain('Ctx—');
+    expect(planMeter().getAttribute('aria-label') ?? '').toContain('context no run yet');
   });
 
   it('stays away from a plan provider that cannot report context', async () => {

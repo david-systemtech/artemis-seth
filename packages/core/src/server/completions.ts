@@ -520,7 +520,19 @@ type TurnEventBody =
       readonly kind: 'thinking';
       readonly text: string;
     }
-  | { readonly kind: 'activity'; readonly activity: ArtemisActivity }
+  | {
+      /**
+       * One of the agent's own tool calls, the moment it starts and again
+       * the moment it ends: its entry in the activity report as it stands
+       * then, with `ok` once there is an outcome.
+       *
+       * Only the agent's own. A subagent's calls are the subagent's business,
+       * reported to the caller through the call that spawned it — the rule a
+       * subagent's text follows — so they go into the report and nowhere else.
+       */
+      readonly kind: 'activity';
+      readonly activity: ArtemisActivity;
+    }
   | {
       /**
        * The run this turn became, announced as soon as it has an id.
@@ -633,13 +645,14 @@ type TurnEventBody =
     }
   | {
       /**
-       * A run event that put nothing on the wire — a tool ending, a bill, a
-       * plan reading — passing by. Carries only its `seq`, so a client's
-       * cursor keeps up with everything the server has relayed rather than
-       * with the last thing it had words for: a resume then asks for exactly
-       * what was missed, and a client that measures its stream against the
-       * run's position on the server can tell "quiet because the agent is
-       * inside a tool" from "quiet because the stream has lost its place".
+       * A run event that put nothing on the wire — a subagent's tool call, a
+       * bill, a plan reading — passing by. Carries only its `seq`, so a
+       * client's cursor keeps up with everything the server has relayed
+       * rather than with the last thing it had words for: a resume then asks
+       * for exactly what was missed, and a client that measures its stream
+       * against the run's position on the server can tell "quiet because the
+       * agent is inside a tool" from "quiet because the stream has lost its
+       * place".
        */
       readonly kind: 'cursor';
     }
@@ -750,6 +763,16 @@ class TurnTranslator {
   context: { tokens?: number; window?: number } = {};
   deniedPermission = false;
   readonly activity: ArtemisActivity[] = [];
+  /**
+   * The calls whose start went out live, by id.
+   *
+   * An end goes out live exactly when its start did. Deciding that again from
+   * the `tool.end` alone would trust every adapter to stamp the same `agentId`
+   * on both halves of a call; one that did not would send a subagent's ending
+   * as a row of the agent's own, or leave a row the caller is drawing running
+   * until the turn is over.
+   */
+  readonly #liveCalls = new Set<string>();
   /** Set by the `run.end` this saw. The turn is over from then on. */
   result: TurnResult | undefined;
   readonly #remotePermissions: boolean;
@@ -899,14 +922,53 @@ class TurnTranslator {
       }
 
       case 'tool.start': {
+        const id = String(event.toolCallId);
         const summary = summariseToolInput(event.input);
         const entry: ArtemisActivity = {
+          id,
           tool: event.name.toLowerCase(),
           at: event.ts,
           ...(summary === undefined ? {} : { summary }),
         };
+        // Every call goes into the report, a subagent's included: the report
+        // is the account of everything the turn did.
         this.activity.push(entry);
+        /*
+         * Onto the wire as it starts, and only the agent's own.
+         *
+         * The report arrives whole on the final chunk, so on its own it put
+         * nothing on screen while the agent worked: a served turn sat still
+         * for minutes and then drew every call at once. A subagent's calls
+         * stay out, for the reason its text does — the caller sees the call
+         * that spawned it.
+         */
+        if (event.agentId !== undefined) break;
+        this.#liveCalls.add(id);
         out.push({ kind: 'activity', activity: entry, seq });
+        break;
+      }
+
+      case 'tool.end': {
+        /*
+         * The call's report entry, closed with its outcome, and on the wire
+         * again if its start went out. `ok` is the protocol's yes or no, so a
+         * denial and a cancellation both read as a call that did not succeed.
+         *
+         * Matched to the latest start by that id that is still running, so an
+         * ending the adapter sends twice closes the call once. An ending with
+         * no start this turn has seen — a resume whose retained tail begins
+         * after the start — has nothing to close, and puts only its cursor on
+         * the wire.
+         */
+        const id = String(event.toolCallId);
+        const index = this.activity.findLastIndex(
+          (entry) => entry.id === id && entry.ok === undefined,
+        );
+        const started = this.activity[index];
+        if (started === undefined) break;
+        const ended: ArtemisActivity = { ...started, ok: event.status === 'ok' };
+        this.activity[index] = ended;
+        if (this.#liveCalls.has(id)) out.push({ kind: 'activity', activity: ended, seq });
         break;
       }
 
@@ -999,12 +1061,13 @@ class TurnTranslator {
       }
 
       default:
-        // `tool.end` and the rest. Not silently dropped by accident — none of
-        // them has a place in an OpenAI reply. (Thinking has its own case
-        // above, and its own field on the wire, precisely so it is never
-        // concatenated into `content`, where a caller would read a model's
-        // private reasoning as its answer. Delegated work and deliveries have
-        // theirs too, for the reasons on their `TurnEventBody` members.)
+        // The slash-command list, a plan reading, a command run and the rest.
+        // Not silently dropped by accident — none of them has a place in an
+        // OpenAI reply. (Thinking has its own case above, and its own field
+        // on the wire, precisely so it is never concatenated into `content`,
+        // where a caller would read a model's private reasoning as its
+        // answer. Delegated work, deliveries and tool calls have theirs too,
+        // for the reasons on their `TurnEventBody` members.)
         break;
     }
 

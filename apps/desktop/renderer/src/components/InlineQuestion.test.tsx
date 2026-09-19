@@ -31,6 +31,7 @@ import type {
 } from '@rx-artemis/protocol';
 
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { forgetAskDrafts } from '@/lib/askDrafts';
 import { forgetFolds } from '@/lib/foldMemory';
 
 class NoopObserver {
@@ -131,6 +132,8 @@ beforeEach(() => {
   // A fresh transcript, and no memory of folds opened in the last test: fold
   // state is keyed by transcript id and these fixtures reuse ids.
   forgetFolds();
+  // Drafts are kept per request id, and these cases reuse the same ids.
+  forgetAskDrafts();
   appTranscript().reset();
   seedApp({
     run: {

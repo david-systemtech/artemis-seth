@@ -5,11 +5,28 @@
  * One always-visible row across the bottom of the window carrying everything
  * that decides what the *next* prompt will do, and nothing that does not:
  *
- *     [profile ▾] [model ▾] [mode ▾]         5hr ⬤  Week ⬤  Fable ⬤
+ *     [profile ▾] [model ▾] [mode ▾]     ended  5hr ⬤  Week ⬤  Fable ⬤  Ctx ⬤
  *
  * Everything left of the rings changes a setting in place; everything right of
  * them is read-only. That split is the whole design: a setting you can change
  * is a control, a fact about the run is text, and nothing here is both.
+ *
+ * ## The rings never give way
+ *
+ * A narrow column cannot hold all of that, and something has to yield. It
+ * used to be the rings, and not by choice: every chip is a `Button`, whose
+ * base classes carry `shrink-0`, so the meter was the one item on the row that
+ * could shrink. It shrank to nothing and its rings ran off the column's right
+ * edge, where the pane clips — Ctx first, then Fable, then the rest, and below
+ * about 450px the `bypass` chip with them.
+ *
+ * So the order is now deliberate. The rings are `shrink-0` and give up
+ * nothing. The profile and model chips truncate, with the run state beside
+ * them — the profile at twice the rate, being the widest and the one whose
+ * first words already say which account it is. The mode chip keeps its word,
+ * for the reason its section gives. When the chips would be squeezed past
+ * reading, the rings wrap onto a line of their own under them, rather than off
+ * the edge.
  *
  * The rings open the usage popover, which carries the context window and the
  * plan's rate-limit windows together — both answer "how much room is left",
@@ -152,37 +169,53 @@ export function StatusLine(): ReactElement {
     <footer className="shrink-0 pb-1">
       <div
         className={cn(
-          'mx-auto flex h-7 w-full items-center gap-1.5 px-3 text-2xs',
+          'mx-auto flex min-h-7 w-full flex-wrap items-center gap-x-2 gap-y-1 px-3 text-2xs',
           COLUMN_MAX[width],
         )}
       >
-        <ProfileSegment />
         {/*
-          The same navigator as the profile chip, anchored at the model chip.
-          Model, thinking and fast mode used to be four segments on this bar,
-          then one popover; they are now the middle of the run navigator, where
-          the model rows can finally read the profile's plan. Everything that
-          was on the bar is one click away instead of zero, and the bar is
-          short enough to read.
+          Everything that can give way, in one group. `basis-88` is the width
+          the chips are measured at when the row decides whether the rings fit
+          beside them — a wrap is decided on bases, not on how far an item
+          could shrink — so the rings share the line only while the chips keep
+          22rem, and take the next line below that. Measured in Chromium: at
+          18rem the model chip was down to "O…" just before the wrap, and a
+          pane one step narrower showed every chip whole, which is the wrong
+          way round. `grow` hands the chips whatever the rings leave, which is
+          also what keeps the run state, pushed to this group's end, sitting
+          against the rings.
         */}
-        <ModelSegment />
-        <ModeSegment />
-        <SandboxSegment />
-
-        <div className="ml-auto flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 grow basis-88 items-center gap-1.5">
+          <ProfileSegment />
+          {/*
+            The same navigator as the profile chip, anchored at the model chip.
+            Model, thinking and fast mode used to be four segments on this bar,
+            then one popover; they are now the middle of the run navigator, where
+            the model rows can finally read the profile's plan. Everything that
+            was on the bar is one click away instead of zero, and the bar is
+            short enough to read.
+          */}
+          <ModelSegment />
+          <ModeSegment />
+          <SandboxSegment />
           <RunSegment />
-          {/*
-            The context readout used to sit here. It moved into the usage
-            popover, where it belongs next to the plan limits — both answer
-            "how much room is left", and splitting them across two controls
-            meant checking two places.
-          */}
-          {/*
-            The directory used to end this row. It reads as a heading for the
-            input rather than a setting on it, and at full-path width it was
-            squeezing the meter beside it, so it moved above the composer as
-            `WorkingDirectoryChip` — same dialog, same one-trigger rule.
-          */}
+        </div>
+
+        {/*
+          The context readout used to sit here. It moved into the usage
+          popover, where it belongs next to the plan limits — both answer "how
+          much room is left", and splitting them across two controls meant
+          checking two places.
+        */}
+        {/*
+          The directory used to end this row. It reads as a heading for the
+          input rather than a setting on it, and at full-path width it was
+          squeezing the meter beside it, so it moved above the composer as
+          `WorkingDirectoryChip` — same dialog, same one-trigger rule.
+        */}
+        {/* `shrink-0`: see "The rings never give way" above. `ml-auto` holds
+            them to the right edge when they have wrapped to a line alone. */}
+        <div className="ml-auto flex shrink-0 items-center">
           <PlanUsageMeter />
         </div>
       </div>
@@ -248,6 +281,14 @@ const CHIP =
  * at the exact widths where truncation kicks in — the mark would break rather
  * than yield. Out here it is `shrink-0` by convention and the text gives way
  * instead.
+ *
+ * ## `shrink`, over the `Button`'s own `shrink-0`
+ *
+ * The chip is what gives way on a narrow row, so it has to be allowed to — see
+ * "The rings never give way" at the top of this file. `overflow-hidden` is for
+ * the far end of that: squeezed past its icon and chevron, a chip clips its
+ * own content rather than painting it over the chip beside it. A caller that
+ * must not yield passes `shrink-0` back, as the mode chip does.
  */
 function SegmentTrigger({
   icon,
@@ -278,7 +319,7 @@ function SegmentTrigger({
           on this row is the meter's ring labels, which are readings.
         */
         CHIP,
-        'max-w-[15rem] min-w-0 gap-1.5 text-2xs font-normal text-ink-muted',
+        'max-w-[15rem] min-w-0 shrink gap-1.5 overflow-hidden text-2xs font-normal text-ink-muted',
         className,
       )}
     >
@@ -303,11 +344,13 @@ function DeadSegment({
   readonly label: string;
 }): ReactElement {
   return (
-    <WithReason reason={reason} side="top" align="start">
+    // `min-w-0` on the wrapper, which is the flex item here: the live chips
+    // give way on a narrow row (see `SegmentTrigger`), and so does this one.
+    <WithReason reason={reason} side="top" align="start" className="min-w-0">
       <span
         aria-label={label}
         aria-disabled="true"
-        className="flex h-[22px] max-w-[15rem] cursor-not-allowed items-center gap-1.5 rounded-md bg-wash px-2 text-2xs text-ink-faint opacity-70"
+        className="flex h-[22px] max-w-[15rem] min-w-0 cursor-not-allowed items-center gap-1.5 overflow-hidden rounded-md bg-wash px-2 text-2xs text-ink-faint opacity-70"
       >
         {icon}
         <span className="truncate">{text}</span>
@@ -373,7 +416,14 @@ function ProfileSegment(): ReactElement {
           // The one value 7D bolds on this row (`.sc b`). Which account is
           // about to be charged is the question this segment exists for, so it
           // gets the weight rather than the model beside it.
-          className={cn(signedOut && 'text-amber', profile && 'font-medium text-ink')}
+          //
+          // `shrink-2`: on a short row this chip gives up twice as much width,
+          // for its size, as the others. See "The rings never give way" above.
+          className={cn(
+            'shrink-2',
+            signedOut && 'text-amber',
+            profile && 'font-medium text-ink',
+          )}
         >
           {label}
         </SegmentTrigger>
@@ -503,7 +553,14 @@ function ModeSegment(): ReactElement {
               <ShieldIcon className="size-3 shrink-0" aria-hidden="true" />
             )
           }
-          className={cn('text-ink', dangerous && 'text-signal', !offered && 'text-amber')}
+          // `shrink-0`: the one chip that keeps its word when the row runs out
+          // of room. `bypass` is the reason this segment exists at all, and a
+          // hazard truncated to "by…" is a hazard nobody reads.
+          className={cn(
+            'shrink-0 text-ink',
+            dangerous && 'text-signal',
+            !offered && 'text-amber',
+          )}
         >
           {offered ? MODE_LABELS[mode] : `${mode} (not accepted)`}
         </SegmentTrigger>
@@ -550,6 +607,12 @@ function ModeSegment(): ReactElement {
  * built on: a chip is a control's ground, so wearing one on a readout would
  * offer a click there is nothing behind. 7D leaves the run state as bare text
  * between the chips and the rings for the same reason.
+ *
+ * It rides at the end of the chips' group rather than beside the rings, which
+ * `ml-auto` makes look the same while they share a line. That is so the rings
+ * are the same width whatever the run is doing: were this their neighbour, the
+ * point at which they wrap would move each time a run started, parked or ended.
+ * On a short row it truncates alongside the profile and model chips.
  */
 function RunSegment(): ReactElement | null {
   const live = usePane(isLive);
@@ -566,21 +629,21 @@ function RunSegment(): ReactElement | null {
     return (
       <span
         className={cn(
-          'flex shrink-0 items-center gap-1 px-1 text-2xs',
+          'ml-auto flex min-w-0 items-center gap-1 overflow-hidden px-1 text-2xs',
           asking ? 'text-cyan' : 'text-amber',
         )}
       >
-        <Icon className="size-3" aria-hidden="true" />
-        {pending} awaiting you
+        <Icon className="size-3 shrink-0" aria-hidden="true" />
+        <span className="truncate">{pending} awaiting you</span>
       </span>
     );
   }
   if (!status) return null;
 
   return (
-    <span className="flex shrink-0 items-center gap-1.5 px-1 text-2xs text-ink-faint">
+    <span className="ml-auto flex min-w-0 items-center gap-1.5 overflow-hidden px-1 text-2xs text-ink-faint">
       <StatusDot tone={live ? 'cyan' : 'neutral'} pulse={live} />
-      {status.replace(/_/g, ' ')}
+      <span className="truncate">{status.replace(/_/g, ' ')}</span>
     </span>
   );
 }

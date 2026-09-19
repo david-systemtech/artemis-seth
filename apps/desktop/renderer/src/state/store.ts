@@ -114,6 +114,7 @@ import {
   handoffTargetBlock,
 } from './handoffTargets';
 import { servedAccountLabel, servedResumeModel } from './servedAccounts';
+import { forgetAskDraft } from '../lib/askDrafts';
 import { call, resolveBridge, type BridgeMode } from '../lib/bridge';
 import {
   describeWorkspace,
@@ -12447,8 +12448,16 @@ export async function stopTask(taskId: string, pane: Pane): Promise<void> {
 /* Permissions                                                                */
 /* -------------------------------------------------------------------------- */
 
-/** Take one request off the queue, clearing `awaiting_permission` when it empties. */
+/**
+ * Take one request off the queue, clearing `awaiting_permission` when it empties.
+ *
+ * The request has settled, so its unsent draft goes with it. This is the one
+ * path every settling takes — an answer sent from here, a `permission.resolved`
+ * from anywhere, a request the provider withdrew — which is why the forgetting
+ * is here rather than in the card. See `lib/askDrafts.ts`.
+ */
 function dropPermissionRequest(requestId: string, pane: Pane): void {
+  forgetAskDraft(requestId);
   setPaneState(pane, (s) => {
     const permissionQueue = s.permissionQueue.filter((r) => r.id !== requestId);
     const run =
