@@ -1193,6 +1193,133 @@ describe('picking a run back up', () => {
   });
 });
 
+/**
+ * A served turn used to report its tool calls once, whole, on the final
+ * chunk — so a client watching it saw nothing move for minutes and then every
+ * call at once. The agent's own calls now cross as they start and as they
+ * end; the report still carries every call, with its id and its outcome.
+ */
+describe('tool calls, as they happen', () => {
+  const activityOf = (events: readonly { kind: string }[]) =>
+    events.filter((event) => event.kind === 'activity').map((event) => (event as { activity: unknown }).activity);
+
+  it('keeps a subagent’s calls off the stream, and in the report', async () => {
+    // The subagent reports to the agent, not to the caller — the rule its
+    // text follows. Its calls move only the cursor, and the caller sees the
+    // call that spawned it, live.
+    const source = fakeRuns([
+      { type: 'tool.start', toolCallId: 'task-1', name: 'Task', input: { prompt: 'look' }, ts: 1, seq: 0 },
+      {
+        type: 'tool.start',
+        toolCallId: 'sub-1',
+        name: 'Grep',
+        input: { pattern: 'TODO' },
+        agentId: 'task-1',
+        parentToolCallId: 'task-1',
+        ts: 2,
+        seq: 1,
+      },
+      { type: 'tool.end', toolCallId: 'sub-1', name: 'Grep', status: 'ok', agentId: 'task-1', seq: 2 },
+      { type: 'tool.end', toolCallId: 'task-1', name: 'Task', status: 'ok', seq: 3 },
+      { type: 'run.end', reason: 'completed', seq: 4 },
+    ] as Partial<AgentEvent>[]);
+
+    const events = await drain(source);
+    expect(events.map((event) => [event.kind, event.seq])).toEqual([
+      ['run', undefined],
+      ['activity', 0],
+      ['cursor', 1],
+      ['cursor', 2],
+      ['activity', 3],
+      ['done', 4],
+    ]);
+    expect(activityOf(events)).toEqual([
+      { id: 'task-1', tool: 'task', at: 1 },
+      { id: 'task-1', tool: 'task', at: 1, ok: true },
+    ]);
+    const done = events.at(-1) as { result: { activity: unknown } };
+    expect(done.result.activity).toEqual([
+      { id: 'task-1', tool: 'task', at: 1, ok: true },
+      { id: 'sub-1', tool: 'grep', at: 2, summary: 'TODO', ok: true },
+    ]);
+  });
+
+  it('reads any ending but ok as a call that failed, and closes a call once', async () => {
+    // `ok` is a yes or no: a denial and a cancellation are both a call that
+    // did not succeed. An ending sent twice closes the call once, and an
+    // ending with no start the turn has seen has nothing to close — only its
+    // cursor crosses.
+    const source = fakeRuns([
+      { type: 'tool.start', toolCallId: 'call-1', name: 'Bash', input: { command: 'rm -rf build' }, ts: 1, seq: 0 },
+      { type: 'tool.end', toolCallId: 'call-1', name: 'Bash', status: 'denied', seq: 1 },
+      { type: 'tool.end', toolCallId: 'call-1', name: 'Bash', status: 'ok', seq: 2 },
+      { type: 'tool.end', toolCallId: 'call-9', name: 'Read', status: 'ok', seq: 3 },
+      { type: 'tool.start', toolCallId: 'call-2', name: 'Read', input: { file_path: '/w/a.ts' }, ts: 2, seq: 4 },
+      { type: 'tool.end', toolCallId: 'call-2', name: 'Read', status: 'cancelled', seq: 5 },
+      { type: 'run.end', reason: 'interrupted', seq: 6 },
+    ] as Partial<AgentEvent>[]);
+
+    const events = await drain(source);
+    expect(events.map((event) => [event.kind, event.seq])).toEqual([
+      ['run', undefined],
+      ['activity', 0],
+      ['activity', 1],
+      ['cursor', 2],
+      ['cursor', 3],
+      ['activity', 4],
+      ['activity', 5],
+      ['done', 6],
+    ]);
+    const done = events.at(-1) as { result: { activity: unknown } };
+    expect(done.result.activity).toEqual([
+      { id: 'call-1', tool: 'bash', at: 1, summary: 'rm -rf build', ok: false },
+      { id: 'call-2', tool: 'read', at: 2, summary: '/w/a.ts', ok: false },
+    ]);
+  });
+
+  it('replays a call’s rows after the cursor to a client picking the run back up', async () => {
+    const source = retainingRuns([
+      { type: 'session.started', sessionId: 'sess-9', seq: 0 },
+      { type: 'tool.start', toolCallId: 'call-1', name: 'Read', input: { file_path: '/w/a.ts' }, ts: 5, seq: 1 },
+      { type: 'tool.end', toolCallId: 'call-1', name: 'Read', status: 'ok', seq: 2 },
+      { type: 'tool.start', toolCallId: 'call-2', name: 'Bash', input: { command: 'pnpm test' }, ts: 6, seq: 3 },
+    ]);
+
+    // The client rendered up to the first call's start; the second call is
+    // still running when it comes back, and ends while it watches.
+    const events = [];
+    for await (const event of resumeTurn(source, { runId: 'run-1' as never, afterSeq: 1 })) {
+      events.push(event);
+      if (event.kind === 'activity' && event.seq === 3) {
+        queueMicrotask(() => {
+          source.emit({ type: 'tool.end', toolCallId: 'call-2', name: 'Bash', status: 'error', seq: 4 });
+          source.emit({ type: 'run.end', reason: 'completed', seq: 5 });
+        });
+      }
+    }
+
+    expect(events.map((event) => [event.kind, event.seq])).toEqual([
+      ['run', undefined],
+      ['activity', 2],
+      ['activity', 3],
+      ['activity', 4],
+      ['done', 5],
+    ]);
+    expect(activityOf(events)).toEqual([
+      { id: 'call-1', tool: 'read', at: 5, summary: '/w/a.ts', ok: true },
+      { id: 'call-2', tool: 'bash', at: 6, summary: 'pnpm test' },
+      { id: 'call-2', tool: 'bash', at: 6, summary: 'pnpm test', ok: false },
+    ]);
+    // The report is rebuilt from the whole tail, the start the client had
+    // already drawn included.
+    const done = events.at(-1) as { result: { activity: unknown } };
+    expect(done.result.activity).toEqual([
+      { id: 'call-1', tool: 'read', at: 5, summary: '/w/a.ts', ok: true },
+      { id: 'call-2', tool: 'bash', at: 6, summary: 'pnpm test', ok: false },
+    ]);
+  });
+});
+
 describe('POST /v1/chat/completions', () => {
   const TOKEN = 'completions-token-0123456789abcdef';
   const CONNECTION = {
@@ -1530,6 +1657,69 @@ describe('POST /v1/chat/completions', () => {
 
       // Role, run announcement, two text chunks, the final chunk.
       expect(chunks.map((chunk) => chunk.artemis?.seq)).toEqual([undefined, undefined, 0, 1, 2]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('puts each of the agent’s calls on the stream as it starts and as it ends', async () => {
+    /*
+     * Through `chunkFor`, end to end. The report on the final chunk used to be
+     * the only word of any call, so a client watching a tool-heavy turn saw
+     * nothing but cursors for minutes and then every row at once. Each call
+     * now rides an empty delta of its own — an OpenAI client appends nothing —
+     * and the report still closes the stream, for a client that reads only
+     * the end.
+     */
+    const source = fakeRuns([
+      { type: 'text.delta', text: 'Reading it.', seq: 0 },
+      { type: 'tool.start', toolCallId: 'call-1', name: 'Read', input: { file_path: '/w/a.ts' }, ts: 5, seq: 1 },
+      { type: 'tool.end', toolCallId: 'call-1', name: 'Read', status: 'ok', seq: 2 },
+      { type: 'text.delta', text: 'Fine.', seq: 3 },
+      { type: 'run.end', reason: 'completed', seq: 4 },
+    ] as Partial<AgentEvent>[]);
+
+    const { server, url } = await serve(source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      });
+      const chunks = (await response.text())
+        .split('\n\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => line.slice(6))
+        .filter((chunk) => chunk !== '[DONE]')
+        .map(
+          (chunk) =>
+            JSON.parse(chunk) as {
+              artemis?: { tool?: unknown; activity?: unknown; seq?: number };
+              choices: { delta: unknown; finish_reason: string | null }[];
+            },
+        );
+
+      const rows = chunks.filter((chunk) => chunk.artemis?.tool !== undefined);
+      // The start carries no outcome and the end does; both carry the cursor
+      // of the event they came from.
+      expect(rows.map((chunk) => chunk.artemis)).toEqual([
+        { tool: { id: 'call-1', tool: 'read', at: 5, summary: '/w/a.ts' }, seq: 1 },
+        { tool: { id: 'call-1', tool: 'read', at: 5, summary: '/w/a.ts', ok: true }, seq: 2 },
+      ]);
+      for (const row of rows) {
+        expect(row.choices[0]).toEqual({ index: 0, delta: {}, finish_reason: null });
+      }
+      // In order: between the text either side of the call, before the end.
+      expect(chunks.map((chunk) => chunk.artemis?.seq)).toEqual([undefined, undefined, 0, 1, 2, 3, 4]);
+
+      // The final chunk still carries the whole report, now with each call's
+      // id and outcome, and no row of its own.
+      const final = chunks.at(-1);
+      expect(final?.choices[0]?.finish_reason).toBe('stop');
+      expect(final?.artemis?.activity).toEqual([
+        { id: 'call-1', tool: 'read', at: 5, summary: '/w/a.ts', ok: true },
+      ]);
+      expect(final?.artemis?.tool).toBeUndefined();
     } finally {
       await server.close();
     }

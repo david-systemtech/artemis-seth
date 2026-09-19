@@ -23,7 +23,7 @@
 
 import { readFile, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import type {
   ProfileId,
@@ -31,8 +31,14 @@ import type {
   SkillInfo,
   SkillOrigin,
   SkillPluginOffer,
+  SkillUpstream,
 } from '@rx-artemis/protocol';
-import { SKILL_LIMITS, skillSlashCommand } from '@rx-artemis/protocol';
+import {
+  SKILL_LIMITS,
+  SKILL_PROVENANCE_FILE,
+  parseSkillProvenance,
+  skillSlashCommand,
+} from '@rx-artemis/protocol';
 
 import { parseFrontmatter } from '../memorybanks/frontmatter.js';
 import { marketplaceSkillOffers, neutralSkillsDir, offeredNameOf, skillFoldersIn } from './bridge.js';
@@ -115,6 +121,40 @@ export async function readSkillDocument(dir: string): Promise<SkillDocument> {
     userInvocable: flag(data?.['user-invocable'], true),
     body,
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Where a copied skill was written                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What a mirror's manifest says about the skills in one folder.
+ *
+ * A mirror keeps `skills.json` at its root and the skills in a folder under
+ * it, so the manifest is looked for beside the skills folder and one level
+ * up — after following links, because the mirror's own installer makes
+ * `~/.agents/skills` a link to `<clone>/skills`, and a synced source is
+ * `<clone>/<folder>` already. Two places and no further: a manifest three
+ * folders away is describing something else.
+ *
+ * Empty whenever there is nothing to read, which is the usual case — a folder
+ * of skills someone put there by hand. See `parseSkillProvenance` for what
+ * counts and why anything else is ignored.
+ */
+async function provenanceIn(dir: string): Promise<ReadonlyMap<string, SkillUpstream>> {
+  const real = await realpath(dir).catch(() => null);
+  if (real === null) return new Map();
+  for (const candidate of [join(real, SKILL_PROVENANCE_FILE), join(dirname(real), SKILL_PROVENANCE_FILE)]) {
+    const raw = await readFile(candidate, 'utf8').catch(() => null);
+    if (raw === null) continue;
+    try {
+      const found = parseSkillProvenance(JSON.parse(raw) as unknown);
+      if (found.size > 0) return found;
+    } catch {
+      // Not JSON: not a manifest, whatever it is called.
+    }
+  }
+  return new Map();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -237,7 +277,10 @@ export async function listSkills(options: ListSkillsOptions): Promise<readonly S
 
   const byName = new Map<string, SkillInfo & { readonly offeredName: string }>();
   for (const root of roots) {
-    for (const folder of await skillFoldersIn(root.dir)) {
+    const folders = await skillFoldersIn(root.dir);
+    // Read only for a folder that holds skills, once, however many it holds.
+    const provenance = folders.length === 0 ? new Map<string, SkillUpstream>() : await provenanceIn(root.dir);
+    for (const folder of folders) {
       const listed = byName.get(folder.name);
       if (listed !== undefined) {
         if (listed.origin.kind === 'profile' && root.origin.kind === 'profile') {
@@ -259,6 +302,7 @@ export async function listSkills(options: ListSkillsOptions): Promise<readonly S
         // What a run is given, not what the file holds: composition cuts a
         // body at the limit, and a price past it is for text no run receives.
         bodyChars: Math.min(document.body.trim().length, SKILL_LIMITS.body),
+        ...(provenance.has(folder.name) ? { upstream: provenance.get(folder.name) as SkillUpstream } : {}),
         offeredName: offeredNameOf(document.declaredName, folder.name),
       });
     }

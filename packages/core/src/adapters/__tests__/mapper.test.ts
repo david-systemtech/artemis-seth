@@ -372,6 +372,242 @@ describe('assistant text', () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* a reply streamed block by block                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The CLI's own framing of a streamed reply, as 2.1.274 sends it: one
+ * `message_start`, then per block a start, its deltas, the block as a
+ * completed `assistant` message holding only itself, and a stop — and one
+ * `message_stop` at the very end.
+ */
+function frame(event: unknown, parentToolUseId: string | null = null): unknown {
+  return { type: 'stream_event', parent_tool_use_id: parentToolUseId, uuid: 'u', session_id: 'sess-abc', event };
+}
+const messageStart = (id: string, parent: string | null = null) =>
+  frame({ type: 'message_start', message: { id } }, parent);
+const blockStart = (index: number, type: string, parent: string | null = null) =>
+  frame({ type: 'content_block_start', index, content_block: { type } }, parent);
+const textDelta = (index: number, text: string, parent: string | null = null) =>
+  frame({ type: 'content_block_delta', index, delta: { type: 'text_delta', text } }, parent);
+const thinkingDelta = (index: number, thinking: string) =>
+  frame({ type: 'content_block_delta', index, delta: { type: 'thinking_delta', thinking } });
+const blockStop = (index: number, parent: string | null = null) =>
+  frame({ type: 'content_block_stop', index }, parent);
+const messageStop = (parent: string | null = null) => frame({ type: 'message_stop' }, parent);
+
+describe('a reply streamed block by block', () => {
+  it('streams the answer that follows the thinking, not only the first block', () => {
+    // The bug: the anchor was dropped when the thinking block completed, so
+    // every answer delta after it was discarded as "before message_start" and
+    // the answer landed whole when its block closed. Measured on a served
+    // run: 55 answer deltas in, none out.
+    const state = makeState();
+    const events = run(state, [
+      INIT,
+      messageStart('msg_01'),
+      blockStart(0, 'thinking'),
+      thinkingDelta(0, 'Weighing it up.'),
+      assistantMessage({ content: [{ type: 'thinking', thinking: 'Weighing it up.', signature: 'sig' }] }),
+      blockStop(0),
+      blockStart(1, 'text'),
+      textDelta(1, 'The answer '),
+      textDelta(1, 'is 42.'),
+      assistantMessage({ content: [{ type: 'text', text: 'The answer is 42.' }], stopReason: 'end_turn' }),
+      blockStop(1),
+      messageStop(),
+    ]);
+
+    const deltas = events.filter((e): e is TextDeltaEvent => e.type === 'text.delta');
+    expect(deltas.map((d) => d.text)).toEqual(['The answer ', 'is 42.']);
+    expect(deltas.every((d) => d.messageId === 'msg_01' && d.blockIndex === 1)).toBe(true);
+
+    // The completion lands on the block its deltas built — index 1, not the
+    // 0 a one-block message would suggest — so it finalises rather than
+    // opening a second copy of the answer.
+    const completes = events.filter((e): e is TextCompleteEvent => e.type === 'text.complete');
+    expect(completes).toHaveLength(1);
+    expect(completes[0]).toMatchObject({ messageId: 'msg_01', blockIndex: 1, stopReason: 'end_turn' });
+
+    const thinking = events.filter((e): e is ThinkingDeltaEvent => e.type === 'thinking.delta');
+    expect(thinking.map((t) => [t.text, t.blockIndex])).toEqual([['Weighing it up.', 0]]);
+  });
+
+  it('streams a second thinking block and does not send it again when it completes', () => {
+    const state = makeState();
+    const events = run(state, [
+      messageStart('msg_01'),
+      blockStart(0, 'thinking'),
+      thinkingDelta(0, 'First pass.'),
+      assistantMessage({ content: [{ type: 'thinking', thinking: 'First pass.', signature: 's' }] }),
+      blockStop(0),
+      blockStart(1, 'thinking'),
+      thinkingDelta(1, 'Second pass.'),
+      assistantMessage({ content: [{ type: 'thinking', thinking: 'Second pass.', signature: 's' }] }),
+      blockStop(1),
+      blockStart(2, 'tool_use'),
+      assistantMessage({
+        content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'ls' } }],
+        stopReason: 'tool_use',
+      }),
+      blockStop(2),
+      messageStop(),
+    ]);
+
+    const thinking = events.filter((e): e is ThinkingDeltaEvent => e.type === 'thinking.delta');
+    expect(thinking.map((t) => [t.text, t.blockIndex])).toEqual([
+      ['First pass.', 0],
+      ['Second pass.', 1],
+    ]);
+    expect(events.filter((e) => e.type === 'tool.start')).toHaveLength(1);
+  });
+
+  it("keeps the agent's anchor while a subagent's reply completes in between", () => {
+    // A subagent's messages share the stream. One completing used to clear
+    // the only anchor there was, and the agent's next deltas were dropped.
+    const state = makeState();
+    const events = run(state, [
+      messageStart('msg_main'),
+      blockStart(0, 'text'),
+      textDelta(0, 'Before, '),
+      messageStart('msg_sub', 'toolu_task'),
+      blockStart(0, 'text', 'toolu_task'),
+      textDelta(0, 'subagent words', 'toolu_task'),
+      assistantMessage({
+        id: 'msg_sub',
+        content: [{ type: 'text', text: 'subagent words' }],
+        parentToolUseId: 'toolu_task',
+      }),
+      blockStop(0, 'toolu_task'),
+      messageStop('toolu_task'),
+      textDelta(0, 'after.'),
+    ]);
+
+    const own = events.filter(
+      (e): e is TextDeltaEvent => e.type === 'text.delta' && e.agentId === undefined,
+    );
+    expect(own.map((d) => [d.text, d.messageId])).toEqual([
+      ['Before, ', 'msg_main'],
+      ['after.', 'msg_main'],
+    ]);
+    const sub = events.filter(
+      (e): e is TextDeltaEvent => e.type === 'text.delta' && e.agentId === 'toolu_task',
+    );
+    expect(sub.map((d) => d.messageId)).toEqual(['msg_sub']);
+  });
+
+  it('lets go of the anchor at message_stop', () => {
+    const state = makeState();
+    const events = run(state, [
+      messageStart('msg_01'),
+      blockStart(0, 'text'),
+      textDelta(0, 'first'),
+      assistantMessage({ content: [{ type: 'text', text: 'first' }] }),
+      blockStop(0),
+      messageStop(),
+      // A later reply with no id of its own, never streamed.
+      assistantMessage({ id: '', uuid: 'uuid-later', content: [{ type: 'text', text: 'later' }] }),
+      // And a delta with no `message_start` in front of it.
+      textDelta(0, 'orphan'),
+    ]);
+
+    const completes = events.filter((e): e is TextCompleteEvent => e.type === 'text.complete');
+    expect(completes.map((c) => [c.messageId, c.blockIndex])).toEqual([
+      ['msg_01', 0],
+      ['uuid-later', 0],
+    ]);
+    expect(events.filter((e) => e.type === 'text.delta').map((e) => (e as TextDeltaEvent).text)).toEqual([
+      'first',
+    ]);
+  });
+
+  it('lets go of the anchor once a reply with another id arrives', () => {
+    // A stream cut off before `message_stop` must not leave its id lying
+    // around for a later message with none.
+    const state = makeState();
+    const events = run(state, [
+      messageStart('msg_01'),
+      blockStart(0, 'text'),
+      textDelta(0, 'cut off'),
+      assistantMessage({ id: 'msg_02', content: [{ type: 'text', text: 'a whole reply' }] }),
+      assistantMessage({ id: '', uuid: 'uuid-third', content: [{ type: 'text', text: 'third' }] }),
+    ]);
+
+    const completes = events.filter((e): e is TextCompleteEvent => e.type === 'text.complete');
+    expect(completes.map((c) => c.messageId)).toEqual(['msg_02', 'uuid-third']);
+  });
+
+  it('lends the id to no message once the block it streamed has completed', () => {
+    // A stream cut off after its block completed, with no `message_stop`: the
+    // next message with no id is not part of that reply and must not land on
+    // its key.
+    const state = makeState();
+    const events = run(state, [
+      messageStart('msg_01'),
+      blockStart(0, 'text'),
+      textDelta(0, 'partial'),
+      assistantMessage({ content: [{ type: 'text', text: 'partial' }] }),
+      assistantMessage({ id: '', uuid: 'uuid-next', content: [{ type: 'text', text: 'next' }] }),
+    ]);
+
+    const completes = events.filter((e): e is TextCompleteEvent => e.type === 'text.complete');
+    expect(completes.map((c) => [c.messageId, c.blockIndex])).toEqual([
+      ['msg_01', 0],
+      ['uuid-next', 0],
+    ]);
+  });
+
+  it('keeps streaming later blocks when the completed blocks carry no id', () => {
+    const state = makeState();
+    const events = run(state, [
+      messageStart('msg_01'),
+      blockStart(0, 'thinking'),
+      thinkingDelta(0, 'Weighing it up.'),
+      assistantMessage({ id: '', content: [{ type: 'thinking', thinking: 'Weighing it up.', signature: 's' }] }),
+      blockStop(0),
+      blockStart(1, 'text'),
+      textDelta(1, 'Streamed '),
+      textDelta(1, 'anyway.'),
+      assistantMessage({ id: '', content: [{ type: 'text', text: 'Streamed anyway.' }] }),
+      blockStop(1),
+      messageStop(),
+    ]);
+
+    const deltas = events.filter((e): e is TextDeltaEvent => e.type === 'text.delta');
+    expect(deltas.map((d) => [d.text, d.messageId, d.blockIndex])).toEqual([
+      ['Streamed ', 'msg_01', 1],
+      ['anyway.', 'msg_01', 1],
+    ]);
+    const completes = events.filter((e): e is TextCompleteEvent => e.type === 'text.complete');
+    expect(completes.map((c) => [c.messageId, c.blockIndex])).toEqual([['msg_01', 1]]);
+    expect(events.filter((e) => e.type === 'thinking.delta')).toHaveLength(1);
+  });
+
+  it('lets go of the anchor when a tool result arrives', () => {
+    const state = makeState();
+    const events = run(state, [
+      messageStart('msg_01'),
+      blockStart(0, 'text'),
+      textDelta(0, 'cut off mid-block'),
+      {
+        type: 'user',
+        parent_tool_use_id: null,
+        uuid: 'uuid-tr',
+        session_id: 'sess-abc',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }],
+        },
+      },
+      assistantMessage({ id: '', uuid: 'uuid-after', content: [{ type: 'text', text: 'after' }] }),
+    ]);
+
+    const completes = events.filter((e): e is TextCompleteEvent => e.type === 'text.complete');
+    expect(completes.map((c) => c.messageId)).toEqual(['uuid-after']);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* thinking                                                                   */
 /* -------------------------------------------------------------------------- */
 

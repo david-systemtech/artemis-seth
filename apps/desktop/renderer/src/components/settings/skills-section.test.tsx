@@ -161,7 +161,7 @@ async function renderPane(): Promise<void> {
   await act(async () => {});
 }
 
-const toggle = (name: string): HTMLElement => screen.getByRole('switch', { name: `Always on: ${name}` });
+const toggle = (name: string): HTMLElement => screen.getByRole('switch', { name: `Load into every prompt: ${name}` });
 const isOn = (name: string): boolean => toggle(name).getAttribute('aria-checked') === 'true';
 
 beforeEach(() => {
@@ -203,8 +203,48 @@ describe('the list', () => {
     await renderPane();
 
     // Order of magnitude, which is all anyone needs: a thousand or five.
-    expect(screen.getByText(/adds about 1\.0k tokens to every run/)).toBeTruthy();
-    expect(screen.getByText(/adds about 5\.5k tokens to every run/)).toBeTruthy();
+    expect(screen.getByText(/loaded into every prompt, not only when it applies: about 1\.0k tokens each time/)).toBeTruthy();
+    expect(screen.getByText(/about 5\.5k tokens each time/)).toBeTruthy();
+  });
+
+  it('says beside every switch that it loads the skill into every prompt', async () => {
+    skills = [skill({ name: 'tdd' }), skill({ name: 'unslop' })];
+    await renderPane();
+
+    // Visible, not only to a screen reader: a bare switch reads as "enable
+    // this skill", and every skill is already available on request.
+    const labels = screen.getAllByText('Every prompt', { selector: 'label' });
+    expect(labels).toHaveLength(2);
+    // And it is the switch's own label, so clicking the words throws it.
+    fireEvent.click(labels[1]!);
+    await act(async () => {});
+    expect(isOn('unslop')).toBe(true);
+    expect(isOn('tdd')).toBe(false);
+  });
+
+  it('names the repository a copied skill was written in, linked at the commit it was copied at', async () => {
+    skills = [
+      skill({
+        name: 'tdd',
+        upstream: {
+          repo: 'mattpocock/skills',
+          path: 'skills/engineering/tdd',
+          commit: '74ca5fe077456a0b3b2f5310cf9430999fd0b5fd',
+          license: 'MIT',
+        },
+      }),
+      skill({ name: 'house-rules' }),
+    ];
+    await renderPane();
+
+    const link = screen.getByRole('link', { name: 'mattpocock/skills' });
+    expect(link.getAttribute('href')).toBe(
+      'https://github.com/mattpocock/skills/tree/74ca5fe077456a0b3b2f5310cf9430999fd0b5fd/skills/engineering/tdd',
+    );
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(screen.getByText(/· MIT · copied at 74ca5fe/)).toBeTruthy();
+    // A skill nobody recorded says nothing about where it came from.
+    expect(screen.getAllByRole('link')).toHaveLength(1);
   });
 
   it('calls out a skill nobody described, because the model will never find it', async () => {
@@ -368,14 +408,14 @@ describe('always on', () => {
     stored = { version: 1, alwaysOn: [{ name: 'only-on-the-server', scope: { kind: 'all' } }] };
     await renderPane();
 
-    expect(screen.getByText('Always on, but not on this machine')).toBeTruthy();
+    expect(screen.getByText('On for every prompt, but not on this machine')).toBeTruthy();
     expect(isOn('only-on-the-server')).toBe(true);
 
     fireEvent.click(toggle('only-on-the-server'));
     await act(async () => {});
 
     expect(saves.at(-1)?.document.alwaysOn).toEqual([]);
-    expect(screen.queryByText('Always on, but not on this machine')).toBeNull();
+    expect(screen.queryByText('On for every prompt, but not on this machine')).toBeNull();
   });
 
   it('draws no switches over a read that failed', async () => {
@@ -407,8 +447,8 @@ describe('always on', () => {
 
     // The switch reaches no run, so no run pays for it - and the row says so
     // rather than quoting a price nobody is charged.
-    expect(screen.queryByText(/Always on adds about/)).toBeNull();
-    expect(screen.getByText(/None of the accounts it reaches is told/)).toBeTruthy();
+    expect(screen.queryByText(/loaded into every prompt/)).toBeNull();
+    expect(screen.getByText(/None of the accounts it reaches can take a skill in every prompt/)).toBeTruthy();
   });
 
   it('says plainly which conversations the switch does not reach', async () => {
@@ -457,7 +497,7 @@ describe('skill repositories', () => {
     skills = [skill({ name: 'unslop', origin: { kind: 'source', sourceId: sources[0]!.source.id } })];
     await renderPane();
 
-    expect(screen.getByText(/Every account on this machine, from david-systemtech\/agent-skills\./)).toBeTruthy();
+    expect(screen.getByText(/Every account on this machine, synced from david-systemtech\/agent-skills\./)).toBeTruthy();
   });
 
   it('adds a repository, shows what the clone brought, and clears the field', async () => {
@@ -562,10 +602,10 @@ describe('an Artemis server', () => {
     expect(screen.getByText('On Home Server')).toBeTruthy();
     expect(serverCalls[0]).toEqual({ what: 'list', request: { profileId: 'p-server' } });
     // The same skill on both machines is two rows and one choice.
-    fireEvent.click(screen.getByRole('switch', { name: 'Always on: unslop, on Home Server' }));
+    fireEvent.click(screen.getByRole('switch', { name: 'Load into every prompt: unslop, on Home Server' }));
     await act(async () => {});
     expect(isOn('unslop')).toBe(true);
-    expect(screen.getByRole('switch', { name: 'Always on: unslop, on Home Server' }).getAttribute('aria-checked')).toBe('true');
+    expect(screen.getByRole('switch', { name: 'Load into every prompt: unslop, on Home Server' }).getAttribute('aria-checked')).toBe('true');
     // Both of the server's rows say where they are, and neither says "this machine".
     expect(screen.getAllByText(/Every account on Home Server\./)).toHaveLength(2);
   });
@@ -578,7 +618,7 @@ describe('an Artemis server', () => {
     await renderPane();
 
     expect(screen.queryByText(/not installed anywhere/)).toBeNull();
-    expect(screen.getByRole('switch', { name: 'Always on: deploy-checklist, on Home Server' }).getAttribute('aria-checked')).toBe('true');
+    expect(screen.getByRole('switch', { name: 'Load into every prompt: deploy-checklist, on Home Server' }).getAttribute('aria-checked')).toBe('true');
   });
 
   it('adds, pulls and removes the server’s repositories through the server', async () => {
@@ -623,7 +663,7 @@ describe('an Artemis server', () => {
     withServer();
     server = { ...server, available: false };
     await renderPane();
-    expect(screen.getByText(/too old to read always-on skills/)).toBeTruthy();
+    expect(screen.getByText(/too old to load them into every prompt/)).toBeTruthy();
 
     cleanup();
     serverFails = 'Could not reach the Artemis server at https://home.example.';

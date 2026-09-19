@@ -26,6 +26,14 @@ export interface ServerExtensionsDelta {
   readonly sessionId?: string;
   readonly resolvedModel?: string;
   readonly activity?: readonly ArtemisActivity[];
+  /**
+   * One of the serving agent's own tool calls, as it starts (no `ok`) or as
+   * it ends (`ok` set). Only ever one with an `id`: a row with nothing to
+   * match it to its ending, or to its entry in the report, could be drawn
+   * but never settled. A server older than the field sends none, and the
+   * report on the final chunk is the whole account, as it always was.
+   */
+  readonly tool?: ArtemisActivity & { readonly id: string };
   readonly endReason?: string;
   /**
    * What the server accepted and set aside, by name — `artemis.systemPrompt`
@@ -184,11 +192,32 @@ function readPermissionNotice(value: unknown): ArtemisPermissionNotice | undefin
 }
 
 /**
+ * Read one activity row: an entry of the report, or a call as it moves.
+ *
+ * Rebuilt rather than trusted: each becomes an event the renderer will draw a
+ * row from, so a malformed entry is dropped here instead of becoming a row
+ * with no name. The call's `id` is read when there is one; a server older
+ * than the live rows sends none.
+ */
+function readActivity(value: unknown): ArtemisActivity | undefined {
+  const entry = asRecord(value);
+  const tool = entry === undefined ? undefined : asString(entry['tool']);
+  if (entry === undefined || tool === undefined) return undefined;
+  const id = asString(entry['id']);
+  const summary = asString(entry['summary']);
+  return {
+    ...(id === undefined ? {} : { id }),
+    tool,
+    at: typeof entry['at'] === 'number' ? entry['at'] : 0,
+    ...(summary === undefined ? {} : { summary }),
+    ...(typeof entry['ok'] === 'boolean' ? { ok: entry['ok'] } : {}),
+  };
+}
+
+/**
  * Read the `artemis` namespace off one chunk.
  *
- * Activity entries are rebuilt rather than trusted: each becomes an event the
- * renderer will draw a row from, so a malformed entry is dropped here instead
- * of becoming a row with no name.
+ * Activity entries are rebuilt rather than trusted — see {@link readActivity}.
  */
 function readExtensions(value: unknown): ServerExtensionsDelta | undefined {
   const record = asRecord(value);
@@ -285,20 +314,15 @@ function readExtensions(value: unknown): ServerExtensionsDelta | undefined {
   if (Array.isArray(activity)) {
     const entries: ArtemisActivity[] = [];
     for (const raw of activity) {
-      const entry = asRecord(raw);
-      const tool = entry === undefined ? undefined : asString(entry['tool']);
-      if (entry === undefined || tool === undefined) continue;
-      entries.push({
-        tool,
-        at: typeof entry['at'] === 'number' ? entry['at'] : 0,
-        ...(asString(entry['summary']) === undefined
-          ? {}
-          : { summary: asString(entry['summary']) as string }),
-        ...(typeof entry['ok'] === 'boolean' ? { ok: entry['ok'] } : {}),
-      });
+      const entry = readActivity(raw);
+      if (entry !== undefined) entries.push(entry);
     }
     if (entries.length > 0) out.activity = entries;
   }
+  // A call as it moves needs its id on top of what a report entry needs: the
+  // id is what its ending, and the report, are matched to it by.
+  const tool = readActivity(record['tool']);
+  if (tool?.id !== undefined) out.tool = { ...tool, id: tool.id };
 
   return Object.keys(out).length > 0 ? out : undefined;
 }

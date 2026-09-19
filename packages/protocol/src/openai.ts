@@ -343,8 +343,23 @@ export interface ArtemisContextReading {
  * that it *cannot* be mistaken for `tool_calls` — see the file comment. A
  * client that ignores it still gets a correct, complete answer; one that reads
  * it can show a user what happened.
+ *
+ * A stream carries it twice, in two shapes. Each of the agent's own calls
+ * crosses as it happens, one row at a time — see
+ * {@link ArtemisResponseExtensions.tool} — and the whole list crosses again on
+ * the final chunk, as {@link ArtemisResponseExtensions.activity}, for a client
+ * that reads only the end.
  */
 export interface ArtemisActivity {
+  /**
+   * The provider's own id for the call.
+   *
+   * What lets a client that drew a row while the call ran recognise the same
+   * call in the report at the end, rather than drawing it a second time.
+   * Absent from a server older than the live rows, whose report was the only
+   * account of a turn's calls a client ever received.
+   */
+  readonly id?: string;
   /** `read`, `write`, `bash`, `search`, … — the adapter's own name, lowercased. */
   readonly tool: string;
   /** One line naming the target, e.g. a path. Never the file's contents. */
@@ -414,6 +429,26 @@ export interface ArtemisResponseExtensions {
   readonly ignored?: readonly string[];
   /** What the agent did. See {@link ArtemisActivity}. */
   readonly activity?: readonly ArtemisActivity[];
+  /**
+   * One row of {@link activity}, as it changes: a tool call of the agent's own,
+   * sent when it starts and sent again when it ends. The start carries no `ok`;
+   * the end carries one. Both carry the call's `id`, and so does its entry in
+   * the report on the final chunk.
+   *
+   * The report alone made a served turn look frozen. It arrives whole at the
+   * end, so a client watching an agent spend thirteen minutes reading files
+   * and running commands saw nothing move, and then every row land at once —
+   * while a pane on the serving machine drew each call the moment it began.
+   * This is the same row, sent when it happens.
+   *
+   * Rides an empty-delta chunk, the way `tasks` does, so an OpenAI client
+   * appends nothing. A subagent's calls are not sent: the subagent reports to
+   * the agent, not to the caller, which is the rule its text already follows,
+   * and they reach the report only. The report still carries every call with
+   * its outcome, which is all a client older than this field reads. Only on
+   * the streaming shape.
+   */
+  readonly tool?: ArtemisActivity;
   /** A prompt the run is parked on, or the news that it no longer is. */
   readonly permission?: ArtemisPermissionNotice;
   /**
