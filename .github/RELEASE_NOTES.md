@@ -1,6 +1,30 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.19.0
+
+Served conversations show their work as it happens, and a few things that looked as though you had written them no longer do.
+
+**Answers stream after the model has thought.** A reply that began with thinking arrived all at once when it finished, because every block after the first lost its live updates. Each block now streams as it is written.
+
+**A served pane draws each tool call as it starts.** On a conversation held by an Artemis Server, the files read and commands run appeared only as a list under the answer once the turn had ended. Each call is now drawn when it starts and settled when it finishes, as it is locally.
+
+**Background tasks no longer speak as you.** When an agent's background command or monitor reported back while the agent was working, the report came back into the transcript as a message from you, holding a raw `<task-notification>` block, on every reopen, reload and reconnection. Those reports are now left out of the history, as the ones that arrive between turns already were.
+
+**A background task that finishes mid-turn gets its answer.** On a served conversation, work that finished while the agent was still answering opened a turn of its own the moment the answer ended, and the server closed the agent in that same moment, so the turn never ran and the report waited unanswered until the next message. The server now keeps the agent for that turn, and for any other queued turn ahead of it.
+
+**Half-answered questions survive a switch.** Options picked on an agent's question, a reason typed on an approval, or a note on a plan were lost when you switched to another conversation or hid the pinned strip before sending. They are now kept until the question is answered.
+
+**The usage rings stay on screen.** On a narrow window or a split pane the context ring, then the others, ran off the right edge of the status line, and at the narrowest widths the permission chip went with them. The chips now shorten instead, and below that the rings take a line of their own. A new conversation shows the context ring from the start, with a dash until there is a reading.
+
+**Settings > Skills says what a switch does and where a skill came from.** Each switch is labelled "Every prompt", and a skill from a mirrored repository names its source, licence and the commit it was copied at.
+
+**Memory banks can ask agents to raise follow-ups as issues.** A new rule in the bank briefing tells agents that work still owed, such as a deferred change, an unexplained finding or a decision waiting on a person, belongs in an issue in the bank's repository rather than in a memory. It is on by default under the memory-bank switch, with its own switch in Settings > Memory banks.
+
+**A server says which release it is.** `GET /health`, the index at `/` and `artemis-server --version` report the server's Artemis release instead of a fixed placeholder.
+
+**Update the server with the app:** the live tool rows, both background-task fixes and the version report are server-side, and reach a served conversation only from a 2.19.0 server.
+
 ## What's new in 2.18.0
 
 Skills get a home: a Settings pane, repositories Artemis keeps cloned for you, always-on switches that reach every conversation including served ones, and a server that carries the same skills as your desktop. Also: one plan-usage reading per account, sidebar groups you can reorder, and four served-conversation fixes.
