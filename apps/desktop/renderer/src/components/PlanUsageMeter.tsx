@@ -31,8 +31,9 @@
  * not have these particular windows.
  *
  * The fourth is the context window — {@link ContextSlot} — and it is the only
- * one that can be absent: it appears once a run has reported a reading and
- * occupies no width before that. It was previously popover-only on a plan
+ * one that can be absent, on a provider that cannot report context at all.
+ * Before a run has reported a reading it holds its place with a dash, as the
+ * plan rings do before theirs. It was previously popover-only on a plan
  * provider, on the reasoning that the rings were about the *plan*. That reading
  * put the one number that ends a conversation without warning behind a click,
  * while three that end it with hours of notice sat in the open.
@@ -623,7 +624,7 @@ export function PlanUsageMeter(): ReactElement | null {
     The popover underneath is unchanged and still lists every window the plan
     reports, including the ones with no ring here.
 
-    A fourth ring joins them when the run's context is known — see
+    A fourth ring sits beside them for the run's context — see
     {@link ContextSlot}. A plan and a window are not alternatives: the plan says
     when you must stop for the day, the window says when *this conversation*
     stops, and the second is the one that arrives without warning.
@@ -633,9 +634,7 @@ export function PlanUsageMeter(): ReactElement | null {
       <PopoverTrigger
         aria-label={[
           `Plan usage — ${slots.map(describeSlot).join(', ')}`,
-          ...(context.reporting && context.tokens !== undefined
-            ? [`context ${describeContext(context)}`]
-            : []),
+          ...(context.reporting ? [`context ${describeContext(context)}`] : []),
         ].join(', ')}
         // Chrome only. `gap-2` between slots and `gap-1` inside one is 7D
         // `.meter`/`.meter .slot` verbatim, and the hover goes to the wash the
@@ -679,18 +678,27 @@ export function PlanUsageMeter(): ReactElement | null {
  * a status bar is room for a proportion, and "of what" is a question with a
  * place to be answered a click away.
  *
- * ## Absent, not empty, when there is nothing to say
+ * ## A dash until the first reading, absent only where none can come
  *
- * Nothing renders unless the provider reports context *and* something has run.
- * An unfilled ring is indistinguishable from a ring at 0% — the same trap
- * {@link ContextOnlyMeter} falls back to a glyph to avoid — and here there is
- * no need for a placeholder at all: the plan rings hold the slot, so the honest
- * thing is to occupy no width until there is a reading. An unknown *window* is
- * different and does render: `utilization` is null, the ring draws its dash,
- * and the popover says which provider declined to state a size.
+ * Before anything has run there is no reading, and the ring says so with the
+ * dash {@link UsageRing} draws for an unknown value — the same ring an unknown
+ * *window* draws, the same one the plan rings wear before their first reading
+ * (see {@link PLACEHOLDER_SLOTS}), and the same one {@link ContextOnlyMeter}
+ * already showed a local run before its first turn.
+ *
+ * It used to occupy no width until a run reported, on the reasoning that an
+ * unfilled ring reads as 0%. The dash is not an unfilled ring — 0% prints "0" —
+ * so that trap was not there, and the absence cost two real things. A ring
+ * arriving after the first turn shoved the row sideways, which is exactly what
+ * the plan placeholders exist to prevent. And a new conversation showed three
+ * rings where every other one shows four, which was reported on 2026-09-19 as
+ * the context ring having gone off the edge of the window.
+ *
+ * Absent only on a provider that does not report context at all: a permanent
+ * dash there would promise a reading that can never arrive.
  */
 function ContextSlot({ reading }: { readonly reading: ContextReading }): ReactElement | null {
-  if (!reading.reporting || reading.tokens === undefined) return null;
+  if (!reading.reporting) return null;
 
   return (
     // Silent to a screen reader on purpose: the trigger's own `aria-label`

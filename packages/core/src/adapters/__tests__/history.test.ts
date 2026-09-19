@@ -224,6 +224,74 @@ describe('replayStoredMessage', () => {
     ]);
   });
 
+  it('drops a task notification the CLI queued mid-turn, as it drops one filed as a turn', () => {
+    // A background task or monitor that reports while a turn is running is fed
+    // to the model through the same `queued_command` record as a message typed
+    // mid-turn, told apart only by `commandMode`. Read without the mode, every
+    // one came back as a user row holding the raw frame, as though the person
+    // had typed it. Reported on 2026-09-19.
+    const events = replayStoredMessage(
+      {
+        type: 'attachment',
+        uuid: 'att-2',
+        timestamp: '2026-09-19T02:24:58.000Z',
+        attachment: {
+          type: 'queued_command',
+          prompt:
+            '<task-notification>\n<task-id>bqq9zizez</task-id>\n<summary>Monitor event: "CI and AI review results"</summary>\n<event>#423 request: pass (SUCCESS)</event>\n</task-notification>',
+          source_uuid: '2f56f612-509c-4ad8-ab21-9e6641d0d98f',
+          commandMode: 'task-notification',
+          timestamp: '2026-09-19T02:24:58.000Z',
+        },
+      },
+      ctx(),
+    );
+
+    expect(events).toEqual([]);
+  });
+
+  it('believes the queued mode over the words: only a prompt is the person', () => {
+    // A mode this reader has never seen is the harness's until it says
+    // otherwise, however ordinary its text looks.
+    for (const commandMode of ['task-notification', 'a-mode-added-later']) {
+      expect(
+        replayStoredMessage(
+          {
+            type: 'attachment',
+            uuid: 'att',
+            attachment: { type: 'queued_command', prompt: 'ordinary words', commandMode },
+          },
+          ctx(),
+        ),
+      ).toEqual([]);
+    }
+  });
+
+  it('still replays a queued message filed before the mode was, unless it is a harness note', () => {
+    const typed = replayStoredMessage(
+      {
+        type: 'attachment',
+        uuid: 'att-3',
+        attachment: { type: 'queued_command', prompt: 'also, add find in page' },
+      },
+      ctx(),
+    );
+    expect(typed).toMatchObject([{ type: 'text.complete', role: 'user', text: 'also, add find in page' }]);
+
+    const note = replayStoredMessage(
+      {
+        type: 'attachment',
+        uuid: 'att-4',
+        attachment: {
+          type: 'queued_command',
+          prompt: '<task-notification>\n<task-id>a12e2a10</task-id>\n</task-notification>',
+        },
+      },
+      ctx(),
+    );
+    expect(note).toEqual([]);
+  });
+
   it('ignores every other kind of attachment', () => {
     // A file the model was shown, an editor selection: the CLI files those
     // the same way, and none of them is a person's sentence.
