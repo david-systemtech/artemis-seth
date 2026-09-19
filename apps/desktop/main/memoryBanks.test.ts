@@ -20,7 +20,7 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -44,7 +44,10 @@ import {
   forgeCredentialFor,
   hasBankBlock,
   hasSessionStartSyncHook,
+  isFollowUpsAsIssues,
   isMasterEnabled,
+  setFollowUpsAsIssues,
+  setMasterEnabled,
   needsPythonInterpreter,
   parseGitOrigin,
   parseRegistry,
@@ -285,6 +288,63 @@ describe('the master switch', () => {
     writeFileSync(join(dir, 'cerebro.json'), JSON.stringify({ version: 1, enabled: 'yes' }));
     configureMemoryBanks(dir);
     expect(isMasterEnabled()).toBe(false);
+  });
+});
+
+/*
+ * The briefing switch shares the gate's file and inverts its default, which is
+ * the pair of facts most likely to be broken by a later edit: a writer that
+ * forgets the other key, or a reader that copies the gate's "absent means no".
+ */
+describe('the follow-ups-as-issues switch', () => {
+  const machine = (): string => mkdtempSync(join(tmpdir(), 'artemis-banks-'));
+
+  it('reads as on before configuration and when the file is absent', () => {
+    configureMemoryBanks(machine());
+    expect(isFollowUpsAsIssues()).toBe(true);
+  });
+
+  it('stays on for a machine upgrading from a file that predates it', () => {
+    // The gate's own file, written before this setting existed. Silence there
+    // is not a no — it is a machine that was never asked.
+    const dir = machine();
+    writeFileSync(join(dir, 'cerebro.json'), JSON.stringify({ version: 1, enabled: true }));
+    configureMemoryBanks(dir);
+    expect(isFollowUpsAsIssues()).toBe(true);
+  });
+
+  it('is off only when it says so exactly', () => {
+    const dir = machine();
+    writeFileSync(
+      join(dir, 'cerebro.json'),
+      JSON.stringify({ version: 1, enabled: true, followUpsAsIssues: false }),
+    );
+    configureMemoryBanks(dir);
+    expect(isFollowUpsAsIssues()).toBe(false);
+  });
+
+  it('keeps the gate when it is written, and the gate keeps it', () => {
+    // One file, two writers. Either one dropping the other's key would show up
+    // as a setting silently reverting to its default.
+    const dir = machine();
+    configureMemoryBanks(dir);
+
+    setFollowUpsAsIssues({ enabled: false });
+    expect(isMasterEnabled()).toBe(false);
+    expect(isFollowUpsAsIssues()).toBe(false);
+
+    setMasterEnabled({ enabled: true });
+    expect(isMasterEnabled()).toBe(true);
+    expect(isFollowUpsAsIssues()).toBe(false);
+
+    setFollowUpsAsIssues({ enabled: true });
+    expect(isMasterEnabled()).toBe(true);
+    expect(isFollowUpsAsIssues()).toBe(true);
+
+    // And the file on disk agrees, for the next process to read.
+    const onDisk = JSON.parse(readFileSync(join(dir, 'cerebro.json'), 'utf8')) as Record<string, unknown>;
+    expect(onDisk['enabled']).toBe(true);
+    expect(onDisk['followUpsAsIssues']).toBe(true);
   });
 });
 

@@ -122,6 +122,7 @@ import type {
   MemoryBankVerifyRemoteRequest,
   MemoryBankVerifyRemoteResponse,
   MemoryBankWireClaudeCodeRequest,
+  MemoryBanksSetFollowUpsAsIssuesRequest,
   MemoryBanksSetMasterEnabledRequest,
   MemoryBanksStatus,
   SecretRef,
@@ -619,6 +620,7 @@ const SWITCH_FILE = 'cerebro.json';
 
 let switchFile: string | null = null;
 let cachedEnabled: boolean | null = null;
+let cachedFollowUps: boolean | null = null;
 
 /**
  * What every spawn is told `ARTEMIS_ROOT` is — Electron's `userData`, which is
@@ -691,6 +693,31 @@ export function configureMemoryBanks(
   bankSecrets = secrets ?? null;
   refResolver = resolveRef ?? null;
   cachedEnabled = null;
+  cachedFollowUps = null;
+}
+
+/**
+ * The switch file as an object, or `null` when there is nothing to read.
+ *
+ * Both settings live in one file because they are one decision surface, and
+ * because two files would let a crash between them leave the pane describing
+ * a state the prompt is not in. The absent-file case is not an error: it is
+ * the ordinary state of a machine where nobody has opened the pane yet, and
+ * each reader supplies its own default for it.
+ */
+function readSwitch(): Record<string, unknown> | null {
+  if (switchFile === null) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(switchFile, 'utf8')) as unknown;
+    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : null;
+  } catch (error) {
+    // ENOENT is the ordinary case — nobody has thrown the switch yet. Anything
+    // else is a file we cannot read, which reads as absent for the same reason.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(`Could not read ${switchFile}; using memory-bank switch defaults`, error);
+    }
+    return null;
+  }
 }
 
 /**
@@ -704,29 +731,40 @@ export function configureMemoryBanks(
 export function isMasterEnabled(): boolean {
   if (cachedEnabled !== null) return cachedEnabled;
   if (switchFile === null) return false;
-
-  let enabled = false;
-  try {
-    const parsed = JSON.parse(readFileSync(switchFile, 'utf8')) as unknown;
-    enabled =
-      typeof parsed === 'object' && parsed !== null && (parsed as Record<string, unknown>)['enabled'] === true;
-  } catch (error) {
-    // ENOENT is the ordinary case — nobody has thrown the switch yet. Anything
-    // else is a file we cannot read, which reads as off for the same reason the
-    // unconfigured case does.
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn(`Could not read ${switchFile}; treating memory banks as off`, error);
-    }
-  }
+  const enabled = readSwitch()?.['enabled'] === true;
   cachedEnabled = enabled;
   return enabled;
 }
 
-function writeSwitch(enabled: boolean): void {
+/**
+ * Are agents told that a follow-up belongs in the bank's issue tracker?
+ *
+ * **On unless told otherwise** — the opposite default to the gate above, and
+ * for a different question. That gate asks whether the banks are worth a run's
+ * context at all, so silence there means no. This asks what the briefing says
+ * once that has been answered yes, and a briefing that omits it teaches the
+ * agent that a memory is the only place to put anything, which is how deferred
+ * work ends up recorded as a fact. Silence here therefore means on.
+ *
+ * Read on the path of every run, so it is synchronous and cached alongside the
+ * gate; {@link writeSwitch} drops both caches.
+ */
+export function isFollowUpsAsIssues(): boolean {
+  if (cachedFollowUps !== null) return cachedFollowUps;
+  if (switchFile === null) return true;
+  const on = readSwitch()?.['followUpsAsIssues'] !== false;
+  cachedFollowUps = on;
+  return on;
+}
+
+function writeSwitch(next: { readonly enabled: boolean; readonly followUpsAsIssues: boolean }): void {
   if (switchFile === null) {
     throw new WorkspaceError('Memory banks are not configured in this process.');
   }
-  const body = `${JSON.stringify({ version: 1, enabled }, null, 2)}\n`;
+  // Both keys, every time. A writer that touched only its own would drop the
+  // other the first time the file was rewritten, and the setting that vanished
+  // would come back as its default rather than as an error anyone would see.
+  const body = `${JSON.stringify({ version: 1, enabled: next.enabled, followUpsAsIssues: next.followUpsAsIssues }, null, 2)}\n`;
   const tmp = `${switchFile}.tmp`;
   mkdirSync(dirname(switchFile), { recursive: true, mode: 0o700 });
   writeFileSync(tmp, body, { encoding: 'utf8', mode: 0o600 });
@@ -742,7 +780,8 @@ function writeSwitch(enabled: boolean): void {
       `Could not write ${switchFile}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  cachedEnabled = enabled;
+  cachedEnabled = next.enabled;
+  cachedFollowUps = next.followUpsAsIssues;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -973,6 +1012,7 @@ export async function readMemoryBanksStatus(): Promise<MemoryBanksStatus> {
   });
   return withCredentialState({
     cliAvailable: banks.some((bank) => bank.embedsCli),
+    followUpsAsIssues: isFollowUpsAsIssues(),
     masterEnabled: isMasterEnabled(),
     banks,
     profiles: profiles.map((profile) => profileState(profile, registry)),
@@ -1973,7 +2013,7 @@ export async function addMemoryBank(request: MemoryBankAddRequest): Promise<Memo
   steps.push(installSaid(await installBankNow(next, record)));
 
   if (!hadBanks && !isMasterEnabled()) {
-    writeSwitch(true);
+    writeSwitch({ enabled: true, followUpsAsIssues: isFollowUpsAsIssues() });
     steps.push('Memory banks are on for Artemis.');
   }
   return { message: steps.join(' ') };
@@ -2195,7 +2235,7 @@ export async function wireMemoryBankClaudeCode(
 export function setMasterEnabled(
   request: MemoryBanksSetMasterEnabledRequest,
 ): MemoryBankActionResponse {
-  writeSwitch(request.enabled);
+  writeSwitch({ enabled: request.enabled, followUpsAsIssues: isFollowUpsAsIssues() });
   if (request.enabled) {
     syncMemoryBanksInBackground();
     return {
@@ -2206,6 +2246,24 @@ export function setMasterEnabled(
   return {
     message:
       'Memory banks are off for Artemis: no run-start syncs, no prompt. The machine wiring (hooks, blocks) stays as the per-bank switches left it.',
+  };
+}
+
+/**
+ * One line of the briefing, on or off. No sync, no install, no CLI call.
+ *
+ * Cheaper than the gate above in every way: it changes what the next run is
+ * told and nothing on disk but this file, so there is no background work to
+ * start and nothing that can half-succeed.
+ */
+export function setFollowUpsAsIssues(
+  request: MemoryBanksSetFollowUpsAsIssuesRequest,
+): MemoryBankActionResponse {
+  writeSwitch({ enabled: isMasterEnabled(), followUpsAsIssues: request.enabled });
+  return {
+    message: request.enabled
+      ? 'Agents will be told to raise follow-ups as issues in the bank repository, and to read the open list when they pick work up.'
+      : 'Agents will not be told about issues. Follow-ups they find will have nowhere to go but the conversation.',
   };
 }
 

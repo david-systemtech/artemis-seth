@@ -48,6 +48,7 @@ export type MemoryBankAction =
   | 'switch'
   | 'profiles'
   | 'master'
+  | 'followups'
   | 'wire'
   | 'forget';
 
@@ -130,6 +131,12 @@ export interface MemoryBanksPane {
   readonly wireClaudeCode: (slug: string, enabled: boolean) => void;
   /** Artemis's master gate: prompt injection + run-start syncs. */
   readonly setMasterEnabled: (enabled: boolean) => void;
+  /**
+   * One line of the briefing: whether agents are told to raise follow-ups as
+   * issues. Nothing on disk changes but the switch file, so unlike the gate
+   * above this one cannot half-succeed.
+   */
+  readonly setFollowUpsAsIssues: (enabled: boolean) => void;
   /** Unwire, uninstall, and forget one bank. The repo stays on disk. */
   readonly forget: (slug: string) => void;
 }
@@ -271,6 +278,10 @@ export function useMemoryBanks(): MemoryBanksPane {
     (enabled: boolean) => void act('master', (c) => c.setMasterEnabled({ enabled })),
     [act],
   );
+  const setFollowUpsAsIssues = useCallback(
+    (enabled: boolean) => void act('followups', (c) => c.setFollowUpsAsIssues({ enabled })),
+    [act],
+  );
   const forget = useCallback(
     (slug: string) => void act('forget', (c) => c.forget({ slug })),
     [act],
@@ -295,6 +306,7 @@ export function useMemoryBanks(): MemoryBanksPane {
     setProfiles,
     wireClaudeCode,
     setMasterEnabled,
+    setFollowUpsAsIssues,
     forget,
   };
 }

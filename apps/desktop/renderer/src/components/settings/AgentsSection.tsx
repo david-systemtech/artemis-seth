@@ -534,7 +534,7 @@ function PromptEditor({
           // For a built-in still on Artemis's text this is Artemis's text, which
           // is what makes the first edit an edit *of* it rather than a blank page
           // the user has to fill from memory.
-          value={builtIn ? promptText(prompt, pane.memoryBanks) : prompt.markdown}
+          value={builtIn ? promptText(prompt, pane.memoryBanks, pane.memoryBanksOptions) : prompt.markdown}
           // The first keystroke on a pristine built-in is the act of taking it
           // over, so it carries the flag. Recording it here rather than inferring
           // it from the text differing keeps a round-trip through the serialiser
