@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { applySlashCommand, matchSlashCommands, SLASH_RANKS } from './slashCommands';
+import { matchSlashCommands, SLASH_RANKS, writeSlashCommand } from './slashCommands';
 
 /** The real shape of the list: built-ins alongside bridged, prefixed entries. */
 const COMMANDS = [
@@ -32,9 +32,24 @@ describe('matchSlashCommands', () => {
       expect(matchSlashCommands(COMMANDS, '/')?.query).toBe('');
     });
 
-    it('stays shut for prose that merely contains a slash', () => {
-      expect(matchSlashCommands(COMMANDS, 'fix /this typo')).toBeNull();
+    it('opens on a token mid-draft, where the caret is', () => {
+      // The whole point of the caret argument: a command is the verb of the
+      // sentence and it arrives when the sentence needs it.
+      expect(names('tidy this up /cer', COMMANDS)).toEqual(['artemis-skills:cerebro']);
+      expect(matchSlashCommands(COMMANDS, 'tidy this up /cer')?.query).toBe('cer');
+    });
+
+    it('is about the token under the caret, not the one at the end', () => {
+      const draft = '/cer and then /comp';
+      expect(matchSlashCommands(COMMANDS, draft, 4)?.query).toBe('cer');
+      expect(matchSlashCommands(COMMANDS, draft, draft.length)?.query).toBe('comp');
+      // Between the two, in the prose, there is nothing to offer.
+      expect(matchSlashCommands(COMMANDS, draft, 8)).toBeNull();
+    });
+
+    it('stays shut for a slash that is not a token', () => {
       expect(matchSlashCommands(COMMANDS, 'and/or')).toBeNull();
+      expect(matchSlashCommands(COMMANDS, 'fix /this typo')).toBeNull();
     });
 
     it('closes once the name is complete and arguments begin', () => {
@@ -123,8 +138,8 @@ describe('matchSlashCommands', () => {
     });
 
     it('inserts a draft with exactly one slash', () => {
-      const [match] = matchSlashCommands(PREFIXED, '/comp')!.matches;
-      expect(applySlashCommand(match!.name)).toBe('/compact ');
+      const menu = matchSlashCommands(PREFIXED, '/comp')!;
+      expect(writeSlashCommand('/comp', menu.token, menu.matches[0]!.name).text).toBe('/compact ');
     });
 
     it('still finds a prefixed bridged command by its segment', () => {
@@ -137,15 +152,68 @@ describe('matchSlashCommands', () => {
     });
 
     it('canonicalises a raw provider string handed straight to apply', () => {
-      expect(applySlashCommand('/compact')).toBe('/compact ');
+      const menu = matchSlashCommands(PREFIXED, '/comp')!;
+      expect(writeSlashCommand('/comp', menu.token, '/compact').text).toBe('/compact ');
     });
   });
 
   it('inserts the canonical name and a space, so the menu closes', () => {
-    const draft = applySlashCommand('artemis-skills:cerebro');
-    expect(draft).toBe('/artemis-skills:cerebro ');
+    const menu = matchSlashCommands(COMMANDS, '/cer')!;
+    const written = writeSlashCommand('/cer', menu.token, 'artemis-skills:cerebro');
+    expect(written.text).toBe('/artemis-skills:cerebro ');
+    expect(written.caret).toBe(written.text.length);
     // The trailing space is what makes Enter send on the next press rather than
     // re-accepting the highlighted row.
-    expect(matchSlashCommands(COMMANDS, draft)).toBeNull();
+    expect(matchSlashCommands(COMMANDS, written.text, written.caret)).toBeNull();
+  });
+});
+
+describe('a token in the middle of a sentence', () => {
+  it('is offered only prefix-quality matches', () => {
+    // `/rail` finds `derail-something` at the head of a draft, where a slash
+    // can only be a command. Mid-sentence that row is noise over what is much
+    // more likely to be a path.
+    const head = matchSlashCommands(['artemis-skills:railway', 'derail-something'], '/rail')!;
+    expect(head.matches.map((m) => m.name)).toEqual(['artemis-skills:railway', 'derail-something']);
+
+    const mid = matchSlashCommands(['artemis-skills:railway', 'derail-something'], 'deploy /rail')!;
+    expect(mid.matches.map((m) => m.name)).toEqual(['artemis-skills:railway']);
+  });
+
+  it('closes rather than opening on a path that matches nothing well', () => {
+    expect(matchSlashCommands(COMMANDS, 'look at /etc/hosts')).toBeNull();
+  });
+
+  it('hands Enter back to the composer, and keeps it for a leading token', () => {
+    expect(matchSlashCommands(COMMANDS, '/cer')?.enterAccepts).toBe(true);
+    expect(matchSlashCommands(COMMANDS, '  /cer')?.enterAccepts).toBe(true);
+    expect(matchSlashCommands(COMMANDS, 'tidy this /cer')?.enterAccepts).toBe(false);
+  });
+});
+
+describe('writeSlashCommand', () => {
+  it('writes over the token and leaves the rest of the sentence alone', () => {
+    const draft = 'tidy the changelog /cer';
+    const menu = matchSlashCommands(COMMANDS, draft)!;
+    const written = writeSlashCommand(draft, menu.token, 'artemis-skills:cerebro');
+    expect(written.text).toBe('tidy the changelog /artemis-skills:cerebro ');
+    expect(written.caret).toBe(written.text.length);
+  });
+
+  it('keeps what follows the token, with the caret between the two', () => {
+    const draft = 'tidy /cer the changelog';
+    const menu = matchSlashCommands(COMMANDS, draft, 9)!;
+    const written = writeSlashCommand(draft, menu.token, 'artemis-skills:cerebro');
+    expect(written.text).toBe('tidy /artemis-skills:cerebro the changelog');
+    // Past the space that was already there rather than past a second one.
+    expect(written.text.slice(written.caret)).toBe('the changelog');
+  });
+
+  it('does not push a line break along with a space it would only trail', () => {
+    const draft = 'first /cer\nsecond';
+    const menu = matchSlashCommands(COMMANDS, draft, 10)!;
+    const written = writeSlashCommand(draft, menu.token, 'artemis-skills:cerebro');
+    expect(written.text).toBe('first /artemis-skills:cerebro\nsecond');
+    expect(written.text.slice(written.caret)).toBe('\nsecond');
   });
 });

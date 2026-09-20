@@ -368,6 +368,51 @@ describe('Composer: the slash menu', () => {
     expect(onArrowOverflow).toHaveBeenCalledWith('up');
   });
 
+  it('opens on a token in the middle of a sentence, offering the provider\'s own', async () => {
+    // The gap this closed: a command is the verb of the sentence and it
+    // arrives when the sentence needs it, which is usually not first.
+    const { lastFrame, stdin } = composer({
+      providerCommands: ['artemis-skills:code-review', 'compact'],
+    });
+    await tick();
+    await press(stdin, 'look over the diff /review');
+    expect(lastFrame()).toContain('/artemis-skills:code-review');
+  });
+
+  it('keeps this terminal\'s own commands out of a mid-sentence menu', async () => {
+    // There is no lift for them — they take no arguments a sentence could
+    // supply — so a row that could not be honoured is not offered.
+    const { lastFrame, stdin } = composer({ providerCommands: ['artemis-skills:model-notes'] });
+    await tick();
+    await press(stdin, 'tell me about /mo');
+    expect(lastFrame()).toContain('/artemis-skills:model-notes');
+    expect(lastFrame()).not.toContain('/model ');
+  });
+
+  it('Tab writes the row over the token and leaves the sentence', async () => {
+    const { lastFrame, stdin } = composer({ providerCommands: ['artemis-skills:code-review'] });
+    await tick();
+    await press(stdin, 'look over the diff /review', TAB);
+    expect(lastFrame()).toContain('look over the diff /artemis-skills:code-review');
+  });
+
+  it('leaves Enter meaning send for a mid-sentence token', async () => {
+    // Enter running the highlighted row is right when the message *is* the
+    // command. In prose it would hijack the send of anyone who typed a path.
+    const onSubmit = vi.fn();
+    const { stdin } = composer({ onSubmit, providerCommands: ['artemis-skills:code-review'] });
+    await tick();
+    await press(stdin, 'look over the diff /review', ENTER);
+    expect(onSubmit).toHaveBeenCalledWith('look over the diff /review', []);
+  });
+
+  it('stays shut for a slash that is not the start of a word', async () => {
+    const { lastFrame, stdin } = composer();
+    await tick();
+    await press(stdin, 'an and/or question');
+    expect(lastFrame()).not.toContain('↑↓ move · Tab complete · Enter run');
+  });
+
   it('a lone slash is the whole menu, clipped and counted', async () => {
     const { lastFrame, stdin } = composer();
     await tick();

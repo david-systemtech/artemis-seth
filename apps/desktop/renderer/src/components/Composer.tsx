@@ -31,7 +31,15 @@
  *    clipboard, and the gesture after taking one is Cmd+V.
  */
 
-import { useCallback, useEffect, useRef, useState, type DragEvent, type ReactElement } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type DragEvent,
+  type ReactElement,
+} from 'react';
 import {
   CircleStopIcon,
   HandIcon,
@@ -45,6 +53,7 @@ import {
 import {
   ATTACHMENT_LIMITS,
   attachmentBytes,
+  hoistSlashCommand,
   isImageAttachment,
   isTaskLive,
   type Attachment,
@@ -82,7 +91,7 @@ import {
 } from '../lib/attachments';
 import { registerComposer } from '../lib/composerFocus';
 import { COLUMN_MAX } from './Transcript';
-import { applySlashCommand, matchSlashCommands } from '../lib/slashCommands';
+import { matchSlashCommands, writeSlashCommand } from '../lib/slashCommands';
 import { ActivityRule } from './Activity';
 import { ParkedAsks } from './ParkedAsks';
 import { SlashCommandMenu, SLASH_LISTBOX_ID, slashOptionId } from './SlashCommandMenu';
@@ -121,6 +130,15 @@ const SUPPORTS_FIELD_SIZING =
   typeof CSS !== 'undefined' &&
   typeof CSS.supports === 'function' &&
   CSS.supports('field-sizing', 'content');
+
+/**
+ * A slash that starts a word, anywhere in the draft.
+ *
+ * What the command-list prefetch watches. The menu opens on a token wherever it
+ * sits, so a check for a slash at position 0 would leave the first
+ * mid-sentence `/` of a session looking at an empty list.
+ */
+const SLASH_SOMEWHERE = /(?:^|\s)\//u;
 
 /**
  * Report what could not be attached.
@@ -274,7 +292,10 @@ export function Composer(): ReactElement {
    * types a `/` into never spawns anything on this path.
    */
   const unasked = usePane((s) => s.run === null && s.commands === null);
-  const reaching = text.startsWith('/');
+  // Any slash that starts a word, not just one that starts the draft: the menu
+  // opens on a token anywhere, so the prefetch has to fire there too or the
+  // first mid-sentence `/` of a session finds an empty list.
+  const reaching = SLASH_SOMEWHERE.test(text);
   useEffect(() => {
     if (unasked && reaching) void refreshCommands(pane);
   }, [unasked, reaching, pane]);
@@ -287,7 +308,23 @@ export function Composer(): ReactElement {
    * than no dismissal. Cleared by the next edit, so typing on brings it back.
    */
   const [dismissed, setDismissed] = useState(false);
-  const menu = dismissed ? null : matchSlashCommands(commands, text);
+  /*
+   * Where the caret is, because the menu is now about the token under it rather
+   * than about the whole draft.
+   *
+   * Mirrored into React state rather than read from the DOM at render, because
+   * the menu is derived during render and `selectionStart` is not something a
+   * render may reach for. Kept in step by `onChange` and `onSelect`, which
+   * between them cover typing, clicking, arrowing and selecting.
+   *
+   * Clamped at the point of use: `setText` also runs from history recall and
+   * from the send that empties the field, and a caret left pointing past the
+   * end of a shorter draft would be nonsense. Clamping there is enough because
+   * a stale caret can only ever be too far right, and the token it then lands
+   * in is one the user is about to move away from anyway.
+   */
+  const [caret, setCaret] = useState(0);
+  const menu = dismissed ? null : matchSlashCommands(commands, text, Math.min(caret, text.length));
   const [highlight, setHighlight] = useState(0);
   /*
    * The highlight is clamped rather than reset on every keystroke.
@@ -299,14 +336,40 @@ export function Composer(): ReactElement {
    */
   const selected = menu === null ? 0 : Math.min(highlight, menu.matches.length - 1);
 
-  /** Accept a command: replace the draft with it and leave the caret after it. */
+  /** The caret an accept asked for, applied once the new value is on screen. */
+  const restoreCaret = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    const at = restoreCaret.current;
+    if (at === null) return;
+    restoreCaret.current = null;
+    textareaRef.current?.setSelectionRange(at, at);
+  }, [text]);
+
+  /**
+   * Accept a command: write it over the token it was typed into, and leave the
+   * caret after it.
+   *
+   * Over the token and not over the draft, so a command picked at the end of a
+   * sentence keeps the sentence. It stays where the user put it — moving it to
+   * the front here would yank the words they are reading out from under them
+   * mid-keystroke — and `send` lifts it on the way out instead.
+   *
+   * The caret is restored through a ref and a layout effect rather than set
+   * here, because the field is controlled: the DOM still holds the old value on
+   * this tick, and `setSelectionRange` against it would land in the wrong place.
+   */
   const acceptCommand = useCallback(
     (name: string) => {
-      setText(applySlashCommand(name));
+      const token = menu?.token;
+      if (token === undefined) return;
+      const written = writeSlashCommand(text, token, name);
+      setText(written.text);
+      setCaret(written.caret);
+      restoreCaret.current = written.caret;
       setHighlight(0);
       textareaRef.current?.focus();
     },
-    [setText],
+    [menu, text, setText],
   );
 
   /**
@@ -443,8 +506,20 @@ export function Composer(): ReactElement {
   }, []);
 
   const send = useCallback(() => {
-    const value = textareaRef.current?.value ?? text;
-    if (value.trim().length === 0) return;
+    const typed = textareaRef.current?.value ?? text;
+    if (typed.trim().length === 0) return;
+    /*
+     * The command goes to the front, because that is the only place a provider
+     * looks for one.
+     *
+     * The draft is left exactly as typed until this moment — what the user is
+     * reading while they write is their own sentence — and the rearrangement
+     * happens once, on the way out. A draft with no command in it, or one that
+     * already leads with a slash, comes back unchanged; see
+     * `hoistSlashCommand`, which is deliberately idempotent so a served run
+     * lifting it again on the server is a no-op.
+     */
+    const value = hoistSlashCommand(typed, commands);
 
     const sent = attachments;
     setText('');
@@ -471,7 +546,7 @@ export function Composer(): ReactElement {
         setAttachments((current) => (current.length === 0 ? sent : current));
       }
     });
-  }, [attachments, text, pane, setText]);
+  }, [attachments, commands, text, pane, setText]);
 
   /**
    * Walk the prompt history.
@@ -789,12 +864,23 @@ export function Composer(): ReactElement {
               }
               onChange={(event) => {
                 setText(event.target.value);
+                setCaret(event.target.selectionStart);
                 // Any edit leaves recall: the text on screen is no longer a
                 // history entry, so Up should start again from the newest.
                 setRecall(null);
                 // An edit also revives a menu Escape closed — the dismissal was
                 // about the draft as it stood, not a preference.
                 setDismissed(false);
+              }}
+              /*
+                Every other way the caret moves: a click into the middle of a
+                sentence, an arrow key, a drag-select, ⌘A. `onChange` covers
+                typing and nothing else, and a menu derived from a caret that
+                only tracked typing would open over the wrong word the moment
+                somebody went back to fix one.
+              */
+              onSelect={(event) => {
+                setCaret(event.currentTarget.selectionStart);
               }}
               /*
                 Paste is the reason this feature exists.
@@ -838,8 +924,23 @@ export function Composer(): ReactElement {
                     setHighlight((selected + step + count) % count);
                     return;
                   }
+                  /*
+                   * Tab accepts wherever the token is. Enter accepts only where
+                   * the token leads the draft.
+                   *
+                   * The asymmetry is about what Enter already means. On a draft
+                   * that *is* the command being typed, sending a half-finished
+                   * `/cer` puts literal text in the transcript and gets
+                   * `Unknown command` back, so accepting is the only sane
+                   * reading. Mid-sentence, Enter means send, the slash under
+                   * the caret is more often a path than a command, and taking
+                   * the key there would hijack the send of anyone who typed
+                   * `/work/…` in the middle of a prompt. A command typed out in
+                   * full still runs from there — `send` lifts it — so nothing
+                   * is lost by leaving Enter alone.
+                   */
                   if (
-                    (event.key === 'Enter' || event.key === 'Tab') &&
+                    (event.key === 'Tab' || (event.key === 'Enter' && menu.enterAccepts)) &&
                     !event.shiftKey &&
                     !event.nativeEvent.isComposing
                   ) {
@@ -865,8 +966,8 @@ export function Composer(): ReactElement {
                  * Empty is the honest scope: with text in the field Tab may be
                  * the user tabbing away, and accepting would replace what they
                  * wrote with a machine's guess. The slash menu cannot collide —
-                 * it claims Tab only while the draft starts with `/`, which is
-                 * never the empty field this requires.
+                 * it claims Tab only with the caret inside a `/token`, which an
+                 * empty field has nowhere to put.
                  */
                 if (
                   event.key === 'Tab' &&
