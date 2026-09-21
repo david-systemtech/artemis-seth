@@ -3918,12 +3918,14 @@ async function handleChatCompletions(
       route: model.route,
     });
   };
+  const slashCommands = await commandsBehind(context, model, workspace.path);
   const turn = {
     model,
     cwd: workspace.path,
     request: chat,
     extensions: applied,
     ignored,
+    ...(slashCommands === undefined ? {} : { slashCommands }),
     ...(redirected === undefined ? {} : { redirected }),
     ...(request.signal === undefined ? {} : { signal: request.signal }),
     // Absent when this build has no directory: with nothing to hold the
@@ -4371,6 +4373,34 @@ const STEER_IGNORED: readonly (readonly [keyof ArtemisChatExtensions, string])[]
 ];
 
 /**
+ * The slash commands the account behind a route would offer.
+ *
+ * Only ever used to lift one to the front of a prompt that put it elsewhere —
+ * see `hoistSlashCommand`. `undefined` is "do not lift", which is what a build
+ * that cannot enumerate commands and a host that failed to answer both get: a
+ * prompt left exactly as it was sent is the honest degradation, and it is what
+ * every client saw before this existed.
+ *
+ * The host caches this per account and directory and shares in-flight reads,
+ * so asking on every turn costs one CLI per cache window rather than per turn.
+ */
+async function commandsBehind(
+  context: ServerContext,
+  model: ServerModel,
+  cwd: string | undefined,
+): Promise<readonly string[] | undefined> {
+  const source = context.commands;
+  if (source === undefined) return undefined;
+  return source
+    .list({
+      profileId: String(model.profileId),
+      providerId: model.providerId,
+      ...(cwd === undefined ? {} : { cwd }),
+    })
+    .catch(() => undefined);
+}
+
+/**
  * Send a completions caller's message into the run already serving its
  * conversation, and answer with that run's stream.
  *
@@ -4435,9 +4465,20 @@ async function steerLiveRun(input: {
     ...input.ignored,
     ...STEER_IGNORED.filter(([field]) => extensions[field] !== undefined).map(([, name]) => name),
   ];
+  // The workspace the live run is in, so the command list is the one a turn
+  // there would really see; a connection without a directory gets the host's
+  // own substitution.
+  const steerCommands = await commandsBehind(
+    context,
+    model,
+    connection.workspace.kind === 'directory' ? connection.workspace.path : undefined,
+  );
   const steer: SteerRequest = {
     runId: live.runId,
-    prompt: promptFromMessages(input.chat.messages, { resuming: true }),
+    prompt: promptFromMessages(input.chat.messages, {
+      resuming: true,
+      ...(steerCommands === undefined ? {} : { commands: steerCommands }),
+    }),
     // Already read, merged and refused-if-unsupported by the route above; a
     // steer into a live run stages them beside what its opening prompt staged.
     ...(extensions.attachments === undefined ? {} : { attachments: extensions.attachments }),

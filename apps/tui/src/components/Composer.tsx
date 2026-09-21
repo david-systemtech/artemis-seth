@@ -264,6 +264,7 @@
 
 import { useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { Box, Text, useInput, usePaste } from 'ink';
+import { slashTokenAt, writeSlashCommand } from '@rx-artemis/protocol';
 
 import { readClipboardImage, readClipboardText } from '../clipboard.js';
 import { matchCommands } from '../commands.js';
@@ -787,10 +788,30 @@ export function Composer({
    */
   const [shell, setShell] = useState(false);
 
-  // A single word beginning with a slash is a command being typed. Whitespace
-  // of any kind ends that: what follows is arguments, or a second line.
-  const typingCommand = !shell && value.startsWith('/') && !/\s/u.test(value);
-  const menu = typingCommand ? matchCommands(value, providerCommands) : [];
+  /*
+   * The `/token` the cursor is in, wherever it sits in the buffer.
+   *
+   * It used to have to be the whole buffer — `value.startsWith('/')` and no
+   * whitespace anywhere — so a command could only ever be the first thing in a
+   * message. People do not write that way: the command is the verb and it
+   * arrives when the sentence needs it, usually at the end. Whitespace still
+   * ends the token, so past the name the menu is out of the way and what is
+   * being typed is arguments.
+   *
+   * Mid-sentence only the provider's commands are offered: `app.tsx` lifts one
+   * of those to the front of the message on send, which is the only place a
+   * provider honours a command, and there is no such lift for the ones this
+   * terminal answers itself. Offering `/quit` inside a sentence would be a row
+   * that either did nothing or ended the conversation.
+   *
+   * In shell mode nothing is offered at all: there `/` is a path.
+   */
+  const commandToken = shell ? null : slashTokenAt(value, buffer.cursor);
+  const typingCommand = commandToken !== null;
+  const menu =
+    commandToken === null
+      ? []
+      : matchCommands(commandToken.name, providerCommands, { providerOnly: !commandToken.leading });
   const selected =
     menu.length === 0
       ? null
@@ -1520,10 +1541,29 @@ export function Composer({
          * would have typed to run it themselves. Everything downstream, the
          * parser above all, sees exactly what it always saw, and the composer
          * still knows nothing about what any command does.
+         *
+         * Only where the token leads the buffer, because only there does Enter
+         * have no other job. Mid-sentence Enter means send, the slash under the
+         * cursor is more often a path than a command, and taking the key there
+         * would hijack the send of anyone who typed `/work/…` into a prompt.
+         * Tab still fills the row in, and a command typed out in full still
+         * runs from there: `app.tsx` lifts it to the front on the way out.
          */
-        if (highlighted !== undefined) {
-          onSubmit(commandWord(highlighted.usage), []);
-          setBuffer(clear);
+        if (highlighted !== undefined && commandToken?.leading === true) {
+          /*
+           * Run it only when the token is all there is. A leading token with
+           * words after it — a command being typed in front of a sentence
+           * already written — is filled in over the token instead, as Tab
+           * would, because submitting the bare command and clearing the box
+           * would throw the sentence away.
+           */
+          if (value.slice(commandToken.end).trim() === '') {
+            onSubmit(commandWord(highlighted.usage), []);
+            setBuffer(clear);
+          } else {
+            const written = writeSlashCommand(value, commandToken, commandWord(highlighted.usage).slice(1));
+            setBuffer((current) => replaceLeavingCursor(current, written.text, written.caret));
+          }
           return;
         }
         if (value.trim().length === 0 && attachments.length === 0) return;
@@ -1700,10 +1740,13 @@ export function Composer({
           return;
         }
         // Fill in the highlighted row — the canonical name, prefix and all,
-        // which is what makes a bridged `/plugin:command` typeable. Through
-        // the editor, so one undo gets back the letters that were typed.
-        if (highlighted !== undefined) {
-          setBuffer((current) => replaceAll(current, `${commandWord(highlighted.usage)} `));
+        // which is what makes a bridged `/plugin:command` typeable. Written
+        // over the token and not over the buffer, so a command picked at the
+        // end of a sentence keeps the sentence. Through the editor, so one undo
+        // gets back the letters that were typed.
+        if (highlighted !== undefined && commandToken !== null) {
+          const written = writeSlashCommand(value, commandToken, commandWord(highlighted.usage).slice(1));
+          setBuffer((current) => replaceLeavingCursor(current, written.text, written.caret));
           return;
         }
         // With no row to fill in, Tab walks the holes the last expansion left.

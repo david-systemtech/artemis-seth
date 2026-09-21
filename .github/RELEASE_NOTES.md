@@ -1,6 +1,16 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.19.1
+
+Two fixes for things that looked as though the agent had said, or done, something it had not.
+
+**A slash command works wherever it is typed.** The command menu only opened when the whole draft was one `/` word, and a command typed after other words never ran: the provider executes a command only at the front of a message, so anywhere else it reached the model as plain text and nothing said so. The menu now opens on the `/` word under the cursor, and on send a word that exactly names one of the conversation's commands is moved to the front, with the rest of what you wrote following it. Anything that is not an exact name, such as `/etc/hosts` or `3/4`, is sent as written.
+
+**A question no longer points at an explanation you were never shown.** Claude's reasoning is shortened before it reaches Artemis, so an agent that worked an explanation out in its reasoning and then asked about it sent a question like "Is that the shared understanding?" with nothing above it. Such a question is now handed back to the agent once, with the reason, and it writes the explanation out before asking again.
+
+**Update the server with the app:** on a served conversation both fixes run on the server, the slash command for clients that have no composer of their own.
+
 ## What's new in 2.19.0
 
 Served conversations show their work as it happens, and a few things that looked as though you had written them no longer do.

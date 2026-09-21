@@ -819,6 +819,64 @@ describe('what gets sent to the provider', () => {
   });
 });
 
+describe('promptFromMessages: a command that is not at the front', () => {
+  const COMMANDS = ['compact', 'artemis-skills:unslop'];
+
+  it('lifts it to the front, with the rest of the turn as its arguments', () => {
+    // A provider honours a command in exactly one place. Without this the turn
+    // reaches the model as prose and nothing anywhere says the command was
+    // ignored.
+    expect(
+      promptFromMessages([{ role: 'user', content: 'tidy the changelog /artemis-skills:unslop' }], {
+        resuming: true,
+        commands: COMMANDS,
+      }),
+    ).toBe('/artemis-skills:unslop tidy the changelog');
+  });
+
+  it('leaves the prompt alone without a list to check against', () => {
+    expect(
+      promptFromMessages([{ role: 'user', content: 'tidy the changelog /artemis-skills:unslop' }], {
+        resuming: true,
+      }),
+    ).toBe('tidy the changelog /artemis-skills:unslop');
+  });
+
+  it('does not touch a path that is not a command', () => {
+    expect(
+      promptFromMessages([{ role: 'user', content: 'read /etc/hosts' }], {
+        resuming: true,
+        commands: COMMANDS,
+      }),
+    ).toBe('read /etc/hosts');
+  });
+
+  it('leaves a prompt with a system prefix alone', () => {
+    // A lifted command would land after text the provider reads first, so it
+    // still would not run — and the system prompt would have a hole in it.
+    const prompt = promptFromMessages(
+      [
+        { role: 'system', content: 'Be brief.' },
+        { role: 'user', content: 'tidy the changelog /compact' },
+      ],
+      { resuming: true, commands: COMMANDS },
+    );
+    expect(prompt).toBe('Be brief.\n\ntidy the changelog /compact');
+  });
+
+  it('leaves a prompt carrying replayed history alone', () => {
+    const prompt = promptFromMessages(
+      [
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: 'reply' },
+        { role: 'user', content: 'tidy that /compact' },
+      ],
+      { resuming: false, commands: COMMANDS },
+    );
+    expect(prompt.endsWith('tidy that /compact')).toBe(true);
+  });
+});
+
 describe('promptFromMessages', () => {
   it('treats the trailing user message as the turn', () => {
     expect(

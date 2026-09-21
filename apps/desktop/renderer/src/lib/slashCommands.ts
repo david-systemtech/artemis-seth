@@ -4,8 +4,8 @@
  *
  * Pure, and separate from the composer, because the interesting part is the
  * ranking and the ranking is the part worth asserting. `Composer.tsx` owns the
- * keyboard and the markup; this owns the question "given this draft, what should
- * be on offer, and in what order".
+ * keyboard and the markup; this owns the question "given this draft and where
+ * the caret is, what should be on offer, and in what order".
  *
  * ---------------------------------------------------------------------------
  * WHY RANKING IS NEEDED AT ALL
@@ -27,12 +27,36 @@
  * WHEN THE MENU IS OPEN
  * ---------------------------------------------------------------------------
  *
- * Only while the whole draft is one slash token: `/`, `/cer`, `/artemis-skills:c`.
- * The first space closes it, because after the name the user is typing arguments
- * and a menu over their sentence is in the way. It follows that a slash command
- * has to be the start of the message, which is also the only place the provider
- * will honour one.
+ * While the caret is inside a slash token — `/`, `/cer`, `/artemis-skills:c` —
+ * wherever that token sits in the draft. The first space still closes it,
+ * because past the name the user is typing arguments and a menu over their
+ * sentence is in the way; what changed is that the token no longer has to be
+ * the whole draft. `sort the imports and /uns` opens it too, and
+ * `hoistSlashCommand` is what makes the command the user then picks actually
+ * run — the provider only honours one at the front of the message, so the
+ * draft is rearranged on its way out.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY A MID-DRAFT TOKEN IS TREATED MORE CAUTIOUSLY
+ * ---------------------------------------------------------------------------
+ *
+ * A leading slash is unambiguous: nothing else starts a message that way. A
+ * slash in the middle of a sentence is usually a path — `/etc/hosts`,
+ * `/work/SYSTEM-SERVER`, `3/4`. Two things follow.
+ *
+ * A loose {@link SLASH_RANKS.contains} hit is not offered for a mid-draft
+ * token, because `/w` would otherwise pop a menu over every command with a `w`
+ * in it while somebody was three characters into typing a directory.
+ *
+ * And Enter keeps meaning *send* for a mid-draft token — see
+ * {@link SlashMenu.enterAccepts}. Enter accepting a highlighted row is right
+ * when the whole message is the command being typed; it is a hijack when the
+ * message is a paragraph of prose that happens to contain a path. Tab accepts
+ * everywhere, and a command typed out in full is lifted on send whether or not
+ * the menu was ever used.
  */
+
+import { canonicalCommandName, slashTokenAt, type SlashToken } from '@rx-artemis/protocol';
 
 /**
  * How well a command matched, lowest first.
@@ -66,25 +90,18 @@ export interface SlashMatch {
 }
 
 export interface SlashMenu {
-  /** What was typed after the slash, verbatim. Empty when the draft is just `/`. */
+  /** What was typed after the slash, verbatim. Empty when the token is just `/`. */
   readonly query: string;
+  /** Where the token sits, so accepting one can write over it and leave the rest. */
+  readonly token: SlashToken;
+  /**
+   * Whether Enter should accept the highlighted row rather than send.
+   *
+   * True only for a token that leads the draft. See the header.
+   */
+  readonly enterAccepts: boolean;
   /** Every match, best first. Never empty — {@link matchSlashCommands} returns null instead. */
   readonly matches: readonly SlashMatch[];
-}
-
-/**
- * The name without its slash, if it arrived wearing one.
- *
- * The field is whatever the provider put in `system.init`, and the two forms are
- * both in this repository: the Claude CLI reports bare names (`compact`,
- * `artemis-skills:cerebro`), while `mockBridge.ts` and the mapper's own fixtures
- * use `/compact`. Nothing guarantees which a future provider sends, and the cost
- * of guessing wrong is a menu offering `//compact` and inserting a draft the
- * provider will reject — so the slash is stripped on the way in and added back
- * exactly once on the way out.
- */
-function canonical(name: string): string {
-  return name.startsWith('/') ? name.slice(1) : name;
 }
 
 /** Split `plugin:name` into its parts, tolerating a name with no prefix. */
@@ -97,24 +114,26 @@ function split(name: string): { readonly label: string; readonly prefix?: string
 /**
  * What the menu should show for this draft, or `null` for "no menu".
  *
- * `null` rather than an empty list for both of the ways there is nothing to
- * show — the draft is not a slash token, or nothing matched — because the
+ * `null` rather than an empty list for all of the ways there is nothing to
+ * show — the caret is not in a slash token, or nothing matched — because the
  * caller's question is only ever "is there a menu", and a query that matches
  * nothing should close the menu rather than show an empty box over the text.
+ *
+ * `caret` is the composer's selection start. It defaults to the end of the
+ * draft so that a caller with no cursor to offer — a test, a headless check —
+ * gets the behaviour of somebody who has just finished typing.
  */
 export function matchSlashCommands(
   commands: readonly string[] | undefined,
   draft: string,
+  caret: number = draft.length,
 ): SlashMenu | null {
   if (commands === undefined || commands.length === 0) return null;
 
-  // The whole draft, not a token at the caret: a slash command is only a command
-  // at the start of a message, so `fix /this typo` is prose and gets no menu.
-  const token = /^\/(\S*)$/.exec(draft);
+  const token = slashTokenAt(draft, caret);
   if (token === null) return null;
 
-  const query = token[1] ?? '';
-  const needle = query.toLowerCase();
+  const needle = token.name.toLowerCase();
 
   const matches: SlashMatch[] = [];
   // Stripping the slash can collide two reported names onto one — `compact` and
@@ -122,7 +141,7 @@ export function matchSlashCommands(
   // duplicate would be two identical rows sharing a React key.
   const seen = new Set<string>();
   for (const reported of commands) {
-    const name = canonical(reported);
+    const name = canonicalCommandName(reported);
     if (seen.has(name)) continue;
     seen.add(name);
     const { label, prefix } = split(name);
@@ -136,6 +155,9 @@ export function matchSlashCommands(
             ? SLASH_RANKS.contains
             : null;
     if (rank === null) continue;
+    // The loose tier is for a token the user has committed to by starting the
+    // message with it. Mid-sentence it is noise over a path. See the header.
+    if (!token.leading && rank === SLASH_RANKS.contains) continue;
     matches.push({ name, label, rank, ...(prefix === undefined ? {} : { prefix }) });
   }
 
@@ -145,19 +167,13 @@ export function matchSlashCommands(
   // by the full name instead would file every bridged command under `a`, which
   // is the prefix's fault and not something the reader should have to know.
   matches.sort((a, b) => a.rank - b.rank || a.label.localeCompare(b.label));
-  return { query, matches };
+  return { query: token.name, token, enterAccepts: token.leading, matches };
 }
 
 /**
- * The draft that accepting a command produces.
- *
- * The trailing space is the point: every command that takes arguments needs one
- * next, and the ones that do not are unharmed by it — the provider trims. It
- * also means the menu closes on accept, because the draft stops being a single
- * slash token, which is what makes Enter send on the very next press.
+ * Accepting a command is {@link writeSlashCommand} in the protocol, which the
+ * TUI composer uses too: the same splice, the same caret rule, one place to fix
+ * either. Re-exported here so this module stays the composer's one import for
+ * everything about the menu.
  */
-export function applySlashCommand(name: string): string {
-  // Canonicalised again rather than trusted: this is exported, and a caller
-  // passing the provider's raw string would otherwise send `//compact`.
-  return `/${canonical(name)} `;
-}
+export { writeSlashCommand } from '@rx-artemis/protocol';

@@ -90,7 +90,7 @@ import type {
   SessionDelegatedWork,
   TokenUsage,
 } from '@rx-artemis/protocol';
-import { isImageMediaType, readAttachments } from '@rx-artemis/protocol';
+import { hoistSlashCommand, isImageMediaType, readAttachments } from '@rx-artemis/protocol';
 import type { RouteRedirect } from './sessionHome.js';
 
 /* -------------------------------------------------------------------------- */
@@ -276,6 +276,14 @@ export interface TurnRequest {
   /** Parameters accepted but not applied, echoed back so a caller can see them. */
   readonly ignored: readonly string[];
   /**
+   * The slash commands the serving account would offer.
+   *
+   * Only ever used to lift one to the front of the prompt when the caller put
+   * it elsewhere — see {@link promptFromMessages}. Absent on a build that
+   * cannot enumerate commands, which simply leaves the prompt as it was sent.
+   */
+  readonly slashCommands?: readonly string[];
+  /**
    * The run is on a different account from the one the route named, because
    * that account is the one holding the conversation being resumed. Echoed
    * back beside {@link ignored}, for the same reason. See `sessionHome.ts`.
@@ -320,10 +328,18 @@ export interface TurnRequest {
  * `system` and `developer` messages always survive, at the front: they are
  * instructions rather than history, and a caller that sets one on every request
  * means it every time.
+ *
+ * `commands` is the slash commands the serving account would offer, and it is
+ * what lets a caller put one somewhere other than the front of their message —
+ * see {@link hoistSlashCommand}. It is applied only when the trailing user
+ * message is the *whole* prompt: with a system or history prefix in front of
+ * it, a lifted command would land after text the provider reads first, so it
+ * would still not run, and all the lift would have achieved is a hole in
+ * somebody's system prompt.
  */
 export function promptFromMessages(
   messages: readonly OpenAiChatMessage[],
-  options: { readonly resuming: boolean },
+  options: { readonly resuming: boolean; readonly commands?: readonly string[] },
 ): string {
   const systems: string[] = [];
   const history: string[] = [];
@@ -363,7 +379,12 @@ export function promptFromMessages(
   if (trailing.length > 0) parts.push(trailing);
   else if (options.resuming && history.length > 0) parts.push(history.join('\n'));
 
-  return parts.join('\n\n').trim();
+  const assembled = parts.join('\n\n').trim();
+  // The one shape where the lift can do anything: the turn standing alone. See
+  // the note above.
+  return parts.length === 1 && trailing.length > 0
+    ? hoistSlashCommand(assembled, options.commands)
+    : assembled;
 }
 
 /**
@@ -1124,7 +1145,10 @@ export async function* runTurn(
   turn: TurnRequest,
 ): AsyncGenerator<TurnEvent> {
   const resuming = turn.extensions.sessionId !== undefined;
-  const prompt = promptFromMessages(turn.request.messages, { resuming });
+  const prompt = promptFromMessages(turn.request.messages, {
+    resuming,
+    ...(turn.slashCommands === undefined ? {} : { commands: turn.slashCommands }),
+  });
   /*
    * Read once, and read as `=== true`, so that a caller who sent `remote: {}`,
    * or nothing at all, is on the old path by construction rather than by the
