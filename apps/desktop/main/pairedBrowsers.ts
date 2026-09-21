@@ -109,20 +109,39 @@ export interface PairedBrowsers {
 export async function openPairedBrowsers(userDataDir: string): Promise<PairedBrowsers> {
   const file = join(userDataDir, STORE_FILE);
   let document = await read(file);
+  /**
+   * Writes happen one at a time, in the order they were asked for.
+   *
+   * Not a refinement. Two of these overlap in ordinary use — a browser
+   * connects, which records that it was seen, while the pairing that produced
+   * it is still landing — and without a chain they raced on the temporary
+   * file: both wrote `paired-browsers.json.tmp`, the first rename consumed it,
+   * and the second failed with `ENOENT` against a path that had just existed.
+   * The end-to-end suite found that on its first run.
+   *
+   * Serialising also fixes the quieter half of the same bug. Each write
+   * serialises the *whole* document, so two that finished out of order would
+   * leave the older one on disk with no error anywhere.
+   */
+  let writing: Promise<void> = Promise.resolve();
 
   async function save(next: StoreDocument): Promise<void> {
     document = next;
-    const temporary = `${file}.tmp`;
-    try {
-      await writeFile(temporary, JSON.stringify(next, null, 2), { mode: 0o600 });
-      await rename(temporary, file);
-    } catch (error) {
-      // In memory the change has happened, and the bridge has already acted on
-      // it. Saying so and carrying on is better than unwinding a pairing the
-      // browser has already been told about: the worst case is a pairing the
-      // user has to redo after a restart, which is what they are doing now.
-      log.error(`Could not write ${STORE_FILE}`, error);
-    }
+    writing = writing.then(async () => {
+      const temporary = `${file}.tmp`;
+      try {
+        await writeFile(temporary, JSON.stringify(next, null, 2), { mode: 0o600 });
+        await rename(temporary, file);
+      } catch (error) {
+        // In memory the change has happened, and the bridge has already acted
+        // on it. Saying so and carrying on is better than unwinding a pairing
+        // the browser has already been told about: the worst case is a pairing
+        // the user has to redo after a restart, which is what they are doing
+        // now.
+        log.error(`Could not write ${STORE_FILE}`, error);
+      }
+    });
+    return writing;
   }
 
   return {

@@ -243,6 +243,23 @@ describe('what the browser said is what the model reads', () => {
     expect(result).toEqual({ ok: true, value: { url: 'https://example.com', title: 'Example' } });
   });
 
+  it('carries a notice on a successful answer through to the tools', async () => {
+    // How a driver says a successful answer is incomplete. Dropping it here
+    // would be the silent partial answer the contract added it to prevent.
+    const { host } = fakeHost({
+      status: 'answered',
+      result: { ok: true, value: [], notice: 'older console entries were dropped' },
+    });
+
+    const result = await extensionPageDriver(RUN, host).console();
+
+    expect(result).toEqual({
+      ok: true,
+      value: [],
+      notice: 'older console entries were dropped',
+    });
+  });
+
   it('passes a policy refusal through without rewriting it', async () => {
     // The extension is where the policy is applied, against the address the
     // tab actually has. Its sentence is the authoritative one and this file

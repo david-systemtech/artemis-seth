@@ -136,6 +136,23 @@ describe('what the browser said is what the model reads', () => {
     });
   });
 
+  it('carries a notice from the client’s browser all the way to the served run', async () => {
+    const { relay, published } = relayWatching();
+    const answering = relay.driverFor('conn-a', 'run-1').console();
+
+    relay.answer('conn-a', lastCallId(published), {
+      ok: true,
+      value: [],
+      notice: 'older console entries were dropped',
+    });
+
+    expect(await answering).toEqual({
+      ok: true,
+      value: [],
+      notice: 'older console entries were dropped',
+    });
+  });
+
   it('passes the client’s own refusal through, so a served run reads the local sentence', async () => {
     // A client with no paired browser answers with its own driver's refusal,
     // which is written once in `extensionPageDriver.ts`. Rewriting it here

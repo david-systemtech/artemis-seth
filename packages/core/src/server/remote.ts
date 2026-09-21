@@ -268,8 +268,17 @@ function handleBrowserAnswer(input: RemoteRequestInput): ServerReply {
  */
 function readDriverResult(value: unknown): DriverResult<unknown> | null {
   if (typeof value !== 'object' || value === null) return null;
-  const raw = value as { ok?: unknown; value?: unknown; reason?: unknown };
-  if (raw.ok === true) return { ok: true, value: raw.value };
+  const raw = value as { ok?: unknown; value?: unknown; reason?: unknown; notice?: unknown };
+  if (raw.ok === true) {
+    return {
+      ok: true,
+      value: raw.value,
+      // Carried, not read: `notice` is how a driver says a successful answer
+      // is partial, and a relay that dropped it would be the silent
+      // partial-answer the contract added it to prevent.
+      ...(typeof raw.notice === 'string' ? { notice: raw.notice } : {}),
+    };
+  }
   if (raw.ok === false && typeof raw.reason === 'string') {
     return { ok: false, reason: raw.reason };
   }

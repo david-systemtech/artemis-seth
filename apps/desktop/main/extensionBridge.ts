@@ -17,11 +17,20 @@
  *    scope by design — issue #436 says the extension only ever talks to the
  *    Artemis client it shares a machine with, and a served conversation
  *    reaches it through that client.
- * 2. **`Origin` must be a `chrome-extension://` origin.** Browsers send
- *    `Origin` on a WebSocket handshake and cannot be talked out of it, so this
- *    is what stops an ordinary web page — which can also open a socket to
+ * 2. **`Origin` must be the Artemis extension's own.** Browsers send `Origin`
+ *    on a WebSocket handshake and cannot be talked out of it, so this is what
+ *    stops an ordinary web page — which can also open a socket to
  *    `127.0.0.1` — from reaching the bridge. A page's origin is its site; an
- *    extension's is its id. Nothing else about the request distinguishes them.
+ *    extension's is its id, and the Artemis extension's id is fixed by the
+ *    `key` in its manifest, so the check is against *that one id* rather than
+ *    against the scheme. A second extension the user installed is not the
+ *    Artemis extension and has no business on this port.
+ *
+ *    {@link ARTEMIS_EXTENSION_ORIGIN_OVERRIDE} is the documented way past it,
+ *    and it exists for one case: somebody building the extension from source
+ *    without the manifest `key`, which Chrome then gives an id derived from
+ *    the directory it was loaded from. That is a development machine, and the
+ *    variable says so.
  * 3. **A pairing code, once.** Minted in Artemis, shown on screen, typed into
  *    the extension. Eight characters from an alphabet with no `O`/`0` or
  *    `I`/`1` in it, good for five minutes, spent on first use, and burned after
@@ -65,6 +74,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import {
   BRIDGE_DEFAULT_PORT,
   BRIDGE_PROTOCOL_VERSION,
+  ARTEMIS_EXTENSION_ID,
   type BridgeFromArtemis,
   type BridgeVerb,
   type DriverResult,
@@ -79,6 +89,28 @@ import { createLogger } from './log.js';
 import { info, type PairedBrowser, type PairedBrowsers } from './pairedBrowsers.js';
 
 const log = createLogger('extension-bridge');
+
+/**
+ * The environment variable that widens the `Origin` gate.
+ *
+ * One or more `chrome-extension://…` origins, comma-separated. For somebody
+ * running a build of the extension without the manifest `key` that fixes its
+ * id — Chrome then derives one from the directory it was loaded from, so it
+ * differs per machine and cannot be written down here.
+ *
+ * Not a general escape hatch: anything that is not a `chrome-extension://`
+ * origin is dropped, so this cannot be used to let a web page in.
+ */
+export const ARTEMIS_EXTENSION_ORIGIN_OVERRIDE = 'ARTEMIS_EXTENSION_ORIGINS';
+
+function developmentOrigins(): readonly string[] {
+  const named = process.env[ARTEMIS_EXTENSION_ORIGIN_OVERRIDE];
+  if (named === undefined) return [];
+  return named
+    .split(',')
+    .map((one) => one.trim())
+    .filter((one) => /^chrome-extension:\/\/[a-p]{32}$/u.test(one));
+}
 
 /* -------------------------------------------------------------------------- */
 /* Constants with reasons                                                     */
@@ -161,6 +193,15 @@ export interface ExtensionBridgeOptions {
   readonly bundledVersion?: string | null;
   /** Called whenever {@link ExtensionBridge.state} would answer differently. */
   readonly onStateChange?: (state: ExtensionBridgeState) => void;
+  /**
+   * Extra origins to accept beyond the shipped extension's.
+   *
+   * For tests, which load a build from a temporary directory and so meet an
+   * id Chrome derived rather than the one the manifest's `key` fixes. In the
+   * app this is unset and {@link ARTEMIS_EXTENSION_ORIGIN_OVERRIDE} is the
+   * only way to widen it.
+   */
+  readonly extensionOrigins?: readonly string[];
 }
 
 export interface ExtensionBridge extends ExtensionDriverHost {
@@ -192,6 +233,15 @@ export function createExtensionBridge(options: ExtensionBridgeOptions): Extensio
   const port = options.port ?? BRIDGE_DEFAULT_PORT;
   const store = options.store;
   const bundledVersion = options.bundledVersion ?? null;
+
+  /**
+   * The origins allowed through gate 2: the shipped extension, plus whatever
+   * a developer named. See the file header on why that override exists.
+   */
+  const allowedOrigins = new Set([
+    `chrome-extension://${ARTEMIS_EXTENSION_ID}`,
+    ...(options.extensionOrigins ?? developmentOrigins()),
+  ]);
 
   let listening: ExtensionBridgeListening = { kind: 'stopped' };
   let server: WebSocketServer | null = null;
@@ -276,8 +326,8 @@ export function createExtensionBridge(options: ExtensionBridgeOptions): Extensio
      * likes here — which is what the pairing code and the proof are for.
      */
     const origin = request.headers.origin;
-    if (origin === undefined || !/^chrome-extension:\/\/[a-z]+$/u.test(origin)) {
-      log.warn(`Refused a bridge connection from an origin that is not an extension: ${String(origin)}`);
+    if (origin === undefined || !allowedOrigins.has(origin)) {
+      log.warn(`Refused a bridge connection from ${String(origin)}, which is not the Artemis extension.`);
       refuse(socket, 'This port only accepts connections from the Artemis browser extension.');
       return;
     }
@@ -680,11 +730,22 @@ function mintCode(): string {
   return code;
 }
 
-/** Whether a MAC is the one this secret makes of this nonce. */
+/**
+ * Whether a MAC is the one this secret makes of this nonce.
+ *
+ * The three encodings are the contract's, spelled out on {@link BridgeProof},
+ * and they are spelled out there because two independent implementations of
+ * "HMAC of a secret" disagree about them and meet as a refusal nobody can
+ * debug. The key is the **bytes the hex secret denotes** and not the
+ * characters of the hex string; the message is the nonce's UTF-8 bytes as
+ * sent, undecoded; the mac is lowercase hex.
+ */
 function proves(secret: string, nonce: string, mac: unknown): boolean {
   if (typeof mac !== 'string') return false;
-  const expected = createHmac('sha256', Buffer.from(secret, 'hex')).update(nonce).digest('hex');
-  return constantTimeEquals(mac, expected);
+  const expected = createHmac('sha256', Buffer.from(secret, 'hex'))
+    .update(nonce, 'utf8')
+    .digest('hex');
+  return constantTimeEquals(mac.toLowerCase(), expected);
 }
 
 /**
@@ -771,9 +832,27 @@ function parse(raw: Buffer | ArrayBuffer | Buffer[]): FromExtension | null {
       if (typeof message['id'] !== 'string') return null;
       const result = message['result'];
       if (typeof result !== 'object' || result === null) return null;
-      const outcome = result as { ok?: unknown; reason?: unknown; value?: unknown };
+      const outcome = result as {
+        ok?: unknown;
+        reason?: unknown;
+        value?: unknown;
+        notice?: unknown;
+      };
       if (outcome.ok === true) {
-        return { type: 'result', id: message['id'], result: { ok: true, value: outcome.value } };
+        return {
+          type: 'result',
+          id: message['id'],
+          result: {
+            ok: true,
+            value: outcome.value,
+            // Something true about a successful answer that is not part of it
+            // — a console buffer that dropped its oldest entries, a wait that
+            // reported what had arrived. Carried through rather than read: the
+            // contract added it so a driver could not silently hand back a
+            // partial answer, and dropping it here would be exactly that.
+            ...(typeof outcome.notice === 'string' ? { notice: outcome.notice } : {}),
+          },
+        };
       }
       if (outcome.ok === false && typeof outcome.reason === 'string') {
         return { type: 'result', id: message['id'], result: { ok: false, reason: outcome.reason } };

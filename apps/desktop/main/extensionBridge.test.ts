@@ -30,13 +30,20 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
-import { BRIDGE_PROTOCOL_VERSION, DEFAULT_PAGE_POLICY } from '@rx-artemis/protocol';
+import {
+  ARTEMIS_EXTENSION_ID,
+  BRIDGE_PROTOCOL_VERSION,
+  DEFAULT_PAGE_POLICY,
+} from '@rx-artemis/protocol';
 
 import { createExtensionBridge, type ExtensionBridge } from './extensionBridge';
 import { openPairedBrowsers } from './pairedBrowsers';
 
-/** An origin shaped like a real extension id, which is what Chrome sends. */
-const EXTENSION_ORIGIN = 'chrome-extension://mnopqrstuvwxyzabcdefghijklmnopqr';
+/** The Artemis extension's own origin — the only one the bridge accepts. */
+const EXTENSION_ORIGIN = `chrome-extension://${ARTEMIS_EXTENSION_ID}`;
+
+/** A different extension's origin, well formed and not ours. */
+const OTHER_EXTENSION_ORIGIN = 'chrome-extension://aaaabbbbccccddddeeeeffffgggghhhh';
 
 let directory = '';
 let bridges: ExtensionBridge[] = [];
@@ -218,6 +225,18 @@ describe('who may open a connection', () => {
 
     expect(message['type']).toBe('refused');
     await page.untilClosed();
+  });
+
+  it('refuses another extension, which a scheme check alone would let in', async () => {
+    // The gate is the *id*, not `chrome-extension://…`. A second extension the
+    // user installed is not the Artemis extension and has no business here,
+    // and its origin is as unforgeable as ours.
+    const { port } = await bridgeOn();
+    const stranger = new FakeExtension(port, OTHER_EXTENSION_ORIGIN);
+    await stranger.open();
+
+    expect((await stranger.next())['type']).toBe('refused');
+    await stranger.untilClosed();
   });
 
   it('refuses a connection that sends no Origin at all', async () => {
@@ -606,6 +625,28 @@ describe('a verb on the wire', () => {
     });
   });
 
+  it('carries a notice on a successful answer, which is how a partial one says so', async () => {
+    // `notice` is the contract's way for a driver to say a successful answer
+    // is incomplete — a console buffer that dropped its oldest entries. A
+    // bridge that rebuilt the result and left it out would be exactly the
+    // silent partial answer it was added to prevent.
+    const { bridge, port } = await bridgeOn();
+    const { extension } = await pair(bridge, port);
+
+    const answering = bridge.call('run-7', 'call-n', { verb: 'console' }, 2_000);
+    await extension.next();
+    extension.send({
+      type: 'result',
+      id: 'call-n',
+      result: { ok: true, value: [], notice: 'older console entries were dropped' },
+    });
+
+    expect(await answering).toEqual({
+      status: 'answered',
+      result: { ok: true, value: [], notice: 'older console entries were dropped' },
+    });
+  });
+
   it('passes the extension’s own refusal through untouched', async () => {
     // The extension applies the page policy and says no in words. Those words
     // are what the model reads; nothing on this side rewrites them.
@@ -756,6 +797,36 @@ describe('the pairing secret', () => {
 
     expect(JSON.stringify(state)).not.toContain(secret);
     expect(Object.keys(state.browsers[0] ?? {})).not.toContain('secret');
+  });
+
+  it('survives two writes landing at once, which pairing and connecting do', async () => {
+    /*
+     * A regression. Pairing writes the browser and going live writes that it
+     * was seen, and the two overlap in ordinary use — the end-to-end suite met
+     * them racing on its first run. Both wrote `paired-browsers.json.tmp`, the
+     * first rename consumed it, and the second failed with `ENOENT` against a
+     * path that had just existed.
+     */
+    const store = await openPairedBrowsers(directory);
+    const browser = {
+      browserId: 'b1',
+      secret: '00'.repeat(32),
+      browserName: 'Chrome',
+      pairedAt: 1,
+    };
+
+    await Promise.all([
+      store.add(browser),
+      store.noteSeen('b1', '2.19.1', 2),
+      store.setPolicy({ ...DEFAULT_PAGE_POLICY, devSites: ['*.test'] }),
+    ]);
+
+    // The last write wins on disk, and every one of them completed: a reopened
+    // store sees the browser and the policy rather than a file that was never
+    // written.
+    const reopened = await openPairedBrowsers(directory);
+    expect(reopened.find('b1')?.browserName).toBe('Chrome');
+    expect(reopened.policy().devSites).toEqual(['*.test']);
   });
 
   it('is written to a file only the owner can read', async () => {

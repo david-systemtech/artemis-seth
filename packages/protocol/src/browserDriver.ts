@@ -426,6 +426,26 @@ export const BRIDGE_PROTOCOL_VERSION = 1;
 /** Where the desktop listens unless told otherwise. */
 export const BRIDGE_DEFAULT_PORT = 47_615;
 
+/**
+ * The Artemis extension's id, which is also its origin on the wire.
+ *
+ * Fixed rather than assigned, because the extension's manifest carries a
+ * `key`: Chrome derives the id from that public key, so it is the same id on
+ * every machine and in every build, and it can therefore be written down.
+ *
+ * It is written down because the desktop checks it. A browser sets `Origin` on
+ * a WebSocket handshake and cannot be talked out of it, so this constant is
+ * what separates "the Artemis extension" from "any other extension the user
+ * installed" — a distinction `chrome-extension://…` alone does not make.
+ *
+ * **Kept in sync by hand with `EXTENSION_ID` in
+ * `apps/extension/src/manifest.ts`**, which is where the `key` it is derived
+ * from lives. The same arrangement as `APP_USER_MODEL_ID` and the builder's
+ * `appId`, and for the same reason: the value exists in two places because
+ * neither can compute the other, and this comment is the link between them.
+ */
+export const ARTEMIS_EXTENSION_ID = 'pbdboognedfpknmikiajchompjfjhdal';
+
 /** Extension → Artemis, first message of a first connection. */
 export interface BridgePairRequest {
   readonly type: 'pair';

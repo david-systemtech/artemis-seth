@@ -80,8 +80,8 @@ jobs:
   # Its own job rather than a step in each matrix entry, because the artifact
   # is the same on all three platforms — it is a zip of JavaScript — and
   # building it three times would be three chances for the three copies to
-  # differ. Linux only, for the reason `scripts/package-extension.ts` gives:
-  # the zip is made with `zip`, which the Windows runner does not have.
+  # differ. One runner is enough and it need not be a particular one; Linux is
+  # chosen because it is the cheapest.
   #
   # The script exits 0 with a notice when this checkout has no `apps/extension`
   # at all, so this job does not turn a branch that predates the extension red.
