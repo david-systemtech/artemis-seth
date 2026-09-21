@@ -107,17 +107,42 @@ This is the largest piece and the one most worth cutting from a first version.
 A first version without it still has `browser_screenshot`, which puts a picture
 in the transcript on request.
 
-## Limits
+## Nothing outlives its use
 
-- **One browser context per run, closed with the run.** Contexts are CDP's
-  isolated profiles: separate cookies and storage in one Chromium process, so
-  two agents testing the same app do not share a login. Targeting is by closure,
-  as now: no tool takes a browser id.
-- **A cap on live contexts per server** (default 2), refused with a sentence the
-  model can read rather than queued.
-- **Idle contexts close** after a few minutes; a run that comes back gets a
-  fresh one and is told so.
-- **A memory limit on the container**, 1 GB by default.
+The failure to design against is a browser that holds memory for pages nobody
+is looking at. It is not hypothetical: a Firefox container on the same host was
+found holding 2.4 GB for a single tab (David, 2026-09-21). Chromium does not
+hand memory back to the system readily either, so closing tabs is necessary and
+not sufficient. Four rules, from the tab outward:
+
+- **A tab closes when it has not been used.** Ten minutes without a tool call
+  by default. The agent is told in the next tool result ("the tab was closed
+  after 10 minutes idle; `browser_open` starts a new one") rather than finding
+  out from an error.
+- **A context closes with its run**, and when its last tab closes. Contexts are
+  CDP's isolated profiles: separate cookies and storage in one Chromium process,
+  so two agents testing the same app do not share a login. At most three tabs
+  in a context; opening a fourth closes the least recently used. Targeting is
+  by closure, as now: no tool takes a browser id.
+- **The browser itself stops when nothing is open.** With no live context for
+  five minutes the server asks Chromium to exit, and starts it again on the next
+  `browser_open`, which measured under a second. An idle server then holds no
+  browser memory at all, and every fresh start is back at the 270 MB baseline
+  instead of wherever the last session left the heap. This is the rule that
+  answers the 2.4 GB tab: a process that has exited has nothing reserved.
+- **A watchdog for the case the clocks miss.** The server reads each tab's
+  memory over CDP on an interval. A tab past a ceiling (500 MB by default) is
+  closed, least recently used first, and the agent is told why. The container's
+  own memory limit (1 GB by default) is the backstop behind that, so a runaway
+  page takes the browser down and not the agents.
+
+Two more, for tidiness. **A cap on live contexts per server** (default 2),
+refused with a sentence the model can read rather than queued. And **a sweep at
+start**: a server that crashed may have left tabs behind in a browser that
+outlived it, so on connecting it closes every target it does not own.
+
+Each of these is a number an operator can change. None of them can be turned
+off.
 
 ## Where it may go
 
