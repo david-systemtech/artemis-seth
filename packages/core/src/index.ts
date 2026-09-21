@@ -10,6 +10,9 @@
  * │ ProviderAdapter / Run — the seam. One implementation per provider,   │
  * │ each mapping a wildly different transport onto the same AgentEvent   │
  * │ union and publishing a capability descriptor the UI degrades against.│
+ * ├── browser ───────────────────────────────────────────────────────────┤
+ * │ pageTools       the `artemisBrowser` tools, written once against the │
+ * │                 `PageDriver` contract — no driver is implemented here│
  * ├── content ───────────────────────────────────────────────────────────┤
  * │ buildContentBridge  the user's skills and commands, as a plugin a    │
  * │                 run can load; marketplace plugins passed through     │
@@ -56,6 +59,7 @@
  */
 
 export * from './adapters/index.js';
+export * from './browser/index.js';
 export * from './content/index.js';
 export * from './memorybanks/index.js';
 export * from './profiles/index.js';
