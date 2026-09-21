@@ -1,0 +1,26 @@
+{
+  "name": "@rx-artemis/extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The Artemis browser extension: an MV3 extension that lets a conversation drive the user's own Chrome, over a loopback socket to the desktop app.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b ../../packages/protocol && tsx build.ts",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@rx-artemis/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.12",
+    "typescript": "~7.0.2",
+    "vitest": "^4.1.10",
+    "ws": "^8.21.3"
+  }
+}

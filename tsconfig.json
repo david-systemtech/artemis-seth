@@ -12,6 +12,7 @@
     { "path": "./apps/desktop/main" },
     { "path": "./apps/desktop/preload" },
     { "path": "./apps/desktop/renderer" },
+    { "path": "./apps/extension" },
     { "path": "./scripts" }
   ]
 }

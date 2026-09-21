@@ -1,0 +1,175 @@
+/*
+ * One stylesheet for both pages.
+ *
+ * No framework and no build step for the CSS: two pages of about forty
+ * elements, and the closest thing to a dependency they should have is the
+ * user's own colour scheme. `color-scheme` plus `light-dark()` is what makes a
+ * page that looks like the rest of Chrome in either theme without a line of
+ * JavaScript deciding which one it is.
+ */
+
+:root {
+  color-scheme: light dark;
+  --ink: light-dark(#1b1b1f, #e8e8ec);
+  --muted: light-dark(#5c5c66, #9a9aa4);
+  --canvas: light-dark(#ffffff, #1b1b1f);
+  --raised: light-dark(#f5f5f7, #26262c);
+  --line: light-dark(#dededf, #3a3a42);
+  --accent: #7c5cff;
+  --good: light-dark(#0f7b3f, #4ade80);
+  --bad: light-dark(#b3261e, #ff8a80);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 16px;
+  font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--canvas);
+}
+
+h1 {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+h2 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 20px 0 8px;
+}
+
+p {
+  margin: 0 0 12px;
+  color: var(--muted);
+}
+
+section {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+  background: var(--raised);
+}
+
+label {
+  display: block;
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+input {
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--canvas);
+  color: var(--ink);
+  width: 200px;
+}
+
+button {
+  font: inherit;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--canvas);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.danger {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.status {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-weight: 600;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.dot.connected {
+  background: var(--good);
+}
+
+.dot.refused {
+  background: var(--bad);
+}
+
+.dot.connecting {
+  background: var(--accent);
+}
+
+.detail {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 4px 8px 4px 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+td.refused {
+  color: var(--bad);
+}
+
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+.empty {
+  color: var(--muted);
+  font-style: italic;
+}

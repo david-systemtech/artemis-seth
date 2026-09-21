@@ -12,6 +12,7 @@
   "scripts": {
     "dev": "pnpm run build:libs && pnpm --filter @rx-artemis/desktop dev",
     "build": "pnpm run build:libs && pnpm --filter @rx-artemis/desktop build",
+    "build:extension": "pnpm run build:libs && pnpm --filter @rx-artemis/extension build",
     "build:libs": "tsc -b packages/protocol packages/transcript packages/core",
     "typecheck": "tsc -b --pretty",
     "typecheck:clean": "tsc -b --clean && tsc -b --pretty",

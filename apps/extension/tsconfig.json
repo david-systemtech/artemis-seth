@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "//": "Solution file. The extension is two programs with incompatible globals — browser source that must never reach for Node, and one Node script that builds it — so neither can be typechecked with the other's `lib` and `types`. `tsc -b` here builds both in order.",
+  "files": [],
+  "references": [{ "path": "./tsconfig.src.json" }, { "path": "./tsconfig.node.json" }]
+}

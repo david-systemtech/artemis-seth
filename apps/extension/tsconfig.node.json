@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "//": "The build script, which is a Node program: it reads the desktop's version off disk, runs esbuild and writes `dist/`. It imports `src/manifest.ts` through the project reference above, so the manifest this script writes and the manifest the tests assert on are the same value.",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "./.tsbuild/node",
+    "tsBuildInfoFile": "./.tsbuild/node/.tsbuildinfo",
+    "emitDeclarationOnly": true,
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "verbatimModuleSyntax": false
+  },
+  "include": ["build.ts"],
+  "exclude": ["node_modules", "dist", ".tsbuild"],
+  "references": [{ "path": "./tsconfig.src.json" }]
+}
