@@ -536,8 +536,8 @@ def read_stream(resp) -> dict:
         # The per-read timeout: not a byte, not even a keep-alive - before the
         # answer began or part-way through it, which the log has to tell apart.
         if first_at is None:
-            raise Stalled(f"sent nothing at all for {STALL_S} s") from exc
-        raise Stalled(f"went silent for {STALL_S} s after about {max(chunks, chars // 4)} tokens") from exc
+            raise Stalled(f"sent nothing at all for {FIRST_TOKEN_S} s") from exc
+        raise Stalled(f"went silent for {FIRST_TOKEN_S} s after about {max(chunks, chars // 4)} tokens") from exc
     if finish is None:
         raise RuntimeError("the stream ended without finishing an answer")
     return {
@@ -635,7 +635,12 @@ def run_effort(api_key: str, model: str, prompt: str, diff_chars: int, effort: s
             req.add_header("HTTP-Referer", f"https://github.com/{REPOSITORY}")
             req.add_header("X-OpenRouter-Title", APP)
             req.add_header("X-OpenRouter-Metadata", "enabled")
-            with urllib.request.urlopen(req, timeout=STALL_S) as resp:
+            # The per-read timeout is the first-token allowance, not the stall:
+            # at STALL_S it would end a request that sends no bytes at all -
+            # not even keep-alives - at 60 s, under the 120 its answer was
+            # promised to begin in. Silence part-way through is caught at the
+            # same 120 s, and a stream of keep-alives by STALL_S in read_stream.
+            with urllib.request.urlopen(req, timeout=FIRST_TOKEN_S) as resp:
                 body = read_stream(resp)
             choice = body["choices"][0]
             if choice.get("finish_reason") == "length":
