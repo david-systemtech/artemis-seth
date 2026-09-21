@@ -1162,9 +1162,12 @@ function validateRunInput(value: unknown, field: string): RunInput {
     fallbackModel: optionalString(input['fallbackModel'], `${field}.fallbackModel`, LIMITS.model),
     permissionMode: permissionMode === null ? undefined : (permissionMode as RunInput['permissionMode']),
     effort: effort === null ? undefined : (effort as RunInput['effort']),
-    // Four switches, each a plain boolean the adapter reads as "on" only when
-    // it is exactly `true`. What they are allowed to *do* is the adapter's and
-    // the provider's to decide; this boundary only proves the type.
+    // Four switches, each a plain boolean read downstream as "on" only when it
+    // is exactly `true`: `fastMode`, `ultracode` and `chromeBrowser` by the
+    // adapter, `chromeBrowser` and `externalBrowser` by the host's own tool
+    // factory (`agentBrowserServers`, which picks the run's browser tools).
+    // What each is allowed to *do* is theirs to decide; this boundary only
+    // proves the type.
     fastMode: optionalBoolean(input['fastMode'], `${field}.fastMode`),
     ultracode: optionalBoolean(input['ultracode'], `${field}.ultracode`),
     chromeBrowser: optionalBoolean(input['chromeBrowser'], `${field}.chromeBrowser`),
