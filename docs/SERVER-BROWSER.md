@@ -111,10 +111,30 @@ So the rule is the opposite of a normal block list:
   `metadata.google.internal`. What is behind them is the host machine's own
   credentials, which is not something an operator can mean to allow.
 
-Checked before navigating **and** against the address the page actually has
-after every load, because a public address that redirects to a private one is
-one HTTP response away from being the whole attack. A page that got somewhere it
-should not be is left on `about:blank`, not merely reported.
+### A name is not an address
+
+Applying those rules to the spelling of the host would be a spelling check:
+`169.254.169.254.nip.io` is a public name for the metadata service, and anybody
+can mint an A record pointing wherever they like. So the rule is applied three
+times, to two different things.
+
+1. **The name**, before anything else. Cheap, and it catches the obvious cases.
+2. **What the name resolves to**, before navigating, using the container's own
+   resolver — the one Chromium is about to use. A metadata address is refused
+   whatever the name is and whatever your allow-list says. A private address is
+   refused unless the *name* is on the allow-list: `artemis-server` and
+   `localhost` resolve into private space by design, and refusing them would
+   refuse the dev servers this exists for. A name that will not resolve is
+   refused, in the resolver's own words.
+3. **The address Chromium actually connected to** for the main document, after
+   every load. This is the only one that catches a name which resolved publicly
+   when Artemis looked and privately by the time the browser fetched it.
+
+Checked before navigating, on **every** navigation the browser makes — including
+a `<meta http-equiv="refresh">`, a `history.pushState`, or a timer calling
+`location.assign`, none of which any tool asked for — and again before every
+verb acts. A page that got somewhere it should not be is left on `about:blank`,
+and the agent is told on its next call.
 
 ### What that does not cover, and what does
 
@@ -123,6 +143,12 @@ makes: an `<img src>` or a `fetch()` to a private address happens inside
 Chromium's own network stack, below anything the DevTools protocol lets a client
 veto without putting an Artemis round trip in front of every subresource of
 every page.
+
+Nor can the third check say anything about a document with **no** remote
+address — a `data:` page, or one served from a cache. Those are held by the
+first two alone. The gap is narrow here rather than silent: `Network.enable` is
+on for every tab, which disables that tab's disk cache, so a document served
+from cache is a case this browser does not have.
 
 The fence for that is at the network level and nowhere else. The compose file
 puts the browser on a network with exactly one other container on it, which

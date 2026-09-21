@@ -39,7 +39,7 @@ one thing here worth arguing with:
 |---|---|
 | `cdp.ts` | One WebSocket: correlation, session routing, deadlines. And `resolveCdpEndpoint`, which is where the Host-header trap lives. |
 | `cdpPage.ts` | One attached target: what a verb *is* on the protocol. No policy, no lifecycle. |
-| `serverBrowserPolicy.ts` | Where the browser may go. One pure function. |
+| `serverBrowserPolicy.ts` | Where the browser may go: the name gate, the address gate, and the resolver behind it. |
 | `serverBrowser.ts` | Contexts, caps, clocks, the watchdog, the sweep, the idle exit. |
 | `cdpPageDriver.ts` | `PageDriver`: the policy gate, the redirect re-check, the refusal wording. |
 
@@ -254,10 +254,44 @@ unauthenticated admin page on the LAN, or the cloud metadata service.
   `metadata.google.internal`). What is behind them is the host's own
   credentials.
 
-Enforced in the driver before every navigation **and** against the address the
-page actually has after every load, because a public address that redirects to a
-private one is the whole attack and the first check cannot see it. A page that
-got somewhere it should not be is left on `about:blank`.
+### The first build of this checked names, which is not a check
+
+Every rule above was applied to the host as written and to nothing else. That
+made the policy a spelling check: `169.254.169.254.nip.io` is a public name that
+resolves to the metadata service, one of a family anybody can mint, and it
+passed. The claim in this document that metadata "can never be reached" was
+false. Review of #437 caught it. The rule is now applied three times, to two
+different things:
+
+1. **The name**, as before — cheap, and it catches the obvious cases.
+2. **What the name resolves to**, before navigating, through the container's own
+   resolver (`dns.promises.lookup`, `all: true`, injectable). Any address
+   deciding it, not all: which record Chromium picks is not ours to choose. A
+   metadata address is refused whatever the name and whatever the allow-list
+   says; a private address is refused unless the *name* is allow-listed, because
+   `artemis-server` resolves into private space by design. A name that will not
+   resolve is refused in the resolver's own words.
+3. **`remoteIPAddress`** for the main document, from `Network.responseReceived`
+   — the machine Chromium actually talked to. The only one of the three that
+   defeats rebinding between the lookup and the fetch, and the one exercised
+   end-to-end against a real browser by starting Chromium with
+   `--host-resolver-rules` and lying to the driver's resolver.
+
+### And it only ran where a verb happened to look
+
+The post-load re-check ran inside `navigate` and `click` and nowhere else, so a
+`<meta http-equiv="refresh">`, a `history.pushState` or a timer calling
+`location.assign` moved the page with nothing watching. It is event-driven now:
+`Page.frameNavigated` and `Page.navigatedWithinDocument` on the top frame apply
+the policy at once, blank the tab, and leave the sentence for whichever verb
+comes next — and **every** verb checks the tab's current address and last
+main-document remote address before it acts, because the page can move before
+Chromium has said so.
+
+One consequence worth stating: `settle` used to return immediately when nothing
+was loading, which is exactly the state a click is in while its handler is still
+deciding to navigate. It now waits a bounded 500 ms for `Page.frameStartedLoading`
+before concluding nothing will happen, on the injected clock.
 
 It does **not** cover a loaded page's own sub-requests: an `<img src>` or a
 `fetch()` happens inside Chromium's network stack, below anything CDP lets a
@@ -265,6 +299,11 @@ client veto without `Fetch.enable` on every request — which would put an Artem
 round trip in front of every subresource of every page. The fence for that is
 the container's network, and the compose file ships the guidance:
 `docs/SERVER-BROWSER.md`, "What that does not cover".
+
+Nor can the third check speak for a document with no remote address — a `data:`
+page, or one served from cache. Those are held by the first two. Narrow rather
+than silent: `Network.enable` is on for every tab, which disables that tab's
+disk cache.
 
 Every call still goes through `canUseTool`, so the user sees `browser_navigate`
 with its URL and answers it, as now — an MCP tool is a tool, and only
