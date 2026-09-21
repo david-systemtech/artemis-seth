@@ -209,11 +209,15 @@ describe('writeSlashCommand', () => {
     expect(written.text.slice(written.caret)).toBe('the changelog');
   });
 
-  it('does not push a line break along with a space it would only trail', () => {
+  it('leaves the caret out of the token before a line break, so the menu closes', () => {
+    // Stopping in front of the break would be the end of the token just
+    // written: the menu would reopen on the finished command, and Enter would
+    // accept it again, to the same text, for ever.
     const draft = 'first /cer\nsecond';
     const menu = matchSlashCommands(COMMANDS, draft, 10)!;
     const written = writeSlashCommand(draft, menu.token, 'artemis-skills:cerebro');
-    expect(written.text).toBe('first /artemis-skills:cerebro\nsecond');
+    expect(written.text).toBe('first /artemis-skills:cerebro \nsecond');
     expect(written.text.slice(written.caret)).toBe('\nsecond');
+    expect(matchSlashCommands(COMMANDS, written.text, written.caret)).toBeNull();
   });
 });

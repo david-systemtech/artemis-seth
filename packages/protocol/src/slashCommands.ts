@@ -152,23 +152,24 @@ export interface SlashInsertion {
  * trims. It also means the menu closes on accept, because the caret stops being
  * inside a slash token, which is what makes the very next keypress send.
  *
- * Nothing is added in front of whitespace that is already there: a space is
- * reused rather than doubled, as `replaceMention` does for the `@` popup, and a
- * line break is left alone rather than pushed along by a space that would only
- * ever be trailing.
+ * A space already there is reused rather than doubled, as `replaceMention`
+ * does for the `@` popup. A line break is not a space to reuse: the caret would
+ * have to stop in front of it, which is the end of the token it just wrote, and
+ * the menu would reopen on the finished command - with Enter accepting it again,
+ * to the same text and the same caret, for ever. So a space goes in before the
+ * break and the caret after that space, still on the line being written. It
+ * trails, which the provider trims.
  */
 export function writeSlashCommand(draft: string, token: SlashToken, name: string): SlashInsertion {
   // Canonicalised rather than trusted: a caller passing the provider's raw
   // string would otherwise write `//compact`.
   const written = `/${canonicalCommandName(name)}`;
   const after = draft.slice(token.end);
-  const gap = /^\s/u.test(after) ? '' : ' ';
-  // The caret steps over a reused space and stops short of a reused line break,
-  // so the next keystroke lands on the line the user was writing on.
-  const stride = after.startsWith(' ') ? 1 : gap.length;
+  const gap = after.startsWith(' ') ? '' : ' ';
   return {
     text: `${draft.slice(0, token.start)}${written}${gap}${after}`,
-    caret: token.start + written.length + stride,
+    // Always past a space, never at the end of the token, so the menu closes.
+    caret: token.start + written.length + 1,
   };
 }
 

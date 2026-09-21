@@ -421,6 +421,20 @@ describe('Composer: the slash menu', () => {
     expect(lastFrame()).toMatch(/\/model? tidy the changelog/u);
   });
 
+  it('closes the menu after filling in a token that ends its line, so Enter sends', async () => {
+    // Before a line break the caret used to stop at the end of the token it had
+    // just written, the menu reopened on the finished command, and every Enter
+    // filled the same row in again: the draft could not be sent.
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, '/mo', CTRL_J, 'second', ...Array<string>(7).fill(LEFT));
+    await press(stdin, ENTER);
+    expect(lastFrame()).not.toContain(MENU_HINT);
+    await press(stdin, ENTER);
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+  });
+
   it('stays shut for a slash that is not the start of a word', async () => {
     const { lastFrame, stdin } = composer();
     await tick();

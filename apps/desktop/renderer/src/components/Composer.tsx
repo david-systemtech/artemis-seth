@@ -317,11 +317,13 @@ export function Composer(): ReactElement {
    * render may reach for. Kept in step by `onChange` and `onSelect`, which
    * between them cover typing, clicking, arrowing and selecting.
    *
-   * Clamped at the point of use: `setText` also runs from history recall and
-   * from the send that empties the field, and a caret left pointing past the
-   * end of a shorter draft would be nonsense. Clamping there is enough because
-   * a stale caret can only ever be too far right, and the token it then lands
-   * in is one the user is about to move away from anyway.
+   * Every other writer of the text says where the caret went. History recall
+   * puts it at the end of the recalled draft, which is where the field puts
+   * it: a value set from code fires no `select`, and without this the menu
+   * would be read at the old draft's caret - the middle of a longer recalled
+   * one, where `hi` then Up to `/compact now` opened a menu over `/compact`
+   * and took the Enter meant to send it. The clamp below is for the send that
+   * empties the field, where the old caret is only ever too far right.
    */
   const [caret, setCaret] = useState(0);
   const menu = dismissed ? null : matchSlashCommands(commands, text, Math.min(caret, text.length));
@@ -574,10 +576,13 @@ export function Composer(): ReactElement {
       if (next >= history.length) {
         setRecall(null);
         setText('');
+        setCaret(0);
         return true;
       }
+      const recalled = history[next] ?? '';
       setRecall(next);
-      setText(history[next] ?? '');
+      setText(recalled);
+      setCaret(recalled.length);
       return true;
     },
     [history, recall, setText],

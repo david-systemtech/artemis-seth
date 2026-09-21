@@ -408,6 +408,23 @@ describe('keyboard precedence', () => {
     expect(field().value).toBe('an earlier prompt');
   });
 
+  it('reads a recalled draft at its end, not at the caret the sent one left', () => {
+    // Sending empties the field without moving the caret the menu reads, so
+    // recalling a longer draft used to read it mid-way: `hi`, sent, then Up to
+    // `/compact now` opened a menu over `/compact` and took the Enter meant to
+    // send it.
+    setUp({ promptHistory: ['/compact now'] });
+    mount(<Composer />);
+    type('hi');
+    fireEvent.keyDown(field(), { key: 'Enter' });
+    expect(field().value).toBe('');
+
+    fireEvent.keyDown(field(), { key: 'ArrowUp' });
+
+    expect(field().value).toBe('/compact now');
+    expect(menu()).toBeNull();
+  });
+
   it('closes on Escape without interrupting the run or losing the draft', () => {
     mount(<Composer />);
     type('/cer');
