@@ -388,6 +388,13 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         ...(input.fastMode === undefined ? {} : { fastMode: input.fastMode }),
         ...(input.ultracode === undefined ? {} : { ultracode: input.ultracode }),
         ...(input.chromeBrowser === true ? { chromeBrowser: true } : {}),
+        // Passed through beside Chrome, and reaching the engine only when the
+        // route allowed it. On this host it never is yet: `createArtemisServer`
+        // is given no `browserRelay` here, so `artemis.extensionBrowser` is
+        // declined and reported under `artemis.ignored` before it gets this
+        // far. The line exists so that wiring a relay on the desktop is one
+        // change rather than two.
+        ...(input.extensionBrowser === true ? { extensionBrowser: true } : {}),
         ...(input.resumeSessionId === undefined
           ? {}
           : { resumeSessionId: input.resumeSessionId as never }),

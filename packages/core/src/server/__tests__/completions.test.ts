@@ -2141,6 +2141,95 @@ describe('POST /v1/chat/completions', () => {
   });
 
   /*
+   * The caller's *own* browser is the other arrangement, and it defaults the
+   * other way. There is no capability to check - the point of
+   * `artemis.extensionBrowser` is that it works for every provider - and the
+   * host allows it unless an operator said otherwise, because the browser it
+   * reaches is one only the calling client can reach. What it does need is a
+   * relay to publish verbs on; a build without one declines and says so.
+   */
+  async function serveRelay(options: { relay: boolean; allowed?: boolean }, source: RunSource) {
+    const { createArtemisServer } = await import('../http.js');
+    const { createBrowserRelay } = await import('../browserRelay.js');
+    const { createWorkspaceResolver } = await import('../workspaces.js');
+    const published: { connectionId: string; call: { callId: string } }[] = [];
+    const relay = createBrowserRelay({
+      publish: (connectionId, call) => published.push({ connectionId, call }),
+    });
+    const server = createArtemisServer({
+      port: 0,
+      connections: () => [CONNECTION],
+      version: '1.1.1',
+      catalogue: CATALOGUE,
+      runs: source,
+      workspaces: createWorkspaceResolver(),
+      ...(options.relay ? { browserRelay: relay } : {}),
+      ...(options.allowed === false ? { allowClientBrowser: false } : {}),
+    });
+    const port = await server.listen();
+    return { server, relay, published, url: `http://127.0.0.1:${port}/v1/chat/completions` };
+  }
+
+  async function askForClientBrowser(options: { relay: boolean; allowed?: boolean }) {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed', result: 'ok' }]);
+    const { server, url } = await serveRelay(options, source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        artemis: { extensionBrowser: true },
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { artemis: { ignored?: readonly string[] } };
+      return { ignored: body.artemis.ignored, input: source.started[0]?.input };
+    } finally {
+      await server.close();
+    }
+  }
+
+  it('lets a run drive the caller’s own browser without an operator switch', async () => {
+    // On by default, unlike Chrome above: the browser reached is the one
+    // paired with the client that sent the request, over the connection it
+    // arrived on, and nothing else can see the verbs or answer them.
+    const { ignored, input } = await askForClientBrowser({ relay: true });
+    expect(ignored ?? []).toEqual([]);
+    expect(input).toMatchObject({ extensionBrowser: true });
+  });
+
+  it('tells the host which connection the run’s browser belongs to', async () => {
+    // Both or neither. The flag says "use the caller's browser" and the id
+    // says which caller; a host handed one without the other would have a run
+    // asking for a browser nobody can be asked about.
+    const { input } = await askForClientBrowser({ relay: true });
+    expect(input).toMatchObject({ connectionId: CONNECTION.id });
+  });
+
+  it('declines the caller’s browser, and says so, when the operator turned it off', async () => {
+    const { ignored, input } = await askForClientBrowser({ relay: true, allowed: false });
+    expect(ignored).toEqual(['artemis.extensionBrowser']);
+    expect(input).not.toHaveProperty('extensionBrowser');
+  });
+
+  it('declines the caller’s browser, and says so, on a build with no relay', async () => {
+    // The desktop's own server host is such a build today. A run that asked
+    // would otherwise be handed a tool set whose every verb times out.
+    const { ignored, input } = await askForClientBrowser({ relay: false });
+    expect(ignored).toEqual(['artemis.extensionBrowser']);
+    expect(input).not.toHaveProperty('extensionBrowser');
+  });
+
+  it('carries no connection id for a run that did not ask for a browser', async () => {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed', result: 'ok' }]);
+    const { server, url } = await serveRelay({ relay: true }, source);
+    try {
+      await post(url, { model: 'work-max/opus', messages: [{ role: 'user', content: 'hi' }] });
+    } finally {
+      await server.close();
+    }
+    expect(source.started[0]?.input).not.toHaveProperty('connectionId');
+  });
+
+  /*
    * The catalogue says whether an account's provider can append standing
    * instructions; Codex and OpenCode cannot, and their adapters never read the
    * field. Sending it anyway would be accepted and unread — the one failure

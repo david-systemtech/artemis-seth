@@ -31,6 +31,7 @@
  *     states for the in-process replay buffer.
  */
 
+import type { BridgeVerb, DriverResult } from './browserDriver.js';
 import type { AgentEvent } from './events.js';
 import type { Attachment } from './attachment.js';
 import type { PermissionDecision } from './permissions.js';
@@ -53,6 +54,19 @@ export const REMOTE_LIVE_WORK_PATH = `${API}/runs/live-work`;
 
 /** `GET` the event stream. See the file comment for the framing. */
 export const REMOTE_EVENTS_PATH = `${API}/events`;
+
+/**
+ * Where a client posts the answer to a browser verb it was asked to perform.
+ *
+ * The other half of {@link REMOTE_STREAM_CHANNELS}'s `browser-call`: the
+ * server publishes a verb to the one connection that started the run, that
+ * connection's client drives the browser paired with *it*, and the result
+ * comes back here. Authenticated like every other route on this surface, by
+ * the same connection token — and checked again inside, because a token that
+ * may start runs is not thereby a token that may answer somebody else's
+ * browser call.
+ */
+export const REMOTE_BROWSER_ANSWER_PATH = `${API}/browser/answer`;
 
 /** `GET` the serving machine's terminals; `POST` to open a shell. */
 export const REMOTE_TERMINALS_PATH = `${API}/terminals`;
@@ -294,9 +308,53 @@ export interface ServerTerminalReplayBody {
 export const REMOTE_STREAM_CHANNELS = [
   'artemis:push:agent-event',
   'artemis:push:terminal-event',
+  /**
+   * One browser verb, for the client that started the run to perform.
+   *
+   * The only channel here that asks the client for something rather than
+   * telling it something, and the only one scoped to a single connection: the
+   * browser being driven is paired with that client and no other, so an event
+   * any other connection could see would be an event any other connection
+   * could answer. See `FeedScope.connectionId`.
+   *
+   * A client too old to know this channel ignores it, the verb goes
+   * unanswered, and the run's driver reports the refusal it has for a client
+   * that is not there — which is the honest outcome and not a stall.
+   */
+  'artemis:push:browser-call',
 ] as const;
 
 export type RemoteStreamChannel = (typeof REMOTE_STREAM_CHANNELS)[number];
+
+/**
+ * One browser verb, addressed to the client that started the run.
+ *
+ * `verb` is a {@link BridgeVerb} spread inline, exactly as
+ * {@link BridgeCall} spreads it — the client passes it to its own extension
+ * driver without translating, which is what keeps the two wires one
+ * vocabulary.
+ */
+export type ServerBrowserCall = BridgeVerb & {
+  readonly object: 'artemis.browser.call';
+  /** Unguessable, minted by the server, and the only thing an answer names. */
+  readonly callId: string;
+  /** The run it belongs to. For the client's own logging and nothing else. */
+  readonly runId: string;
+  /** The key the extension files this conversation's tab under. */
+  readonly runKey: string;
+};
+
+/** Body of `POST /api/v0/browser/answer`. */
+export interface RemoteBrowserAnswerBody {
+  readonly callId: string;
+  readonly result: DriverResult<unknown>;
+}
+
+/** Reply to `POST /api/v0/browser/answer`. */
+export interface ServerBrowserAnswerBody {
+  readonly object: 'artemis.browser.answer';
+  readonly callId: string;
+}
 
 /** `event:` name of the greeting message every stream opens with. */
 export const REMOTE_STREAM_HELLO = 'artemis:stream:hello';

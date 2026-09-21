@@ -681,6 +681,43 @@ describe('GET /api/v0/events', () => {
     await stream.close();
   });
 
+  it('sends a browser call only to the connection it is addressed to', async () => {
+    /*
+     * The narrowest scope axis, and the only one that is about identity rather
+     * than permission. Both connections below may see run events on `prof-a`;
+     * only the one the call names may see — and therefore answer — the
+     * question. A second client watching the same run must not be able to say
+     * what happened in the first client's browser.
+     */
+    const feed = createPushFeed();
+    const mine = await openStream({ feed });
+    const theirs = await openStream({ feed }, asNarrow);
+    // Both greetings first, so the publishes below cannot share a chunk with
+    // them and the reads that follow are unambiguous.
+    expect(decode(await mine.next())[0]?.event).toBe(REMOTE_STREAM_HELLO);
+    expect(decode(await theirs.next())[0]?.event).toBe(REMOTE_STREAM_HELLO);
+
+    feed.publish(
+      'artemis:push:browser-call',
+      { object: 'artemis.browser.call', callId: 'c1', runId: 'run-a', runKey: 'run-a', verb: 'read' },
+      { connectionId: 'conn-1' },
+    );
+    // Something both may see, published after it, so the second stream has a
+    // message to arrive at — a stream that simply stayed quiet would pass this
+    // test whether or not the filter worked.
+    feed.publish('artemis:push:agent-event', agentEvent('run-a', 1), { profileId: 'prof-a' });
+
+    const addressed = await waitForEvent(mine, 'artemis:push:browser-call');
+    expect(JSON.parse(addressed.data ?? '')).toMatchObject({ callId: 'c1' });
+
+    // The agent event, not the call: the browser question was never theirs.
+    const next = await waitForEvent(theirs, 'artemis:push:agent-event');
+    expect(next.event).toBe('artemis:push:agent-event');
+
+    await mine.close();
+    await theirs.close();
+  });
+
   it('replays from Last-Event-ID', async () => {
     const feed = createPushFeed();
     for (let i = 1; i <= 4; i += 1) {

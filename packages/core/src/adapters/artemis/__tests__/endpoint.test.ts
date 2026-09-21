@@ -397,6 +397,21 @@ describe('a resumed turn', () => {
     expect(asked.artemis?.['chromeBrowser']).toBe(true);
     expect(silent.artemis).not.toHaveProperty('chromeBrowser');
   });
+
+  it('asks the server for the caller’s own browser when the run wants it', async () => {
+    // The other browser a served run can have, and the one the client itself
+    // drives: the server publishes each verb back down this connection. Same
+    // `true`-or-absent spelling, so an older server simply drops the field.
+    const { origin, seen } = await serve((_request, response) => happyStream(response));
+
+    await drive(origin, { extensionBrowser: true });
+    await drive(origin, { extensionBrowser: false });
+
+    const asked = seen[0]?.body as { artemis?: Record<string, unknown> };
+    const silent = seen[1]?.body as { artemis?: Record<string, unknown> };
+    expect(asked.artemis?.['extensionBrowser']).toBe(true);
+    expect(silent.artemis).not.toHaveProperty('extensionBrowser');
+  });
 });
 
 describe('refusals and losses', () => {

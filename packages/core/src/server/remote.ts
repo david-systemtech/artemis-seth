@@ -38,7 +38,9 @@ import { resolve, sep } from 'node:path';
 import type { FeedEvent, FeedScope, PushFeed } from './feed.js';
 import type {
   Attachment,
+  DriverResult,
   PermissionDecision,
+  ServerBrowserAnswerBody,
   RunHandle,
   RunInput,
   ServerConnection,
@@ -63,6 +65,7 @@ import {
   readAttachments,
   visibleToConnection,
   parseRemoteResourcePath,
+  REMOTE_BROWSER_ANSWER_PATH,
   REMOTE_EVENTS_PATH,
   REMOTE_LIVE_WORK_PATH,
   REMOTE_RUNS_PATH,
@@ -101,6 +104,7 @@ export function isRemotePath(path: string): boolean {
     path === REMOTE_RUNS_PATH ||
     path === REMOTE_LIVE_WORK_PATH ||
     path === REMOTE_EVENTS_PATH ||
+    path === REMOTE_BROWSER_ANSWER_PATH ||
     path === REMOTE_TERMINALS_PATH ||
     path.startsWith(`${REMOTE_RUNS_PATH}/`) ||
     path.startsWith(`${REMOTE_TERMINALS_PATH}/`)
@@ -149,6 +153,11 @@ export async function handleRemoteRequest(
     return attribute(await handleLiveWork(context, connection));
   }
 
+  if (path === REMOTE_BROWSER_ANSWER_PATH) {
+    if (method !== 'POST') return attribute(methodNotAllowed('A browser answer is a POST.'));
+    return attribute(handleBrowserAnswer(input));
+  }
+
   if (path === REMOTE_RUNS_PATH) {
     if (method === 'GET') return attribute(await handleRunList(context, connection));
     if (method === 'POST') return attribute(await handleStartRun(input));
@@ -184,6 +193,87 @@ export async function handleRemoteRequest(
   return attribute(
     fail(404, 'invalid_request_error', 'unknown_endpoint', 'No such remote route.'),
   );
+}
+
+/* -------------------------------------------------------------------------- */
+/* The browser relay's answer route                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One browser verb's result, from the client that was asked to perform it.
+ *
+ * Two checks past the bearer token, and neither is a formality. The call id is
+ * sixteen random bytes minted by the relay, so an id a caller did not receive
+ * is an id it cannot name; and the relay refuses an answer from a connection
+ * other than the one the call was addressed to, so an id that *did* leak —
+ * into a log, into a screenshot — still buys nothing. A token that may start
+ * runs is not thereby a token that may answer somebody else's browser call.
+ *
+ * "No such call" and "not your call" are both 404, and deliberately the same
+ * shape of no: distinguishing them would tell a caller which ids exist.
+ */
+function handleBrowserAnswer(input: RemoteRequestInput): ServerReply {
+  const relay = input.context.browserRelay;
+  if (relay === undefined) {
+    return fail(
+      501,
+      'invalid_request_error',
+      'not_implemented',
+      'This Artemis build does not relay browser actions to its clients.',
+    );
+  }
+
+  const body = (typeof input.request.body === 'object' && input.request.body !== null
+    ? input.request.body
+    : {}) as Record<string, unknown>;
+
+  const callId = body['callId'];
+  if (typeof callId !== 'string' || callId.length === 0) {
+    return fail(400, 'invalid_request_error', 'invalid_body', '`callId` must name a call.');
+  }
+
+  const result = readDriverResult(body['result']);
+  if (result === null) {
+    return fail(
+      400,
+      'invalid_request_error',
+      'invalid_body',
+      '`result` must be `{ ok: true, value }` or `{ ok: false, reason }`.',
+    );
+  }
+
+  const outcome = relay.answer(input.connection.id, callId, result);
+  if (outcome !== null) {
+    return fail(
+      404,
+      'invalid_request_error',
+      'unknown_call',
+      'No browser call is waiting for that answer.',
+    );
+  }
+
+  const reply: ServerBrowserAnswerBody = { object: 'artemis.browser.answer', callId };
+  return ok(reply);
+}
+
+/**
+ * A `DriverResult` off the wire, or `null` for anything that is not one.
+ *
+ * `value` is passed through unchecked, and that is the same decision
+ * `extensionPageDriver.ts` documents: the wire cannot know which verb a call
+ * id belonged to, and re-deriving it here would mean twelve schemas kept in
+ * step with the contract they are the contract of. What is checked is the
+ * discriminator and the refusal sentence, because those are what this side
+ * reads.
+ */
+function readDriverResult(value: unknown): DriverResult<unknown> | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const raw = value as { ok?: unknown; value?: unknown; reason?: unknown };
+  if (raw.ok === true) return { ok: true, value: raw.value };
+  if (raw.ok === false && typeof raw.reason === 'string') {
+    return { ok: false, reason: raw.reason };
+  }
+  return null;
 }
 
 function methodNotAllowed(message: string): ServerReply {
@@ -257,16 +347,27 @@ function unknownSession(): ServerReply {
 /**
  * May this connection hear about something concerning this scope?
  *
- * Two independent axes, both narrowing: an event about an account outside the
- * allowance is invisible however it travelled, and an event pinned to another
+ * Three independent axes, all narrowing: an event about an account outside the
+ * allowance is invisible however it travelled, an event pinned to another
  * connection family's workspace (a terminal, in practice) stays inside that
- * family. An event with no scope on an axis is not narrowed by it.
+ * family, and an event addressed to one connection by id reaches that
+ * connection alone. An event with no scope on an axis is not narrowed by it.
+ *
+ * The third is stricter than the first two in kind. `profileId` and
+ * `workspaceKey` ask what a connection is *allowed* to see, so two connections
+ * with the same allowance both hear the event. `connectionId` names the
+ * connection, because the browser relay's events are questions — the client
+ * that started the run is the only one whose browser can answer, and an event
+ * a second connection could see would be one it could answer.
  */
 function scopeVisible(connection: ServerConnection, scope: FeedScope): boolean {
   if (scope.profileId !== undefined && !connectionAllowsProfile(connection, scope.profileId)) {
     return false;
   }
   if (scope.workspaceKey !== undefined && scope.workspaceKey !== workspaceKeyFor(connection)) {
+    return false;
+  }
+  if (scope.connectionId !== undefined && scope.connectionId !== connection.id) {
     return false;
   }
   return true;

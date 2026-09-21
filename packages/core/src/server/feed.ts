@@ -39,6 +39,19 @@ export interface FeedScope {
   readonly profileId?: string;
   /** The workspace pin this event belongs to. Filtered by the connection's own. */
   readonly workspaceKey?: string;
+  /**
+   * The one connection this event is for, by id.
+   *
+   * The narrowest axis, and the only one that is about *identity* rather than
+   * about permission: the other two ask what a connection is allowed to see,
+   * and this one names the connection. It exists for the browser relay, where
+   * a verb is addressed to the client that started the run because that client
+   * is the only one whose browser can perform it — and where an event a second
+   * connection could see would be an event a second connection could answer.
+   *
+   * Set it whenever the *answer* matters, not merely the audience.
+   */
+  readonly connectionId?: string;
 }
 
 /** One retained push: the payload, its channel, and where it stands. */

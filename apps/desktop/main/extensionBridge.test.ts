@@ -51,7 +51,14 @@ beforeEach(async () => {
 afterEach(async () => {
   for (const socket of sockets.splice(0)) socket.close();
   for (const bridge of bridges.splice(0)) await bridge.dispose();
-  await rm(directory, { recursive: true, force: true });
+  /*
+   * The store writes through a temporary file and a rename, fired and not
+   * awaited from the bridge's message handler — so a pairing made in the last
+   * line of a test can still be landing here. A tick plus `maxRetries` is what
+   * keeps that from failing the *next* test's cleanup with ENOTEMPTY.
+   */
+  await new Promise((done) => setTimeout(done, 20));
+  await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 });
 
 /** A bridge on a free port, with its own store, already listening. */

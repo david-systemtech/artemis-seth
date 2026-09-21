@@ -14,3 +14,4 @@
  */
 
 export * from './pageTools.js';
+export * from './servedBrowser.js';

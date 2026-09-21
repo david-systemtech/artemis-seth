@@ -30,8 +30,10 @@
  *    attended work no longer has to.
  */
 
+import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+
 
 import type {
   AgentEvent,
@@ -55,6 +57,7 @@ import {
 import {
   RunError,
   checkAuthStatus,
+  createBrowserRelay,
   createCatalogue,
   createDefaultProviderRegistry,
   createPushFeed,
@@ -70,9 +73,11 @@ import {
   machineBankPrompt,
   managedEnvKeys,
   memoryToolServer,
+  pageToolServer,
   registryPath,
   resolveContentPlugins,
   resolveSkills,
+  servedBrowserServers,
   skillRootsFor,
   MEMORY_TOOL_SERVER,
   DuplicateProfileLabelError,
@@ -90,6 +95,7 @@ import {
   type PushFeed,
   type RemoteAccessEvent,
   type RemoteRunGuard,
+  type BrowserRelay,
   type RunSource,
   type ServerProfileRecord,
   type ServerRoutineStore,
@@ -167,6 +173,13 @@ export interface HeadlessHost {
   readonly skillsAdmin: SkillsAdmin;
   /** Every push the server can stream to a remote client. See `server/feed.ts`. */
   readonly feed: PushFeed;
+  /**
+   * Where a served run's browser verbs go, and where their answers arrive.
+   *
+   * Handed to `createArtemisServer` so the answer route can settle a call. See
+   * `server/browserRelay.ts`.
+   */
+  readonly browserRelay: BrowserRelay;
   /** Interrupt-on-disconnect for bridge-started runs. See `server/guard.ts`. */
   readonly guard: RemoteRunGuard;
   /**
@@ -202,7 +215,7 @@ export function createHeadlessHost(
        * headless deployment has to give. `memoryTools` is declared below and
        * captured, not called, until a run starts.
        */
-      agentToolServers: (_runId, input) => memoryTools(input),
+      agentToolServers: (runId, input) => hostToolServers(runId, input),
       /*
        * The provider started a turn nobody asked for — register it.
        *
@@ -231,7 +244,7 @@ export function createHeadlessHost(
      * `engine.ts`, which says the same thing about the same pair.
      */
     local: {
-      agentToolServers: (_runId, input) => memoryTools(input),
+      agentToolServers: (runId, input) => hostToolServers(runId, input),
     },
   });
   const managed = [...new Set(providers.list().flatMap((adapter) => managedEnvKeys(adapter.credentials)))];
@@ -490,7 +503,31 @@ export function createHeadlessHost(
    * its profile.
    */
   const feed = createPushFeed();
+
+  /**
+   * The browser relay: a served run's verbs, sent to the client that started it.
+   *
+   * On the feed rather than on the run's own event stream, scoped to one
+   * connection by id — see `server/browserRelay.ts` for why a question must
+   * not be replayable and must not be answerable by a second client watching
+   * the same run.
+   *
+   * `runsByConnection` is what a tool factory reads. The factory is called
+   * when a run starts and is given the run id and its input, neither of which
+   * carries a connection — so the route's connection id is recorded against a
+   * run id minted before `runs.start`, and dropped when the run ends.
+   */
+  const relayOwners = new Map<string, string>();
+  const relay = createBrowserRelay({
+    publish: (connectionId, call) => {
+      feed.publish('artemis:push:browser-call', call, { connectionId });
+    },
+  });
+
   runs.subscribe((event) => {
+    // A run that has ended cannot be asked for another page, and the entry
+    // would otherwise outlive the process's interest in it.
+    if (event.type === 'run.end') relayOwners.delete(String(event.runId));
     const profileId = runs.get(event.runId)?.profileId;
     feed.publish(
       'artemis:push:agent-event',
@@ -777,6 +814,40 @@ export function createHeadlessHost(
   };
 
   /**
+   * Every tool server a served run gets, from the one factory both adapters
+   * are handed.
+   *
+   * Two kinds, and they compose rather than compete: the memory tools, which
+   * depend only on the run, and the browser tools, which depend on which
+   * browser this run was given. `servedBrowserServers` is the table for the
+   * second — the same shape as the desktop's `agentBrowserServers` and with
+   * its own rows, because a server has no dock browser and no default browser
+   * worth opening on a machine nobody is looking at.
+   *
+   * `build.extension` is offered only for a run that asked for it *and* whose
+   * connection is known: a run relaying to nobody would hand the agent a tool
+   * set whose every verb refuses, which is right when a client has gone away
+   * and wrong when there was never a client to begin with.
+   */
+  const hostToolServers = (
+    runId: RunId,
+    input: RunInput,
+    // The server-config type is inferred from core rather than imported from
+    // the Agent SDK: `apps/server` does not depend on the SDK directly, and
+    // the one place that shape is needed is here. Same trick `memoryTools`
+    // above uses, for the same reason.
+  ): NonNullable<ReturnType<typeof servedBrowserServers>> | undefined => {
+    const owner = relayOwners.get(String(runId));
+    const browser = servedBrowserServers(
+      input,
+      owner === undefined ? {} : { extension: () => pageToolServer(relay.driverFor(owner, String(runId))) },
+    );
+    const memory = memoryTools(input);
+    if (browser === undefined && memory === undefined) return undefined;
+    return { ...browser, ...memory } as NonNullable<ReturnType<typeof servedBrowserServers>>;
+  };
+
+  /**
    * This machine's memory-bank prompt for one run.
    *
    * Here and not on the client, because the prompt is about the machine the
@@ -908,7 +979,20 @@ export function createHeadlessHost(
       // Pulled in the background and at most every so often: the run starts on
       // the copies already here, and the next one gets whatever this fetched.
       void skillRegistry.sources().then((sources) => skillSources.syncInBackground(sources));
+      /*
+       * The run id is minted here rather than by the registry, and only
+       * because of the browser relay: the tool factory is called *during*
+       * `runs.start` and is given the run id, so the connection this run
+       * belongs to has to be recorded against that id before the call. Every
+       * other path is unaffected — the registry accepts a supplied id exactly
+       * as the desktop's optimistic UI relies on.
+       */
+      const runId = `run-${randomUUID()}` as RunId;
+      if (input.extensionBrowser === true && input.connectionId !== undefined) {
+        relayOwners.set(String(runId), input.connectionId);
+      }
       return runs.start({
+        runId,
         providerId: input.providerId as ProviderId,
         profileId: input.profileId as ProfileId,
         cwd: input.cwd,
@@ -918,6 +1002,7 @@ export function createHeadlessHost(
         ...(input.fastMode === undefined ? {} : { fastMode: input.fastMode }),
         ...(input.ultracode === undefined ? {} : { ultracode: input.ultracode }),
         ...(input.chromeBrowser === true ? { chromeBrowser: true } : {}),
+        ...(input.extensionBrowser === true ? { extensionBrowser: true } : {}),
         ...(input.resumeSessionId === undefined
           ? {}
           : { resumeSessionId: input.resumeSessionId as never }),
@@ -1227,6 +1312,7 @@ export function createHeadlessHost(
         Promise.resolve(banks.setScope(slug, scope)),
     },
     feed,
+    browserRelay: relay,
     guard,
     recordAccess: (event) => accessLog.record(event),
     dispose: async () => {

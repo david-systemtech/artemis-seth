@@ -142,6 +142,24 @@ export interface RunSource {
     readonly ultracode?: boolean;
     /** Only ever `true`, and only once the route has allowed it - see `http.ts`. */
     readonly chromeBrowser?: boolean;
+    /**
+     * Drive the browser paired with the client that started this run. Only
+     * ever `true`, and only once the route has allowed it.
+     *
+     * Meaningless without {@link connectionId}, which names the client the
+     * verbs go to — the route sets both together or neither.
+     */
+    readonly extensionBrowser?: boolean;
+    /**
+     * Which connection asked for this run.
+     *
+     * Carried only for {@link extensionBrowser}: the browser relay publishes
+     * each verb to this connection and refuses an answer from any other, so
+     * the host has to know which one it was. Not a general "who asked" field —
+     * ownership of a completions-started run is `runs.ts`'s business and is
+     * recorded there.
+     */
+    readonly connectionId?: string;
     readonly resumeSessionId?: string;
     /**
      * Branch from `resumeSessionId` into a new session, leaving the original
@@ -275,6 +293,14 @@ export interface TurnRequest {
   readonly cwd: string;
   readonly request: OpenAiChatRequest;
   readonly extensions: ArtemisChatExtensions;
+  /**
+   * Which connection asked for this turn.
+   *
+   * Only read for `artemis.extensionBrowser`, whose verbs travel back down the
+   * connection they came in on — see `browserRelay.ts`. Everything else about
+   * a connection's rights was settled by the route before this was entered.
+   */
+  readonly connectionId?: string;
   /** Parameters accepted but not applied, echoed back so a caller can see them. */
   readonly ignored: readonly string[];
   /**
@@ -1190,6 +1216,12 @@ export async function* runTurn(
           ? {}
           : { ultracode: turn.extensions.ultracode }),
         ...(turn.extensions.chromeBrowser === true ? { chromeBrowser: true } : {}),
+        // Both or neither: the flag says "use the caller's browser" and the id
+        // says which caller, and a host handed one without the other would
+        // have a run asking for a browser nobody can be asked about.
+        ...(turn.extensions.extensionBrowser === true
+          ? { extensionBrowser: true, connectionId: turn.connectionId }
+          : {}),
         ...(turn.extensions.sessionId === undefined
           ? {}
           : { resumeSessionId: turn.extensions.sessionId }),

@@ -145,6 +145,7 @@ import {
 } from './completions.js';
 import { RunError } from '../sessions/errors.js';
 import type { RemoteAccessEvent } from '../sessions/lifecycleLog.js';
+import type { BrowserRelay } from './browserRelay.js';
 import type { PushFeed } from './feed.js';
 import type { RemoteRunGuard } from './guard.js';
 import { workspaceKeyFor, type LedgerScope, type SessionLedger } from './ledger.js';
@@ -312,6 +313,32 @@ export interface ServerContext {
    * `ARTEMIS_ALLOW_CHROME_BROWSER`; a host that never sets this declines.
    */
   readonly allowChromeBrowser?: boolean;
+  /**
+   * Whether a served run may drive the *caller's own* browser, through the
+   * client that sent the request.
+   *
+   * Defaulted **on** by the headless server, which is the opposite of
+   * {@link allowChromeBrowser} and for a reason worth stating: that one
+   * reaches a Chrome signed in as the serving account, on the serving machine,
+   * so allowing it lets a connection act in somebody else's browser. This one
+   * reaches a browser paired with the client that made the request, over the
+   * connection that request arrived on — the caller is asking a run they
+   * started to use a browser only their own client can reach, which is a
+   * smaller thing than the workspace access they already have. The env var is
+   * an off switch (`ARTEMIS_ALLOW_CLIENT_BROWSER=0`) rather than an on switch,
+   * for an operator who wants the server's runs to touch no browser at all.
+   *
+   * `undefined` is *on*, so a host that never sets it — the desktop's own
+   * server — behaves as the headless one does.
+   */
+  readonly allowClientBrowser?: boolean;
+  /**
+   * Where a served run's browser verbs go, and where their answers arrive.
+   *
+   * Absent means this build has no relay, and `artemis.extensionBrowser` is
+   * declined and reported. See `browserRelay.ts`.
+   */
+  readonly browserRelay?: BrowserRelay;
   /**
    * The push feed the event stream serves. Absent means this build has no
    * live feed to offer and `/api/v0/events` answers `501` — a catalogue-only
@@ -1677,6 +1704,10 @@ export interface ArtemisServerOptions {
   readonly allowedHosts?: readonly string[] | 'any';
   /** See {@link ServerContext.allowChromeBrowser}. */
   readonly allowChromeBrowser?: boolean;
+  /** See {@link ServerContext.allowClientBrowser}. */
+  readonly allowClientBrowser?: boolean;
+  /** See {@link ServerContext.browserRelay}. */
+  readonly browserRelay?: BrowserRelay;
   /** See {@link ServerContext.feed}. */
   readonly feed?: PushFeed;
   /** See {@link ServerContext.remoteStream}. */
@@ -1821,6 +1852,11 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
           ...(options.commands === undefined ? {} : { commands: options.commands }),
           ...(options.allowedHosts === undefined ? {} : { allowedHosts: options.allowedHosts }),
           ...(options.allowChromeBrowser === true ? { allowChromeBrowser: true } : {}),
+          // Grouped with Chrome because they are the same kind of thing, and
+          // spelled differently because they default the other way: absent is
+          // *on* here, so only an explicit `false` reaches the context.
+          ...(options.allowClientBrowser === false ? { allowClientBrowser: false } : {}),
+          ...(options.browserRelay === undefined ? {} : { browserRelay: options.browserRelay }),
           ...(options.feed === undefined ? {} : { feed: options.feed }),
           ...(options.remoteStream === undefined ? {} : { remoteStream: options.remoteStream }),
           ...(options.guard === undefined ? {} : { guard: options.guard }),
@@ -3887,18 +3923,34 @@ async function handleChatCompletions(
    */
   const mayBrowse =
     account?.capabilities.chromeBridge === true && context.allowChromeBrowser === true;
-  const { chromeBrowser: _declined, ...withoutChrome } = canAppend ? extensions : withoutAppends;
-  const applied: ArtemisChatExtensions =
-    extensions.chromeBrowser === true && !mayBrowse
-      ? withoutChrome
-      : canAppend
-        ? extensions
-        : withoutAppends;
+  /*
+   * The caller's own browser, dropped and reported on the same reasoning and
+   * with a different shape of no. There is no capability to check — the point
+   * of `artemis.extensionBrowser` is that it works for every provider — so the
+   * two noes are: this build has no relay to publish verbs on, and the
+   * operator turned it off. Absent is *on* here, unlike Chrome above; see
+   * `ServerContext.allowClientBrowser`.
+   */
+  const mayRelay = context.browserRelay !== undefined && context.allowClientBrowser !== false;
+  const kept = canAppend ? extensions : withoutAppends;
+  const { chromeBrowser: _noChrome, ...withoutChrome } = kept;
+  const { extensionBrowser: _noRelay, ...withoutRelay } = kept;
+  const { chromeBrowser: _alsoNoChrome, extensionBrowser: _alsoNoRelay, ...withoutEither } = kept;
+  const droppedChrome = extensions.chromeBrowser === true && !mayBrowse;
+  const droppedRelay = extensions.extensionBrowser === true && !mayRelay;
+  const applied: ArtemisChatExtensions = droppedChrome
+    ? droppedRelay
+      ? withoutEither
+      : withoutChrome
+    : droppedRelay
+      ? withoutRelay
+      : kept;
   const ignored: readonly string[] = [
     ...review.ignored,
     ...(canAppend || systemPrompt === undefined ? [] : ['artemis.systemPrompt']),
     ...(canAppend || alwaysOnSkills === undefined ? [] : ['artemis.alwaysOnSkills']),
-    ...(extensions.chromeBrowser === true && !mayBrowse ? ['artemis.chromeBrowser'] : []),
+    ...(droppedChrome ? ['artemis.chromeBrowser'] : []),
+    ...(droppedRelay ? ['artemis.extensionBrowser'] : []),
   ];
 
   let workspace;
@@ -3954,6 +4006,9 @@ async function handleChatCompletions(
     cwd: workspace.path,
     request: chat,
     extensions: applied,
+    // Read only by `artemis.extensionBrowser`, whose verbs go back down this
+    // connection and are answered by nothing else. See `browserRelay.ts`.
+    connectionId: connection.id,
     ignored,
     ...(slashCommands === undefined ? {} : { slashCommands }),
     ...(redirected === undefined ? {} : { redirected }),
@@ -4401,6 +4456,10 @@ const STEER_IGNORED: readonly (readonly [keyof ArtemisChatExtensions, string])[]
   ['fastMode', 'artemis.fastMode'],
   ['ultracode', 'artemis.ultracode'],
   ['chromeBrowser', 'artemis.chromeBrowser'],
+  // A live run's browser tool set is fixed when it starts, exactly as its
+  // Chrome is: the servers were built and handed to the provider, and a steer
+  // arrives after that.
+  ['extensionBrowser', 'artemis.extensionBrowser'],
 ];
 
 /**
