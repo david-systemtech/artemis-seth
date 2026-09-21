@@ -255,10 +255,16 @@ describe('a message to a conversation the server is still working on', () => {
         model: 'work-max/opus',
         messages: [{ role: 'user', content: 'keep going' }],
         stream: true,
-        artemis: { sessionId: 'sess-9', systemPrompt: 'be brief', thinking: 'high' },
+        artemis: { sessionId: 'sess-9', systemPrompt: 'be brief', thinking: 'high', chromeBrowser: true },
       });
       const chunks = await parseStream(response);
-      expect(chunks[0]?.artemis?.ignored).toEqual(['artemis.systemPrompt', 'artemis.thinking']);
+      // Chrome among them: a turn already running was started with its tools,
+      // and a browser cannot be handed to it part-way.
+      expect(chunks[0]?.artemis?.ignored).toEqual([
+        'artemis.systemPrompt',
+        'artemis.thinking',
+        'artemis.chromeBrowser',
+      ]);
     } finally {
       await close();
     }

@@ -1857,6 +1857,55 @@ export function questionLeansOnUnsaidProse(prompt: QuestionPrompt): boolean {
   );
 }
 
+/* ------------------------------ Chrome bridge ----------------------------- */
+
+/** Every tool of the CLI's Claude-in-Chrome server is named under this. */
+export const CHROME_TOOL_PREFIX = 'mcp__claude-in-chrome__';
+
+/**
+ * Whether a tool result is the Chrome bridge saying nobody is on the other end.
+ * ============================================================================
+ *
+ * The CLI reaches the extension through Anthropic's relay, which lists the
+ * extensions signed in to claude.ai **as the same account as the run** - and
+ * only those. So a Chrome signed in to a different account is, to the relay,
+ * no Chrome at all, and the CLI says the one thing it knows: "Browser extension
+ * is not connected". Measured 2026-09-21: three accounts on one server, one
+ * browser; two got this message and the third got the browser.
+ *
+ * Someone who keeps a personal and a work account - in different browsers, as
+ * people do - therefore meets a switch that does nothing and an agent that
+ * says the extension is missing while they are looking at it. The CLI's text
+ * does mention the account, in the middle of a paragraph about restarting
+ * Chrome, and what reaches the user is the model's paraphrase of it. So the
+ * adapter says it itself, naming the account: see `chromeUnreachableNotice`.
+ *
+ * Matched on the CLI's own two phrasings rather than on `status`, because the
+ * bridge reports this as an ordinary result, not as a failed call.
+ */
+export function chromeExtensionUnreachable(event: AgentEvent): boolean {
+  if (event.type !== 'tool.end' || event.name?.startsWith(CHROME_TOOL_PREFIX) !== true) return false;
+  const said = event.resultText ?? '';
+  return said.includes('Browser extension is not connected') || said.includes('No Chrome extension connected');
+}
+
+/**
+ * What the user is told when the bridge found no browser.
+ *
+ * With the account when it is known, because that is the whole of the fix: the
+ * extension and the conversation have to be the same claude.ai account, and
+ * the person reading this can see which one their Chrome is signed in to.
+ */
+export function chromeUnreachableNotice(email: string | undefined): string {
+  const who = email === undefined ? 'the same claude.ai account as this conversation' : `claude.ai as ${email}`;
+  const running = email === undefined ? '' : ` This conversation is running as ${email}.`;
+  return (
+    `Chrome could not be reached: no Chrome with the Claude extension is signed in to ${who}.${running} ` +
+    'Sign the extension in to that account, or run this conversation on the account your Chrome uses. ' +
+    'A Chrome signed in to a different account looks exactly like no Chrome at all.'
+  );
+}
+
 /**
  * Write the user's answers back into the tool's own arguments.
  *

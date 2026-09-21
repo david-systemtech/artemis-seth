@@ -302,6 +302,17 @@ export interface ServerContext {
    */
   readonly allowedHosts?: readonly string[] | 'any';
   /**
+   * Whether a served run may be connected to a Chrome.
+   *
+   * The operator's say, and `undefined` is no. `artemis.chromeBrowser` pairs a
+   * run with the Chrome signed in as the *serving account*, so allowing it lets
+   * every connection that may use an account act in that account owner's
+   * browser - their logged-in sessions, not the host's workspace. That is the
+   * operator's to decide and nobody else's: the headless server reads
+   * `ARTEMIS_ALLOW_CHROME_BROWSER`; a host that never sets this declines.
+   */
+  readonly allowChromeBrowser?: boolean;
+  /**
    * The push feed the event stream serves. Absent means this build has no
    * live feed to offer and `/api/v0/events` answers `501` — a catalogue-only
    * deployment, and every test that is not about the stream.
@@ -1664,6 +1675,8 @@ export interface ArtemisServerOptions {
   readonly commands?: CommandSource;
   /** See {@link ServerContext.allowedHosts}. */
   readonly allowedHosts?: readonly string[] | 'any';
+  /** See {@link ServerContext.allowChromeBrowser}. */
+  readonly allowChromeBrowser?: boolean;
   /** See {@link ServerContext.feed}. */
   readonly feed?: PushFeed;
   /** See {@link ServerContext.remoteStream}. */
@@ -1807,6 +1820,7 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
           ...(options.usage === undefined ? {} : { usage: options.usage }),
           ...(options.commands === undefined ? {} : { commands: options.commands }),
           ...(options.allowedHosts === undefined ? {} : { allowedHosts: options.allowedHosts }),
+          ...(options.allowChromeBrowser === true ? { allowChromeBrowser: true } : {}),
           ...(options.feed === undefined ? {} : { feed: options.feed }),
           ...(options.remoteStream === undefined ? {} : { remoteStream: options.remoteStream }),
           ...(options.guard === undefined ? {} : { guard: options.guard }),
@@ -3862,14 +3876,30 @@ async function handleChatCompletions(
   // instructions were dropped would still believe its skills were read.
   const { systemPrompt, alwaysOnSkills, ...withoutAppends } = extensions;
   const canAppend = account?.capabilities.systemPromptAppend === true;
-  const applied: ArtemisChatExtensions = canAppend ? extensions : withoutAppends;
-  const ignored: readonly string[] = canAppend
-    ? review.ignored
-    : [
-        ...review.ignored,
-        ...(systemPrompt === undefined ? [] : ['artemis.systemPrompt']),
-        ...(alwaysOnSkills === undefined ? [] : ['artemis.alwaysOnSkills']),
-      ];
+
+  /*
+   * Chrome, dropped *and reported* on the same reasoning as the appends: a
+   * client whose request for a browser was quietly set aside shows its user a
+   * switch that is on and an agent that cannot browse. Two separate noes - the
+   * provider has no bridge, or this host's operator has not allowed one - and
+   * either is enough. See `ArtemisChatExtensions.chromeBrowser` for why the
+   * second exists.
+   */
+  const mayBrowse =
+    account?.capabilities.chromeBridge === true && context.allowChromeBrowser === true;
+  const { chromeBrowser: _declined, ...withoutChrome } = canAppend ? extensions : withoutAppends;
+  const applied: ArtemisChatExtensions =
+    extensions.chromeBrowser === true && !mayBrowse
+      ? withoutChrome
+      : canAppend
+        ? extensions
+        : withoutAppends;
+  const ignored: readonly string[] = [
+    ...review.ignored,
+    ...(canAppend || systemPrompt === undefined ? [] : ['artemis.systemPrompt']),
+    ...(canAppend || alwaysOnSkills === undefined ? [] : ['artemis.alwaysOnSkills']),
+    ...(extensions.chromeBrowser === true && !mayBrowse ? ['artemis.chromeBrowser'] : []),
+  ];
 
   let workspace;
   try {
@@ -4370,6 +4400,7 @@ const STEER_IGNORED: readonly (readonly [keyof ArtemisChatExtensions, string])[]
   ['thinking', 'artemis.thinking'],
   ['fastMode', 'artemis.fastMode'],
   ['ultracode', 'artemis.ultracode'],
+  ['chromeBrowser', 'artemis.chromeBrowser'],
 ];
 
 /**

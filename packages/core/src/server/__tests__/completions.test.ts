@@ -2072,6 +2072,75 @@ describe('POST /v1/chat/completions', () => {
   });
 
   /*
+   * A served run connected to a Chrome drives the browser signed in as the
+   * *serving account* - its owner's logins, on a request from whoever holds a
+   * connection that may use the account. So it takes two yeses, the provider's
+   * and the operator's, and a no is said rather than swallowed: a client whose
+   * request was quietly set aside shows a switch that is on and an agent that
+   * cannot browse.
+   */
+  async function serveChrome(options: { bridge: boolean; allowed: boolean }, source: RunSource) {
+    const { createArtemisServer } = await import('../http.js');
+    const { createWorkspaceResolver } = await import('../workspaces.js');
+    const profiles = await CATALOGUE.read();
+    const server = createArtemisServer({
+      port: 0,
+      connections: () => [CONNECTION],
+      version: '1.1.1',
+      catalogue: {
+        read: async () =>
+          profiles.map((profile) => ({
+            ...profile,
+            capabilities: { ...NO_CAPABILITIES, chromeBridge: options.bridge },
+          })),
+        invalidate: () => undefined,
+      },
+      runs: source,
+      workspaces: createWorkspaceResolver(),
+      ...(options.allowed ? { allowChromeBrowser: true } : {}),
+    });
+    const port = await server.listen();
+    return { server, url: `http://127.0.0.1:${port}/v1/chat/completions` };
+  }
+
+  async function askForChrome(options: { bridge: boolean; allowed: boolean }) {
+    const source = fakeRuns([{ type: 'run.end', reason: 'completed', result: 'ok' }]);
+    const { server, url } = await serveChrome(options, source);
+    try {
+      const response = await post(url, {
+        model: 'work-max/opus',
+        messages: [{ role: 'user', content: 'hi' }],
+        artemis: { chromeBrowser: true },
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { artemis: { ignored?: readonly string[] } };
+      return { ignored: body.artemis.ignored, input: source.started[0]?.input };
+    } finally {
+      await server.close();
+    }
+  }
+
+  it('connects a run to Chrome when the provider has a bridge and the operator allowed it', async () => {
+    const { ignored, input } = await askForChrome({ bridge: true, allowed: true });
+    expect(ignored ?? []).toEqual([]);
+    expect(input).toMatchObject({ chromeBrowser: true });
+  });
+
+  it('declines Chrome, and says so, on a host whose operator has not allowed it', async () => {
+    // The default. A connection is for running code in the host's workspace;
+    // acting in the account owner's browser is more than that.
+    const { ignored, input } = await askForChrome({ bridge: true, allowed: false });
+    expect(ignored).toEqual(['artemis.chromeBrowser']);
+    expect(input).not.toHaveProperty('chromeBrowser');
+  });
+
+  it('declines Chrome, and says so, for an account whose provider has no bridge', async () => {
+    const { ignored, input } = await askForChrome({ bridge: false, allowed: true });
+    expect(ignored).toEqual(['artemis.chromeBrowser']);
+    expect(input).not.toHaveProperty('chromeBrowser');
+  });
+
+  /*
    * The catalogue says whether an account's provider can append standing
    * instructions; Codex and OpenCode cannot, and their adapters never read the
    * field. Sending it anyway would be accepted and unread — the one failure

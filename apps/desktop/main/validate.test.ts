@@ -98,6 +98,36 @@ describe('validateRunsStart', () => {
     expect(result.input.rewindToMessageId).toBe('a4f0c2d1-9b8e-4c1d-9f00-1234567890ab');
   });
 
+  it('carries the four switches through, because a switch that dies here is drawn and does nothing', () => {
+    // The Chrome, external-browser, fast and ultracode switches were set by
+    // the window and read past this boundary - by the adapter, and by the
+    // host's browser-tool factory - and none of them was in this
+    // whitelist - so for a month each was a control that changed nothing, and
+    // an agent asked to use Chrome had never been told it could. The type
+    // guard on the validator now refuses a field it has not been given; this
+    // pins the values.
+    const result = validateRunsStart({
+      input: { ...VALID_RUN, fastMode: true, ultracode: true, chromeBrowser: true, externalBrowser: false },
+    });
+    expect(result.input).toMatchObject({
+      fastMode: true,
+      ultracode: true,
+      chromeBrowser: true,
+      externalBrowser: false,
+    });
+  });
+
+  it('refuses a switch that is not a boolean, rather than reading it as on', () => {
+    expect(() => validateRunsStart({ input: { ...VALID_RUN, chromeBrowser: 'yes' } })).toThrow(ValidationError);
+  });
+
+  it('leaves always-on skills to the main process, whatever the window asks for', () => {
+    // `engine.ts` decides them from the user's settings. Read here, the field
+    // would be a way for a renderer to ask for a skill by name.
+    const result = validateRunsStart({ input: { ...VALID_RUN, alwaysOnSkills: ['anything'] } });
+    expect(result.input).not.toHaveProperty('alwaysOnSkills');
+  });
+
   it('drops fields the contract does not define', () => {
     // The interesting case: a renderer trying to reach past the contract into
     // the Claude Agent SDK's own `Options`.
