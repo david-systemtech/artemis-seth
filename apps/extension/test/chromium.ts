@@ -179,6 +179,15 @@ export async function launchBrowser(options: { readonly binary: string; readonly
     // that has nothing to do with this suite.
     { stdio: ['ignore', 'ignore', 'ignore'] },
   );
+  /*
+   * A runner that dies before `close` - a timeout, an interrupted suite - would
+   * leave this browser running with no parent. One was found that way, 19
+   * minutes old. An `exit` handler has to be synchronous, which a signal is.
+   */
+  const killOnExit = (): void => {
+    child.kill('SIGTERM');
+  };
+  process.once('exit', killOnExit);
 
   const devtoolsPort = await readDevToolsPort(join(profile, 'DevToolsActivePort'), child);
 
@@ -223,11 +232,22 @@ export async function launchBrowser(options: { readonly binary: string; readonly
     },
     close: async (): Promise<void> => {
       browserCdp.close();
-      child.kill('SIGKILL');
-      await new Promise<void>((resolve) => {
+      process.off('exit', killOnExit);
+      /*
+       * Asked first, then made to. SIGKILL alone reaps the browser process and
+       * orphans its zygote and renderers, which were measured here going on
+       * holding several hundred megabytes with nobody left to stop them. A
+       * Chrome given SIGTERM takes its children down with it; the kill is for
+       * the one that does not answer.
+       */
+      child.kill('SIGTERM');
+      const exited = new Promise<void>((resolve) => {
         if (child.exitCode !== null || child.signalCode !== null) resolve();
         else child.once('exit', () => resolve());
       });
+      const gaveUp = setTimeout(() => child.kill('SIGKILL'), 3_000);
+      await exited;
+      clearTimeout(gaveUp);
       // A killed Chrome's child processes go on writing to the profile for a
       // moment after the parent is reaped, so a plain recursive remove
       // intermittently fails with ENOTEMPTY — and a test suite that is green
