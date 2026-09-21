@@ -32,10 +32,35 @@
  *    behind it is the *host's* credentials rather than anything the agent is
  *    testing. This is the one rule with no switch.
  *
- * ## What this cannot do
+ * ## A name is not an address, and the first version of this forgot it
  *
- * It gates **navigation**, which is the address an agent names and the address
- * the page ends up at after redirects. It does **not** gate the requests a page
+ * Every rule above was applied to the *name* in the URL and to nothing else,
+ * which made the whole policy a spelling check. `http://169.254.169.254.nip.io/`
+ * is a public name that resolves to the metadata service; so is any A record an
+ * attacker controls. The claim that metadata "can never be reached" was false.
+ *
+ * So the rule is applied three times, to two different things:
+ *
+ *  1. {@link navigationStanding} — the **name**, before anything else. Cheap,
+ *     and it catches the obvious cases without a resolver.
+ *  2. {@link addressStanding}, over the addresses the name **resolves to**,
+ *     before navigating. A metadata address is refused whatever the name is and
+ *     whatever the allow-list says. A private address is refused unless the
+ *     *name* is allow-listed — `artemis-server` and `localhost` legitimately
+ *     resolve into private space, and refusing them would refuse the dev
+ *     servers this browser exists for.
+ *  3. {@link addressStanding} again, over `remoteIPAddress` — the address the
+ *     browser **actually connected to** for the main document, reported by
+ *     `Network.responseReceived`. This is the only one that defeats DNS
+ *     rebinding: a name that resolved publicly a moment ago can resolve into
+ *     private space by the time Chromium fetches it, and the lookup in step 2
+ *     cannot see that.
+ *
+ * ## What this still cannot do
+ *
+ * It gates **navigation**: the address an agent names, the address the page
+ * ends up at after redirects or its own scripting, and the address the main
+ * document was actually served from. It does **not** gate the requests a page
  * makes once it is loaded: an `<img src>` or a `fetch()` to a private address
  * happens inside Chromium's own network stack, below anything the DevTools
  * protocol lets a client veto without `Fetch.enable` on every request — which
@@ -43,7 +68,16 @@
  * The fence for that is the container's network, and it is the reason the
  * compose service in `docker/docker-compose.yml` puts the browser on its own
  * network with only the server reachable from it. See `docs/SERVER-BROWSER.md`.
+ *
+ * And a document with **no** remote address — one served from the cache, or a
+ * `data:`/`about:` page — leaves step 3 with nothing to check, so those pages
+ * are held by steps 1 and 2 alone. That is a narrow gap here rather than a
+ * silent one: `Network.enable` is on for every tab this driver opens, which
+ * disables that tab's disk cache, so a document being served from cache is a
+ * case this browser does not have.
  */
+
+import { lookup } from 'node:dns/promises';
 
 import { hostMatches, hostOf, isLocalHost } from '@rx-artemis/protocol';
 
@@ -98,13 +132,19 @@ export type NavigationStanding =
   | { readonly allowed: false; readonly reason: string };
 
 /**
- * Apply the rule above to one address.
+ * Apply the rule to the **name** in an address. The first of three gates.
  *
- * Used before navigating **and** on the address the page actually has once it
- * has loaded. The second call is not belt-and-braces: a public address that
- * redirects to `http://169.254.169.254/` is the attack this exists for, and the
- * first call cannot see it. `hostOf` is the contract's parser — see its comment
- * on why it refuses rather than guesses, which is the property a gate needs.
+ * Used before navigating and on the address the page has after every load,
+ * including one it reached by its own scripting. The later calls are not
+ * belt-and-braces: a public address that redirects to `http://10.0.0.5/` is the
+ * attack this exists for, and the first call cannot see it.
+ *
+ * On its own this is a spelling check, and it is named one here so that nobody
+ * reads it as the whole policy: a name is not an address, and
+ * `169.254.169.254.nip.io` passes every test in this function.
+ * {@link addressStanding} is the gate that means something. `hostOf` is the
+ * contract's parser — see its comment on why it refuses rather than guesses,
+ * which is the property a gate needs.
  */
 export function navigationStanding(url: string, policy: ServerBrowserAllowList): NavigationStanding {
   const parsed = hostOf(url);
@@ -147,6 +187,123 @@ export function navigationStanding(url: string, policy: ServerBrowserAllowList):
   return { allowed: true, host };
 }
 
+/* -------------------------------------------------------------------------- */
+/* The gate that means something                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Hostname → the addresses it resolves to. Injected, so a test never asks DNS.
+ *
+ * Rejecting is an answer: a name that cannot be resolved is a name this browser
+ * refuses to open, and the resolver's own words say why better than anything
+ * written here.
+ */
+export type HostResolver = (host: string) => Promise<readonly string[]>;
+
+/** Does this look like an address already, so no resolver is involved? */
+export function isAddressLiteral(host: string): boolean {
+  const bare = host.replace(/^\[|\]$/gu, '');
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/u.test(bare) || bare.includes(':');
+}
+
+/** One of the cloud instance-credential endpoints, by address. */
+function isMetadataAddress(address: string): boolean {
+  const bare = address.toLowerCase().replace(/^\[|\]$/gu, '');
+  return METADATA_HOSTS.includes(bare);
+}
+
+/**
+ * Apply the rule to the addresses behind a name.
+ *
+ * Called twice per navigation and once per verb, over two different sources:
+ * the addresses `HostResolver` gave before the fetch, and the single
+ * `remoteIPAddress` Chromium reports for the main document after it. The same
+ * function for both, because "may this browser talk to this address" has one
+ * answer and two places that need it.
+ *
+ * **Any** address decides it, not all of them: a name with one public A record
+ * and one pointing at `169.254.169.254` is a name this browser does not open,
+ * because which one Chromium picks is not ours to choose.
+ *
+ * The allow-list is consulted by **name**, and that is the load-bearing part.
+ * `artemis-server` resolves to a private address by design — it is the dev
+ * server this browser exists to test — so a rule that refused every private
+ * address would refuse the whole feature. What the allow-list cannot buy is a
+ * metadata address: an operator who lists a name that resolves to one has made
+ * a mistake, and what is behind it is the host machine's own credentials.
+ */
+export function addressStanding(
+  host: string,
+  addresses: readonly string[],
+  policy: ServerBrowserAllowList,
+): NavigationStanding {
+  const metadata = addresses.find((address) => isMetadataAddress(address));
+  if (metadata !== undefined) {
+    return {
+      allowed: false,
+      reason:
+        `${host} resolves to ${metadata}, a cloud metadata address, and is never ` +
+        'opened — whatever ARTEMIS_BROWSER_ALLOW_HOSTS says, and whatever the ' +
+        'name looks like. What is behind it is the host machine’s own ' +
+        'credentials, not anything this browser is here to test.',
+    };
+  }
+
+  // Named by the operator: a private address behind it is the point of naming
+  // it. Checked after the metadata rule, which has no such escape.
+  if (policy.allowHosts.some((pattern) => hostMatches(host, pattern))) {
+    return { allowed: true, host };
+  }
+
+  const internal = addresses.find((address) => isLocalHost(address));
+  if (internal !== undefined) {
+    return {
+      allowed: false,
+      reason:
+        `${host} resolves to ${internal}, which is inside the operator’s own ` +
+        'network. A public name that points at a private address is refused ' +
+        'exactly as the address would be. This browser opens public addresses ' +
+        'and the internal hosts named in ARTEMIS_BROWSER_ALLOW_HOSTS; do not ' +
+        'look for another route to it.',
+    };
+  }
+
+  return { allowed: true, host };
+}
+
+/**
+ * The whole of the pre-navigation gate: the name, then what it resolves to.
+ *
+ * An address literal is not resolved — {@link navigationStanding} has already
+ * judged it as the address it is, and asking a resolver about `10.0.0.5` would
+ * be asking it to agree with itself.
+ */
+export async function navigationStandingFor(
+  url: string,
+  policy: ServerBrowserAllowList,
+  resolve: HostResolver,
+): Promise<NavigationStanding> {
+  const named = navigationStanding(url, policy);
+  if (!named.allowed) return named;
+  if (isAddressLiteral(named.host)) return named;
+
+  let addresses: readonly string[];
+  try {
+    addresses = await resolve(named.host);
+  } catch (error) {
+    return {
+      allowed: false,
+      reason:
+        `${named.host} could not be resolved: ${error instanceof Error ? error.message : String(error)}. ` +
+        'This browser does not open a name it cannot look up.',
+    };
+  }
+  if (addresses.length === 0) {
+    return { allowed: false, reason: `${named.host} resolves to no address at all.` };
+  }
+  return addressStanding(named.host, addresses, policy);
+}
+
 /**
  * Read the allow-list an operator wrote as one comma-separated line.
  *
@@ -162,4 +319,15 @@ export function allowListFrom(declared: string | undefined): ServerBrowserAllowL
     .map((name) => name.trim().toLowerCase())
     .filter((name) => name.length > 0);
   return { allowHosts: [...new Set([...DEFAULT_ALLOW_HOSTS, ...extra])] };
+}
+
+/**
+ * The resolver this uses when nobody injected one.
+ *
+ * `all: true`, because a name with several A records must be judged on every
+ * one of them: Chromium picks whichever it likes, and a rule that read only the
+ * first would be a rule an attacker chooses the order of.
+ */
+export function systemHostResolver(): HostResolver {
+  return async (host: string) => (await lookup(host, { all: true })).map((one) => one.address);
 }
