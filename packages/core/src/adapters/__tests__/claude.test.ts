@@ -84,6 +84,14 @@ class FakeQuery {
     this.flags.push(settings);
   }
 
+  /** Who the process is signed in as. Counted, so a test can tell it was not asked. */
+  accountInfoCalls = 0;
+  accountInfoImpl: () => Promise<{ email?: string }> = () => Promise.resolve({ email: 'someone@example.com' });
+  accountInfo(): Promise<{ email?: string }> {
+    this.accountInfoCalls += 1;
+    return this.accountInfoImpl();
+  }
+
   close(): void {
     this.closed = true;
     this.messages.close();
@@ -3863,5 +3871,109 @@ describe('a question that leans on prose the user never saw', () => {
     const event = (await until(iterator, 'permission.request')) as PermissionRequestEvent;
     expect(event.request.question).toBeUndefined();
     await run.dispose();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Chrome that cannot be reached                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A Chrome signed in to another account looks exactly like no Chrome at all.
+ *
+ * The CLI reaches the extension through a relay that lists only extensions
+ * signed in to claude.ai as the run's own account, so a person with a personal
+ * and a work account meets a switch that does nothing. The adapter says which
+ * account the conversation is running as, because that is the whole fix.
+ */
+describe('a Chrome tool that finds no browser', () => {
+  const NOT_CONNECTED =
+    'Browser extension is not connected. Please ensure the Claude browser extension is installed and running ' +
+    '(https://claude.ai/chrome), and that you are logged into claude.ai with the same account as Claude Code.';
+
+  /** One Chrome tool call and its result, as the CLI writes them. */
+  function chromeCall(id: string, result: string): SDKMessage[] {
+    return [
+      {
+        type: 'assistant',
+        uuid: `uuid-call-${id}`,
+        session_id: 'sess-abc',
+        parent_tool_use_id: null,
+        message: {
+          id: `msg_${id}`,
+          role: 'assistant',
+          type: 'message',
+          model: 'claude-opus-4',
+          stop_reason: 'tool_use',
+          content: [{ type: 'tool_use', id: `toolu_${id}`, name: 'mcp__claude-in-chrome__tabs_context_mcp', input: {} }],
+        },
+      },
+      {
+        type: 'user',
+        uuid: `uuid-result-${id}`,
+        session_id: 'sess-abc',
+        parent_tool_use_id: null,
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `toolu_${id}`, content: result }] },
+      },
+    ] as unknown as SDKMessage[];
+  }
+
+  async function notices(input: ResolvedRunInput, results: readonly string[]): Promise<string[]> {
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(input);
+    harness().fake.messages.push(INIT_MESSAGE);
+    // Let the account answer land, as it has long since by the time a real
+    // tool call can have failed.
+    await Promise.resolve();
+    // One at a time: the queue's `push` takes a single message.
+    results.forEach((result, i) => chromeCall(String(i), result).forEach((m) => harness().fake.messages.push(m)));
+    harness().fake.messages.push(RESULT_MESSAGE);
+    const events = await drain(run.events);
+    return events
+      .filter((e) => e.type === 'text.complete' && e.synthetic === true)
+      .map((e) => (e as { text: string }).text);
+  }
+
+  it('says so itself, naming the account the conversation is running as', async () => {
+    const said = await notices({ ...BASE_INPUT, chromeBrowser: true }, [NOT_CONNECTED]);
+    expect(said).toHaveLength(1);
+    expect(said[0]).toContain('someone@example.com');
+    expect(said[0]).toContain('different account');
+  });
+
+  it('says it once, however many Chrome tools the agent tries', async () => {
+    const said = await notices({ ...BASE_INPUT, chromeBrowser: true }, [NOT_CONNECTED, NOT_CONNECTED, NOT_CONNECTED]);
+    expect(said).toHaveLength(1);
+  });
+
+  it('says nothing about a Chrome tool that worked', async () => {
+    expect(await notices({ ...BASE_INPUT, chromeBrowser: true }, ['Tab context: 2 tabs'])).toEqual([]);
+  });
+
+  it('asks who the account is only for a run that wants Chrome', async () => {
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(BASE_INPUT);
+    harness().fake.messages.push(INIT_MESSAGE);
+    expect(harness().fake.accountInfoCalls).toBe(0);
+    await run.dispose();
+  });
+
+  it('still says it, without the address, when the account cannot be read', async () => {
+    const { harness } = installQuery();
+    // Installed before the run starts, since the account is asked for as the
+    // query opens.
+    const original = sdkMock.onQuery;
+    sdkMock.onQuery = (params) => {
+      const fake = original?.(params) as FakeQuery;
+      fake.accountInfoImpl = () => Promise.reject(new Error('control channel closed'));
+      return fake;
+    };
+    const run = await createClaudeAdapter().createRun({ ...BASE_INPUT, chromeBrowser: true });
+    [INIT_MESSAGE, ...chromeCall('0', NOT_CONNECTED), RESULT_MESSAGE].forEach((m) => harness().fake.messages.push(m));
+    const events = await drain(run.events);
+    const said = events.filter((e) => e.type === 'text.complete' && e.synthetic === true);
+    expect(said).toHaveLength(1);
+    expect((said[0] as { text: string }).text).toContain('the same claude.ai account as this conversation');
+    expect((said[0] as { text: string }).text).not.toContain('@');
   });
 });

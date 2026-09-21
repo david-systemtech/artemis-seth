@@ -193,6 +193,16 @@ export interface Capabilities {
   readonly attachLive?: boolean;
 
   /**
+   * `RunInput.chromeBrowser` is honoured: the provider can connect a run to
+   * the user's own Chrome through a bridge of its own. Absent means no. Claude
+   * is the only one today - its CLI pairs with the Claude-in-Chrome extension
+   * through Anthropic's relay, by account, which is also why this works from a
+   * machine with no display: the browser does not have to be on the machine
+   * the run is on, only signed in to the same account.
+   */
+  readonly chromeBridge?: boolean;
+
+  /**
    * The provider reports token usage, so `usage` events carry meaningful
    * numbers and the UI can show a usage readout.
    */

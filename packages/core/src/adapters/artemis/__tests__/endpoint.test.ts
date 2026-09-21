@@ -382,6 +382,21 @@ describe('a resumed turn', () => {
       remote: { detach: true, permissions: true },
     });
   });
+
+  it('asks the server for Chrome when the run wants it, and says nothing when it does not', async () => {
+    // Set in the window and dropped on the way out, the switch was on and the
+    // served agent had never been told it could browse. `true` or absent, so
+    // there is one spelling of the request on the wire.
+    const { origin, seen } = await serve((_request, response) => happyStream(response));
+
+    await drive(origin, { chromeBrowser: true });
+    await drive(origin, { chromeBrowser: false });
+
+    const asked = seen[0]?.body as { artemis?: Record<string, unknown> };
+    const silent = seen[1]?.body as { artemis?: Record<string, unknown> };
+    expect(asked.artemis?.['chromeBrowser']).toBe(true);
+    expect(silent.artemis).not.toHaveProperty('chromeBrowser');
+  });
 });
 
 describe('refusals and losses', () => {

@@ -142,6 +142,8 @@ import {
   UNSAID_PROSE_DENY_MESSAGE,
   WITHDRAWN_DENY_MESSAGE,
   buildPermissionRequest,
+  chromeExtensionUnreachable,
+  chromeUnreachableNotice,
   createClaudeMapperState,
   finalizeRun,
   mapAggregatedSessionInfo,
@@ -239,6 +241,7 @@ export const CLAUDE_CAPABILITIES: Capabilities = {
   imageInput: true, // base64 `image` blocks in the user message's content
   fileInput: true, // staged to a granted temp directory and named in the prompt
   taskSuggestions: true, // `Options.mcpServers`, through `agentToolServers`
+  chromeBridge: true, // the CLI's `--chrome`, paired with the extension by account
 };
 
 /** Env var selecting an isolated Claude config — and therefore session — directory. */
@@ -2925,6 +2928,14 @@ class ClaudeProcess {
   #handedBackSinceFloor = false;
 
   /**
+   * The account this process is signed in as, asked for when a run wants
+   * Chrome, and whether the user has been told Chrome could not be reached
+   * since they last had the floor. See `chromeExtensionUnreachable`.
+   */
+  #accountEmail: string | undefined;
+  #chromeNoticeSaid = false;
+
+  /**
    * Messages pushed at the CLI that it has not been seen to read yet.
    *
    * In send order, which is delivery order — the CLI's queue is FIFO — and keyed
@@ -3950,6 +3961,20 @@ class ClaudeProcess {
 
     this.#query = sdkQuery;
     this.#pumpDone = this.#pump(sdkQuery);
+    /*
+     * Which account this is, for the one sentence that needs it - and only when
+     * the run asked for Chrome, since nothing else reads it. Asked now so the
+     * answer is in hand by the time a Chrome tool can have failed; a run whose
+     * answer never comes says the same thing without the address.
+     */
+    if (this.#input.chromeBrowser === true) {
+      void sdkQuery
+        .accountInfo()
+        .then((account) => {
+          this.#accountEmail = account.email;
+        })
+        .catch(() => undefined);
+    }
   }
 
   /**
@@ -4752,6 +4777,23 @@ class ClaudeProcess {
       // assistant message's content blocks.
       if (event.type === 'tool.start') this.#observeToolCall(event.name);
       this.#emit(event);
+      /*
+       * The bridge found no browser, which to the person watching is a switch
+       * that did nothing. Said once per floor, straight after the result it
+       * explains and ahead of the model's own account of it, as the adapter's
+       * text and not the model's - see `chromeExtensionUnreachable`.
+       */
+      if (!this.#chromeNoticeSaid && chromeExtensionUnreachable(event)) {
+        this.#chromeNoticeSaid = true;
+        this.#emit({
+          type: 'text.complete',
+          ...nextEventEnvelope(this.#state),
+          messageId: randomUUID() as MessageId,
+          role: 'assistant',
+          text: chromeUnreachableNotice(this.#accountEmail),
+          synthetic: true,
+        });
+      }
     }
 
     // After the turn's own events, so a row set describing what a tool call
@@ -5104,6 +5146,7 @@ class ClaudeProcess {
   #userHasFloor(): void {
     this.#spokeSinceFloor = false;
     this.#handedBackSinceFloor = false;
+    this.#chromeNoticeSaid = false;
   }
 
   /**

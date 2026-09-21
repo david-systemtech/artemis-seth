@@ -43,11 +43,16 @@
  * which is not.
  *
  * `fastMode`, `ultracode`, `chromeBrowser` and `externalBrowser` are absent
- * here **because they are absent from `validate.ts` too**. They are dropped on
- * the local path today, so honouring them here would make the remote surface
- * strictly more capable than the window — the exact asymmetry that produced the
- * hole above, pointed the other way. If they should travel, they should start
- * travelling on both paths in one change.
+ * here, and no longer for the reason this used to give. They were absent from
+ * `validate.ts` too - dropped on the local path, which turned out to be a bug
+ * and not a policy: four switches drawn in the window that no run ever heard
+ * of. The window carries them now. This route still does not, each for a
+ * reason of its own: `externalBrowser` describes the *host's* browser tools and
+ * a server has no window to open; `chromeBrowser` connects a run to the serving
+ * account owner's Chrome, which needs the operator's say, and the route that
+ * asks for it is `/v1/chat/completions` (`artemis.chromeBrowser`, see
+ * `ServerContext.allowChromeBrowser`); `fastMode` and `ultracode` travel there
+ * too, gated per route by the catalogue this route never reads.
  *
  * ---------------------------------------------------------------------------
  * PATHS ARE VALIDATED HERE AND CONFINED BY THE CALLER
