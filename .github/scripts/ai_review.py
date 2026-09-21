@@ -78,9 +78,14 @@ TOKEN_BUDGET_FLOOR = 32_000
 TOKEN_BUDGET_CEILING = 131_072
 
 
+# At every effort, not only `max`. The `high` budget used to be the flat floor,
+# on the belief that high reasons briefly; measured 2026-09-21 it does not on a
+# large diff - 23,688 tokens written for a 70 kB diff, and a 73 kB one that
+# spent all 32,000 on reasoning and never answered. Flat, that was invisible
+# while each provider was stopped at a few minutes by the clock; once the
+# answer was streamed and a working provider was let finish, it was the first
+# thing a large review ran into.
 def token_budget(effort: str, diff_chars: int) -> int:
-    if effort != "max":
-        return TOKEN_BUDGET_FLOOR
     return int(min(max(16_000 + 2 * diff_chars, TOKEN_BUDGET_FLOOR), TOKEN_BUDGET_CEILING))
 
 
@@ -94,17 +99,42 @@ PRICE_CEILING = {"prompt": 0.15, "completion": 0.5}
 # than five minutes, which is longer than anyone waits for a pull request.
 MIN_TOKENS_PER_S = 45
 
-# How long one provider gets before the next is tried.
+# When a provider is left for the next one.
 #
 # The ranking is made from OpenRouter's rolling medians, and a median is not a
 # promise: on 2026-09-18 CoreWeave was published at 76 tokens a second, refused
 # two requests and spent fifteen minutes producing nothing on a third, while
-# BaseTen finished the same review in 93 seconds. So a provider is given a
-# budget, not trust: half as long again as its published speed says this
-# review should take, and never less than this. Long enough for a healthy
-# provider to finish, short enough that a sick one costs minutes and not the
-# review. There is no fixed upper bound - the review's own deadline is one.
-ATTEMPT_BUDGET_MIN_S = 90
+# BaseTen finished the same review in 93 seconds. So a provider is not trusted
+# to finish - but it is not judged by a clock either.
+#
+# It used to be: each provider got half as long again as its published speed
+# said the review would take. That needs to know how long the review will be,
+# and nobody does. On 2026-09-21 a `high` review of a 70 kB diff was sized at
+# 8,760 tokens and wrote about 19,000 (by its bill), so every provider was
+# stopped by this script before it could have finished at its own published
+# speed - together at 174 s, BaseTen at 186, Fireworks at 205, Wafer at 150 -
+# and two reviews in a row posted nothing. The one that had succeeded did so
+# only because Fireworks happened to run at twice its median. The estimate
+# errs the other way at `max`: 118k expected for a 108 kB diff that wrote 35k.
+#
+# So the answer is streamed, and a provider is judged by what it is doing:
+#
+#  - It has not begun within FIRST_TOKEN_S. A request that sits in a queue
+#    shows nothing, whatever the provider's median says.
+#  - It went quiet for STALL_S mid-answer. The `: OPENROUTER PROCESSING`
+#    comments the router sends while a request waits are not progress and do
+#    not reset this.
+#
+# A provider that is producing is left to produce, for as long as the review's
+# deadline allows. Its pace is logged, not judged: "can it finish in time at
+# this rate" needs to know how much is left to write, which is the guess this
+# replaced - and the first version had that rule, which reduces to a speed
+# floor of expected tokens over deadline. At `max`, where the estimate runs
+# three times high, it would have cut healthy providers a minute in. Until the
+# estimates are fitted to the usage every review now logs, the deadline is the
+# only judge of a slow provider.
+FIRST_TOKEN_S = 120
+STALL_S = 60
 
 # How many attempts that actually *used* a provider - ran out its budget, or
 # failed some other way. A refusal is not one of these: a 429 "rate-limited
@@ -299,6 +329,14 @@ class AttemptTimeout(BaseException):
     """
 
 
+class Stalled(Exception):
+    """A provider never began its answer, or went quiet part-way through it.
+
+    Treated like AttemptTimeout - the provider is not asked again - but raised
+    from the stream reader, which knows *why*, so the log can say.
+    """
+
+
 class Truncated(Exception):
     """The answer ran out of tokens before it began. Another provider would too."""
 
@@ -307,9 +345,8 @@ class OutOfTime(Exception):
     """This effort level has no time left to try in."""
 
 
-# The whole review's clock. The 300-second timeout on the request is per
-# socket read, and a provider that trickles keep-alive bytes resets it for
-# ever: on 2026-09-18 a single request ran 25 minutes and was killed by the
+# The whole review's clock. The timeout on the request is per socket read,
+# and a provider that trickles keep-alive bytes resets it for ever: on 2026-09-18 a single request ran 25 minutes and was killed by the
 # job's own timeout, which left a cancelled check on a healthy pull request -
 # the one thing this script exists never to do. Nothing else here is a total
 # deadline, so this is.
@@ -447,6 +484,71 @@ def call_model(api_key: str, model: str, prompt: str, diff_chars: int) -> tuple[
         return result, "high", f"A `{wanted}`-effort review did not finish ({why}), so this is a quicker `high` pass."
 
 
+def read_stream(resp) -> dict:
+    """Read a streamed answer into the shape an unstreamed one has, judging the provider as it goes.
+
+    What the router sends, measured 2026-09-21 on this model: `data:` chunks
+    whose delta carries `reasoning` or `content`, about one token each; `:`
+    comment lines while a request waits, which are not progress; and `usage`,
+    exact token counts included, on the last chunk without being asked for.
+
+    Progress is counted as the larger of chunks and characters over four. A
+    provider is not obliged to send one token a chunk, and counting chunks
+    alone would make one that batches look slow - which is the thing that gets
+    a provider cut. The exact count arrives in `usage` at the end.
+    """
+    started = time.monotonic()
+    first_at: float | None = None
+    last_at = started
+    chunks = chars = 0
+    content: list[str] = []
+    finish = usage = provider = None
+    try:
+        for raw in resp:
+            now = time.monotonic()
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if line.startswith("data: ") and line != "data: [DONE]":
+                chunk = json.loads(line[6:])
+                if chunk.get("error"):
+                    raise RuntimeError(f"the stream reported an error: {json.dumps(chunk['error'])[:300]}")
+                provider = chunk.get("provider") or provider
+                usage = chunk.get("usage") or usage
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    text = (delta.get("reasoning") or "") + (delta.get("content") or "")
+                    if text:
+                        chunks += 1
+                        chars += len(text)
+                        last_at = now
+                        first_at = first_at or now
+                    if delta.get("content"):
+                        content.append(delta["content"])
+                    finish = choice.get("finish_reason") or finish
+            # Judged on every line, comments included: they are what keep this
+            # loop turning while nothing else arrives.
+            tokens = max(chunks, chars // 4)
+            if first_at is None:
+                if now - started > FIRST_TOKEN_S:
+                    raise Stalled(f"had not begun after {FIRST_TOKEN_S} s")
+            elif now - last_at > STALL_S:
+                raise Stalled(f"went quiet for {STALL_S} s after about {tokens} tokens")
+    except TimeoutError as exc:
+        # The per-read timeout: not a byte, not even a keep-alive - before the
+        # answer began or part-way through it, which the log has to tell apart.
+        if first_at is None:
+            raise Stalled(f"sent nothing at all for {FIRST_TOKEN_S} s") from exc
+        raise Stalled(f"went silent for {FIRST_TOKEN_S} s after about {max(chunks, chars // 4)} tokens") from exc
+    if finish is None:
+        raise RuntimeError("the stream ended without finishing an answer")
+    return {
+        "choices": [{"finish_reason": finish, "message": {"content": "".join(content) or None}}],
+        "usage": usage or {},
+        "provider": provider,
+        "elapsed": time.monotonic() - started,
+        "generating": time.monotonic() - (first_at or started),
+    }
+
+
 def run_effort(api_key: str, model: str, prompt: str, diff_chars: int, effort: str, reserve: float) -> dict:
     budget_tokens = token_budget(effort, diff_chars)
     tokens_out = expected_tokens(effort, diff_chars)
@@ -457,6 +559,9 @@ def run_effort(api_key: str, model: str, prompt: str, diff_chars: int, effort: s
         queue = [{"tag": tag, "speed": 60.0, "cost": 0.0} for tag in ("baseten", "coreweave", "fireworks")]
     payload = {
         "model": model,
+        # Streamed so that a provider is judged by what it is doing rather
+        # than by a guess at how long the review will be - see FIRST_TOKEN_S.
+        "stream": True,
         "temperature": 0,
         # Wide on purpose: reasoning tokens are drawn from this budget, and a
         # truncated answer is indistinguishable from a healthy empty one.
@@ -497,7 +602,7 @@ def run_effort(api_key: str, model: str, prompt: str, diff_chars: int, effort: s
     used = 0  # the ones that cost a provider's time - what MAX_ATTEMPTS bounds
     while queue and used < MAX_ATTEMPTS:
         candidate = queue.pop(0)
-        tag, speed = candidate["tag"], candidate["speed"] or 20.0
+        tag = candidate["tag"]
         attempt += 1
         if tag in asked_again_at:
             # Only what is left of its wait - the other fast providers' turns
@@ -507,11 +612,13 @@ def run_effort(api_key: str, model: str, prompt: str, diff_chars: int, effort: s
             if wait > 0:
                 log(f"{tag} has refused {refusals[tag]} time(s); asking it again in {wait:.0f} s")
                 time.sleep(wait)
-        budget = int(min(max(1.5 * tokens_out / speed, ATTEMPT_BUDGET_MIN_S), seconds_left() - reserve))
+        # What is left of the review's clock is this provider's to use, so
+        # long as it keeps producing - read_stream decides when it has not.
+        budget = int(seconds_left() - reserve)
         if budget < 10:
             signal.alarm(0)
             raise OutOfTime(f"no time left for another provider; last: {last}")
-        log(f"attempt {attempt}: {tag}, {budget} s to answer")
+        log(f"attempt {attempt}: {tag}, streamed, up to {budget} s")
         payload["provider"] = {
             "order": [tag],
             "allow_fallbacks": False,
@@ -528,8 +635,13 @@ def run_effort(api_key: str, model: str, prompt: str, diff_chars: int, effort: s
             req.add_header("HTTP-Referer", f"https://github.com/{REPOSITORY}")
             req.add_header("X-OpenRouter-Title", APP)
             req.add_header("X-OpenRouter-Metadata", "enabled")
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                body = json.loads(resp.read().decode())
+            # The per-read timeout is the first-token allowance, not the stall:
+            # at STALL_S it would end a request that sends no bytes at all -
+            # not even keep-alives - at 60 s, under the 120 its answer was
+            # promised to begin in. Silence part-way through is caught at the
+            # same 120 s, and a stream of keep-alives by STALL_S in read_stream.
+            with urllib.request.urlopen(req, timeout=FIRST_TOKEN_S) as resp:
+                body = read_stream(resp)
             choice = body["choices"][0]
             if choice.get("finish_reason") == "length":
                 # Not a provider's fault and not worth another provider: how
@@ -547,16 +659,28 @@ def run_effort(api_key: str, model: str, prompt: str, diff_chars: int, effort: s
                 text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
                 text = re.sub(r"\n?```$", "", text.strip())
             parsed = json.loads(text)
-            cost = body.get("usage", {}).get("cost")
-            routed = body.get("openrouter_metadata") or {}
+            usage = body["usage"]
+            written = usage.get("completion_tokens") or 0
+            reasoned = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
             signal.alarm(0)
+            # The real counts, against the estimate the budgets were sized
+            # from: the data the estimates in this file should be fitted to.
             log(
-                f"model ok (attempt {attempt} on {tag}, cost ${cost}, served by {body.get('provider')}"
-                f" on router attempt {routed.get('attempt')})"
+                f"model ok (attempt {attempt} on {tag}, served by {body.get('provider')}): "
+                f"{written} tokens written ({reasoned} reasoning) against {tokens_out} expected, "
+                f"prompt {usage.get('prompt_tokens')}, {body['elapsed']:.0f} s in all, "
+                f"{written / max(body['generating'], 1):.0f} tok/s, cost ${usage.get('cost')}"
             )
             return parsed
         except Truncated:
             raise
+        except Stalled as exc:
+            signal.alarm(0)
+            used += 1
+            # Not asked again: what it could not do once it will not do twice.
+            last = f"{tag} {exc}"
+            log(f"attempt {attempt} abandoned: {last}")
+            continue
         except AttemptTimeout:
             used += 1
             # Not asked again: what it was slow at once it will be slow at twice.
