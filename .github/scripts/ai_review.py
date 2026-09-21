@@ -330,7 +330,7 @@ class AttemptTimeout(BaseException):
 
 
 class Stalled(Exception):
-    """A provider stopped producing, never started, or is too slow to finish in time.
+    """A provider never began its answer, or went quiet part-way through it.
 
     Treated like AttemptTimeout - the provider is not asked again - but raised
     from the stream reader, which knows *why*, so the log can say.
