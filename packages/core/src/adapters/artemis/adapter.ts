@@ -884,6 +884,12 @@ class ArtemisRun implements Run {
         // The Chrome it pairs with is the one signed in as the *serving*
         // account, wherever that Chrome is; an older server drops the field.
         ...(this.#input.chromeBrowser === true ? { chromeBrowser: true } : {}),
+        // The other browser a served run can be given, and the one that is the
+        // caller's own: the server publishes each verb back down this very
+        // connection and this client drives the browser paired with it. Sent
+        // whenever the run asked for it; an older server drops the field, and
+        // the run browses with whatever it was given instead.
+        ...(this.#input.extensionBrowser === true ? { extensionBrowser: true } : {}),
         // Opt into the two behaviours a remote client needs and a script does
         // not: a disconnect detaches the run rather than killing it, and a
         // permission prompt comes back here to be answered instead of being

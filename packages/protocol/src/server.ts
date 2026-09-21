@@ -1615,6 +1615,27 @@ export interface ArtemisChatExtensions {
    */
   readonly chromeBrowser?: boolean;
   /**
+   * Let the agent drive the **caller's own** browser, through the client that
+   * sent this request - {@link RunInput.extensionBrowser}, asked of another
+   * machine.
+   *
+   * The opposite arrangement to {@link chromeBrowser}, and the reason it can
+   * have the opposite default. That field reaches a Chrome signed in as the
+   * *serving* account, on the serving machine, which is somebody else's
+   * browser and why a host says no until an operator says otherwise. This one
+   * reaches a browser paired with the *client* that started the run: the
+   * server publishes each verb back down the connection the request arrived
+   * on, and nothing else can see it or answer it. A caller asking for this is
+   * asking a run they started to use a browser only their own client can
+   * reach, so the host allows it unless its operator has turned it off - see
+   * `ARTEMIS_ALLOW_CLIENT_BROWSER`.
+   *
+   * Still declinable and still reported under `artemis.ignored` when it is: a
+   * request that arrives without a connection to relay back to has nowhere to
+   * send a verb, and an operator may have said no.
+   */
+  readonly extensionBrowser?: boolean;
+  /**
    * Continue an earlier conversation. Absent starts a new one.
    *
    * The only piece of turn state a caller supplies, and it exists because
@@ -1884,6 +1905,7 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
     // Only ever `true`: absent and `false` are the same request, so there is
     // one spelling of it downstream.
     ...(extensions['chromeBrowser'] === true ? { chromeBrowser: true } : {}),
+    ...(extensions['extensionBrowser'] === true ? { extensionBrowser: true } : {}),
     ...(typeof extensions['sessionId'] === 'string'
       ? { sessionId: extensions['sessionId'] as string }
       : {}),
