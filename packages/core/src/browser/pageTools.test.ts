@@ -536,6 +536,36 @@ describe('the wording says which browser these tools are driving', () => {
     expect(instructions).toContain('cannot reach any other tab');
   });
 
+  it('states the deep verbs’ rule per browser, because it is not one rule', () => {
+    /*
+     * These three descriptions used to be written once, for every driver, and
+     * what they said was the *extension's* rule — "allowed only on the sites
+     * the user is developing", "values are shown only where the site's policy
+     * allows them". On the server browser that is simply untrue: it is signed
+     * in to nothing and has no per-site anything. A model told a false rule
+     * either works around a refusal it will never meet, or declines a call
+     * that would have worked.
+     */
+    expect(describeOf('server', 'browser_evaluate')).toContain('signed in to nothing');
+    expect(describeOf('server', 'browser_evaluate')).toContain('any page it can open');
+    expect(describeOf('server', 'browser_evaluate')).not.toContain('sites the user is developing');
+
+    for (const verb of ['browser_cookies', 'browser_storage'] as const) {
+      expect(describeOf('server', verb)).toContain('signed in to nothing');
+      expect(describeOf('server', verb)).not.toContain('policy');
+    }
+  });
+
+  it('keeps the dev-sites rule where it is true, and says who can widen it', () => {
+    expect(describeOf('extension', 'browser_evaluate')).toContain(
+      'sites the user is developing',
+    );
+    expect(describeOf('extension', 'browser_evaluate')).toContain('Artemis settings');
+    expect(describeOf('extension', 'browser_cookies')).toContain('user’s own browser');
+    expect(describeOf('extension', 'browser_cookies')).toContain('Artemis settings');
+    expect(describeOf('extension', 'browser_storage')).toContain('Artemis settings');
+  });
+
   it('never describes one browser in another’s words', () => {
     expect(pageToolInstructions('server')).not.toContain('dock');
     expect(pageToolInstructions('extension')).not.toContain('dock');
