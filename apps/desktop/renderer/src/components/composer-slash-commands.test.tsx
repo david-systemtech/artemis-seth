@@ -341,6 +341,25 @@ describe('keyboard precedence', () => {
     expect(field().value).toBe('tidy the changelog /artemis-skills:cerebro ');
   });
 
+  it('puts the caret after an accept that leaves the draft as it was, and only then', () => {
+    // Arrowing back into a finished command reopens the menu, and accepting it
+    // rewrites `/compact now` to `/compact now` — byte for byte. The caret must
+    // still land after the command, and the request must not linger to throw
+    // the caret back there on the next keystroke.
+    mount(<Composer />);
+    type('/compact now');
+    field().setSelectionRange(3, 3);
+    fireEvent.select(field());
+    expect(menu()).not.toBeNull();
+
+    fireEvent.keyDown(field(), { key: 'Tab' });
+    expect(field().value).toBe('/compact now');
+    expect(field().selectionStart).toBe('/compact '.length);
+
+    type('/compact now!');
+    expect(field().selectionStart).toBe('/compact now!'.length);
+  });
+
   it('leaves Enter meaning send for a mid-draft token', () => {
     // Enter accepting is right when the message *is* the command. In prose it
     // would hijack the send of anyone who typed a path mid-sentence.

@@ -1550,8 +1550,20 @@ export function Composer({
          * runs from there: `app.tsx` lifts it to the front on the way out.
          */
         if (highlighted !== undefined && commandToken?.leading === true) {
-          onSubmit(commandWord(highlighted.usage), []);
-          setBuffer(clear);
+          /*
+           * Run it only when the token is all there is. A leading token with
+           * words after it — a command being typed in front of a sentence
+           * already written — is filled in over the token instead, as Tab
+           * would, because submitting the bare command and clearing the box
+           * would throw the sentence away.
+           */
+          if (value.slice(commandToken.end).trim() === '') {
+            onSubmit(commandWord(highlighted.usage), []);
+            setBuffer(clear);
+          } else {
+            const written = writeSlashCommand(value, commandToken, commandWord(highlighted.usage).slice(1));
+            setBuffer((current) => replaceLeavingCursor(current, written.text, written.caret));
+          }
           return;
         }
         if (value.trim().length === 0 && attachments.length === 0) return;

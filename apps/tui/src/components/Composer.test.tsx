@@ -406,6 +406,21 @@ describe('Composer: the slash menu', () => {
     expect(onSubmit).toHaveBeenCalledWith('look over the diff /review', []);
   });
 
+  it('fills a leading token in on Enter when words follow it, and keeps them', async () => {
+    // The menu opens for a leading token with a sentence after it — a command
+    // typed in front of words already written. Running the bare command there
+    // would clear the box and lose the sentence, so Enter fills the row in over
+    // the token, as Tab does, and sends nothing.
+    const onSubmit = vi.fn();
+    const { lastFrame, stdin } = composer({ onSubmit });
+    await tick();
+    await press(stdin, '/mo tidy the changelog', ...Array<string>(19).fill(LEFT));
+    expect(lastFrame()).toContain(MENU_HINT);
+    await press(stdin, ENTER);
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(lastFrame()).toMatch(/\/model? tidy the changelog/u);
+  });
+
   it('stays shut for a slash that is not the start of a word', async () => {
     const { lastFrame, stdin } = composer();
     await tick();

@@ -336,14 +336,23 @@ export function Composer(): ReactElement {
    */
   const selected = menu === null ? 0 : Math.min(highlight, menu.matches.length - 1);
 
-  /** The caret an accept asked for, applied once the new value is on screen. */
+  /**
+   * The caret an accept asked for, applied once the new value is on screen.
+   *
+   * Keyed on a count of accepts as well as on the text, because an accept can
+   * leave the draft byte-for-byte as it was — `/compact now` with the caret
+   * back in `compact` rewrites to `/compact now` — and an effect keyed on the
+   * text alone would then not run, leaving the request to fire on the next
+   * keystroke and throw the caret back to where the accept had been.
+   */
   const restoreCaret = useRef<number | null>(null);
+  const [accepts, setAccepts] = useState(0);
   useLayoutEffect(() => {
     const at = restoreCaret.current;
     if (at === null) return;
     restoreCaret.current = null;
     textareaRef.current?.setSelectionRange(at, at);
-  }, [text]);
+  }, [text, accepts]);
 
   /**
    * Accept a command: write it over the token it was typed into, and leave the
@@ -366,6 +375,7 @@ export function Composer(): ReactElement {
       setText(written.text);
       setCaret(written.caret);
       restoreCaret.current = written.caret;
+      setAccepts((count) => count + 1);
       setHighlight(0);
       textareaRef.current?.focus();
     },
