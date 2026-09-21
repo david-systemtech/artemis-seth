@@ -115,6 +115,21 @@ export const DISPOSED_DENY_MESSAGE =
  */
 export const WITHDRAWN_DENY_MESSAGE = 'The provider withdrew this tool call.';
 
+/**
+ * Sent when a question is handed back for leaning on prose nobody was shown.
+ *
+ * Addressed to the model, and it has to correct a belief rather than report a
+ * rule: the model is not being careless when it does this, it is wrong about
+ * where its own words went. So the message says what happened to them. See
+ * {@link questionLeansOnUnsaidProse}.
+ */
+export const UNSAID_PROSE_DENY_MESSAGE =
+  'This question refers to something you have not said. Nothing you wrote since the user ' +
+  'last spoke reached them: reasoning is summarised before it is shown and is never ' +
+  'displayed in full, so an explanation worked out there is invisible to the person being ' +
+  'asked. Put the explanation in an ordinary message, then ask again. A question is only ' +
+  'handed back for this once, so if you judge it unnecessary, ask again as you were.';
+
 /* -------------------------------------------------------------------------- */
 /* JSON coercion                                                              */
 /* -------------------------------------------------------------------------- */
@@ -1768,6 +1783,78 @@ function readOption(value: unknown): QuestionOption | undefined {
     ...(typeof preview === 'string' && preview.length > 0 ? { preview } : {}),
   };
   return option;
+}
+
+/**
+ * Phrases that only mean something to a reader who was shown prose first.
+ *
+ * Three families, and each one is a back-reference of a different kind:
+ * to a *place* ("the explanation above"), to an *act of telling* ("as I
+ * explained"), and to a *thing* with no antecedent ("Is that the shared
+ * understanding?"). The last is the one that catches the case this exists for,
+ * because a model that believes it has just explained something asks the
+ * shortest possible follow-up.
+ *
+ * Matched against the question text alone. An option's label and description
+ * are the model's own account of a choice and are shown in full beside it, so
+ * they carry their context with them; the question is the sentence that has to
+ * stand on its own.
+ */
+const LEANS_ON_PROSE: readonly RegExp[] = [
+  // "the explanation above", "the rules just below", "the breakdown above"
+  /\b(?:explanations?|summar(?:y|ies)|breakdowns?|walkthroughs?|analys[ei]s|reasoning|outlines?|write-?ups?|notes?|lists?|tables?|rules?|points?|messages?)\s+(?:just\s+)?(?:above|below)\b/i,
+  // "as described above", "set out below", "as above"
+  /\b(?:as|described|outlined|laid\s+out|set\s+out|shown|listed|noted|explained|covered|summari[sz]ed)\s+(?:just\s+)?(?:above|below)\b/i,
+  // "after the explanation above", "following the breakdown"
+  /\b(?:after|following)\s+the\s+(?:explanation|summary|breakdown|walkthrough|analysis|reasoning|above)\b/i,
+  // "as I explained", "as I just laid out"
+  /\bas\s+I\s+(?:just\s+)?(?:explained|described|laid\s+out|set\s+out|noted|said|mentioned|outlined|wrote|showed)\b/i,
+  // "per my summary", "given the explanation", "based on the breakdown"
+  /\b(?:per|given|from|based\s+on)\s+(?:my|the)\s+(?:explanation|summary|breakdown|walkthrough|analysis|reasoning|outline|write-?up)\b/i,
+  /*
+   * "Is that the shared understanding?" — a demonstrative standing in for the
+   * thing that was never said. Anchored to the opening, where a bare "that"
+   * can only point outside the question.
+   *
+   * The two word lists are what separates a pronoun from a determiner, which
+   * is the whole difficulty of this one: "Is that *the* shared understanding?"
+   * points outside the question, "Is this schema better?" points at its own
+   * next word. A pronoun is followed by the determiner that opens its
+   * complement or by a word closing the clause; a determiner is followed by
+   * its noun, and every noun there is.
+   */
+  /^\s*(?:is|are|was|were)\s+(?:that|this|these|those)\s+(?:the|a|an|my|your|our|their|its|his|her|right|correct|ok|okay|fine|enough|accurate|acceptable|what|how|why|where|when|who)\b/i,
+  /^\s*(?:does|do|did|should|would|will|can|could|shall)\s+(?:that|this|these|those)\s+(?:be|been|look|sound|seem|work|hold|cover|match|capture|make|read|suit|do|go|still|all)\b/i,
+];
+
+/**
+ * Whether a question can only be answered by someone who was shown prose first.
+ * ============================================================================
+ *
+ * Claude's reasoning is summarised before Artemis ever sees it — the CLI is
+ * asked for the most it will give (`--thinking-display summarized`; the only
+ * other setting is `omitted`) and that is still a précis. A model that works an
+ * explanation out in its reasoning and then asks about it has therefore said
+ * nothing: what reaches the user is a sentence in the past tense claiming the
+ * explanation exists, followed by a question that depends on it. Measured on a
+ * real session, twice in consecutive turns.
+ *
+ * Nothing downstream can repair that, because the words are not merely hidden,
+ * they were never returned. The only moment at which anything can be done is
+ * before the question is put in front of anyone — see `ClaudeProcess.#canUseTool`,
+ * which is also where "was anything actually said" is known.
+ *
+ * Deliberately a small list of phrasings rather than a judgement about whether
+ * a question is self-contained. The cost of a false positive is one round trip
+ * and a paragraph the user probably wanted anyway; the cost of guessing wrongly
+ * in the other direction is a model taught to preface every question with
+ * filler. So this matches what a back-reference *says*, not what a question
+ * might need.
+ */
+export function questionLeansOnUnsaidProse(prompt: QuestionPrompt): boolean {
+  return prompt.questions.some((question) =>
+    LEANS_ON_PROSE.some((pattern) => pattern.test(question.question)),
+  );
 }
 
 /**

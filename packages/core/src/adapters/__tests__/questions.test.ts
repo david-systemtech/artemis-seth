@@ -19,7 +19,13 @@ import { describe, expect, it } from 'vitest';
 
 import type { JsonObject, QuestionPrompt } from '@rx-artemis/protocol';
 
-import { buildPermissionRequest, readQuestionPrompt, toPermissionResult, withQuestionAnswers } from '../mapper.js';
+import {
+  buildPermissionRequest,
+  questionLeansOnUnsaidProse,
+  readQuestionPrompt,
+  toPermissionResult,
+  withQuestionAnswers,
+} from '../mapper.js';
 
 /** The arguments the tool actually arrives with. */
 const INPUT: JsonObject = {
@@ -229,5 +235,98 @@ describe('toPermissionResult with a question', () => {
       { toolUseID: 'toolu_1', toolName: 'AskUserQuestion', question: PROMPT, input: INPUT },
     );
     expect(result).toMatchObject({ behavior: 'allow', updatedInput: { questions: [] } });
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Questions about things that were never said                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The detector behind the one question Artemis hands back.
+ *
+ * Its job is narrow on purpose: find the phrasings that promise the reader
+ * prose, not judge whether a question is answerable. So the cases that matter
+ * here are the ones on the boundary — "above" used as a comparison rather than
+ * as a place, a demonstrative that has its antecedent inside the question — and
+ * each false-positive test is protecting a real question someone might ask.
+ */
+describe('questionLeansOnUnsaidProse', () => {
+  /** One question, with the throwaway options the predicate never reads. */
+  function ask(question: string): QuestionPrompt {
+    return {
+      questions: [
+        {
+          question,
+          header: 'Pick',
+          multiSelect: false,
+          options: [
+            { label: 'Yes', description: '' },
+            { label: 'No', description: '' },
+          ],
+        },
+      ],
+    };
+  }
+
+  it.each([
+    // The two that were measured on a real session.
+    'Unit cost precision, after the explanation above.',
+    'Is that the shared understanding for the purchase order pricing ticket?',
+    // A place.
+    'Given the summary above, which schema wins?',
+    'Which of the rules below should hold?',
+    'Take the approach described above?',
+    // An act of telling.
+    'As I explained, should the cascade stay as it is?',
+    'Per my summary, is six decimals enough?',
+    // A demonstrative with nothing to point at.
+    'Does this look right?',
+    'Should those be merged?',
+  ])('catches %j', (question) => {
+    expect(questionLeansOnUnsaidProse(ask(question))).toBe(true);
+  });
+
+  it.each([
+    // "above" and "below" as comparisons, which is what they usually are in a
+    // question about numbers — the reason the patterns want a noun or a verb
+    // of telling beside them rather than the bare word.
+    'What happens when a discount is above the line total?',
+    'Should quantities below ten round up?',
+    // A demonstrative that is answered inside the question.
+    'Which of these should the importer trust?',
+    'Is this schema better than the one in the ticket?',
+    // Ordinary self-contained questions, which are most of them.
+    'Which date library?',
+    'Should the run stop on the first failure?',
+    'Do you want the migration split across two releases?',
+  ])('leaves %j alone', (question) => {
+    expect(questionLeansOnUnsaidProse(ask(question))).toBe(false);
+  });
+
+  it('fires when any one of several questions leans, not only the first', () => {
+    const prompt: QuestionPrompt = {
+      questions: [...ask('Which date library?').questions, ...ask('Is that right?').questions],
+    };
+    expect(questionLeansOnUnsaidProse(prompt)).toBe(true);
+  });
+
+  it('reads the question, not the options that answer it', () => {
+    // An option's description is shown in full beside the question, so it
+    // carries its own context. Only the question has to stand on its own.
+    const prompt: QuestionPrompt = {
+      questions: [
+        {
+          question: 'Which date library?',
+          header: 'Library',
+          multiSelect: false,
+          options: [
+            { label: 'date-fns', description: 'As I explained above, it tree-shakes.' },
+            { label: 'Luxon', description: 'Per my summary above, better zones.' },
+          ],
+        },
+      ],
+    };
+    expect(questionLeansOnUnsaidProse(prompt)).toBe(false);
   });
 });
