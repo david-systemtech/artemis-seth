@@ -1599,8 +1599,9 @@ export interface ArtemisChatExtensions {
   /** Spend materially more compute. Only on routes with `ultracode: true`. */
   readonly ultracode?: boolean;
   /**
-   * Let the agent drive the caller's own Chrome through the serving provider's
-   * bridge - {@link RunInput.chromeBrowser}, asked of another machine.
+   * Let the agent drive a Chrome through the serving provider's bridge -
+   * {@link RunInput.chromeBrowser}, asked of another machine. **Which** Chrome
+   * is the serving account's, not necessarily the caller's: see below.
    *
    * A request the host may decline twice over, and says so under
    * `artemis.ignored` when it does: the serving account's provider has to have
