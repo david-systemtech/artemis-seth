@@ -24,35 +24,40 @@
  * modes, two registers, and the one that has room spells it out.
  *
  * ---------------------------------------------------------------------------
- * THE BROWSER SWITCHES ARE PERMISSION QUESTIONS, SO THEY LIVE HERE
+ * WHOSE BROWSER IS A PERMISSION QUESTION, SO IT LIVES HERE
  * ---------------------------------------------------------------------------
  *
- * They had a pane of their own once, parked beside this one with a nav comment
+ * It had a pane of its own once, parked beside this one with a nav comment
  * arguing the adjacency — "a comfort question until it is a permission
- * question". The second half of that sentence won. Both switches decide what
- * the agent may *reach*: the user's signed-in Chrome with a two-way bridge, or
- * their default browser one-way. That is the same species of question as the
- * mode list above, so they sit under it rather than one door over.
+ * question". The second half of that sentence won. The choice decides what the
+ * agent may *reach*, which is the same species of question as the mode list
+ * above, so it sits under it rather than one door over.
  *
- * The pair is the same preference at two strengths, which is why it is two
- * switches and not a three-way choice:
+ * It used to be two independent switches — "Browse with your Chrome" and "Open
+ * pages in your default browser" — described here as "the same preference at
+ * two strengths". Two switches were four combinations for three answers, with
+ * one combination that meant nothing and a paragraph under each explaining
+ * which won. Adding the Artemis extension would have made it three switches,
+ * eight combinations and four answers, so it is now one picker of four:
  *
- *  - **Chrome** hands the agent a two-way bridge (the Claude-in-Chrome
- *    extension): it opens tabs in the user's Chrome *and* can read, click and
- *    type there, in a tab group the user watches. Claude sessions only, and
- *    only when the profile is signed in — an API-key profile keeps the bridge
- *    off, a rule the CLI enforces and this pane only reports.
- *  - **Default browser** is one-way: pages the agent opens land in the user's
- *    default browser, and the agent is told it cannot see them. Works with
- *    every provider, grants nothing beyond "open a tab".
+ *  - **Artemis's built-in browser** — the dock tab. Its own cookie jar, which
+ *    is why it loses on the real web: sign-in flows reject embedded browsers
+ *    outright and every permission prompt is refused.
+ *  - **My Chrome (Artemis extension)** — the user's real browser, every
+ *    provider, through a bridge Artemis owns. Disabled with a reason when no
+ *    browser is paired or the paired one is not running; pairing lives in
+ *    Settings → Browser.
+ *  - **Claude in Chrome** — the same browser through Claude's own bridge.
+ *    Claude conversations only, which is why it is disabled with a reason on
+ *    every other provider, and only when the account is signed in rather than
+ *    using an API key — a rule the CLI enforces and this pane only reports.
+ *  - **Open in my browser** — one-way. Pages land in the default browser and
+ *    the agent is told it cannot see them.
  *
- * When both are on, Chrome wins for the runs it applies to — it is the
- * stronger form of the same preference. The copy under each switch says so,
- * because a pair of toggles whose interaction is a surprise is a pane that
- * teaches distrust. Why the embedded dock browser loses on the real web —
- * its own cookie jar, every permission refused, sign-in flows that reject
- * embedded browsers outright — is told under the first switch, where the
- * question comes up.
+ * The rules for which options can be offered are in `browserChoice.ts` and not
+ * here, because the composer needs the same answer when it builds a run input:
+ * an option this pane would have disabled must not be one a stored preference
+ * silently keeps using.
  *
  * ---------------------------------------------------------------------------
  * THE TOOL LISTS ARE SHOWN, DISABLED, AND SAY WHY
@@ -83,24 +88,45 @@ import { usePermissionModes } from '../../hooks/useCapability';
 import { ChoiceList, SettingsGroup, SettingsPane, type Choice } from './pane';
 import {
   activeProviderLabel,
-  setAgentChrome,
-  setOpenWebExternally,
+  browserModeContext,
+  setBrowserMode,
+  setExtensionReach,
   setPermissionMode,
   useApp,
 } from '../../state/store';
 import { usePane } from '../../state/paneContext';
+import {
+  BROWSER_MODES,
+  BROWSER_MODE_LABELS,
+  BROWSER_MODE_NOTES,
+  browserModeUnavailable,
+  type BrowserMode,
+  type ExtensionReach,
+} from '../../state/browserChoice';
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field';
-import {
-  Item,
-  ItemActions,
-  ItemContent,
-  ItemDescription,
-  ItemGroup,
-  ItemTitle,
-} from '@/components/ui/item';
-import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+
+/**
+ * The two ways a conversation can come by the paired Chrome.
+ *
+ * Per conversation is first because it is the default and stays it: driving a
+ * browser full of somebody's live sessions is a larger grant than any other
+ * option in this pane, and a default that made every conversation take it
+ * would be a grant nobody opted into.
+ */
+const REACH_CHOICES: readonly Choice<ExtensionReach>[] = [
+  {
+    id: 'per-conversation',
+    label: 'Each conversation chooses',
+    note: 'A conversation uses your Chrome only after you pick it there. Everything else gets the built-in browser.',
+  },
+  {
+    id: 'always-on',
+    label: 'Always on',
+    note: 'Every conversation uses your paired Chrome, unless it picks something else for itself.',
+  },
+];
 
 /** Long-form names for the settings pane. See the file header on why these differ from the status line's. */
 const MODE_LABELS: Record<PermissionMode, string> = {
@@ -135,8 +161,38 @@ export function PermissionsSection(): ReactElement {
   const modes = usePermissionModes();
   const mode = usePane((s) => s.permissionMode);
   const providerLabel = usePane(activeProviderLabel);
-  const chrome = useApp((s) => s.agentChrome);
-  const external = useApp((s) => s.openWebExternally);
+  const providerId = usePane((s) => s.activeProviderId);
+  const browserMode = useApp((s) => s.browserMode);
+  const reach = useApp((s) => s.extensionReach);
+  /*
+   * Selected as the array, then folded here.
+   *
+   * A selector that returned `{ anyPaired, anyConnected }` would build a new
+   * object on every store notification, which `useApp` compares by identity —
+   * an infinite render loop, and one that only appears once something else in
+   * the window starts changing. The array is a reference the store holds, so
+   * selecting it is stable.
+   */
+  const pairedBrowsers = useApp((s) => s.extensionBridge?.browsers);
+  const browserContext = browserModeContext(pairedBrowsers, providerId);
+
+  /**
+   * The four options, each carrying its own reason for being unavailable.
+   *
+   * Built here rather than held as a constant because two of the four depend
+   * on the machine right now — which provider this conversation runs as, and
+   * whether a paired browser is awake — and a picker that offered an option
+   * the run would then decline would be a control that changed nothing.
+   */
+  const browserChoices: readonly Choice<BrowserMode>[] = BROWSER_MODES.map((id) => {
+    const unavailable = browserModeUnavailable(id, browserContext);
+    return {
+      id,
+      label: BROWSER_MODE_LABELS[id],
+      note: BROWSER_MODE_NOTES[id],
+      ...(unavailable === null ? {} : { disabled: true, reason: unavailable }),
+    };
+  });
 
   /**
    * A stored mode the current provider does not accept.
@@ -196,62 +252,32 @@ export function PermissionsSection(): ReactElement {
       </SettingsGroup>
 
       {/* After the mode list, deliberately: the modes decide what runs without
-          asking, and these decide what the agent may reach while it runs —
+          asking, and this decides what the agent may reach while it runs —
           the same question, asked of the web. See the file header. */}
-      <SettingsGroup label="Agent browsing">
-        <ItemGroup className="gap-0 divide-y divide-hairline">
-          <Item size="sm" className="items-start">
-            <ItemContent>
-              <ItemTitle className="text-xs text-ink">Browse with your Chrome</ItemTitle>
-              <ItemDescription className="line-clamp-none text-2xs leading-relaxed text-ink-faint">
-                Claude sessions drive your own Chrome through the Claude in Chrome extension: tabs
-                open in a colour-coded group in your real browser, with your logins and your
-                password manager, and the agent can read and act on what it opened while you keep
-                using other tabs. Needs the extension installed and a profile signed in with an
-                account — a profile using an API key keeps this off, silently, because the
-                extension cannot authenticate with one. The embedded dock browser is not offered
-                to these runs. Applies to Claude accounts running on this machine: a session on an
-                Artemis Server account runs on the server, which cannot reach this browser. If the
-                extension does not connect on the first enabled run, restart Chrome once — it only
-                discovers newly installed connectors at startup — and approve the connection when
-                the extension asks.
-              </ItemDescription>
-            </ItemContent>
-            <ItemActions>
-              <Switch
-                id="settings-agent-chrome"
-                aria-label="Browse with your Chrome"
-                checked={chrome}
-                onCheckedChange={setAgentChrome}
-              />
-            </ItemActions>
-          </Item>
-        </ItemGroup>
+      <SettingsGroup label="Browser">
+        <ChoiceList
+          label="Which browser the agent uses"
+          value={browserMode}
+          choices={browserChoices}
+          onChange={setBrowserMode}
+        />
+        <p className="px-3 py-2.5 text-2xs leading-relaxed text-ink-faint">
+          Applies to the next run. A run already in flight keeps the browser it started with.
+          Pairing your Chrome, and what the agent may read on each site, are in Settings → Browser.
+        </p>
       </SettingsGroup>
 
-      <SettingsGroup label="Pages opened for you">
-        <ItemGroup className="gap-0 divide-y divide-hairline">
-          <Item size="sm" className="items-start">
-            <ItemContent>
-              <ItemTitle className="text-xs text-ink">Open pages in your default browser</ItemTitle>
-              <ItemDescription className="line-clamp-none text-2xs leading-relaxed text-ink-faint">
-                Previews and pages the agent opens land in your default browser — signed in,
-                password manager and all — instead of the embedded dock browser. The agent keeps a
-                way to show you a page and loses the ability to read or click it, so it is told to
-                verify its work through logs and tests, or to ask you. Applies to every provider.
-                When Chrome browsing above is on, Claude runs use that richer bridge instead.
-              </ItemDescription>
-            </ItemContent>
-            <ItemActions>
-              <Switch
-                id="settings-open-web-externally"
-                aria-label="Open pages in your default browser"
-                checked={external}
-                onCheckedChange={setOpenWebExternally}
-              />
-            </ItemActions>
-          </Item>
-        </ItemGroup>
+      {/* Only about the paired Chrome, so it is its own group rather than a
+          line under the picker: the other three modes grant nothing that
+          depends on this, and a "how do conversations get it" note attached to
+          a four-option list would read as applying to all four. */}
+      <SettingsGroup label="How conversations get your Chrome">
+        <ChoiceList
+          label="How conversations get your Chrome"
+          value={reach}
+          choices={REACH_CHOICES}
+          onChange={setExtensionReach}
+        />
       </SettingsGroup>
 
       <SettingsGroup label="Tool policy">

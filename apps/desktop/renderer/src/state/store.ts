@@ -98,7 +98,18 @@ import type {
   HandoffTrigger,
   UpdateChannel,
   UsageSnapshot,
+  ExtensionBridgeState,
+  PairedBrowserInfo,
 } from '@rx-artemis/protocol';
+import {
+  browserFlagsFor,
+  browserModeFromPrefs,
+  effectiveBrowserMode,
+  isExtensionReach,
+  type BrowserMode,
+  type BrowserModeContext,
+  type ExtensionReach,
+} from './browserChoice';
 import { activityOf } from '../components/Activity';
 import {
   handoffPrompt,
@@ -263,7 +274,11 @@ const SETTINGS_SECTION_HOMES: Readonly<Record<SettingsSection, SettingsSection>>
   models: 'models',
   runs: 'runs',
   appearance: 'appearance',
-  browser: 'permissions',
+  // Its own room again, and a different one from the pane that inherited the
+  // id: `browser` used to name two switches that belonged beside the
+  // permission modes, and it now names pairing a Chrome and the rules that
+  // apply in it. The choice of *which* browser stayed with the modes.
+  browser: 'browser',
   permissions: 'permissions',
   agents: 'agents',
   skills: 'skills',
@@ -959,26 +974,35 @@ export interface AppState {
    */
   readonly autoHandoff: boolean;
   /**
-   * Whether the agent browses with the user's own Chrome.
+   * Which browser the agent drives, as one choice of four.
    *
-   * Rides every Claude run as {@link RunInput.chromeBrowser}: the CLI connects
-   * the run to the Claude-in-Chrome extension, the agent works in real tabs in
-   * the user's browser — their logins, their password manager — and the
-   * embedded dock browser is not offered to that run at all.
+   * Replaces the two independent switches this used to be — "Browse with your
+   * Chrome" and "Open pages in your default browser" — whose four combinations
+   * were three answers and one that meant nothing. See `browserChoice.ts`,
+   * which holds the type, the migration off those two keys, and the rules for
+   * when an option cannot be offered.
    *
    * A window preference rather than a pane one, because "whose browser is
    * this" is not a per-conversation question: the extension bridges one
-   * browser to one session at a time, and a per-pane switch would invite two
-   * columns to fight over it.
+   * browser to one Artemis at a time, and a per-pane default would invite two
+   * columns to fight over it. A conversation may still override it — see
+   * {@link SessionState.browserMode} — which is a different thing from having
+   * its own default.
    */
-  readonly agentChrome: boolean;
+  readonly browserMode: BrowserMode;
   /**
-   * Whether pages the agent opens for the user land in their default browser
-   * rather than the embedded dock one. See {@link RunInput.externalBrowser} —
-   * the agent keeps a way to *show* the user a page and loses the tools that
-   * only make sense against a page Artemis owns.
+   * How conversations get the paired Chrome: each one asks, or all of them.
+   *
+   * Per conversation is the default and stays it. Driving a browser full of
+   * somebody's live sessions is a larger grant than the other three modes, and
+   * a default that made every conversation take it would be a grant nobody
+   * opted into. Always-on is for the person who has decided once — David's own
+   * choice, and the reason the setting exists rather than being assumed either
+   * way.
    */
-  readonly openWebExternally: boolean;
+  readonly extensionReach: ExtensionReach;
+  /** What the extension bridge is doing, as the picker and the pane read it. */
+  readonly extensionBridge: ExtensionBridgeState | null;
   /**
    * Where each handoff rule fires, as percent overrides keyed by
    * `HandoffThreshold.id`. Only rules the user has moved appear here — an
@@ -1694,6 +1718,13 @@ interface Prefs {
   dockScope?: 'pane' | 'all';
   escapeStopsRun?: boolean;
   autoHandoff?: boolean;
+  /**
+   * The picker's value. Absent on a preferences file written before the
+   * picker existed, which is what `agentChrome` and `openWebExternally` are
+   * still read for — see `browserModeFromPrefs`. They are no longer written.
+   */
+  browserMode?: string;
+  extensionReach?: string;
   agentChrome?: boolean;
   openWebExternally?: boolean;
   handoffThresholds?: Record<string, number>;
@@ -2130,6 +2161,11 @@ function loadPrefs(): Prefs {
     dockScope: raw['dockScope'] === 'all' ? 'all' : undefined,
     escapeStopsRun: boolOrUndefined(raw['escapeStopsRun']),
     autoHandoff: boolOrUndefined(raw['autoHandoff']),
+    browserMode: typeof raw['browserMode'] === 'string' ? raw['browserMode'] : undefined,
+    extensionReach: typeof raw['extensionReach'] === 'string' ? raw['extensionReach'] : undefined,
+    // Still read, never written: these two are where the browser preference
+    // lived before the picker, and a user upgrading must keep the browser they
+    // had. See `browserModeFromPrefs`.
     agentChrome: boolOrUndefined(raw['agentChrome']),
     openWebExternally: boolOrUndefined(raw['openWebExternally']),
     handoffThresholds: numberMap(raw['handoffThresholds']),
@@ -2306,8 +2342,8 @@ function savePrefs(): void {
     dockScope: s.dockScope,
     escapeStopsRun: s.escapeStopsRun,
     autoHandoff: s.autoHandoff,
-    agentChrome: s.agentChrome,
-    openWebExternally: s.openWebExternally,
+    browserMode: s.browserMode,
+    extensionReach: s.extensionReach,
     handoffThresholds: s.handoffThresholds,
     updateChannel: s.updateChannel,
     sharedClaudeConfig: s.sharedClaudeConfig,
@@ -2409,6 +2445,9 @@ function seedSession(overrides: Partial<SessionState> = {}): SessionState {
     effort: prefs.effort ?? null,
     fastMode: prefs.fastMode ?? false,
     ultracode: prefs.ultracode ?? false,
+    // Not restored from preferences: a conversation's browser choice belongs to
+    // that conversation, and a fresh column has not had one.
+    browserMode: null,
     forkOnResume: false,
     resumeSessionId: null,
     historyLoading: false,
@@ -2542,10 +2581,17 @@ export const useApp = create<AppState>(() => ({
   // Off unless asked for. Stopping someone's work is the most intrusive thing
   // this app does on its own, and it is not a default anyone opted into.
   autoHandoff: prefs.autoHandoff ?? false,
-  // Both off by default: each hands the agent a browser the user is signed
-  // into, which is a grant nobody should discover was made for them.
-  agentChrome: prefs.agentChrome ?? false,
-  openWebExternally: prefs.openWebExternally ?? false,
+  // The dock browser unless the file says otherwise, and the two retired
+  // switches are read when it does not: each of the other three modes hands
+  // the agent a browser the user is signed into, which is a grant nobody
+  // should discover was made for them.
+  browserMode: browserModeFromPrefs(prefs),
+  // Per conversation, always, on a file that has not said. See the field.
+  extensionReach: isExtensionReach(prefs.extensionReach) ? prefs.extensionReach : 'per-conversation',
+  // Filled by the first push, or by the pane's own read. `null` is "not asked
+  // yet", which the picker reads as "no browser is paired" — the same answer
+  // it would give for a real empty one, and the safe way round.
+  extensionBridge: null,
   handoffThresholds: prefs.handoffThresholds ?? {},
   updateChannel: prefs.updateChannel ?? 'stable',
 
@@ -4722,6 +4768,7 @@ function seedBeside(source: Pane, state: AppState = useApp.getState()): SessionS
     effort: from.effort,
     fastMode: from.fastMode,
     ultracode: from.ultracode,
+    browserMode: from.browserMode,
     // The catalogue is a property of the account, and the account came across
     // with it — so it comes too, rather than making the new pane flash the
     // built-in list until its own fetch lands.
@@ -6380,6 +6427,39 @@ export async function describeMemoryBank(
  * `browser.close` to send back — reloading it would put the reader back on the
  * page that had just crashed, which is a loop rather than a recovery.
  */
+/**
+ * Follow the extension bridge: what is paired, what is connected, the policy.
+ *
+ * In the window store rather than in a hook beside `useServerState`, and the
+ * difference is who reads it. The server's state is drawn by one pane and
+ * nothing else; this is read by the Browser picker, by the composer that
+ * builds a run input, and by the pane — so a hook would mean three copies of
+ * one fact, arriving at three different times.
+ *
+ * The pull is for the first paint and the subscription is for everything
+ * after: a browser connects when the user opens Chrome and disconnects when
+ * they close it, and neither is a moment the renderer could have known to ask
+ * about. The push wins a race with the pull for the reason `useServerState`
+ * gives — the read answers with the state at dispatch time.
+ */
+export function installExtensionBridgeFeed(): () => void {
+  const { bridge } = resolveBridge();
+  if (!bridge) return () => undefined;
+  const surface = bridge.extensionBridge;
+
+  let pushed = false;
+  const unsubscribe = surface.onState((state) => {
+    pushed = true;
+    useApp.setState({ extensionBridge: state });
+  });
+
+  void call(() => surface.state({})).then((result) => {
+    if (result.ok && !pushed) useApp.setState({ extensionBridge: result.value.state });
+  });
+
+  return unsubscribe;
+}
+
 export function installBrowserFeed(): () => void {
   const { bridge } = resolveBridge();
   if (!bridge) return () => undefined;
@@ -9945,19 +10025,54 @@ export function setEscapeStopsRun(on: boolean): void {
 }
 
 /**
- * Let the agent browse with the user's own Chrome. Applies from the next run —
+ * Choose the browser conversations use by default. Applies from the next run —
  * a run already in flight keeps the tools it started with, which is the same
  * rule every setting in the dialog follows.
  */
-export function setAgentChrome(on: boolean): void {
-  useApp.setState({ agentChrome: on });
+export function setBrowserMode(mode: BrowserMode): void {
+  useApp.setState({ browserMode: mode });
   savePrefs();
 }
 
-/** Prefer the user's default browser for pages the agent opens. */
-export function setOpenWebExternally(on: boolean): void {
-  useApp.setState({ openWebExternally: on });
+/** Choose whether every conversation gets the paired Chrome, or each one asks. */
+export function setExtensionReach(reach: ExtensionReach): void {
+  useApp.setState({ extensionReach: reach });
   savePrefs();
+}
+
+/**
+ * Choose a browser for *this conversation*, or clear the choice.
+ *
+ * `null` puts the conversation back on the window's default, which is not the
+ * same as choosing the default: the window's may change afterwards, and a
+ * conversation that never expressed a preference should follow it.
+ */
+export function setPaneBrowserMode(mode: BrowserMode | null, pane: Pane = focusedPane()): void {
+  setPaneState(pane, { browserMode: mode });
+  savePrefs();
+}
+
+/**
+ * What the picker needs to know about the machine.
+ *
+ * Takes the browser list rather than the whole state, so that a component can
+ * select the list — a reference the store holds — and fold it here. A selector
+ * that built this object would return a new one on every notification, which
+ * `useApp` compares by identity, which is a render loop.
+ *
+ * `undefined` is a window that has not heard from main yet, and it answers the
+ * same as an empty list. That is the safe way round: offering an option that
+ * may not exist would be a control that fails at the run.
+ */
+export function browserModeContext(
+  browsers: readonly PairedBrowserInfo[] | undefined,
+  providerId: ProviderId | null,
+): BrowserModeContext {
+  return {
+    providerId,
+    anyPaired: (browsers?.length ?? 0) > 0,
+    anyConnected: browsers?.some((one) => one.connected) ?? false,
+  };
 }
 
 export function setAutoHandoff(on: boolean): void {
@@ -12002,16 +12117,23 @@ export async function submitPrompt(
     ...(effort ? { effort: effort.id } : {}),
     ...(supportsFast ? { fastMode: state.fastMode } : {}),
     ...(supportsUltra ? { ultracode: state.ultracode } : {}),
-    // Only for the provider whose CLI has the bridge. The flag is a request the
-    // provider may still decline (API-key auth, no extension) — but sending it
-    // to a provider that has never heard of Chrome would be asking the wrong
-    // party a question whose silence looks like an answer.
-    ...(windowState.agentChrome && state.activeProviderId === 'claude'
-      ? { chromeBrowser: true }
-      : {}),
-    // Unconditionally when set: this describes what the *host's* browser tools
-    // do, and the host is the same host whichever provider is running.
-    ...(windowState.openWebExternally ? { externalBrowser: true } : {}),
+    /*
+     * The browser, as at most one of three booleans.
+     *
+     * One place decides it, and it is not here: `effectiveBrowserMode` folds
+     * the conversation's own choice, the window's default, the always-on
+     * setting and whether each mode can work at all into a single mode, and
+     * `browserFlagsFor` spells that mode out. A run input cannot ask for two
+     * browsers, because the thing that builds it cannot say two.
+     */
+    ...browserFlagsFor(
+      effectiveBrowserMode({
+        windowMode: windowState.browserMode,
+        reach: windowState.extensionReach,
+        paneMode: state.browserMode,
+        context: browserModeContext(windowState.extensionBridge?.browsers, state.activeProviderId),
+      }),
+    ),
     ...(capabilities.permissionModes.includes(state.permissionMode)
       ? { permissionMode: state.permissionMode }
       : {}),
