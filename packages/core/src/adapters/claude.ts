@@ -136,8 +136,10 @@ import type { StagedAttachment } from './attachments.js';
 import { checkWorkingDirectory } from '../workspace/workdir.js';
 import { CLAUDE_ENV_SCRUB_KEYS, composeProviderEnv, readEnv } from './env.js';
 import {
+  ASK_USER_QUESTION_TOOL,
   CLAUDE_PROVIDER_ID,
   DISPOSED_DENY_MESSAGE,
+  UNSAID_PROSE_DENY_MESSAGE,
   WITHDRAWN_DENY_MESSAGE,
   buildPermissionRequest,
   createClaudeMapperState,
@@ -146,6 +148,8 @@ import {
   mapSdkMessage,
   mapSessionInfo,
   nextEventEnvelope,
+  questionLeansOnUnsaidProse,
+  readQuestionPrompt,
   toPermissionResult,
 } from './mapper.js';
 import type { ClaudeMapperState } from './mapper.js';
@@ -2533,6 +2537,37 @@ function startsTurn(message: SDKMessage): boolean {
 }
 
 /**
+ * Whether an event puts the main agent's own words in front of the user.
+ *
+ * Read as "has anything been said", so each exclusion is a thing that is on
+ * screen without the agent having said it *now*:
+ *
+ *  - **A subagent's text** belongs to a delegated transcript on its own
+ *    surface. The agent asking the question did not write it.
+ *  - **A replay** is history being redrawn on resume. It was said before the
+ *    user last spoke, which is the whole span this is measuring.
+ *  - **Synthetic text** is the adapter's, not the model's — a refusal notice,
+ *    the output of a locally-run slash command. Nothing in it is an
+ *    explanation the model can then ask about.
+ *
+ * Empty deltas do not count either: the stream carries them, and a block that
+ * opened and closed with nothing in it said nothing.
+ */
+function saysSomethingToTheUser(event: AgentEvent): boolean {
+  if (event.type === 'text.delta') {
+    return event.text.length > 0 && event.agentId === undefined;
+  }
+  if (event.type !== 'text.complete') return false;
+  return (
+    event.role === 'assistant' &&
+    event.text.length > 0 &&
+    event.agentId === undefined &&
+    event.replay !== true &&
+    event.synthetic !== true
+  );
+}
+
+/**
  * The prose of an echoed user turn, for recognising a message by its words.
  *
  * Only text is joined: images and documents were dropped on the way out of the
@@ -2876,6 +2911,20 @@ class ClaudeProcess {
   readonly #decisionWaiters: (() => void)[] = [];
 
   /**
+   * Whether the agent has said anything to the user since the user last had the
+   * floor, and whether a question has already been handed back since then.
+   *
+   * Scoped to the floor rather than to the turn because an interview is one
+   * turn: the model asks, the user answers, the same run carries on. A
+   * paragraph written before the first question is no reason to let the fourth
+   * one refer to prose that was never written — which is the shape the failure
+   * was measured in. See {@link #userHasFloor} for what counts as the user
+   * having it, and {@link #canUseTool} for the use.
+   */
+  #spokeSinceFloor = false;
+  #handedBackSinceFloor = false;
+
+  /**
    * Messages pushed at the CLI that it has not been seen to read yet.
    *
    * In send order, which is delivery order — the CLI's queue is FIFO — and keyed
@@ -3011,6 +3060,7 @@ class ClaudeProcess {
    */
   beginOpeningTurn(input: ResolvedRunInput): ClaudeTurn {
     const prepared = this.#prepareTurn(input);
+    this.#userHasFloor();
     this.#pendingTurn = { ...prepared, uuid: randomUUID(), text: input.prompt };
     return prepared.turn;
   }
@@ -3401,6 +3451,7 @@ class ClaudeProcess {
    */
   async continueWith(input: ResolvedRunInput): Promise<ClaudeTurn> {
     const prepared = this.#prepareTurn(input);
+    this.#userHasFloor();
     await this.#applySettings(turnSettings(input));
     const staged = await this.#stage(input.attachments);
     /*
@@ -4428,6 +4479,14 @@ class ClaudeProcess {
       );
     }
     this.#pending.delete(requestId);
+    /*
+     * Answering a *question* is the user speaking, so what the agent has told
+     * them starts again from here — see {@link #userHasFloor}. Approving a tool
+     * call is not: it is a judgement about risk, made without saying anything,
+     * and prose written before it is still on the screen and still the answer
+     * to what comes after.
+     */
+    if (entry.question !== undefined) this.#userHasFloor();
 
     if (decision.behavior === 'deny' && decision.interrupt === true) {
       this.#state.permissionDenyInterrupted = true;
@@ -5026,10 +5085,25 @@ class ClaudeProcess {
 
   #emit(event: AgentEvent): void {
     if (this.#eventQueue.closed) return;
+    if (saysSomethingToTheUser(event)) this.#spokeSinceFloor = true;
     this.#eventQueue.push(event);
     // Nothing follows `run.end`: the stream terminates with it, which is what
     // lets a consumer's `for await` finish on its own.
     if (event.type === 'run.end') this.#eventQueue.close();
+  }
+
+  /**
+   * The user has the floor: nothing said before now counts as said to them.
+   *
+   * Two things give it to them and nothing else does — typing a prompt, and
+   * answering a question. Approving a tool call does not, and neither does a
+   * turn the CLI opens for itself: in both the user said nothing, so the
+   * record of what they have been told carries across unchanged. See
+   * {@link #spokeSinceFloor}.
+   */
+  #userHasFloor(): void {
+    this.#spokeSinceFloor = false;
+    this.#handedBackSinceFloor = false;
   }
 
   /**
@@ -5195,6 +5269,60 @@ class ClaudeProcess {
      */
     if (toolName === SUGGESTED_TASK_TOOL) {
       return { behavior: 'allow', updatedInput: input, toolUseID: options.toolUseID };
+    }
+
+    /*
+     * A question about something the user was never shown.
+     *
+     * The model's reasoning is summarised before it leaves the provider, so an
+     * explanation composed there arrives as a sentence in the past tense saying
+     * the explanation exists. The model, whose own context keeps the reasoning,
+     * goes on believing it was delivered and asks about it — and the user gets
+     * a question referring to prose that is not on their screen and cannot be
+     * scrolled back to, because it was never sent. See
+     * {@link questionLeansOnUnsaidProse}.
+     *
+     * Handing the call back is the only lever there is: `canUseTool` is where a
+     * question can still be stopped before a person is looking at it, and a
+     * denial is the only thing it can say that the model reads and acts on. The
+     * model writes the paragraph and asks again, which is what the user wanted
+     * in the first place.
+     *
+     * Bounded to once per floor, and the message says so. A model that has
+     * judged the question self-contained and asked again is not overruled a
+     * second time: the alternative is a loop between a guard and a model that
+     * disagree, with the user watching a run go nowhere.
+     *
+     * Three things narrow it, all of them "is this really that situation":
+     * a subagent's question goes to its own surface and is left alone; a prompt
+     * whose arguments do not decode is not a question yet and degrades to an
+     * ordinary approval; and anything the agent has actually said since the
+     * user last spoke settles the matter outright.
+     */
+    if (
+      toolName === ASK_USER_QUESTION_TOOL &&
+      options.agentID === undefined &&
+      !this.#spokeSinceFloor &&
+      !this.#handedBackSinceFloor
+    ) {
+      const prompt = readQuestionPrompt(toolName, input);
+      if (prompt !== undefined && questionLeansOnUnsaidProse(prompt)) {
+        this.#handedBackSinceFloor = true;
+        this.#deps.diagnostic?.(
+          `Run ${this.runId}: handed back a question that refers to prose the user was never shown.`,
+        );
+        /*
+         * No `decisionClassification`. The SDK's vocabulary is `user_temporary`
+         * / `user_permanent` / `user_reject`, all three of them claims about
+         * what a person did, and no person has seen this call. The CLI infers
+         * conservatively when the field is absent, which is the honest answer.
+         */
+        return {
+          behavior: 'deny',
+          message: UNSAID_PROSE_DENY_MESSAGE,
+          toolUseID: options.toolUseID,
+        };
+      }
     }
 
     this.#permissionCounter += 1;

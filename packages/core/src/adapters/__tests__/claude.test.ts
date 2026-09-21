@@ -37,6 +37,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 const { buildClaudeOptions, CLAUDE_CAPABILITIES, createClaudeAdapter, mapSystemPrompt } =
   await import('../claude.js');
 const { AsyncQueue } = await import('../stream.js');
+const { UNSAID_PROSE_DENY_MESSAGE } = await import('../mapper.js');
 const { AdapterError, toAgentError } = await import('../types.js');
 type ResolvedRunInput = import('../types.js').ResolvedRunInput;
 
@@ -3610,5 +3611,257 @@ describe('suggested tasks', () => {
 
   it('declares the capability the chips are gated on', () => {
     expect(CLAUDE_CAPABILITIES.taskSuggestions).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Questions about things that were never said                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The one question that is handed back instead of being asked.
+ *
+ * Claude's reasoning is summarised before Artemis sees it, so an explanation
+ * the model composes there reaches the user as one past-tense sentence saying
+ * the explanation exists. Ask a question that leans on it and the user is
+ * looking at a "that" with no antecedent anywhere on their screen. `canUseTool`
+ * is the last moment anything can be done about it, and the only moment at
+ * which "has anything actually been said" is known.
+ */
+describe('a question that leans on prose the user never saw', () => {
+  const LEANING = {
+    questions: [
+      {
+        question: 'Is that the shared understanding for the pricing ticket?',
+        header: 'Confirm',
+        multiSelect: false,
+        options: [
+          { label: 'Yes, record it', description: 'I write it up and close the ticket.' },
+          { label: 'No, corrections first', description: 'I apply them, then record.' },
+        ],
+      },
+    ],
+  };
+
+  const PLAIN = {
+    questions: [
+      {
+        question: 'Which date library?',
+        header: 'Library',
+        multiSelect: false,
+        options: [
+          { label: 'date-fns', description: 'Tree-shakeable.' },
+          { label: 'Luxon', description: 'Good zones.' },
+        ],
+      },
+    ],
+  };
+
+  /** `AskUserQuestion` for the given arguments, called exactly as the SDK would. */
+  function ask(
+    options: Record<string, unknown>,
+    input: Record<string, unknown>,
+    overrides: Record<string, unknown> = {},
+  ): Promise<unknown> {
+    const canUseTool = options['canUseTool'] as (
+      name: string,
+      args: Record<string, unknown>,
+      opts: Record<string, unknown>,
+    ) => Promise<unknown>;
+    return canUseTool('AskUserQuestion', input, {
+      signal: new AbortController().signal,
+      toolUseID: 'toolu_ask',
+      requestId: 'req_ask',
+      ...overrides,
+    });
+  }
+
+  /** An assistant message carrying one block of prose. */
+  function saying(text: string, id: string): SDKMessage {
+    return {
+      type: 'assistant',
+      uuid: `uuid-${id}`,
+      session_id: 'sess-abc',
+      parent_tool_use_id: null,
+      message: {
+        id: `msg_${id}`,
+        role: 'assistant',
+        type: 'message',
+        model: 'claude-opus-4',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text }],
+      },
+    } as unknown as SDKMessage;
+  }
+
+  /** Pull events until one of `type` arrives, so unrelated frames cannot fail a test. */
+  async function until(
+    iterator: AsyncIterator<AgentEvent>,
+    type: AgentEvent['type'],
+  ): Promise<AgentEvent> {
+    for (let i = 0; i < 20; i += 1) {
+      const event = (await iterator.next()).value as AgentEvent | undefined;
+      if (event === undefined) break;
+      if (event.type === type) return event;
+    }
+    throw new Error(`no ${type} arrived`);
+  }
+
+  it('hands it back with the reason, and parks nothing on the stream', async () => {
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(BASE_INPUT);
+    const iterator = run.events[Symbol.asyncIterator]();
+    harness().fake.messages.push(INIT_MESSAGE);
+    await iterator.next();
+
+    await expect(ask(harness().options, LEANING)).resolves.toEqual({
+      behavior: 'deny',
+      message: UNSAID_PROSE_DENY_MESSAGE,
+      toolUseID: 'toolu_ask',
+    });
+
+    // Nobody was shown a card, which is the point: the question is stopped
+    // before a person is looking at it. Asserted by what arrives next rather
+    // than by a timeout, so a request emitted late still fails this.
+    harness().fake.messages.push(RESULT_MESSAGE);
+    const next = (await iterator.next()).value as AgentEvent;
+    expect(next.type).not.toBe('permission.request');
+    await run.dispose();
+  });
+
+  it('claims nothing about what a user decided', async () => {
+    // The SDK's classifications are `user_temporary`, `user_permanent` and
+    // `user_reject` — all three claims about a person, and no person has seen
+    // this call. Leaving it unset lets the CLI infer conservatively.
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(BASE_INPUT);
+    harness().fake.messages.push(INIT_MESSAGE);
+
+    const result = (await ask(harness().options, LEANING)) as Record<string, unknown>;
+    expect(result).not.toHaveProperty('decisionClassification');
+    await run.dispose();
+  });
+
+  it('asks it normally once the agent has actually said something', async () => {
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(BASE_INPUT);
+    const iterator = run.events[Symbol.asyncIterator]();
+    harness().fake.messages.push(INIT_MESSAGE);
+    await iterator.next();
+
+    harness().fake.messages.push(saying('Here is the cascade, in the order it applies.', '01'));
+    await until(iterator, 'text.complete');
+
+    void ask(harness().options, LEANING);
+    const event = (await until(iterator, 'permission.request')) as PermissionRequestEvent;
+    expect(event.request.question?.questions[0]?.header).toBe('Confirm');
+    await run.dispose();
+  });
+
+  it('leaves a self-contained question alone even in silence', async () => {
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(BASE_INPUT);
+    const iterator = run.events[Symbol.asyncIterator]();
+    harness().fake.messages.push(INIT_MESSAGE);
+    await iterator.next();
+
+    void ask(harness().options, PLAIN);
+    const event = (await until(iterator, 'permission.request')) as PermissionRequestEvent;
+    expect(event.request.question?.questions[0]?.header).toBe('Library');
+    await run.dispose();
+  });
+
+  it('hands back only once, so a model that disagrees is not looped', async () => {
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(BASE_INPUT);
+    const iterator = run.events[Symbol.asyncIterator]();
+    harness().fake.messages.push(INIT_MESSAGE);
+    await iterator.next();
+
+    await expect(ask(harness().options, LEANING)).resolves.toMatchObject({ behavior: 'deny' });
+
+    // Asked again with no paragraph in between: the model has judged the
+    // question self-contained, and it gets to.
+    void ask(harness().options, LEANING);
+    const event = (await until(iterator, 'permission.request')) as PermissionRequestEvent;
+    expect(event.request.toolName).toBe('AskUserQuestion');
+    await run.dispose();
+  });
+
+  it('re-arms when the user answers, because an interview is one turn', async () => {
+    // The failure this exists for was the third question of an interview, not
+    // the first. A paragraph written before question one is no reason to let
+    // question three refer to prose that was never written.
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(BASE_INPUT);
+    const iterator = run.events[Symbol.asyncIterator]();
+    harness().fake.messages.push(INIT_MESSAGE);
+    await iterator.next();
+
+    harness().fake.messages.push(saying('One more round covers what is left.', '01'));
+    await until(iterator, 'text.complete');
+
+    void ask(harness().options, PLAIN);
+    const first = (await until(iterator, 'permission.request')) as PermissionRequestEvent;
+    await run.respondToPermission(first.requestId, { behavior: 'allow' });
+
+    // The user has spoken; the agent has not spoken since.
+    await expect(ask(harness().options, LEANING)).resolves.toMatchObject({
+      behavior: 'deny',
+      message: UNSAID_PROSE_DENY_MESSAGE,
+    });
+    await run.dispose();
+  });
+
+  it('is not re-armed by an ordinary approval, which says nothing', async () => {
+    // Approving a tool call is a judgement about risk made without speaking.
+    // The paragraph written before it is still on screen and still the answer
+    // to what comes after, so the question that follows is asked normally.
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(BASE_INPUT);
+    const iterator = run.events[Symbol.asyncIterator]();
+    harness().fake.messages.push(INIT_MESSAGE);
+    await iterator.next();
+
+    harness().fake.messages.push(saying('Here is the cascade, in the order it applies.', '01'));
+    await until(iterator, 'text.complete');
+
+    void callCanUseTool(harness().options, new AbortController().signal);
+    const bash = (await until(iterator, 'permission.request')) as PermissionRequestEvent;
+    await run.respondToPermission(bash.requestId, { behavior: 'allow' });
+
+    void ask(harness().options, LEANING);
+    const event = (await until(iterator, 'permission.request')) as PermissionRequestEvent;
+    expect(event.request.question?.questions[0]?.header).toBe('Confirm');
+    await run.dispose();
+  });
+
+  it("leaves a subagent's question alone, since its prose is on another surface", async () => {
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(BASE_INPUT);
+    const iterator = run.events[Symbol.asyncIterator]();
+    harness().fake.messages.push(INIT_MESSAGE);
+    await iterator.next();
+
+    void ask(harness().options, LEANING, { agentID: 'agent-1' });
+    const event = (await until(iterator, 'permission.request')) as PermissionRequestEvent;
+    expect(event.request.agentId).toBe('agent-1');
+    await run.dispose();
+  });
+
+  it('still parks a prompt whose arguments do not decode into questions', async () => {
+    // Not a question yet — it degrades to an ordinary approval showing the raw
+    // arguments, and handing back something nobody can read as a question
+    // would replace an ugly card with no card.
+    const { harness } = installQuery();
+    const run = await createClaudeAdapter().createRun(BASE_INPUT);
+    const iterator = run.events[Symbol.asyncIterator]();
+    harness().fake.messages.push(INIT_MESSAGE);
+    await iterator.next();
+
+    void ask(harness().options, { questions: [{ question: 'Is that right?' }] });
+    const event = (await until(iterator, 'permission.request')) as PermissionRequestEvent;
+    expect(event.request.question).toBeUndefined();
+    await run.dispose();
   });
 });
