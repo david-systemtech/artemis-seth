@@ -37,9 +37,18 @@
 /** Which browser is on the other end. */
 export type BrowserDriverKind = 'embedded' | 'server' | 'extension';
 
-/** The outcome of one verb: what was asked for, or why not. */
+/**
+ * The outcome of one verb: what was asked for, or why not.
+ *
+ * `notice` is something true about a successful answer that is not part of it —
+ * a buffer that dropped its oldest entries before the agent came to read them,
+ * a wait that timed out and reported what had arrived. {@link PageText} carries
+ * its own `truncated` flag because clipping is the normal case there; for
+ * everything else there was nowhere to say it, and a driver that silently hands
+ * back a partial answer is one an agent will draw a wrong conclusion from.
+ */
 export type DriverResult<T> =
-  | { readonly ok: true; readonly value: T }
+  | { readonly ok: true; readonly value: T; readonly notice?: string }
   | { readonly ok: false; readonly reason: string };
 
 /** Where a page is. */
@@ -451,7 +460,16 @@ export interface BridgeChallenge {
   readonly nonce: string;
 }
 
-/** Extension → Artemis: `HMAC-SHA256(secret, nonce)`, hex. */
+/**
+ * Extension → Artemis: `HMAC-SHA256(secret, nonce)`, hex.
+ *
+ * The encodings are part of the contract, because two independent
+ * implementations of "HMAC of a secret" disagree about them and meet as a
+ * refusal nobody can debug. The key is the **bytes the hex secret denotes**,
+ * not the characters of the hex string; the message is the nonce's UTF-8 bytes,
+ * as sent, undecoded; the mac is lowercase hex. In Node that is
+ * `createHmac('sha256', Buffer.from(secret, 'hex')).update(nonce).digest('hex')`.
+ */
 export interface BridgeProof {
   readonly type: 'proof';
   readonly mac: string;

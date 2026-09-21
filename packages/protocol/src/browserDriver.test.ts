@@ -9,7 +9,15 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { DEFAULT_PAGE_POLICY, hostMatches, hostOf, isLocalHost, standingOf, type PagePolicy } from './browserDriver.js';
+import {
+  DEFAULT_PAGE_POLICY,
+  hostMatches,
+  hostOf,
+  isLocalHost,
+  standingOf,
+  type DriverResult,
+  type PagePolicy,
+} from './browserDriver.js';
 
 const policy = (over: Partial<PagePolicy> = {}): PagePolicy => ({ ...DEFAULT_PAGE_POLICY, ...over });
 
@@ -118,5 +126,21 @@ describe('standingOf', () => {
   it('never lets "everywhere" reach a blocked site', () => {
     const wide = policy({ evaluateEverywhere: true, deepReadEverywhere: true });
     expect(standingOf('https://www.chase.com/', wide)).toMatchObject({ blocked: true, deepRead: false, evaluate: false });
+  });
+});
+
+describe('DriverResult', () => {
+  it('lets a driver hand back an answer and say what is missing from it', () => {
+    // The shape a bounded console buffer needs: the lines that survived, plus
+    // the fact that older ones did not. Compiling is most of the assertion —
+    // before `notice` existed there was nowhere to put that sentence.
+    const dropped: DriverResult<readonly string[]> = {
+      ok: true,
+      value: ['the last line'],
+      notice: 'Artemis dropped 12 earlier console entries; the buffer holds 500.',
+    };
+    const whole: DriverResult<readonly string[]> = { ok: true, value: ['the last line'] };
+    expect(dropped.ok && dropped.notice).toContain('dropped 12');
+    expect(whole.ok && whole.notice).toBeUndefined();
   });
 });
