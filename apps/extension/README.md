@@ -13,6 +13,16 @@ Any conversation can use it — Claude, Codex, a local model, running here or on
 server — because it implements `PageDriver` from `@rx-artemis/protocol`, which
 is the one contract all three browsers answer to.
 
+**A conversation running on an Artemis Server can use it too, and the extension
+knows nothing about that.** The agent on the server sends a verb; the server
+publishes it to the one connection the run came in on; the Artemis desktop at
+that end performs it through this extension and posts the answer back. Nothing
+tunnel-related reaches here — this extension still only ever dials the Artemis
+on its own machine — and a server's operator can turn the whole arrangement off
+with `ARTEMIS_ALLOW_CLIENT_BROWSER=0`, in which case the conversation is told so
+in as many words. See `packages/core/src/server/browserRelay.ts` and
+`packages/core/src/adapters/artemis/browserClient.ts`.
+
 ---
 
 ## The security model, in plain words
@@ -34,6 +44,10 @@ connection proves the secret without sending it: Artemis sends a nonce, the
 extension answers with `HMAC-SHA256(secret, nonce)`. Another process that can
 open the port cannot drive your browser; one that can read the extension's
 storage already owns your browser and did not need to.
+
+Artemis, for its part, accepts a connection only from *this* extension's origin
+— the id the manifest's `key` fixes — rather than from any extension you happen
+to have installed.
 
 **The policy is enforced here, in the browser.** Artemis sends a `PagePolicy`
 and this extension decides — on every verb, against the address the tab
@@ -199,6 +213,35 @@ Nothing in that suite leaves the machine. The three hosts it uses —
 reached under three names through Chrome's `--host-resolver-rules`, which is how
 a blocked bank and a public-looking site can both be exercised without a packet
 going anywhere.
+
+There is a second end-to-end suite on the other side of the wire,
+`apps/desktop/main/extensionBridge.e2e.test.ts`, run with
+
+```bash
+cd apps/desktop && NODE_ENV=test pnpm exec vitest run main/extensionBridge.e2e.test.ts
+```
+
+It drives *this* extension from the real Artemis bridge rather than from a fake
+one — the only place the mac is computed here and verified there — and then does
+the same thing again through a real Artemis Server, to prove the served path
+end to end. Same skip rule, for the same reasons.
+
+### What those suites do not prove
+
+- **No human has looked at any of this.** The machines it was built on have no
+  display. The browser was real and headless; the pane in Artemis that pairs
+  with it, the picker that chooses it and every word of their copy exist only as
+  assertions.
+- **The served suite stands one thing in.** A fake run source drives the relayed
+  driver where an agent would. What that skips is `/v1/chat/completions`
+  deciding whether a run may have a browser at all, which has its own tests in
+  `packages/core/src/server/__tests__/completions.test.ts`.
+- **A desktop *serving* other people does not relay.** It declines
+  `artemis.extensionBrowser` and says so; `apps/desktop/main/server.ts` has the
+  reason. The headless server does relay, and is what the suite above uses.
+- **Nothing has been through GitHub Actions or a packaged build.** The release
+  workflow's extension job and `extraResources` placing the zip inside the app
+  are untested outside of reading them.
 
 ## Where things are
 

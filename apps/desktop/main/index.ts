@@ -32,9 +32,15 @@ import {
   PREFS_READ_CHANNEL,
   PREFS_WRITE_CHANNEL,
   SUGGESTED_TASK_SERVER,
+  type RunId,
 } from '@rx-artemis/protocol';
 
-import { MEMORY_TOOL_SERVER, memoryToolServer, profilesRoot } from '@rx-artemis/core';
+import {
+  MEMORY_TOOL_SERVER,
+  memoryToolServer,
+  profilesRoot,
+  setBrowserRelayClient,
+} from '@rx-artemis/core';
 
 import { APP_NAME, flavouredAppName, previousUserDataDir } from './appNames.js';
 import { configurePrefs, readPrefsSync, writePrefs } from './prefs.js';
@@ -73,6 +79,7 @@ import {
   externalBrowserToolServer,
 } from './browserTools.js';
 import { createExtensionBridge, type ExtensionBridge } from './extensionBridge.js';
+import { extensionPageDriver } from './extensionPageDriver.js';
 import { openPairedBrowsers } from './pairedBrowsers.js';
 import { suggestedTaskToolServer } from './taskTools.js';
 import { banksForRun, isMasterEnabled, memoryToolServerOptions } from './memoryBanks.js';
@@ -449,6 +456,20 @@ async function bootstrap(): Promise<void> {
     onStateChange: (state) => broadcast(IPC_PUSH.extensionBridgeState, state),
   });
   await extensionBridge.start();
+  /*
+   * And this machine's browser is now something a *server* can ask for.
+   *
+   * A conversation whose agent runs on an Artemis Server sends its browser
+   * verbs back down the connection it came in on, and this is the answer to
+   * them: the same `ExtensionPageDriver` a local run gets, so a served run
+   * drives the same Chrome under the same policy and — when there is no
+   * browser to be had — reads the same refusal sentences.
+   *
+   * Registered here, once, for the whole process. Until it is, the adapter
+   * does not ask a server for a browser at all, which is the honest lesser
+   * feature rather than a run waiting out deadlines nobody will answer.
+   */
+  setBrowserRelayClient((runKey) => extensionPageDriver(runKey as RunId, requireExtensionBridge()));
 
   const sdkExecutablePath = bundledSdkExecutablePath();
   await engineHost.start({
@@ -799,6 +820,10 @@ app.on('before-quit', (event) => {
   // the copy that is exiting, and the extension would be dialling a port held
   // by a dead process.
   void extensionBridge?.dispose();
+  // And stop answering servers. Each relay client holds an open event stream
+  // to a serving machine; a quit that left them would leave sockets to other
+  // people's computers behind a process that is exiting.
+  setBrowserRelayClient(null);
   // Stops the minute tick and flushes the ledger's write chain, so the firing
   // the user just watched is on disk before the process exits.
   void routineHost?.dispose();

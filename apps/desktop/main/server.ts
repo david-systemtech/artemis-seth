@@ -388,12 +388,25 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
         ...(input.fastMode === undefined ? {} : { fastMode: input.fastMode }),
         ...(input.ultracode === undefined ? {} : { ultracode: input.ultracode }),
         ...(input.chromeBrowser === true ? { chromeBrowser: true } : {}),
-        // Passed through beside Chrome, and reaching the engine only when the
-        // route allowed it. On this host it never is yet: `createArtemisServer`
-        // is given no `browserRelay` here, so `artemis.extensionBrowser` is
-        // declined and reported under `artemis.ignored` before it gets this
-        // far. The line exists so that wiring a relay on the desktop is one
-        // change rather than two.
+        /*
+         * Passed through beside Chrome, and reaching the engine only when the
+         * route allowed it. On this host it never is: `createArtemisServer` is
+         * given no `browserRelay` here, so `artemis.extensionBrowser` is
+         * declined and reported under `artemis.ignored` before it gets this
+         * far — and the client is told why, in the transcript, by the adapter.
+         *
+         * Deliberately not wired, and the reason is not the line count. This
+         * host's runs are built by the *desktop's* `agentToolServers`, which
+         * is one factory serving two kinds of run: the window's own, which
+         * reach this machine's paired browser directly, and a served client's,
+         * which must relay to *theirs*. Relaying here means that factory
+         * learning to tell those apart, in the composition root, which is
+         * exactly where the server-side browser work is landing. A desktop
+         * that serves others therefore offers them the browsers it already
+         * offers — its own embedded one — and says so rather than pretending.
+         * The headless server (`apps/server/src/host.ts`) has one factory and
+         * one kind of run, which is why the relay fits there and not here.
+         */
         ...(input.extensionBrowser === true ? { extensionBrowser: true } : {}),
         ...(input.resumeSessionId === undefined
           ? {}

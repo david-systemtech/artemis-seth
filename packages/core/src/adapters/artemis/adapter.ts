@@ -68,6 +68,7 @@ import type {
   BackgroundTask,
   Capabilities,
   MessageId,
+  PageDriver,
   PermissionDecision,
   PermissionRequest,
   PermissionRequestId,
@@ -117,6 +118,7 @@ import type {
   SessionTranscript,
 } from '../types.js';
 import { splitEvents } from '../local/stream.js';
+import { createBrowserCallClient, type BrowserCallClient } from './browserClient.js';
 import { parseServerCommands, parseServerModels } from './catalogue.js';
 import { guardRemoteDecision } from './permissions.js';
 import { ServedWork } from './liveWork.js';
@@ -587,6 +589,8 @@ class ArtemisRun implements Run {
   #notices = 0;
   /** Whether the "instructions set aside" notice has been said. Once per run. */
   #instructionsDropped = false;
+  /** Said once per run: the server would not relay to this machine's browser. */
+  #clientBrowserDropped = false;
   /** The redirect notice is said once per run, like the instructions one. */
   #redirectNoted = false;
   /**
@@ -1078,8 +1082,21 @@ class ArtemisRun implements Run {
         ...(this.#usage === undefined ? {} : { usage: this.#usage }),
       } as never);
     } finally {
+      /*
+       * The run is over, so nothing on this machine should still be answering
+       * for it. The tab itself is closed by the *server*, which sends a `close`
+       * verb from its own run-ended hook — releasing here without that would
+       * leave the tab open with nobody to shut it, which is why the two are
+       * separate acts and this one comes second.
+       */
+      if (this.#remoteRunId !== undefined) this.#relay()?.release(String(this.#remoteRunId));
       this.#queue.close();
     }
+  }
+
+  /** The relay listener for this run's server, or `null` when there is none. */
+  #relay(): BrowserCallClient | null {
+    return relayClientFor(baseUrl(this.#input.env), () => authHeaders(this.#input.env));
   }
 
   /**
@@ -1298,6 +1315,22 @@ class ArtemisRun implements Run {
       );
     }
     /*
+     * The server set the caller's own browser aside. Said once, because the
+     * picker on this side is showing "My Chrome" and the agent is about to
+     * browse something else — or nothing — without either of them saying so.
+     *
+     * The operator's switch is named because it is the only cure, and it is
+     * not on this machine: the person who can change it is whoever runs that
+     * server, and a message that said only "the server declined" would leave
+     * the user with nothing to ask them for.
+     */
+    if (extensions?.ignored?.includes('artemis.extensionBrowser') === true && !this.#clientBrowserDropped) {
+      this.#clientBrowserDropped = true;
+      this.#notice(
+        'The Artemis server running this conversation does not let its runs use the browser on your machine, so this run started without one. Its operator can allow it by setting ARTEMIS_ALLOW_CLIENT_BROWSER=1 on the server.',
+      );
+    }
+    /*
      * The server moved the run to the account that holds this conversation.
      * The column asked for another one — a route it was left on — and the
      * transcript lives in exactly one account's store, so the alternative was
@@ -1313,7 +1346,19 @@ class ArtemisRun implements Run {
     }
     // Learned like the session id: the server announces it once and early,
     // and every native run route addresses it from here on.
-    if (extensions?.runId !== undefined) this.#remoteRunId = extensions.runId as RunId;
+    if (extensions?.runId !== undefined) {
+      this.#remoteRunId = extensions.runId as RunId;
+      /*
+       * And it is the key the browser relay addresses this run by. Claimed the
+       * moment it is known, because a verb published before the claim would be
+       * one this client saw and could not attribute — the client holds such a
+       * call briefly for exactly this, and the announcement is what releases
+       * it. Claimed only for a run that asked: a client that answered for a
+       * run it did not start would be the double execution the ownership rule
+       * exists to prevent.
+       */
+      if (this.#input.extensionBrowser === true) this.#relay()?.own(String(extensions.runId));
+    }
     // The seam, announced beside the run id. The first reading stands: a
     // reconnect replays the announcement, and the count is a fact about how
     // the run began, not about the stream that is carrying it now.
@@ -1883,34 +1928,78 @@ async function fetchServerSessions(
 /* -------------------------------------------------------------------------- */
 
 /**
- * Whether this client can perform a browser verb a server sends back.
+ * This machine's browser, for the runs a server sends verbs back for.
  *
- * `false` until something calls {@link setBrowserRelayClient}, and nothing does
- * yet — the server half of the relay is finished (`server/browserRelay.ts`,
- * the `artemis:push:browser-call` channel, `POST /api/v0/browser/answer`) and
- * the client half is not. What remains is small and named: subscribe to that
- * channel on the event stream a served window already holds, run each call
- * through the machine's own `ExtensionPageDriver`, and post the result.
+ * A module-level registration rather than an adapter option because the
+ * answering half is a property of the *process*, not of one run or one server:
+ * one desktop has one paired browser, and a run's input has no business
+ * carrying whether this build knows how to drive it. The desktop sets it once,
+ * at startup, with a factory over its extension bridge; a headless host, a
+ * smoke script and every test that has not asked for one leave it unset.
  *
- * A module-level switch rather than an adapter option because the answering
- * half is a property of the *process*, not of one run or one server: one
- * desktop has one paired browser, and a run's input has no business carrying
- * whether this build knows how to drive it.
- *
- * Until it is set, a run that asked for the caller's browser simply does not
- * ask the server for one, and browses with whatever the serving machine gives
- * it. That is a lesser feature, not a broken one, which is the difference
- * worth keeping.
+ * Unset is the honest lesser feature rather than a broken one: a run that
+ * asked for the caller's browser does not ask the server for one, so the
+ * server cannot honour a request nobody will answer and leave the agent
+ * waiting out deadlines. See {@link canRelayBrowser}.
  */
-let browserRelayClient = false;
+let relayedBrowsers: ((runKey: string) => PageDriver) | null = null;
 
-/** See {@link browserRelayClient}. Called once, by whatever wires the answer loop. */
-export function setBrowserRelayClient(ready: boolean): void {
-  browserRelayClient = ready;
+/** One {@link BrowserCallClient} per server root, made on first use. */
+const relayClients = new Map<string, BrowserCallClient>();
+
+/**
+ * Say how to drive this machine's browser, or that it cannot be driven.
+ *
+ * Called once, by whatever owns the browser — `apps/desktop/main/index.ts`
+ * with its extension bridge. Passing `null` stops every client and puts the
+ * process back to not asking for a browser at all, which is what a test does
+ * between cases.
+ */
+export function setBrowserRelayClient(driverFor: ((runKey: string) => PageDriver) | null): void {
+  relayedBrowsers = driverFor;
+  if (driverFor === null) {
+    for (const client of relayClients.values()) client.stop();
+    relayClients.clear();
+  }
 }
 
 function canRelayBrowser(): boolean {
-  return browserRelayClient;
+  return relayedBrowsers !== null;
+}
+
+/**
+ * The listener for one server, opened on demand.
+ *
+ * Keyed by root and not by token: a token rotation is the same server, and the
+ * headers are read per request so the new one is used without the stream being
+ * rebuilt. Keyed by root and not by account for the same reason — the feed is
+ * scoped by *connection*, and two accounts reached through one connection are
+ * one stream.
+ */
+function relayClientFor(
+  root: string,
+  headers: () => Readonly<Record<string, string>>,
+): BrowserCallClient | null {
+  const driverFor = relayedBrowsers;
+  if (driverFor === null) return null;
+  const existing = relayClients.get(root);
+  if (existing !== undefined) return existing;
+  const created = createBrowserCallClient({
+    root,
+    headers,
+    driverFor,
+    /*
+     * Swallowed, on this file's own convention: nothing else here logs, the
+     * engine has no channel for an adapter's asides, and everything a failure
+     * here costs is already visible to the agent — a verb that was not
+     * answered becomes the server's own refusal sentence, in the transcript,
+     * in words. A reporter that wrote to stderr would put noise in a desktop
+     * app's console for an outcome the user has already been told about.
+     */
+    onError: () => undefined,
+  });
+  relayClients.set(root, created);
+  return created;
 }
 
 export function createArtemisAdapter(

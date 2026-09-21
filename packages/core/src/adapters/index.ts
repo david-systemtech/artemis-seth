@@ -36,4 +36,10 @@ export * from './signIn.js';
 // through the registry like every other provider.
 export * from './artemis/admin.js';
 
-export { artemisEndpoint, artemisAuthHeaders } from './artemis/adapter.js';
+export { artemisEndpoint, artemisAuthHeaders, setBrowserRelayClient } from './artemis/adapter.js';
+export {
+  createBrowserCallClient,
+  performBrowserCall,
+  type BrowserCallClient,
+  type BrowserCallClientOptions,
+} from './artemis/browserClient.js';

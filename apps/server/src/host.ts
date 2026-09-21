@@ -337,6 +337,25 @@ export function createHeadlessHost(
      * are few, so the memory is cheap next to the reply it saves.
      */
     historyLimit: 50_000,
+    /*
+     * The one hook that tells a tool server its run is over.
+     *
+     * Nothing in the `agentToolServers` seam does: the factory is called when
+     * a run starts and is handed the run id and its input, and there is no
+     * matching call when the run stops — so a `PageDriver` built there is
+     * never closed by anything the seam knows about. For the relayed browser
+     * that means a tab left open in the user's Chrome per served conversation,
+     * for ever.
+     *
+     * `releaseRelayedBrowser` is declared below and captured, not called,
+     * until a run ends — which is necessarily long after both exist. Same
+     * arrangement the `onContinuation` wiring above uses, and for the same
+     * reason: the registry and the things that read it are mutually recursive
+     * and one of them has to be second.
+     */
+    onLifecycle: (event) => {
+      if (event.kind === 'run.ended') releaseRelayedBrowser(String(event.runId));
+    },
   });
 
   const catalogue = createCatalogue({
@@ -524,10 +543,26 @@ export function createHeadlessHost(
     },
   });
 
+  /**
+   * A served run has ended: shut its tab and forget who owned it.
+   *
+   * The close travels the same way every other verb does — published to the
+   * connection that started the run, performed by that client's own extension
+   * driver — so the tab the agent opened in somebody's Chrome goes away with
+   * the conversation rather than accumulating one per turn. Nothing waits for
+   * the answer: the run is over and there is nobody to report it to.
+   *
+   * Forgetting is second and unconditional. A driver built after this point
+   * would publish to a connection nothing is listening on any more.
+   */
+  function releaseRelayedBrowser(runId: string): void {
+    const owner = relayOwners.get(runId);
+    if (owner === undefined) return;
+    relayOwners.delete(runId);
+    void relay.driverFor(owner, runId).close();
+  }
+
   runs.subscribe((event) => {
-    // A run that has ended cannot be asked for another page, and the entry
-    // would otherwise outlive the process's interest in it.
-    if (event.type === 'run.end') relayOwners.delete(String(event.runId));
     const profileId = runs.get(event.runId)?.profileId;
     feed.publish(
       'artemis:push:agent-event',

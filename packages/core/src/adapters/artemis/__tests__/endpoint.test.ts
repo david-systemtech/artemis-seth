@@ -403,7 +403,7 @@ describe('a resumed turn', () => {
     // drives: the server publishes each verb back down this connection. Same
     // `true`-or-absent spelling, so an older server simply drops the field.
     const { setBrowserRelayClient } = await import('../adapter.js');
-    setBrowserRelayClient(true);
+    setBrowserRelayClient(() => ({}) as never);
     try {
       const { origin, seen } = await serve((_request, response) => happyStream(response));
 
@@ -415,7 +415,7 @@ describe('a resumed turn', () => {
       expect(asked.artemis?.['extensionBrowser']).toBe(true);
       expect(silent.artemis).not.toHaveProperty('extensionBrowser');
     } finally {
-      setBrowserRelayClient(false);
+      setBrowserRelayClient(null);
     }
   });
 
@@ -627,6 +627,35 @@ describe('what the server set aside', () => {
     expect((notices[0] as { text: string }).text).toMatch(/cannot take standing instructions/);
     // The reply itself is untouched.
     expect(events.some((event) => event.type === 'text.delta' && (event as { text: string }).text === 'Hello.')).toBe(true);
+  });
+
+  it('says once that the server would not let the run use this machine’s browser', async () => {
+    /*
+     * The picker on this side is showing "My Chrome" and the agent is about to
+     * browse something else, or nothing. The operator's switch is named
+     * because it is the only cure and it is not on this machine — a message
+     * that said only "the server declined" would leave the user with nothing
+     * to ask its operator for.
+     */
+    const { origin } = await serve((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      const ignored = { artemis: { ignored: ['artemis.extensionBrowser'] } };
+      response.write(sse(chunk({ role: 'assistant' }, ignored)));
+      response.write(sse(chunk({ content: 'Hello.' }, ignored)));
+      response.write(sse(chunk({}, { finish_reason: 'stop', artemis: { endReason: 'completed' } })));
+      response.write(sse('[DONE]'));
+      response.end();
+    });
+
+    const events = await drive(origin, { extensionBrowser: true });
+
+    const notices = events.filter(
+      (event) => event.type === 'text.complete' && (event as { synthetic?: boolean }).synthetic === true,
+    );
+    expect(notices).toHaveLength(1);
+    const text = (notices[0] as { text: string }).text;
+    expect(text).toMatch(/does not let its runs use the browser on your machine/);
+    expect(text).toContain('ARTEMIS_ALLOW_CLIENT_BROWSER');
   });
 
   it('names the always-on skills when they are what the run went without, and both when both', async () => {

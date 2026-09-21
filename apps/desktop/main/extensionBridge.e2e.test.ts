@@ -55,6 +55,15 @@ import { WebSocket } from 'ws';
 
 import { ARTEMIS_EXTENSION_ID, type PageLocation, type PageText, type RunId } from '@rx-artemis/protocol';
 
+import {
+  createBrowserCallClient,
+  createBrowserRelay,
+  createPushFeed,
+  createArtemisServer,
+  createWorkspaceResolver,
+  type BrowserCallClient,
+} from '@rx-artemis/core';
+
 import { createExtensionBridge, type ExtensionBridge } from './extensionBridge';
 import { extensionPageDriver } from './extensionPageDriver';
 import { openPairedBrowsers } from './pairedBrowsers';
@@ -74,65 +83,76 @@ let chrome: ChromeUnderTest | null = null;
 let site: Server | null = null;
 let siteUrl = '';
 
-describe.skipIf(binary === null)('the real extension on the real bridge', () => {
-  beforeAll(async () => {
-    // Built through the workspace script rather than imported, so this test
-    // exercises the same command the release workflow runs.
-    execFileSync('pnpm', ['run', 'build:extension'], { cwd: repoRoot, stdio: 'ignore' });
-    if (!existsSync(join(extensionDist, 'manifest.json'))) {
-      throw new Error('build:extension produced no manifest.json');
-    }
+/*
+ * One browser for the whole file, torn down after every describe in it.
+ *
+ * At the file's level rather than inside the first suite, because the second
+ * one shares this browser and a suite's `afterAll` runs before the next
+ * suite's tests — which closed Chrome out from under the served path and cost
+ * one confusing run to find. A second headless Chromium would be fifteen
+ * seconds and one more process to fail to reap.
+ */
+beforeAll(async () => {
+  if (binary === null) return;
+  // Built through the workspace script rather than imported, so this test
+  // exercises the same command the release workflow runs.
+  execFileSync('pnpm', ['run', 'build:extension'], { cwd: repoRoot, stdio: 'ignore' });
+  if (!existsSync(join(extensionDist, 'manifest.json'))) {
+    throw new Error('build:extension produced no manifest.json');
+  }
 
-    site = await startSite();
-    siteUrl = `http://127.0.0.1:${String((site.address() as { port: number }).port)}/`;
+  site = await startSite();
+  siteUrl = `http://127.0.0.1:${String((site.address() as { port: number }).port)}/`;
 
-    dataDir = await mkdtemp(join(tmpdir(), 'artemis-e2e-data-'));
-    bridge = createExtensionBridge({ store: await openPairedBrowsers(dataDir), port: 0 });
-    await bridge.start();
-    const listening = bridge.state().listening;
-    if (listening.kind !== 'listening') throw new Error('the bridge did not listen');
-    bridgePort = listening.port;
+  dataDir = await mkdtemp(join(tmpdir(), 'artemis-e2e-data-'));
+  bridge = createExtensionBridge({ store: await openPairedBrowsers(dataDir), port: 0 });
+  await bridge.start();
+  const listening = bridge.state().listening;
+  if (listening.kind !== 'listening') throw new Error('the bridge did not listen');
+  bridgePort = listening.port;
 
-    chrome = await launchChrome(binary as string, extensionDist);
-    profileDir = chrome.profileDir;
+  chrome = await launchChrome(binary as string, extensionDist);
+  profileDir = chrome.profileDir;
 
-    // Pairing driven through the real options page, the way a person does it:
-    // the port Artemis is listening on, then the code Artemis is showing. The
-    // `input` events are not decoration — the page treats a field that has
-    // been typed into as the user's, so assigning `value` alone would exercise
-    // a path nobody takes.
-    const code = bridge.offerPairing(true).pairing?.code ?? '';
-    const options = await chrome.openPage(`chrome-extension://${ARTEMIS_EXTENSION_ID}/options.html`);
-    await options.evaluate(`(async () => {
-      const type = (id, value) => {
-        const field = document.getElementById(id);
-        field.value = value;
-        field.dispatchEvent(new Event('input', { bubbles: true }));
-      };
-      type('port', ${JSON.stringify(String(bridgePort))});
-      document.getElementById('save-port').click();
-      await new Promise((r) => setTimeout(r, 200));
-      type('code', ${JSON.stringify(code)});
-      document.getElementById('pair').click();
-    })()`);
+  // Pairing driven through the real options page, the way a person does it:
+  // the port Artemis is listening on, then the code Artemis is showing. The
+  // `input` events are not decoration — the page treats a field that has
+  // been typed into as the user's, so assigning `value` alone would exercise
+  // a path nobody takes.
+  const code = bridge.offerPairing(true).pairing?.code ?? '';
+  const options = await chrome.openPage(`chrome-extension://${ARTEMIS_EXTENSION_ID}/options.html`);
+  await options.evaluate(`(async () => {
+    const type = (id, value) => {
+      const field = document.getElementById(id);
+      field.value = value;
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    type('port', ${JSON.stringify(String(bridgePort))});
+    document.getElementById('save-port').click();
+    await new Promise((r) => setTimeout(r, 200));
+    type('code', ${JSON.stringify(code)});
+    document.getElementById('pair').click();
+  })()`);
 
-    await until(() => bridge?.state().browsers.some((one) => one.connected) === true, 60_000);
-  }, 240_000);
+  await until(() => bridge?.state().browsers.some((one) => one.connected) === true, 60_000);
+}, 240_000);
 
-  afterAll(async () => {
-    await chrome?.close();
-    await bridge?.dispose();
-    await new Promise<void>((done) => {
-      if (site === null) return done();
-      site.closeAllConnections();
-      site.close(() => done());
-    });
-    if (dataDir !== '') await rm(dataDir, { recursive: true, force: true });
-    if (profileDir !== '') {
-      await rm(profileDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
-    }
+afterAll(async () => {
+  await chrome?.close();
+  await bridge?.dispose();
+  await new Promise<void>((done) => {
+    if (site === null) return done();
+    site.closeAllConnections();
+    site.close(() => done());
   });
+  if (dataDir !== '') await rm(dataDir, { recursive: true, force: true });
+  if (profileDir !== '') {
+    await rm(profileDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  }
+});
 
+
+describe.skipIf(binary === null)('the real extension on the real bridge', () => {
   it('paired, and reports the browser by the name the extension gave', () => {
     // The whole handshake in one assertion: a code minted here, typed there,
     // answered with a browser id and a secret this side stored.
@@ -241,6 +261,179 @@ describe.skipIf(binary === null)('the real extension on the real bridge', () => 
   }, 180_000);
 });
 
+/* -------------------------------------------------------------------------- */
+/* The served path                                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The whole relay, with a real server at one end and a real Chrome at the
+ * other.
+ *
+ * Everything between them is the shipping code: `createArtemisServer` serving
+ * `/api/v0/events` and `/api/v0/browser/answer`, `createBrowserRelay`
+ * publishing verbs scoped to one connection, `createBrowserCallClient`
+ * listening on that connection and performing them, `ExtensionPageDriver`
+ * putting them on the bridge, and the extension doing them in a tab.
+ *
+ * The one thing standing in for something is the run: a fake `RunSource` whose
+ * `startRun` drives the relayed driver, rather than an agent deciding to. What
+ * that skips is `/v1/chat/completions` deciding whether the run may have a
+ * browser at all, which has its own tests in `completions.test.ts` and needs
+ * no browser to be exercised.
+ *
+ * It shares the browser, the bridge and the pairing above, because a second
+ * headless Chromium is fifteen seconds and one more process to fail to reap.
+ */
+describe.skipIf(binary === null)('a run on a server, driving the browser here', () => {
+  const TOKEN = 'served-e2e-token-abcdefghijklmnop';
+  const CONNECTION = {
+    id: 'conn-e2e',
+    label: 'The client with the browser',
+    workspace: { kind: 'directory' as const, path: '/w' },
+    token: TOKEN,
+    createdAt: 0,
+  };
+  const SERVED_RUN = 'served-run-1';
+
+  let server: Awaited<ReturnType<typeof startServer>> | null = null;
+  let client: BrowserCallClient | null = null;
+
+  /** A core server with the relay wired, on a free port. */
+  async function startServer() {
+    const relay = createBrowserRelay({
+      publish: (connectionId, call) => {
+        feed.publish('artemis:push:browser-call', call, { connectionId });
+      },
+    });
+    const feed = createPushFeed();
+    /*
+     * A run source that does what an agent's browser tools would: it takes the
+     * relayed driver and uses it. `startRun` is never called here — the tests
+     * drive the driver directly — but the shape is the seam a real host fills.
+     */
+    const runs = {
+      startRun: async () => {
+        throw new Error('not under test');
+      },
+      subscribe: () => () => undefined,
+      interrupt: async () => undefined,
+      respondToPermission: async () => undefined,
+      disposeRun: async () => undefined,
+    };
+    const made = createArtemisServer({
+      port: 0,
+      connections: () => [CONNECTION],
+      version: '1.1.1',
+      catalogue: { read: async () => [], invalidate: () => undefined },
+      runs: runs as never,
+      workspaces: createWorkspaceResolver(),
+      feed,
+      browserRelay: relay,
+    });
+    const port = await made.listen();
+    return { server: made, relay, root: `http://127.0.0.1:${String(port)}` };
+  }
+
+  beforeAll(async () => {
+    server = await startServer();
+    client = createBrowserCallClient({
+      root: server.root,
+      headers: () => ({ authorization: `Bearer ${TOKEN}` }),
+      // The same driver a local run gets, so a served run drives the same
+      // Chrome under the same policy and reads the same refusals.
+      driverFor: (runKey) => extensionPageDriver(runKey as RunId, bridge as ExtensionBridge),
+    });
+    client.own(SERVED_RUN);
+    /*
+     * And wait for the feed before the first verb. A test publishes the
+     * instant it claims a run, where a real conversation takes a model round
+     * trip to decide it wants a browser — see `BrowserCallClient.ready`.
+     */
+    await client.ready();
+  }, 60_000);
+
+  afterAll(async () => {
+    client?.stop();
+    await server?.server.close();
+  });
+
+  it('opens, reads and clicks a page from the server side', async () => {
+    // The verbs start on the server, travel to this machine over the feed, are
+    // performed in a real Chrome, and come back as answers the server's own
+    // driver resolves. Nothing here touches the bridge directly.
+    const driver = (server as NonNullable<typeof server>).relay.driverFor(CONNECTION.id, SERVED_RUN);
+
+    const opened = await driver.open(siteUrl);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    expect((opened.value as PageLocation).url).toContain('127.0.0.1');
+
+    const read = await driver.read();
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect((read.value as PageText).text).toContain('The page under test');
+
+    const clicked = await driver.click('#go');
+    expect(clicked.ok).toBe(true);
+
+    // Read again: the click swapped the heading, so this proves the action
+    // reached the page rather than that a selector matched somewhere.
+    const after = await driver.read();
+    expect(after.ok).toBe(true);
+    if (!after.ok) return;
+    expect((after.value as PageText).text).toContain('Clicked');
+  }, 180_000);
+
+  it('brings the extension’s own refusal back to the server', async () => {
+    const driver = (server as NonNullable<typeof server>).relay.driverFor(CONNECTION.id, SERVED_RUN);
+    await driver.open(siteUrl);
+
+    const result = await driver.click('#nothing-matches-this');
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    // The extension's sentence, not the relay's deadline — which is the whole
+    // point: a refusal travels as an answer, so the agent hears why rather
+    // than waiting out a timeout and guessing.
+    expect(result.reason).not.toContain('did not answer');
+    expect(result.reason).toMatch(/#nothing-matches-this/u);
+  }, 120_000);
+
+  it('leaves a run this client does not own unanswered', async () => {
+    /*
+     * The ownership rule, end to end. Another window of the same connection
+     * would be the one holding that run, and this client must not act for it —
+     * a click performed twice is a form submitted twice. With nobody holding
+     * it at all, the server's own deadline is what answers, in words.
+     */
+    const driver = (server as NonNullable<typeof server>).relay.driverFor(
+      CONNECTION.id,
+      'a-run-nobody-here-started',
+    );
+
+    const result = await driver.read();
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toContain('did not answer');
+  }, 60_000);
+
+  it('closes the run’s tab when the server says the run has ended', async () => {
+    // What the registry's lifecycle hook sends on `run.ended`. The tab is in a
+    // tab group Artemis put in somebody's Chrome, and a week of conversations
+    // leaving one behind each is a browser nobody can find anything in.
+    const driver = (server as NonNullable<typeof server>).relay.driverFor(CONNECTION.id, SERVED_RUN);
+    await driver.open(siteUrl);
+
+    await driver.close();
+
+    // The tab is gone, so the next verb has no page to act on and says so
+    // rather than answering about a page that is not there.
+    const after = await driver.read();
+    expect(after.ok).toBe(false);
+  }, 120_000);
+});
+
 /*
  * Always runs, so the skip above is visible in the report. A suite that is
  * silently absent is a suite that stops being maintained.
@@ -328,6 +521,16 @@ async function launchChrome(binaryPath: string, extensionDir: string): Promise<C
     `--disable-extensions-except=${extensionDir}`,
     'about:blank',
   ], { stdio: ['ignore', 'ignore', 'ignore'] });
+  /*
+   * A runner that dies before `close` — a timeout, an interrupted suite —
+   * would leave this browser running with no parent. One was found that way,
+   * nineteen minutes old. An `exit` handler has to be synchronous, which a
+   * signal is.
+   */
+  const killOnExit = (): void => {
+    child.kill('SIGTERM');
+  };
+  process.once('exit', killOnExit);
 
   const port = await readDevToolsPort(join(profile, 'DevToolsActivePort'));
   const sockets: WebSocket[] = [];
@@ -357,11 +560,22 @@ async function launchChrome(binaryPath: string, extensionDir: string): Promise<C
 
     close: async () => {
       for (const socket of sockets) socket.close();
-      child.kill('SIGKILL');
-      await new Promise<void>((done) => {
+      process.off('exit', killOnExit);
+      /*
+       * Asked first, then made to. SIGKILL alone reaps the browser process and
+       * orphans its zygote and its renderers, which go on holding several
+       * hundred megabytes with nobody left to stop them. A Chrome given
+       * SIGTERM takes its children down with it; the kill is for the one that
+       * does not answer.
+       */
+      child.kill('SIGTERM');
+      const exited = new Promise<void>((done) => {
         if (child.exitCode !== null || child.signalCode !== null) return done();
         child.once('exit', () => done());
       });
+      const gaveUp = setTimeout(() => child.kill('SIGKILL'), 3_000);
+      await exited;
+      clearTimeout(gaveUp);
     },
   };
 }
