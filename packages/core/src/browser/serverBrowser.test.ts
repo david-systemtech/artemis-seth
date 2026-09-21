@@ -1418,6 +1418,29 @@ describe('the sweep on connecting', () => {
     expect([...chromium.targets.keys()]).toEqual(mine);
   });
 
+  it('does not close a tab that is still being set up', async () => {
+    /*
+     * The race the ownership rule is for. `lease.page` is assigned at the end
+     * of `openFor`, three round trips after the target exists, and the
+     * maintenance timer does not wait for that — so a sweep landing in the
+     * window used to find a target belonging to no lease and close it, taking
+     * the tab out from under the run that was still attaching to it.
+     *
+     * Ownership is by *context* now, claimed the instant Chromium names one.
+     */
+    const browser = build();
+    let swept: Promise<void> | null = null;
+    chromium.onCall = (method) => {
+      if (method === 'Target.createTarget' && swept === null) swept = browser.maintain();
+    };
+
+    const opened = await browser.driver().open('https://example.com/a');
+    await swept;
+    expect(opened.ok).toBe(true);
+    expect(chromium.targets.size).toBe(1);
+    expect(chromium.called('Target.closeTarget')).toHaveLength(0);
+  });
+
   it('closes a window a page opened, which no tool could have driven', async () => {
     const browser = build();
     await browser.driver().open('https://example.com/a');

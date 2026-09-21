@@ -235,6 +235,14 @@ class ServerBrowserImpl implements ServerBrowser {
   readonly #endpointDeps: EndpointDeps;
   readonly #log: (line: string) => void;
   readonly #leases = new Set<Lease>();
+  /**
+   * Every browser context this server made, from the instant Chromium named it.
+   *
+   * What {@link #sweep} owns things by. A lease records its context too, but a
+   * lease is only a lease once `openFor` has finished walking three round
+   * trips, and the sweep runs on a timer that does not wait for that.
+   */
+  readonly #ourContexts = new Set<string>();
   readonly #stopTimer: () => void;
 
   #cdp: CdpConnection | null = null;
@@ -298,6 +306,17 @@ class ServerBrowserImpl implements ServerBrowser {
     const contextId = String(
       (await cdp.call('Target.createBrowserContext', { disposeOnDetach: false }))['browserContextId'],
     );
+    /*
+     * Claimed the instant the browser names it, and before any `await`.
+     *
+     * The sweep decides what is ours by *context*, and this is the set it
+     * reads. Recording it on the lease alone would leave a window — between
+     * `Target.createTarget` answering and `lease.page` being assigned three
+     * awaits later — in which a maintenance pass would have seen a target
+     * belonging to no lease and closed the tab out from under the run that was
+     * still setting it up.
+     */
+    this.#ourContexts.add(contextId);
     lease.contextId = contextId;
     this.#emptySince = null;
 
@@ -332,6 +351,7 @@ class ServerBrowserImpl implements ServerBrowser {
       // A context with no tab in it is a context nothing will ever close, and
       // it counts against the cap for the life of the process.
       await cdp.call('Target.disposeBrowserContext', { browserContextId: contextId }).catch(() => undefined);
+      this.#ourContexts.delete(contextId);
       lease.contextId = null;
       this.#noteEmpty();
       throw error;
@@ -445,6 +465,7 @@ class ServerBrowserImpl implements ServerBrowser {
       // Disposing the context is what throws away the cookies and the storage,
       // so two runs testing the same app never share a login. Closing the tab
       // alone would leave the profile behind.
+      this.#ourContexts.delete(contextId);
       await this.#cdp
         ?.call('Target.disposeBrowserContext', { browserContextId: contextId })
         .catch(() => undefined);
@@ -465,14 +486,27 @@ class ServerBrowserImpl implements ServerBrowser {
    * 141 (2026-09-21): closing *every* target leaves the browser running with no
    * targets at all, so this cannot take the browser down by tidying — which the
    * old headless mode, where the last tab closing quit the process, would have.
+   *
+   * ## Ownership is by context, and that is a correction
+   *
+   * It used to be by target id, read off `lease.page`. `lease.page` is assigned
+   * at the *end* of `openFor`, three round trips after the target exists, so a
+   * maintenance pass landing in that window found a target belonging to no
+   * lease and closed it — taking the tab out from under a run that was still
+   * attaching to it, on a timer, once in a while, and reported as "that browser
+   * is no longer open". A context is claimed the instant Chromium names it and
+   * released only when it is disposed, so there is no window.
+   *
+   * It also gets the popup case right for free: a window a page opens with
+   * `window.open` lives in *our* context, and closing it needs it to be
+   * recognised as ours-but-unwanted rather than as a stranger's.
    */
   async #sweep(): Promise<void> {
     const cdp = this.#cdp;
     if (cdp === null || !cdp.open) return;
+    // The tabs the leases are actually driving. Anything else in one of our
+    // contexts is a window a page opened, which no tool could name.
     const ours = new Set([...this.#leases].map((one) => one.page?.targetId).filter((id): id is string => id !== undefined));
-    const ourContexts = new Set(
-      [...this.#leases].map((one) => one.contextId).filter((id): id is string => id !== null),
-    );
 
     let targets: unknown;
     try {
@@ -488,17 +522,33 @@ class ServerBrowserImpl implements ServerBrowser {
       const info = one as { targetId?: unknown; type?: unknown; browserContextId?: unknown };
       const targetId = typeof info.targetId === 'string' ? info.targetId : null;
       if (targetId === null || ours.has(targetId)) continue;
-      // Only pages and their workers. A `browser` or `service_worker` target
-      // belongs to Chromium itself and closing one is not tidying.
-      if (info.type !== 'page' && info.type !== 'iframe' && info.type !== 'webview') continue;
       const contextId = typeof info.browserContextId === 'string' ? info.browserContextId : null;
-      if (contextId !== null && !ourContexts.has(contextId)) strayContexts.add(contextId);
+      /*
+       * A target in a context we claimed but that no lease is driving yet is a
+       * tab mid-setup. Left alone; the run that is building it will record it a
+       * round trip from now, and closing it would be closing our own work.
+       */
+      if (contextId !== null && this.#ourContexts.has(contextId) && !this.#hasPage(contextId)) continue;
+      /*
+       * Documents only: `page`, and the two other kinds that render one.
+       * `browser`, `service_worker`, `shared_worker` and `other` targets belong
+       * to Chromium itself or outlive any one page, and closing them is not
+       * tidying — a service worker is how a progressive web app the agent is
+       * testing works at all.
+       */
+      if (info.type !== 'page' && info.type !== 'iframe' && info.type !== 'webview') continue;
+      if (contextId !== null && !this.#ourContexts.has(contextId)) strayContexts.add(contextId);
       await cdp.call('Target.closeTarget', { targetId }).catch(() => undefined);
       this.#log(`browser sweep closed a target this server does not own (${targetId}).`);
     }
     for (const contextId of strayContexts) {
       await cdp.call('Target.disposeBrowserContext', { browserContextId: contextId }).catch(() => undefined);
     }
+  }
+
+  /** Is a lease actually driving a tab in this context yet? */
+  #hasPage(contextId: string): boolean {
+    return [...this.#leases].some((one) => one.page !== null && one.contextId === contextId);
   }
 
   /**
@@ -548,6 +598,10 @@ class ServerBrowserImpl implements ServerBrowser {
           const connection = new CdpConnection(await this.#dial(endpoint));
           connection.onClosed(() => {
             if (this.#cdp === connection) this.#cdp = null;
+            // Context ids belong to the browser that is gone. Keeping them
+            // would make the next browser's sweep spare a stranger's tabs that
+            // happened to reuse an id.
+            this.#ourContexts.clear();
             // Every lease's tab died with the socket. Say so, rather than
             // letting the next verb fail against a target that is not there.
             for (const lease of this.#leases) {
