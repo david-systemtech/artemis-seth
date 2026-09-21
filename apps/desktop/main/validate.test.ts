@@ -10,6 +10,11 @@ import {
   validateServerSkillsSourceAdd,
   validateServerSkillsSourceRemove,
   validateServerSkillsSourceSync,
+  validateExtensionBridgePair,
+  validateExtensionBridgePolicy,
+  validateExtensionBridgeSaveBundle,
+  validateExtensionBridgeState,
+  validateExtensionBridgeUnpair,
   validatePreviewOpen,
   validateProfilesCreate,
   validateProfilesSuggestDir,
@@ -98,23 +103,43 @@ describe('validateRunsStart', () => {
     expect(result.input.rewindToMessageId).toBe('a4f0c2d1-9b8e-4c1d-9f00-1234567890ab');
   });
 
-  it('carries the four switches through, because a switch that dies here is drawn and does nothing', () => {
+  it('carries the five switches through, because a switch that dies here is drawn and does nothing', () => {
     // The Chrome, external-browser, fast and ultracode switches were set by
     // the window and read past this boundary - by the adapter, and by the
     // host's browser-tool factory - and none of them was in this
     // whitelist - so for a month each was a control that changed nothing, and
     // an agent asked to use Chrome had never been told it could. The type
     // guard on the validator now refuses a field it has not been given; this
-    // pins the values.
+    // pins the values. `extensionBrowser` joined them with the Artemis
+    // extension and is the same kind of field, read by the same factory.
     const result = validateRunsStart({
-      input: { ...VALID_RUN, fastMode: true, ultracode: true, chromeBrowser: true, externalBrowser: false },
+      input: {
+        ...VALID_RUN,
+        fastMode: true,
+        ultracode: true,
+        chromeBrowser: true,
+        extensionBrowser: false,
+        externalBrowser: false,
+      },
     });
     expect(result.input).toMatchObject({
       fastMode: true,
       ultracode: true,
       chromeBrowser: true,
+      extensionBrowser: false,
       externalBrowser: false,
     });
+  });
+
+  it('carries a run that asked for the Artemis extension', () => {
+    const result = validateRunsStart({ input: { ...VALID_RUN, extensionBrowser: true } });
+    expect(result.input).toMatchObject({ extensionBrowser: true });
+  });
+
+  it('refuses an extension switch that is not a boolean', () => {
+    expect(() =>
+      validateRunsStart({ input: { ...VALID_RUN, extensionBrowser: 'yes' } }),
+    ).toThrow(ValidationError);
   });
 
   it('refuses a switch that is not a boolean, rather than reading it as on', () => {
@@ -169,6 +194,90 @@ describe('validateRunsStart', () => {
  * has been compromised, or a bug — because this is the last place a payload can
  * be refused before it is written to a file and billed to an account.
  */
+/* -------------------------------------------------------------------------- */
+/* The extension bridge                                                       */
+/* -------------------------------------------------------------------------- */
+
+describe('the extension-bridge validators', () => {
+  it('reads the pairing switch, and refuses anything that is not a boolean', () => {
+    // Not defaulted. "Show a code" and "withdraw the one on screen" are
+    // opposite acts, and a payload that failed to say which must not pick one.
+    expect(validateExtensionBridgePair({ offer: true })).toEqual({ offer: true });
+    expect(validateExtensionBridgePair({ offer: false })).toEqual({ offer: false });
+    expect(() => validateExtensionBridgePair({})).toThrow(ValidationError);
+    expect(() => validateExtensionBridgePair({ offer: 'yes' })).toThrow(ValidationError);
+  });
+
+  it('requires a browser id to unpair, rather than unpairing something', () => {
+    expect(validateExtensionBridgeUnpair({ browserId: 'abc' })).toEqual({ browserId: 'abc' });
+    expect(() => validateExtensionBridgeUnpair({})).toThrow(ValidationError);
+    expect(() => validateExtensionBridgeUnpair({ browserId: '' })).toThrow(ValidationError);
+  });
+
+  it('carries a whole policy through, lists and switches alike', () => {
+    const result = validateExtensionBridgePolicy({
+      policy: {
+        devSites: ['localhost', '*.test'],
+        blockedSites: ['news.example'],
+        unblockedSites: ['*.stripe.com'],
+        evaluateEverywhere: true,
+        deepReadEverywhere: false,
+      },
+    });
+
+    expect(result.policy).toEqual({
+      devSites: ['localhost', '*.test'],
+      blockedSites: ['news.example'],
+      unblockedSites: ['*.stripe.com'],
+      evaluateEverywhere: true,
+      deepReadEverywhere: false,
+    });
+  });
+
+  it('reads a missing list as empty, because an absent list is a list of nothing', () => {
+    const result = validateExtensionBridgePolicy({
+      policy: { evaluateEverywhere: false, deepReadEverywhere: false },
+    });
+
+    expect(result.policy.devSites).toEqual([]);
+    expect(result.policy.blockedSites).toEqual([]);
+    expect(result.policy.unblockedSites).toEqual([]);
+  });
+
+  it('refuses a policy whose switches are missing, rather than reading them as off', () => {
+    // These two are the ones that widen what an agent may do on every site.
+    // A payload that failed to say has not said "off", it has failed to say.
+    expect(() => validateExtensionBridgePolicy({ policy: { devSites: [] } })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it('refuses a site list that is not an array of strings', () => {
+    expect(() =>
+      validateExtensionBridgePolicy({
+        policy: { devSites: [42], evaluateEverywhere: false, deepReadEverywhere: false },
+      }),
+    ).toThrow(ValidationError);
+  });
+
+  it('refuses a site list long enough to be a payload rather than a preference', () => {
+    // This list is forwarded verbatim to every connected extension, which
+    // matches every entry against every navigation.
+    const enormous = Array.from({ length: 1_000 }, (_one, index) => `host${String(index)}.example`);
+    expect(() =>
+      validateExtensionBridgePolicy({
+        policy: { devSites: enormous, evaluateEverywhere: false, deepReadEverywhere: false },
+      }),
+    ).toThrow(ValidationError);
+  });
+
+  it('accepts the empty request the read-only channels carry', () => {
+    expect(validateExtensionBridgeState({})).toEqual({});
+    expect(validateExtensionBridgeState(undefined)).toEqual({});
+    expect(validateExtensionBridgeSaveBundle({})).toEqual({});
+  });
+});
+
 describe('attachments', () => {
   /** A 1×1 PNG. Small, real, and decodes. */
   const PNG =

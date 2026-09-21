@@ -517,8 +517,17 @@ export function createExtensionBridge(options: ExtensionBridgeOptions): Extensio
         });
         created.on('listening', () => {
           server = created;
-          listening = { kind: 'listening', port };
-          log.info(`The extension bridge is listening on 127.0.0.1:${String(port)}.`);
+          /*
+           * The port the OS actually gave us, not the one that was asked for.
+           * They are the same number in the app — the extension dials a fixed
+           * address, so nothing here may drift — and different only when a
+           * caller passes `0` to mean "any free port", which is what a test
+           * does to avoid fighting a real Artemis on the same machine.
+           */
+          const bound = created.address();
+          const boundPort = typeof bound === 'object' && bound !== null ? bound.port : port;
+          listening = { kind: 'listening', port: boundPort };
+          log.info(`The extension bridge is listening on 127.0.0.1:${String(boundPort)}.`);
           announce();
           done();
         });

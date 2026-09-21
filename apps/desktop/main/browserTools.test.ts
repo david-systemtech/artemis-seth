@@ -272,7 +272,7 @@ describe('which browser a run gets', () => {
   /** Builders that record being asked and return tell-apart markers. */
   function builders(): {
     asked: string[];
-    build: { embedded: () => never; external: () => never };
+    build: { embedded: () => never; external: () => never; extension: () => never };
   } {
     const asked: string[] = [];
     return {
@@ -285,6 +285,10 @@ describe('which browser a run gets', () => {
         external: () => {
           asked.push('external');
           return 'the external server' as never;
+        },
+        extension: () => {
+          asked.push('extension');
+          return 'the extension server' as never;
         },
       },
     };
@@ -330,6 +334,55 @@ describe('which browser a run gets', () => {
 
     expect(servers).toBeUndefined();
     expect(asked).toEqual([]);
+  });
+
+  it('hands a run that asked for the Artemis extension the extension server', () => {
+    const { asked, build } = builders();
+
+    const servers = agentBrowserServers({ extensionBrowser: true }, build);
+
+    // Same key, because the key is the contract: a permission allow-list built
+    // under one mode must survive the user switching to another.
+    expect(servers).toEqual({ artemisBrowser: 'the extension server' });
+    expect(asked).toEqual(['extension']);
+  });
+
+  it('builds the extension server even with nothing paired, so the refusal is a sentence', () => {
+    // Falling back to the dock browser here would have the agent report on the
+    // wrong cookie jar and never mention the substitution. The driver answers
+    // every verb with "the extension is not connected", which the agent can
+    // repeat to the user.
+    const { asked, build } = builders();
+
+    agentBrowserServers({ extensionBrowser: true }, build);
+
+    expect(asked).toEqual(['extension']);
+  });
+
+  it('lets Chrome win over the extension, because Chrome means no Artemis tools at all', () => {
+    const { asked, build } = builders();
+
+    const servers = agentBrowserServers({ chromeBrowser: true, extensionBrowser: true }, build);
+
+    expect(servers).toBeUndefined();
+    expect(asked).toEqual([]);
+  });
+
+  it('lets the extension win over the open-only server, which cannot read what it opened', () => {
+    const { asked, build } = builders();
+
+    const servers = agentBrowserServers({ extensionBrowser: true, externalBrowser: true }, build);
+
+    expect(servers).toEqual({ artemisBrowser: 'the extension server' });
+    expect(asked).toEqual(['extension']);
+  });
+
+  it('builds nothing it was not going to use, whichever row wins', () => {
+    const { asked, build } = builders();
+
+    agentBrowserServers({ externalBrowser: true }, build);
+
+    expect(asked).toEqual(['external']);
   });
 });
 
