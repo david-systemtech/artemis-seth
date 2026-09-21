@@ -187,18 +187,24 @@ export function writeSlashCommand(draft: string, token: SlashToken, name: string
  */
 export function hoistSlashCommand(draft: string, commands: readonly string[] | undefined): string {
   if (commands === undefined || commands.length === 0) return draft;
-  // Already at the front — and this is the branch that makes a second lift a
-  // no-op, which is what lets the composer and the server both do it.
-  if (draft.trimStart().startsWith('/')) return draft;
-
   const known = new Set(commands.map(canonicalCommandName));
-  const token = slashTokensIn(draft).find((candidate) => known.has(candidate.name));
+  const tokens = slashTokensIn(draft);
+  // A command already at the front: the branch that makes a second lift a
+  // no-op, which is what lets the composer and the server both do it. Only a
+  // *command* at the front - a draft that opens with a path, `/work/foo then
+  // /compact`, would otherwise keep the command the menu offered where the
+  // provider ignores it, and get `Unknown command` back for the path.
+  if (tokens[0]?.leading === true && known.has(tokens[0].name)) return draft;
+
+  const token = tokens.find((candidate) => known.has(candidate.name));
   if (token === undefined) return draft;
 
   const before = draft.slice(0, token.start);
   const after = draft.slice(token.end);
   const head = before.replace(/\s+$/u, '');
   const tail = after.replace(/^\s+/u, '');
+  // Never empty: a known command with nothing before it returned above, so
+  // there is always something in front of the one being lifted.
   const rest = head === '' ? tail : tail === '' ? head : `${head}${seam(before, after)}${tail}`;
-  return rest === '' ? `/${token.name}` : `/${token.name} ${rest}`;
+  return `/${token.name} ${rest}`;
 }

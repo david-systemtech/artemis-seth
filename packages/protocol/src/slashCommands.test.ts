@@ -109,8 +109,16 @@ describe('hoistSlashCommand', () => {
     );
   });
 
-  it('drops to the bare command when the draft held nothing else', () => {
+  it('leaves a command that is all the draft holds exactly as typed', () => {
     expect(hoistSlashCommand('  /compact  ', COMMANDS)).toBe('  /compact  ');
     expect(hoistSlashCommand('\t/compact', COMMANDS)).toBe('\t/compact');
+  });
+
+  it('lifts past a draft that opens with a path, which the provider would take for a command', () => {
+    // The menu offers `/compact` mid-draft whatever the draft opens with, so
+    // the lift has to honour it there too - or the pick comes back as text.
+    expect(hoistSlashCommand('/work/foo then /compact', COMMANDS)).toBe('/compact /work/foo then');
+    // And a lifted draft is left alone by a second lift.
+    expect(hoistSlashCommand('/compact /work/foo then', COMMANDS)).toBe('/compact /work/foo then');
   });
 });
