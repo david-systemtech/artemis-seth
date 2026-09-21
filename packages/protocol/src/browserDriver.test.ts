@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { DEFAULT_PAGE_POLICY, hostMatches, isLocalHost, standingOf, type PagePolicy } from './browserDriver.js';
+import { DEFAULT_PAGE_POLICY, hostMatches, hostOf, isLocalHost, standingOf, type PagePolicy } from './browserDriver.js';
 
 const policy = (over: Partial<PagePolicy> = {}): PagePolicy => ({ ...DEFAULT_PAGE_POLICY, ...over });
 
@@ -39,6 +39,23 @@ describe('isLocalHost', () => {
   );
 });
 
+describe('hostOf', () => {
+  it('reads the host a browser would go to, not the one a reader sees first', () => {
+    expect(hostOf('https://paypal.com@evil.test/login')).toEqual({ scheme: 'https', host: 'evil.test' });
+    expect(hostOf('https://user:pw@www.paypal.com:8443/x?y#z')).toEqual({ scheme: 'https', host: 'www.paypal.com' });
+    expect(hostOf('HTTPS://WWW.PayPal.COM./')).toEqual({ scheme: 'https', host: 'www.paypal.com' });
+    expect(hostOf('http://[::1]:3000/')).toEqual({ scheme: 'http', host: '::1' });
+  });
+
+  it('refuses what it cannot read the way a browser would', () => {
+    // A browser treats a backslash as a slash in an http address.
+    expect(hostOf('https://evil.test\\@www.paypal.com/')).toBeNull();
+    expect(hostOf('https://www.paypal.com\tevil.test/')).toBeNull();
+    expect(hostOf('https:///')).toBeNull();
+    expect(hostOf('')).toBeNull();
+  });
+});
+
 describe('standingOf', () => {
   it('keeps an agent out of banks, payments and password managers by default', () => {
     for (const url of ['https://www.paypal.com/signin', 'https://vault.bitwarden.com/', 'https://online.bdo.com.ph/']) {
@@ -57,6 +74,11 @@ describe('standingOf', () => {
   it('blocks what the user added, even a dev site', () => {
     const mine = policy({ blockedSites: ['localhost'], devSites: ['localhost'] });
     expect(standingOf('http://localhost:3000/', mine).blocked).toBe(true);
+  });
+
+  it('is not fooled by a blocked name in the userinfo, in either direction', () => {
+    expect(standingOf('https://github.com@www.paypal.com/', policy()).blocked).toBe(true);
+    expect(standingOf('https://www.paypal.com@github.com/', policy()).blocked).toBe(false);
   });
 
   it('refuses anything that is not a web page', () => {

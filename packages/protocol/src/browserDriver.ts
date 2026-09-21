@@ -246,6 +246,38 @@ export function isLocalHost(host: string): boolean {
   return /^f[cd][0-9a-f]{2}:/u.test(h) || /^fe[89ab][0-9a-f]:/u.test(h);
 }
 
+/**
+ * The scheme and host of an address, or `null` for anything that is not plainly
+ * one.
+ *
+ * A regular expression rather than `new URL()`, for the reason `github.ts`
+ * gives: this package is built without the DOM or Node's globals. That makes
+ * this a parser a block list depends on, so it refuses instead of guessing:
+ *
+ *  - whitespace, control characters and backslashes are rejected outright - a
+ *    browser reads `\` as `/` in an http address, and a reader here would not;
+ *  - userinfo is discarded, so `https://paypal.com@evil.test/` is `evil.test`;
+ *  - the host ends at the first `/`, `?` or `#`, then at the port.
+ *
+ * A difference of opinion with the browser is still possible in principle,
+ * which is why a driver also checks the address the page *actually* has after
+ * every load. This is the first gate, not the only one.
+ */
+export function hostOf(url: string): { readonly scheme: string; readonly host: string } | null {
+  const text = url.trim();
+  if (text.length === 0 || text.length > 8_192) return null;
+  if (/[\s\u0000-\u001f\u007f\\]/u.test(text)) return null;
+  const match = /^([a-z][a-z0-9+.-]*):(?:\/\/)?([^/?#]*)/iu.exec(text);
+  if (match === null) return null;
+  const scheme = (match[1] as string).toLowerCase();
+  const authority = match[2] as string;
+  const afterUserinfo = authority.slice(authority.lastIndexOf('@') + 1);
+  const bracketed = /^\[([0-9a-f:.]+)\](?::\d*)?$/iu.exec(afterUserinfo);
+  const host = bracketed !== null ? (bracketed[1] as string) : afterUserinfo.replace(/:\d*$/u, '');
+  if (host.length === 0 && (scheme === 'http' || scheme === 'https')) return null;
+  return { scheme, host: host.toLowerCase().replace(/\.$/u, '') };
+}
+
 /** What a policy says about one address. */
 export interface SiteStanding {
   /** The agent may not open it. `reason` is the sentence the model is given. */
@@ -263,19 +295,15 @@ export interface SiteStanding {
  * cannot disagree about what a site is.
  */
 export function standingOf(url: string, policy: PagePolicy): SiteStanding {
-  let host: string;
-  let protocol: string;
-  try {
-    const parsed = new URL(url);
-    host = parsed.hostname;
-    protocol = parsed.protocol;
-  } catch {
+  const parsed = hostOf(url);
+  if (parsed === null) {
     return { blocked: true, reason: `“${url}” is not an address.`, deepRead: false, evaluate: false };
   }
-  if (protocol !== 'http:' && protocol !== 'https:') {
+  const { host, scheme } = parsed;
+  if (scheme !== 'http' && scheme !== 'https') {
     return {
       blocked: true,
-      reason: `Only http and https pages can be driven, not ${protocol}//.`,
+      reason: `Only http and https pages can be driven, not ${scheme}: pages.`,
       deepRead: false,
       evaluate: false,
     };
