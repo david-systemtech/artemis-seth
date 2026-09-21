@@ -124,16 +124,17 @@ MIN_TOKENS_PER_S = 45
 #  - It went quiet for STALL_S mid-answer. The `: OPENROUTER PROCESSING`
 #    comments the router sends while a request waits are not progress and do
 #    not reset this.
-#  - Its own measured pace, once there has been PACE_GRACE_S of it to measure,
-#    cannot deliver what is expected to remain before the review's deadline.
-#    Only while fewer tokens have arrived than were expected: past that the
-#    estimate has already been shown wrong and says nothing about the rest.
 #
 # A provider that is producing is left to produce, for as long as the review's
-# deadline allows.
+# deadline allows. Its pace is logged, not judged: "can it finish in time at
+# this rate" needs to know how much is left to write, which is the guess this
+# replaced - and the first version had that rule, which reduces to a speed
+# floor of expected tokens over deadline. At `max`, where the estimate runs
+# three times high, it would have cut healthy providers a minute in. Until the
+# estimates are fitted to the usage every review now logs, the deadline is the
+# only judge of a slow provider.
 FIRST_TOKEN_S = 120
 STALL_S = 60
-PACE_GRACE_S = 60
 
 # How many attempts that actually *used* a provider - ran out its budget, or
 # failed some other way. A refusal is not one of these: a 429 "rate-limited
@@ -483,7 +484,7 @@ def call_model(api_key: str, model: str, prompt: str, diff_chars: int) -> tuple[
         return result, "high", f"A `{wanted}`-effort review did not finish ({why}), so this is a quicker `high` pass."
 
 
-def read_stream(resp, tokens_out: int, deadline_at: float) -> dict:
+def read_stream(resp) -> dict:
     """Read a streamed answer into the shape an unstreamed one has, judging the provider as it goes.
 
     What the router sends, measured 2026-09-21 on this model: `data:` chunks
@@ -531,13 +532,12 @@ def read_stream(resp, tokens_out: int, deadline_at: float) -> dict:
                     raise Stalled(f"had not begun after {FIRST_TOKEN_S} s")
             elif now - last_at > STALL_S:
                 raise Stalled(f"went quiet for {STALL_S} s after about {tokens} tokens")
-            elif now - first_at > PACE_GRACE_S and tokens < tokens_out:
-                pace = tokens / (now - first_at)
-                if now + (tokens_out - tokens) / pace > deadline_at:
-                    raise Stalled(f"at {pace:.0f} tok/s could not finish before the deadline")
     except TimeoutError as exc:
-        # The per-read timeout: nothing at all, not even a keep-alive.
-        raise Stalled(f"sent nothing at all for {STALL_S} s") from exc
+        # The per-read timeout: not a byte, not even a keep-alive - before the
+        # answer began or part-way through it, which the log has to tell apart.
+        if first_at is None:
+            raise Stalled(f"sent nothing at all for {STALL_S} s") from exc
+        raise Stalled(f"went silent for {STALL_S} s after about {max(chunks, chars // 4)} tokens") from exc
     if finish is None:
         raise RuntimeError("the stream ended without finishing an answer")
     return {
@@ -636,7 +636,7 @@ def run_effort(api_key: str, model: str, prompt: str, diff_chars: int, effort: s
             req.add_header("X-OpenRouter-Title", APP)
             req.add_header("X-OpenRouter-Metadata", "enabled")
             with urllib.request.urlopen(req, timeout=STALL_S) as resp:
-                body = read_stream(resp, tokens_out, time.monotonic() + budget)
+                body = read_stream(resp)
             choice = body["choices"][0]
             if choice.get("finish_reason") == "length":
                 # Not a provider's fault and not worth another provider: how
