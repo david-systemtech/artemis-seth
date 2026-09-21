@@ -9,6 +9,10 @@
  * like "the browser service is down" and would be nothing of the kind.
  */
 
+import { readFileSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import { CdpConnection, resolveCdpEndpoint, type CdpTransport } from './cdp.js';
@@ -212,5 +216,33 @@ describe('turning a compose file’s address into an endpoint', () => {
     await expect(
       resolveCdpEndpoint('http://browser:9222', { lookup, fetchJson: async () => ({ ok: true }) }),
     ).rejects.toThrow('did not name a webSocketDebuggerUrl');
+  });
+});
+
+describe('the source of this feature is source', () => {
+  it('holds no raw control byte, so git does not call a file binary', () => {
+    /*
+     * This is here because it happened. A listener key was joined with a
+     * literal NUL written straight into a template string, which made git
+     * classify `cdp.ts` as binary: `git diff` showed `- -` instead of line
+     * counts, the pull request could not be reviewed, and `git grep` skipped
+     * the file. The fix is to write the separator as an escape; this is what
+     * stops the next one.
+     *
+     * Tab and newline are the two control characters source legitimately has.
+     * Everything else below 0x20, plus DEL, is a byte that arrived by accident
+     * — from a paste, or from a tool that decoded an escape on the way in.
+     */
+    const here = dirname(fileURLToPath(import.meta.url));
+    const offenders: string[] = [];
+    for (const name of readdirSync(here)) {
+      if (!name.endsWith('.ts')) continue;
+      const bytes = readFileSync(join(here, name));
+      const at = bytes.findIndex(
+        (byte) => (byte < 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) || byte === 0x7f,
+      );
+      if (at >= 0) offenders.push(`${name} at byte ${String(at)} (0x${bytes[at]?.toString(16) ?? ''})`);
+    }
+    expect(offenders).toEqual([]);
   });
 });
