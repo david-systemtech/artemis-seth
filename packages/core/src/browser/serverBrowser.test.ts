@@ -30,10 +30,32 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import type { PageDriver } from '@rx-artemis/protocol';
+import { hostOf, type PageDriver } from '@rx-artemis/protocol';
 
 import type { CdpTransport } from './cdp.js';
 import { createServerBrowser, type BrowserTimers, type ServerBrowser } from './serverBrowser.js';
+import { isAddressLiteral } from './serverBrowserPolicy.js';
+
+/**
+ * The frame every page in this file lives in.
+ *
+ * A constant because the checks under test all turn on "is this the top
+ * frame?", and a test that let the id drift would pass for the wrong reason.
+ */
+const TOP_FRAME = 'frame-top';
+
+/** What a name resolves to when a test has not said otherwise: a public address. */
+const DEFAULT_ADDRESSES: readonly string[] = ['203.0.113.10'];
+
+/**
+ * The resolver, as the tests control it.
+ *
+ * Every name resolves somewhere public unless a test puts it here, and a name
+ * mapped to `null` fails to resolve at all. DNS is the whole of the second gate
+ * now, so a suite that reached the real resolver would be a suite whose results
+ * depended on the machine it ran on.
+ */
+let dns: Map<string, readonly string[] | null>;
 
 /* -------------------------------------------------------------------------- */
 /* A Chromium that is only a record of what was asked                         */
@@ -74,6 +96,14 @@ class FakeChromium {
   purged = 0;
   /** Set to refuse the next dial, so a reconnect can be watched. */
   refuseDials = 0;
+  /**
+   * Called as each message is answered, before the reply is sent.
+   *
+   * The seam for testing a race: whatever this does happens while the caller is
+   * still waiting, which is the only way to put a maintenance pass inside a
+   * half-finished `openFor`.
+   */
+  onCall: ((method: string, params: Record<string, unknown>) => void) | null = null;
 
   #nextId = 1;
   #onMessage: ((message: string) => void) | null = null;
@@ -147,6 +177,7 @@ class FakeChromium {
     } catch (error) {
       result = error instanceof Error ? error : new Error(String(error));
     }
+    this.onCall?.(method, params);
     // Asynchronously, as a socket would, so a caller that did not await is not
     // quietly serialised by the fake.
     queueMicrotask(() => {
@@ -159,15 +190,93 @@ class FakeChromium {
     });
   }
 
-  /** What a real browser does a beat after answering. */
+  /**
+   * What a real browser does a beat after answering.
+   *
+   * Two cases, and the second is the one that used to be missed: a navigation
+   * the *page* started. A click handler calling `location.assign` navigates
+   * after the mouse events have been acknowledged, so a verb that asked "is
+   * anything loading?" the instant the last `Input.*` call returned was told
+   * no.
+   */
   #after(method: string, params: Record<string, unknown>, sessionId: string | undefined): void {
-    if (method !== 'Page.navigate' || sessionId === undefined) return;
-    const url = String(params['url']);
-    if (this.navigationFailures.has(url)) return;
-    queueMicrotask(() => {
-      this.emit('Page.loadEventFired', { timestamp: 1 }, sessionId);
-    });
+    if (sessionId === undefined) return;
+
+    if (method === 'Page.navigate') {
+      const url = String(params['url']);
+      if (this.navigationFailures.has(url)) return;
+      queueMicrotask(() => {
+        this.arriveAt(this.redirects.get(url) ?? url, sessionId);
+      });
+      return;
+    }
+
+    if (
+      method === 'Input.dispatchMouseEvent' &&
+      params['type'] === 'mouseReleased' &&
+      this.navigatesOnClick !== null
+    ) {
+      const to = this.navigatesOnClick;
+      this.navigatesOnClick = null;
+      queueMicrotask(() => {
+        this.arriveAt(to, sessionId);
+      });
+    }
   }
+
+  /** Where the page goes next, and the events Chromium sends on the way. */
+  navigatesOnClick: string | null = null;
+
+  /**
+   * The events one arrival produces, in Chromium's own order.
+   *
+   * The order is load-bearing: the main document's response carries the address
+   * it came from, and it has to be recorded before `frameNavigated` asks
+   * whether the page may be where it is.
+   */
+  arriveAt(url: string, sessionId: string): void {
+    const target = this.sessions.get(sessionId);
+    if (target !== undefined) {
+      this.targets.set(target, {
+        contextId: this.targets.get(target)?.contextId ?? null,
+        url,
+        title: url === 'about:blank' ? '' : this.title,
+      });
+    }
+    this.emit('Page.frameStartedLoading', { frameId: TOP_FRAME }, sessionId);
+    if (url !== 'about:blank') {
+      this.emit(
+        'Network.responseReceived',
+        {
+          requestId: `doc-${String(this.#nextId++)}`,
+          type: 'Document',
+          frameId: TOP_FRAME,
+          response: { status: 200, remoteIPAddress: this.servedFrom(url) },
+        },
+        sessionId,
+      );
+    }
+    this.emit('Page.frameNavigated', { frame: { id: TOP_FRAME, url } }, sessionId);
+    this.emit('Page.loadEventFired', { timestamp: 1 }, sessionId);
+  }
+
+  /**
+   * The address a page was actually served from.
+   *
+   * Defaults to the address its name resolves to, which is what a browser
+   * without an attacker in it would report. A test that wants the two to
+   * disagree — which is what DNS rebinding *is* — sets {@link servedFromOverride}.
+   */
+  servedFrom(url: string): string {
+    const override = this.servedFromOverride.get(url);
+    if (override !== undefined) return override;
+    const host = hostOf(url)?.host ?? '';
+    if (isAddressLiteral(host)) return host;
+    return (dns.get(host) ?? DEFAULT_ADDRESSES)[0] ?? '';
+  }
+
+  /** url → the address Chromium says it really talked to. See {@link servedFrom}. */
+  servedFromOverride = new Map<string, string>();
 
   #answer(
     method: string,
@@ -265,6 +374,9 @@ class FakeChromium {
         return { result: { type: 'boolean', value: true } };
       }
 
+      case 'Page.getFrameTree':
+        return { frameTree: { frame: { id: TOP_FRAME, url: 'about:blank' } } };
+
       case 'DOM.getDocument':
         return { root: { nodeId: 1 } };
       case 'DOM.querySelector': {
@@ -329,8 +441,18 @@ class FakeTimers implements BrowserTimers {
     };
   }
 
+  /**
+   * Wait, in the only sense a test has of the word: one turn of the macrotask
+   * queue.
+   *
+   * Not instant, deliberately. The navigation grace in `settle` is a race
+   * between this and an event the fake browser emits in a microtask, and a
+   * grace that resolved immediately would win that race every time — which
+   * would pin the bug rather than the fix.
+   */
   async after(ms: number): Promise<void> {
     this.waits.push(ms);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
 
   advanceMinutes(minutes: number): void {
@@ -350,6 +472,11 @@ function build(limits?: Parameters<typeof createServerBrowser>[0]['limits']): Se
     endpoint: 'ws://browser:9222/devtools/browser/fake',
     dial: async () => chromium.dial(),
     endpointDeps: { lookup: async () => '172.20.0.3' },
+    resolveHost: async (host) => {
+      const answer = dns.get(host);
+      if (answer === null) throw new Error(`getaddrinfo ENOTFOUND ${host}`);
+      return answer ?? DEFAULT_ADDRESSES;
+    },
     timers,
     ...(limits === undefined ? {} : { limits }),
   });
@@ -375,6 +502,7 @@ function reasonOf(result: { ok: boolean; reason?: string }): string {
 beforeEach(() => {
   chromium = new FakeChromium();
   timers = new FakeTimers();
+  dns = new Map();
   chromium.elements.set('button[type="submit"]', { box: [10, 20, 110, 20, 110, 60, 10, 60] });
   chromium.elements.set('#email', { box: [0, 0, 200, 0, 200, 30, 0, 30], kind: 'field' });
 });
@@ -455,7 +583,7 @@ describe('going somewhere else', () => {
     chromium.redirects.set('https://shortener.example/x', 'http://169.254.169.254/latest/meta-data/');
     const { driver } = await openAt();
     const refused = await driver.navigate('https://shortener.example/x');
-    expect(reasonOf(refused)).toContain('redirected to http://169.254.169.254/latest/meta-data/');
+    expect(reasonOf(refused)).toContain('went to http://169.254.169.254/latest/meta-data/');
     expect(reasonOf(refused)).toContain('The tab is now blank.');
     // And it is actually blank, rather than loaded with the agent merely told
     // not to look.
@@ -466,20 +594,18 @@ describe('going somewhere else', () => {
     chromium.redirects.set('https://shortener.example/x', 'http://10.0.0.5/admin');
     const browser = build();
     const refused = await browser.driver().open('https://shortener.example/x');
-    expect(reasonOf(refused)).toContain('redirected to http://10.0.0.5/admin');
+    expect(reasonOf(refused)).toContain('went to http://10.0.0.5/admin');
   });
 
   it('catches a link that navigated somewhere denied after a click', async () => {
-    chromium.redirects.set('https://example.com/orders', 'http://10.0.0.5/admin');
     const { driver } = await openAt('https://example.com/start');
     chromium.elements.set('a.next', { box: [0, 0, 10, 0, 10, 10, 0, 10] });
-    // The click navigates; the fake's redirect table stands in for the page's
-    // own `location.href`.
-    chromium.redirects.set('about:blank', 'about:blank');
-    const target = [...chromium.targets.keys()][0] as string;
-    chromium.targets.set(target, { contextId: null, url: 'http://10.0.0.5/admin', title: 'Admin' });
+    // The click is what moves the page, the way a real one would: the address
+    // changes while the mouse events are still being acknowledged.
+    chromium.navigatesOnClick = 'http://10.0.0.5/admin';
     const refused = await driver.click('a.next');
-    expect(reasonOf(refused)).toContain('That link went to http://10.0.0.5/admin');
+    expect(reasonOf(refused)).toContain('http://10.0.0.5/admin');
+    expect(reasonOf(refused)).toContain('The tab is now blank.');
   });
 });
 
@@ -994,6 +1120,284 @@ describe('the memory watchdog', () => {
     // goes first.
     expect(closed).toHaveLength(2);
     expect(closed[0]).toBe('target-2');
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* A name is not an address                                                   */
+/* -------------------------------------------------------------------------- */
+
+describe('the address behind a name', () => {
+  it('refuses a public name that resolves to the metadata service', async () => {
+    /*
+     * The hole the first version of this had. Every rule was applied to the
+     * spelling of the host, so `169.254.169.254.nip.io` — a real public name
+     * that resolves to the metadata service, and one of a family anybody can
+     * mint — passed both gates and the claim that metadata "can never be
+     * reached" was false.
+     */
+    dns.set('169.254.169.254.nip.io', ['169.254.169.254']);
+    const browser = build();
+    const refused = await browser.driver().open('http://169.254.169.254.nip.io/latest/meta-data/');
+    expect(reasonOf(refused)).toContain('resolves to 169.254.169.254');
+    expect(reasonOf(refused)).toContain('cloud metadata address');
+    // And nothing was built for it: the gate runs before a context is made.
+    expect(chromium.called('Target.createBrowserContext')).toHaveLength(0);
+  });
+
+  it('refuses a public name that resolves into the private network', async () => {
+    dns.set('admin.example', ['192.168.1.10']);
+    const browser = build();
+    expect(reasonOf(await browser.driver().open('https://admin.example/'))).toContain(
+      'resolves to 192.168.1.10',
+    );
+  });
+
+  it('refuses a name where only one of its addresses is bad', async () => {
+    // Which record Chromium picks is not ours to choose, so any of them
+    // deciding it is the only safe reading.
+    dns.set('mixed.example', ['203.0.113.7', '10.0.0.9']);
+    const browser = build();
+    expect(reasonOf(await browser.driver().open('https://mixed.example/'))).toContain(
+      'resolves to 10.0.0.9',
+    );
+  });
+
+  it('opens an allow-listed name that resolves into the private network', async () => {
+    // The reason the allow-list is consulted by name. `artemis-server` is a
+    // compose service and resolves to a private address by design; a rule that
+    // refused every private address would refuse the dev servers this browser
+    // exists to test.
+    dns.set('artemis-server', ['172.20.0.4']);
+    const browser = build();
+    expect((await browser.driver().open('http://artemis-server:3000/orders')).ok).toBe(true);
+  });
+
+  it('refuses an allow-listed name that resolves to metadata, because that rule has no switch', async () => {
+    dns.set('staging.internal', ['169.254.169.254']);
+    const browser = build({ allowHosts: ['staging.internal'] });
+    expect(reasonOf(await browser.driver().open('https://staging.internal/'))).toContain(
+      'cloud metadata address',
+    );
+  });
+
+  it('refuses a name it cannot resolve, in the resolver’s own words', async () => {
+    dns.set('nowhere.example', null);
+    const browser = build();
+    const refused = await browser.driver().open('https://nowhere.example/');
+    expect(reasonOf(refused)).toContain('getaddrinfo ENOTFOUND nowhere.example');
+    expect(reasonOf(refused)).toContain('does not open a name it cannot look up');
+  });
+
+  it('asks no resolver about an address literal', async () => {
+    let asked = 0;
+    const browser = createServerBrowser({
+      endpoint: 'ws://browser:9222/devtools/browser/fake',
+      dial: async () => chromium.dial(),
+      endpointDeps: { lookup: async () => '172.20.0.3' },
+      resolveHost: async () => {
+        asked += 1;
+        return DEFAULT_ADDRESSES;
+      },
+      timers,
+      limits: { allowHosts: ['127.0.0.1'] },
+    });
+    expect((await browser.driver().open('http://127.0.0.1:5173/')).ok).toBe(true);
+    // The name gate already judged it as the address it is. Asking a resolver
+    // about `127.0.0.1` would be asking it to agree with itself.
+    expect(asked).toBe(0);
+  });
+
+  it('refuses when the address served does not match the address looked up', async () => {
+    /*
+     * Rebinding, which is what the third gate is for. The name resolved
+     * publicly when the driver asked, and by the time Chromium fetched it the
+     * answer had changed — so only `remoteIPAddress`, the machine the browser
+     * really talked to, can catch it.
+     */
+    dns.set('rebind.example', ['203.0.113.7']);
+    chromium.servedFromOverride.set('https://rebind.example/', '169.254.169.254');
+    const browser = build();
+    const refused = await browser.driver().open('https://rebind.example/');
+    expect(reasonOf(refused)).toContain('cloud metadata address');
+    expect(reasonOf(refused)).toContain('The tab is now blank.');
+  });
+
+  it('checks the last main-document address on every verb, not only on arrival', async () => {
+    /*
+     * The address is recorded by the page and read by the driver, so a verb
+     * running long after the load still judges the machine the document came
+     * from. Pinned by moving the record under a page that is already open: a
+     * soft reload, or a document response that arrives after the navigation
+     * the driver watched.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.emit(
+      'Network.responseReceived',
+      {
+        requestId: 'doc-late',
+        type: 'Document',
+        frameId: TOP_FRAME,
+        response: { status: 200, remoteIPAddress: '10.0.0.5' },
+      },
+      session,
+    );
+    const refused = await driver.read();
+    expect(reasonOf(refused)).toContain('resolves to 10.0.0.5');
+    expect(reasonOf(refused)).toContain('The tab is now blank.');
+  });
+
+  it('ignores the address a subframe was served from', async () => {
+    // An advert in an iframe reaching a private address is the network's
+    // business. Treating it as the page's would refuse pages for what their
+    // third parties did.
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.emit(
+      'Network.responseReceived',
+      {
+        requestId: 'sub-1',
+        type: 'Document',
+        frameId: 'frame-advert',
+        response: { status: 200, remoteIPAddress: '169.254.169.254' },
+      },
+      session,
+    );
+    expect((await driver.read()).ok).toBe(true);
+  });
+
+  it('treats a page with no remote address as nothing to check, not as a pass', async () => {
+    // A `data:` page or one with no document response. The name gate still
+    // holds it; there is simply no second opinion to be had.
+    const { driver } = await openAt();
+    chromium.servedFromOverride.set('https://example.com/other', '');
+    expect((await driver.navigate('https://example.com/other')).ok).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The policy runs on every load, not only the ones a verb asked for          */
+/* -------------------------------------------------------------------------- */
+
+describe('a page that moves itself', () => {
+  it('is blanked at once and reported on the next verb', async () => {
+    // A `<meta http-equiv="refresh">`, or a timer calling `location.assign`.
+    // No tool call is in flight, so the listener is the only thing that can
+    // act — and the verb that comes next is the only thing with anybody to
+    // tell.
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.arriveAt('http://10.0.0.5/admin', session);
+    await Promise.resolve();
+
+    const refused = await driver.read();
+    expect(reasonOf(refused)).toContain('The page went to http://10.0.0.5/admin');
+    expect(reasonOf(refused)).toContain('The tab is now blank.');
+    expect(chromium.called('Page.navigate').at(-1)).toEqual({ url: 'about:blank' });
+  });
+
+  it('says it once, and the verb after that is ordinary', async () => {
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.arriveAt('http://10.0.0.5/admin', session);
+    await Promise.resolve();
+    await driver.read();
+    // The tab is blank now, so there is nothing to refuse and nothing to read.
+    expect((await driver.read()).ok).toBe(true);
+  });
+
+  it('is caught on a same-document navigation as well as a real one', async () => {
+    /*
+     * `history.pushState` and a fragment change fire
+     * `Page.navigatedWithinDocument` and nothing else, so a listener watching
+     * only `frameNavigated` would never see a single-page application move.
+     * The address here could not be reached that way in a real browser — a
+     * pushState cannot change origin — but what is under test is that the
+     * event is wired to the policy at all.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.emit(
+      'Page.navigatedWithinDocument',
+      { frameId: TOP_FRAME, url: 'http://10.0.0.5/admin' },
+      session,
+    );
+    await Promise.resolve();
+    expect(reasonOf(await driver.read())).toContain('http://10.0.0.5/admin');
+  });
+
+  it('lets browser_navigate be the remedy rather than refusing it', async () => {
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.arriveAt('http://10.0.0.5/admin', session);
+    await Promise.resolve();
+    // Going somewhere allowed is what the agent should do next, so it works —
+    // and it is not made to read a stale refusal first.
+    expect((await driver.navigate('https://example.com/orders')).ok).toBe(true);
+  });
+
+  it('is checked by every verb, not only the ones that navigate', async () => {
+    /*
+     * The listener fires on `Page.frameNavigated`, and a page can be somewhere
+     * new before Chromium has said so. Every verb therefore looks for itself,
+     * which is what this pins: the tab's address changes with no event at all.
+     */
+    const target = [...chromium.targets.keys()];
+    const { driver } = await openAt();
+    const mine = [...chromium.targets.keys()].find((id) => !target.includes(id)) as string;
+    const moved = (): void => {
+      chromium.targets.set(mine, { contextId: null, url: 'http://10.0.0.5/admin', title: 'Admin' });
+    };
+
+    for (const verb of [
+      () => driver.read(),
+      () => driver.screenshot(),
+      () => driver.console(),
+      () => driver.network(),
+      () => driver.cookies(),
+      () => driver.storage(),
+      () => driver.evaluate('1'),
+      () => driver.click('button[type="submit"]'),
+      () => driver.type('#email', 'x'),
+    ]) {
+      moved();
+      expect(reasonOf(await verb())).toContain('may not open');
+      // Blanked, so the next round starts from a page that is allowed.
+      await driver.navigate('https://example.com/orders');
+    }
+  });
+});
+
+describe('a click whose navigation starts late', () => {
+  it('waits a moment for it rather than reporting the page it left', async () => {
+    /*
+     * A handler calling `location.assign` has not navigated by the time the
+     * mouse events are acknowledged. `settle` used to ask "is anything
+     * loading?" at exactly that instant, be told no, and report the old
+     * address — which, once the policy started reading that address, meant
+     * checking the page the click had just left.
+     */
+    const { driver } = await openAt('https://example.com/start');
+    chromium.elements.set('a.next', { box: [0, 0, 10, 0, 10, 10, 0, 10] });
+    chromium.navigatesOnClick = 'https://example.com/next';
+
+    const clicked = await driver.click('a.next');
+    expect(clicked).toEqual({
+      ok: true,
+      value: { url: 'https://example.com/next', title: 'Orders' },
+    });
+    // The grace was asked for, and bounded.
+    expect(timers.waits).toContain(500);
+  });
+
+  it('does not hang on a click that navigates nowhere', async () => {
+    const { driver } = await openAt('https://example.com/start');
+    const clicked = await driver.click('button[type="submit"]');
+    expect(clicked).toEqual({
+      ok: true,
+      value: { url: 'https://example.com/start', title: 'Orders' },
+    });
   });
 });
 

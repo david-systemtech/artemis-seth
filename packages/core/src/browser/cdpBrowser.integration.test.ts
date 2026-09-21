@@ -155,9 +155,16 @@ class TestTimers implements BrowserTimers {
       if (at >= 0) this.ticks.splice(at, 1);
     };
   }
-  async after(): Promise<void> {
-    // Reconnection backoff. Nothing here tests it, and waiting would be a
-    // second of nothing.
+  /**
+   * A real wait, unlike the unit suite's.
+   *
+   * This is the clock the navigation grace runs on, and the whole point of
+   * these tests is that a real Chromium really does take a moment to act on a
+   * click. The only other caller is the reconnection backoff, which nothing
+   * here exercises.
+   */
+  async after(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, ms));
   }
   advanceMinutes(minutes: number): void {
     this.#now += minutes * 60_000;
@@ -221,6 +228,30 @@ beforeAll(async () => {
       response.end();
       return;
     }
+    if (url === '/meta-refresh') {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end(
+        `<!doctype html><html><head><meta http-equiv="refresh" content="0; url=http://localhost:${String(sitePort)}/"></head><body>going</body></html>`,
+      );
+      return;
+    }
+    if (url === '/js-redirect') {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end(
+        `<!doctype html><html><body>going<script>setTimeout(function () { location.href = 'http://localhost:${String(sitePort)}/'; }, 30);</script></body></html>`,
+      );
+      return;
+    }
+    if (url === '/slow-click') {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end(
+        '<!doctype html><html><body><button id="go" type="button">Go</button>' +
+          "<script>document.getElementById('go').addEventListener('click', function () {" +
+          "  setTimeout(function () { location.href = '/?arrived=1'; }, 150);" +
+          '});</script></body></html>',
+      );
+      return;
+    }
     if (url === '/api/missing') {
       response.writeHead(404, { 'content-type': 'text/plain' });
       response.end('no');
@@ -243,6 +274,16 @@ beforeAll(async () => {
       '--no-sandbox',
       '--disable-gpu',
       '--disable-dev-shm-usage',
+      /*
+       * Chromium's own resolver, pointed at the test site for one name.
+       *
+       * This is what makes a real rebinding test possible: the driver is told
+       * (by an injected resolver) that `rebind.example` is public, and the
+       * browser really connects to 127.0.0.1 — which is the disagreement the
+       * `remoteIPAddress` check exists to catch, and the only way to produce it
+       * without an attacker's nameserver.
+       */
+      '--host-resolver-rules=MAP rebind.example 127.0.0.1',
       `--remote-debugging-port=${String(cdpPort)}`,
       `--user-data-dir=${profileDir}`,
       'about:blank',
@@ -376,6 +417,22 @@ when('every verb against a real Chromium', () => {
     expect(await value(driver.evaluate('document.getElementById("result").textContent'))).toBe(
       'saved clicked@example.com',
     );
+  });
+
+  it('waits for a click whose navigation starts on a timer', async () => {
+    /*
+     * The handler navigates 150 ms after the click, which is long after the
+     * mouse events are acknowledged. `settle` used to conclude that nothing was
+     * loading and report the page the click had just left.
+     *
+     * On this conversation's own tab rather than a second one: the server's cap
+     * is two contexts, and a test that quietly spends one is a test that breaks
+     * whichever test runs after it.
+     */
+    await value(driver.navigate(`${origin}/slow-click`));
+    const at = await value(driver.click('#go'));
+    expect(at.url).toBe(`${origin}/?arrived=1`);
+    await value(driver.navigate(`${origin}/`));
   });
 
   it('refuses a selector that matches nothing, in a sentence', async () => {
@@ -519,7 +576,7 @@ when('the navigation policy against a real redirect', () => {
     const driver = browser.driver();
     await value(driver.open(`${origin}/`));
     const said = await refusal(driver.navigate(`${origin}/redirect`));
-    expect(said).toContain('redirected to');
+    expect(said).toContain(`http://localhost:${String(sitePort)}`);
     expect(said).toContain('The tab is now blank.');
     // And it really is blank, rather than loaded with the agent merely told
     // not to look at it.
@@ -527,6 +584,82 @@ when('the navigation policy against a real redirect', () => {
     expect(at.url).toBe('about:blank');
     await driver.close();
   });
+
+  it('catches a real meta refresh into a refused address, with no verb in flight', async () => {
+    /*
+     * The gap the event-driven check closes. Nothing asked the browser to go
+     * anywhere: the page it was already on carries
+     * `<meta http-equiv="refresh">`, and the policy used to run only inside
+     * `navigate` and `click`. The refusal therefore has to arrive on whatever
+     * verb the agent calls next.
+     */
+    const driver = browser.driver();
+    await value(driver.open(`${origin}/meta-refresh`));
+    // The refresh fires after the load the navigation waited for, so no verb
+    // is in flight when the page moves. The next one is what has to say so.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const said = await refusal(driver.read());
+    expect(said).toContain(`http://localhost:${String(sitePort)}`);
+    expect(said).toContain('The tab is now blank.');
+    await driver.close();
+  });
+
+  it('catches a real `location =` into a refused address between two verbs', async () => {
+    // The same hole from the other direction: a timer, firing after the
+    // navigation the agent asked for had already settled.
+    const driver = browser.driver();
+    await value(driver.open(`${origin}/js-redirect`));
+    // Long enough for the page's own 30 ms timer, which is the point: nothing
+    // Artemis did moved this page.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const said = await refusal(driver.read());
+    expect(said).toContain(`http://localhost:${String(sitePort)}`);
+    expect(said).toContain('The tab is now blank.');
+    await driver.close();
+  });
+
+  it('refuses a page Chromium really reached at an address the lookup did not give', async () => {
+    /*
+     * Rebinding, end to end and against a real browser. The driver is told
+     * `rebind.example` is public; Chromium, under `--host-resolver-rules`,
+     * connects to 127.0.0.1. Nothing but `remoteIPAddress` — the machine the
+     * main document actually came from — can see the disagreement, which is
+     * why the third gate exists.
+     */
+    const lied = createServerBrowser({
+      endpoint: `http://127.0.0.1:${String(cdpPort)}`,
+      timers,
+      limits: { allowHosts: [] },
+      resolveHost: async () => ['203.0.113.10'],
+    });
+    try {
+      const said = await refusal(lied.driver().open(`http://rebind.example:${String(sitePort)}/`));
+      expect(said).toContain('resolves to 127.0.0.1');
+      expect(said).toContain('inside the operator’s own network');
+    } finally {
+      await lied.dispose();
+    }
+  }, 30_000);
+
+  it('opens an allow-listed name that really is served from a private address', async () => {
+    // The other side of the same rule, and the reason the allow-list is
+    // consulted by name: `localhost` resolves into private space by design, and
+    // a gate that refused every private address would refuse the dev servers.
+    const named = createServerBrowser({
+      endpoint: `http://127.0.0.1:${String(cdpPort)}`,
+      timers,
+      limits: { allowHosts: ['localhost'] },
+    });
+    try {
+      const driver = named.driver();
+      const at = await value(driver.open(`http://localhost:${String(sitePort)}/`));
+      expect(at.title).toBe('Orders');
+      // And a verb on it is not refused by the address check either.
+      expect((await driver.read()).ok).toBe(true);
+    } finally {
+      await named.dispose();
+    }
+  }, 30_000);
 
   it('refuses a cloud metadata address whatever the allow-list says', async () => {
     const allowing = createServerBrowser({

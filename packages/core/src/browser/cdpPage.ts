@@ -203,18 +203,52 @@ export class CdpPage {
   readonly #unsubscribe: (() => void)[] = [];
   /** Resolvers waiting for the next `Page.loadEventFired`. */
   #loadWaiters: (() => void)[] = [];
+  /** Resolvers waiting for a navigation to *begin*. See {@link settle}. */
+  #startWaiters: (() => void)[] = [];
   #loading = false;
+  /** How long to wait, and how. Injected so no test waits in real time. */
+  readonly #sleep: (ms: number) => Promise<void>;
+  /**
+   * The frame with no parent. Captured at {@link start} and kept in step with
+   * `Page.frameNavigated`, because every check below is about the *top* frame:
+   * an advert in an iframe reaching a private address is the network's problem,
+   * and treating it as the page's would refuse pages for what their third
+   * parties did.
+   */
+  #topFrameId: string | null = null;
+  /**
+   * The address the main document was actually served from, per
+   * `Network.responseReceived`.
+   *
+   * The only thing here that can catch a name which resolved publicly a moment
+   * ago and privately by the time Chromium fetched it. `null` when there is
+   * nothing to check — a `data:` or `about:` page, or a document with no
+   * remote address — and the driver treats `null` as "unknown", not as "fine":
+   * see `serverBrowserPolicy.ts` on why that gap is narrow here.
+   */
+  #mainDocumentAddress: string | null = null;
+  /** Told whenever the top frame arrives somewhere new. */
+  #onNavigated: ((url: string) => void) | null = null;
 
   constructor(options: {
     readonly cdp: CdpConnection;
     readonly sessionId: string;
     readonly targetId: string;
     readonly browserContextId: string;
+    /** How to wait. Defaults to a real timer; a test injects its own. */
+    readonly sleep?: (ms: number) => Promise<void>;
   }) {
     this.#cdp = options.cdp;
     this.#session = options.sessionId;
     this.targetId = options.targetId;
     this.browserContextId = options.browserContextId;
+    this.#sleep =
+      options.sleep ??
+      ((ms) =>
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, ms);
+          timer.unref?.();
+        }));
   }
 
   /**
@@ -240,6 +274,41 @@ export class CdpPage {
       mobile: false,
     });
     this.#listen();
+    // Which frame is the top one, so every later check knows what to ignore.
+    // Asked once and then maintained from `Page.frameNavigated`; a failure here
+    // leaves it null, and a null top frame makes the checks treat every
+    // navigation as the page's own, which is the cautious way round.
+    try {
+      const tree = (await this.#call('Page.getFrameTree'))['frameTree'] as
+        | { frame?: { id?: unknown } }
+        | undefined;
+      if (typeof tree?.frame?.id === 'string') this.#topFrameId = tree.frame.id;
+    } catch {
+      /* The checks below cope with not knowing. */
+    }
+  }
+
+  /**
+   * Be told whenever the top frame arrives somewhere new.
+   *
+   * The seam the navigation policy hangs off. A page can reach an address
+   * without any verb being called — a `<meta http-equiv="refresh">`, a
+   * `location =` on a timer, a form that posts itself — and a policy that only
+   * ran inside `navigate` and `click` would never see it. Registered once by
+   * the driver, before the page is sent anywhere.
+   */
+  onNavigated(listener: (url: string) => void): void {
+    this.#onNavigated = listener;
+  }
+
+  /**
+   * The address the main document was served from, or `null` when unknown.
+   *
+   * See the field's comment: `null` means there is nothing to check, not that
+   * the check passed.
+   */
+  mainDocumentAddress(): string | null {
+    return this.#mainDocumentAddress;
   }
 
   /* ---------------------------------------------------------------- */
@@ -265,9 +334,30 @@ export class CdpPage {
     await settled;
   }
 
-  /** Wait for a load already under way — after a click, say — but never for long. */
-  async settle(): Promise<void> {
-    if (!this.#loading) return;
+  /**
+   * Wait for a load — one already under way, or one about to start.
+   *
+   * `graceMs` is the fix for a bug this had: a click whose handler navigates
+   * does not navigate *synchronously*, so by the time the last `Input.*` call
+   * was acknowledged `#loading` was still false and `settle` returned at once.
+   * The verb then reported the old address, and — worse, once the policy became
+   * event-driven — the check ran against the page the click had just left. So
+   * when nothing is loading yet, wait a bounded moment for
+   * `Page.frameStartedLoading` before concluding that nothing is going to.
+   *
+   * Bounded and small: half a second is long enough for a handler to run and
+   * short enough that a click which really does nothing does not feel like a
+   * hang. The wait itself is injected, so no test spends it.
+   */
+  async settle(options?: { readonly graceMs?: number }): Promise<void> {
+    if (!this.#loading) {
+      const grace = options?.graceMs ?? 0;
+      if (grace <= 0) return;
+      const started = this.#awaitLoadStart();
+      await Promise.race([started.begun, this.#sleep(grace)]);
+      started.cancel();
+      if (!this.#loading) return;
+    }
     await this.#awaitLoad();
   }
 
@@ -517,6 +607,20 @@ export class CdpPage {
     return js + dom;
   }
 
+  /**
+   * Is this the frame the policy cares about?
+   *
+   * A frame id this page has never heard of counts as the top one. Not
+   * carelessness: `Page.getFrameTree` can fail at startup, and a check that
+   * silently stopped applying because the id was unknown would be a gate that
+   * opened itself. Erring towards "this is the page" costs at worst a refusal
+   * the agent can read.
+   */
+  #isTopFrame(frameId: unknown): boolean {
+    if (this.#topFrameId === null) return true;
+    return typeof frameId !== 'string' || frameId === this.#topFrameId;
+  }
+
   /** Stop listening. The target itself is the manager's to close. */
   detach(): void {
     for (const off of this.#unsubscribe.splice(0, this.#unsubscribe.length)) off();
@@ -654,6 +758,28 @@ export class CdpPage {
     });
   }
 
+  /**
+   * A promise that settles when a navigation *begins*, and a way to stop
+   * waiting for one.
+   *
+   * Separate from {@link #awaitLoad} because the two answer different
+   * questions — "has anything started?" against "has it finished?" — and
+   * {@link settle} needs the first before it may ask the second.
+   */
+  #awaitLoadStart(): { readonly begun: Promise<void>; readonly cancel: () => void } {
+    let done = (): void => undefined;
+    const begun = new Promise<void>((resolve) => {
+      done = resolve;
+      this.#startWaiters.push(resolve);
+    });
+    return {
+      begun,
+      cancel: () => {
+        this.#startWaiters = this.#startWaiters.filter((one) => one !== done);
+      },
+    };
+  }
+
   #releaseLoad(): void {
     this.#loading = false;
     for (const waiter of this.#loadWaiters.splice(0, this.#loadWaiters.length)) waiter();
@@ -671,10 +797,45 @@ export class CdpPage {
     on('Page.loadEventFired', () => {
       this.#releaseLoad();
     });
-    on('Page.frameStartedLoading', () => {
+    on('Page.frameStartedLoading', (params) => {
       // A click that navigates: `settle` has something to wait for without the
       // verb having to know a navigation happened.
       this.#loading = true;
+      for (const waiter of this.#startWaiters.splice(0, this.#startWaiters.length)) waiter();
+      /*
+       * The last page's remote address stops being an answer about this one.
+       * Cleared here rather than on arrival because a navigation that never
+       * produces a document — one that fails, or is cancelled — would otherwise
+       * leave the previous page's address to be checked against the new page's
+       * name, and refuse a page for where a different one was served from.
+       */
+      if (this.#isTopFrame(params['frameId'])) this.#mainDocumentAddress = null;
+    });
+
+    /*
+     * Where the top frame has arrived, whoever sent it there.
+     *
+     * Both events, because they are two different ways to change the address
+     * and only one of them loads a document: `frameNavigated` is a real
+     * navigation, `navigatedWithinDocument` is `history.pushState` and a
+     * fragment change. A single-page application moving from `/orders` to
+     * `/admin` fires only the second, and a policy that watched only the first
+     * would never see it.
+     *
+     * A subframe is ignored: an advert reaching a private address is the
+     * network's business, and treating it as the page's would refuse pages for
+     * what their third parties did.
+     */
+    on('Page.frameNavigated', (params) => {
+      const frame = (params['frame'] ?? {}) as { id?: unknown; parentId?: unknown; url?: unknown };
+      if (typeof frame.parentId === 'string' && frame.parentId.length > 0) return;
+      if (typeof frame.id === 'string') this.#topFrameId = frame.id;
+      if (typeof frame.url === 'string') this.#onNavigated?.(frame.url);
+    });
+
+    on('Page.navigatedWithinDocument', (params) => {
+      if (!this.#isTopFrame(params['frameId'])) return;
+      if (typeof params['url'] === 'string') this.#onNavigated?.(params['url']);
     });
 
     on('Runtime.consoleAPICalled', (params) => {
@@ -760,9 +921,30 @@ export class CdpPage {
     });
 
     on('Network.responseReceived', (params) => {
+      const response = (params['response'] ?? {}) as Record<string, unknown>;
+
+      /*
+       * The address the main document really came from.
+       *
+       * Recorded here and nowhere else, because this is the one place Chromium
+       * says which machine it actually talked to. A name resolves before the
+       * fetch and can resolve differently during it, so the lookup the driver
+       * did is a statement about the past; this is a statement about what
+       * happened. On a redirect chain only the final response arrives as a
+       * `responseReceived`, which is the one that matters.
+       *
+       * An empty address — a `data:` page, or one served from a cache that
+       * `Network.enable` has already disabled for this tab — records `null`,
+       * which the driver reads as "nothing to check" rather than as a pass.
+       */
+      if (params['type'] === 'Document' && this.#isTopFrame(params['frameId'])) {
+        const remote = response['remoteIPAddress'];
+        this.#mainDocumentAddress =
+          typeof remote === 'string' && remote.length > 0 ? remote.replace(/^\[|\]$/gu, '') : null;
+      }
+
       const held = this.#inFlight.get(String(params['requestId']));
       if (held === undefined) return;
-      const response = (params['response'] ?? {}) as Record<string, unknown>;
       this.#inFlight.set(String(params['requestId']), {
         ...held,
         entry: {

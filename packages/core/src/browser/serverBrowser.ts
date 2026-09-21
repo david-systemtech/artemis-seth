@@ -59,9 +59,14 @@
 import type { PageDriver } from '@rx-artemis/protocol';
 
 import { CdpConnection, resolveCdpEndpoint, webSocketDialer, type CdpDialer, type EndpointDeps } from './cdp.js';
-import { CdpPage } from './cdpPage.js';
+import { CdpPage, VIEWPORT } from './cdpPage.js';
 import { cdpPageDriver, type PageLease } from './cdpPageDriver.js';
-import { allowListFrom, type ServerBrowserAllowList } from './serverBrowserPolicy.js';
+import {
+  allowListFrom,
+  systemHostResolver,
+  type HostResolver,
+  type ServerBrowserAllowList,
+} from './serverBrowserPolicy.js';
 
 /** The numbers an operator may change. None of them may be set to "never". */
 export interface ServerBrowserLimits {
@@ -152,6 +157,11 @@ export interface ServerBrowserOptions {
   readonly dial?: CdpDialer;
   /** How the endpoint is discovered. Injected by tests. */
   readonly endpointDeps?: EndpointDeps;
+  /**
+   * Hostname → addresses, for the half of the navigation policy a name cannot
+   * answer. The container's own resolver live, a map in tests.
+   */
+  readonly resolveHost?: HostResolver;
   readonly timers?: BrowserTimers;
   /** Where operational news goes. The server writes it to stderr. */
   readonly log?: (line: string) => void;
@@ -187,6 +197,10 @@ class Lease implements PageLease {
     return this.browser.allowList;
   }
 
+  get resolveHost(): HostResolver {
+    return this.browser.resolveHost;
+  }
+
   current(): CdpPage | null {
     return this.page;
   }
@@ -214,6 +228,7 @@ class ServerBrowserImpl implements ServerBrowser {
   readonly limits: ServerBrowserLimits;
   readonly allowList: ServerBrowserAllowList;
   readonly timers: BrowserTimers;
+  readonly resolveHost: HostResolver;
 
   readonly #endpoint: string;
   readonly #dial: CdpDialer;
@@ -232,6 +247,7 @@ class ServerBrowserImpl implements ServerBrowser {
     this.limits = { ...DEFAULT_LIMITS, ...options.limits };
     this.allowList = { allowHosts: this.limits.allowHosts };
     this.timers = options.timers ?? REAL_TIMERS;
+    this.resolveHost = options.resolveHost ?? systemHostResolver();
     this.#endpoint = options.endpoint;
     this.#dial = options.dial ?? webSocketDialer();
     this.#endpointDeps = options.endpointDeps ?? {};
@@ -291,15 +307,23 @@ class ServerBrowserImpl implements ServerBrowser {
           await cdp.call('Target.createTarget', {
             url: 'about:blank',
             browserContextId: contextId,
-            width: 1280,
-            height: 800,
+            width: VIEWPORT.width,
+            height: VIEWPORT.height,
           })
         )['targetId'],
       );
       const sessionId = String(
         (await cdp.call('Target.attachToTarget', { targetId, flatten: true }))['sessionId'],
       );
-      const page = new CdpPage({ cdp, sessionId, targetId, browserContextId: contextId });
+      const page = new CdpPage({
+        cdp,
+        sessionId,
+        targetId,
+        browserContextId: contextId,
+        // The same clock every other deadline here uses, so a test that owns
+        // time owns the navigation grace too.
+        sleep: (ms) => this.timers.after(ms),
+      });
       await page.start();
       lease.page = page;
       lease.touch();

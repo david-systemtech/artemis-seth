@@ -34,9 +34,26 @@
  * What this browser has instead is a position: it sits inside the operator's
  * network, so it can route to the LAN and to the cloud metadata service. The
  * rule is therefore the inverse — the public internet is open, and anything
- * internal is shut unless an operator named it. See `serverBrowserPolicy.ts`,
- * and note what it cannot do: a page's own sub-requests are not filtered by it,
- * and only a network-level rule on the container can be.
+ * internal is shut unless an operator named it. See `serverBrowserPolicy.ts`.
+ *
+ * Where that policy is applied is this file's business, and it is applied in
+ * three places because one was not enough:
+ *
+ *  - **Before navigating**, on the address the agent named *and on what it
+ *    resolves to*. A name check alone was a spelling check:
+ *    `169.254.169.254.nip.io` is a public name for the metadata service.
+ *  - **On every navigation the browser makes**, from `Page.frameNavigated` and
+ *    `Page.navigatedWithinDocument`. A page can move itself with a meta refresh
+ *    or a timer, with no tool call anywhere near it, and a policy that only ran
+ *    inside `navigate` and `click` never saw that. The listener blanks the tab
+ *    and leaves its sentence for the next verb.
+ *  - **Before every verb acts**, over the address the tab has now and the
+ *    machine the main document was actually served from. The second is what
+ *    defeats rebinding between the lookup and the fetch.
+ *
+ * What none of it covers: a loaded page's own sub-requests, which happen below
+ * anything CDP lets a client veto cheaply. Only a network-level rule on the
+ * container can, and `docs/SERVER-BROWSER.md` says so and says how.
  *
  * ## One tab, and it may go away between calls
  *
@@ -66,7 +83,13 @@ import type {
 } from '@rx-artemis/protocol';
 
 import type { CdpPage } from './cdpPage.js';
-import { navigationStanding, type ServerBrowserAllowList } from './serverBrowserPolicy.js';
+import {
+  addressStanding,
+  navigationStanding,
+  navigationStandingFor,
+  type HostResolver,
+  type ServerBrowserAllowList,
+} from './serverBrowserPolicy.js';
 
 /**
  * This browser can do everything the contract describes. See the file header
@@ -82,6 +105,17 @@ const SERVER_ABILITIES: PageDriverAbilities = {
 
 /** The sentence a verb answers with when the run has no tab yet. */
 const NO_BROWSER = 'No browser is open for this conversation. Use browser_open first.';
+
+/**
+ * How long an action waits to see whether it started a navigation.
+ *
+ * A click whose handler calls `location.assign` has not navigated by the time
+ * the mouse events are acknowledged, so a verb that asked "is anything loading?"
+ * at that moment was told no and reported the address the page had *before* the
+ * click. Half a second is long enough for a handler to run and short enough
+ * that a click which really does nothing does not read as a hang.
+ */
+const NAVIGATION_GRACE_MS = 500;
 
 /**
  * One run's claim on the server's browser.
@@ -104,6 +138,14 @@ export interface PageLease {
   /** The run has finished: close the tab and dispose its context. */
   release(): Promise<void>;
   readonly allowList: ServerBrowserAllowList;
+  /**
+   * Hostname → addresses, for the half of the policy a name cannot answer.
+   *
+   * On the lease rather than built here so a test never touches DNS, and so an
+   * operator's resolver — the container's, which is what Chromium will use —
+   * is the one the gate consults.
+   */
+  readonly resolveHost: HostResolver;
 }
 
 function ok<T>(value: T): DriverResult<T> {
@@ -134,6 +176,16 @@ class CdpPageDriver implements PageDriver {
   readonly abilities = SERVER_ABILITIES;
 
   readonly #lease: PageLease;
+  /**
+   * A refusal the navigation listener recorded, waiting for the next verb.
+   *
+   * A page can arrive somewhere it may not be with no tool call in flight — a
+   * `<meta http-equiv="refresh">`, a `location =` on a timer. The listener
+   * cannot answer anybody, so it blanks the tab and leaves the sentence here.
+   */
+  #blocked: string | null = null;
+  /** The tab this driver has hooked the navigation listener onto. */
+  #watching: CdpPage | null = null;
 
   constructor(lease: PageLease) {
     this.#lease = lease;
@@ -148,18 +200,20 @@ class CdpPageDriver implements PageDriver {
     this.#lease.takeNotice();
 
     /*
-     * The address is checked before anything is created. An agent asking for
-     * `file:///etc/passwd` or for the metadata service gets the refusal without
-     * a context being made, so a denied `open` costs the server nothing and
-     * does not spend one of its two context slots.
+     * The address is checked before anything is created — the name, and then
+     * what the name resolves to. An agent asking for `file:///etc/passwd`, for
+     * the metadata service, or for a public name that points at it gets the
+     * refusal without a context being made, so a denied `open` costs the server
+     * nothing and does not spend one of its two context slots.
      */
     if (url !== undefined) {
-      const standing = navigationStanding(url, this.#lease.allowList);
+      const standing = await this.#mayOpen(url);
       if (!standing.allowed) return no(standing.reason);
     }
 
     try {
       const page = await this.#lease.open();
+      this.#watch(page);
       if (url === undefined) return ok(await page.location());
       return await this.#go(page, url);
     } catch (error) {
@@ -170,7 +224,7 @@ class CdpPageDriver implements PageDriver {
   async navigate(url: string): Promise<DriverResult<PageLocation>> {
     const page = this.#page();
     if (typeof page === 'string') return no(page);
-    const standing = navigationStanding(url, this.#lease.allowList);
+    const standing = await this.#mayOpen(url);
     if (!standing.allowed) return no(standing.reason);
     try {
       return await this.#go(page, url);
@@ -196,18 +250,26 @@ class CdpPageDriver implements PageDriver {
   async click(selector: string): Promise<DriverResult<PageLocation>> {
     return this.#on(async (page) => {
       await page.click(selector);
-      // A click very often navigates, so the verb that follows should not have
-      // to guess whether it is looking at the old page — and a link to a denied
-      // address is a navigation the first gate never saw.
-      await page.settle();
-      return this.#whereNow(page, 'That link went to');
+      /*
+       * A click very often navigates, so the verb that follows should not have
+       * to guess whether it is looking at the old page — and a link to a denied
+       * address is a navigation the first gate never saw. The grace is because
+       * a handler that navigates has not navigated yet when the mouse events
+       * are acknowledged: see {@link NAVIGATION_GRACE_MS}.
+       */
+      await page.settle({ graceMs: NAVIGATION_GRACE_MS });
+      return this.#whereNow(page, 'That click went to');
     });
   }
 
   async type(selector: string, text: string): Promise<DriverResult<PageLocation>> {
     return this.#on(async (page) => {
       await page.type(selector, text);
-      return ok(await page.location());
+      // Typing can submit: a framework listening for `change` may navigate on
+      // the value it just received, and reporting the address the field was on
+      // would be reporting the page that is already gone.
+      await page.settle({ graceMs: NAVIGATION_GRACE_MS });
+      return this.#whereNow(page, 'Typing that took the page to');
     });
   }
 
@@ -277,11 +339,21 @@ class CdpPageDriver implements PageDriver {
     return page;
   }
 
-  /** Run a verb on this run's tab, turning a throw into the contract's refusal. */
+  /**
+   * Run a verb on this run's tab, once the page has been checked.
+   *
+   * The check is here rather than in each verb because "where is this tab
+   * *now*" is a question every verb has to ask and none of them is about. A
+   * page that moved itself between two tool calls — a meta refresh, a timer
+   * calling `location.assign` — is a page `browser_read` must not read, and the
+   * verb that would have read it is the only thing with anybody to tell.
+   */
   async #on<T>(work: (page: CdpPage) => Promise<DriverResult<T>>): Promise<DriverResult<T>> {
     const page = this.#page();
     if (typeof page === 'string') return no(page);
     try {
+      const refusal = await this.#guard(page);
+      if (refusal !== null) return no(refusal);
       return await work(page);
     } catch (error) {
       return no(messageOf(error));
@@ -290,31 +362,123 @@ class CdpPageDriver implements PageDriver {
 
   /** Go somewhere, then check where the browser actually ended up. */
   async #go(page: CdpPage, url: string): Promise<DriverResult<PageLocation>> {
+    // A deliberate navigation clears whatever the last page did on its way out:
+    // the agent is being told where it is going now, not where it was stopped.
+    this.#blocked = null;
     await page.navigate(url);
-    return this.#whereNow(page, 'That address redirected to');
+    return this.#whereNow(page, 'That address went to');
+  }
+
+  /**
+   * May this browser open this address? The name, then what it resolves to.
+   *
+   * Both halves before anything is created. The resolver is the container's
+   * own, which is the one Chromium will use a moment later — see
+   * `serverBrowserPolicy.ts` on why a name check alone was a spelling check.
+   */
+  async #mayOpen(url: string): Promise<{ allowed: boolean; reason: string }> {
+    const standing = await navigationStandingFor(url, this.#lease.allowList, this.#lease.resolveHost);
+    return standing.allowed ? { allowed: true, reason: '' } : { allowed: false, reason: standing.reason };
+  }
+
+  /**
+   * Watch where this tab goes, for the navigations no verb asked for.
+   *
+   * Set once per tab. The listener cannot answer anybody — nothing is waiting
+   * on it — so it does the two things it can: blank the tab, and leave the
+   * sentence for whichever verb comes next.
+   */
+  #watch(page: CdpPage): void {
+    if (this.#watching === page) return;
+    this.#watching = page;
+    page.onNavigated((url) => {
+      const refusal = this.#verdictOn(page, url);
+      if (refusal === null) return;
+      /*
+       * Neutral about *how* it got there, because the listener cannot tell: a
+       * server redirect, a `<meta http-equiv="refresh">` and a timer calling
+       * `location.assign` all arrive as the same event. Saying "the page moved
+       * itself" would be a guess, and on a plain 302 a wrong one.
+       */
+      this.#blocked = `The page went to ${url}, which this browser may not open. ${refusal} The tab is now blank.`;
+      void page.navigate('about:blank').catch(() => undefined);
+    });
+  }
+
+  /**
+   * Why this tab may not be where it is, or `null`.
+   *
+   * Two checks over one address: the name, and the machine the main document
+   * was actually served from. The second is the one that catches a name which
+   * resolved publicly when the driver looked and privately when Chromium
+   * fetched — and it is free, because the page recorded it from
+   * `Network.responseReceived` on the way in.
+   *
+   * No resolver here, deliberately. This runs on every verb and inside an event
+   * handler; a DNS lookup in both would be a lookup per tool call for a weaker
+   * answer than the remote address already gives.
+   */
+  #verdictOn(page: CdpPage, url: string): string | null {
+    // A tab that has not been anywhere sits on about:blank, which is not an
+    // http address and would fail the gate for the wrong reason.
+    if (url.length === 0 || url === 'about:blank') return null;
+
+    const named = navigationStanding(url, this.#lease.allowList);
+    if (!named.allowed) return named.reason;
+
+    const address = page.mainDocumentAddress();
+    // `null` is "nothing to check" and not "fine": a data: page, or one whose
+    // document had no remote address. See `serverBrowserPolicy.ts` on how
+    // narrow that gap is for this browser.
+    if (address === null) return null;
+
+    const byAddress = addressStanding(named.host, [address], this.#lease.allowList);
+    return byAddress.allowed ? null : byAddress.reason;
+  }
+
+  /**
+   * The sentence a verb must refuse with before it acts, or `null`.
+   *
+   * Takes whatever the navigation listener left, and then checks for itself —
+   * because the listener fires on `Page.frameNavigated`, and a page can be
+   * somewhere new before Chromium has said so.
+   */
+  async #guard(page: CdpPage): Promise<string | null> {
+    const recorded = this.#blocked;
+    this.#blocked = null;
+    if (recorded !== null) return recorded;
+
+    const at = await page.location();
+    const refusal = this.#verdictOn(page, at.url);
+    if (refusal === null) return null;
+    await page.navigate('about:blank').catch(() => undefined);
+    return `This tab is on ${at.url}, which this browser may not open. ${refusal} The tab is now blank.`;
   }
 
   /**
    * Where the page is now, refused if that is somewhere it may not be.
    *
-   * The second half of the navigation policy, and the half that matters. The
-   * first gate reads the address the agent named; a redirect chain ends
-   * somewhere else, and `http://a-public-shortener.example/x` → `http://169.254.169.254/`
-   * is one HTTP response away from being the attack this whole policy exists
-   * for. So the address the browser *has* is checked too, and a page that got
+   * The half of the navigation policy that matters. The first gate reads the
+   * address the agent named and what it resolved to; a redirect chain ends
+   * somewhere else, and `http://a-public-shortener.example/x` →
+   * `http://169.254.169.254/` is one HTTP response away from being the attack
+   * this whole policy exists for. So the address the browser *has*, and the
+   * machine it actually talked to, are checked too — and a page that got
    * somewhere it should not be is left on `about:blank` rather than sitting
    * loaded with the agent merely told not to read it.
    */
   async #whereNow(page: CdpPage, lead: string): Promise<DriverResult<PageLocation>> {
-    const at = await page.location();
-    // A page that has not navigated at all sits on about:blank, which is not an
-    // http address and would fail the gate for the wrong reason.
-    if (at.url.length === 0 || at.url === 'about:blank') return ok(at);
+    // Something moved the page mid-navigation and the listener already acted.
+    // Its sentence is more specific than anything this could compose.
+    const recorded = this.#blocked;
+    this.#blocked = null;
+    if (recorded !== null) return no(recorded);
 
-    const standing = navigationStanding(at.url, this.#lease.allowList);
-    if (standing.allowed) return ok(at);
+    const at = await page.location();
+    const refusal = this.#verdictOn(page, at.url);
+    if (refusal === null) return ok(at);
 
     await page.navigate('about:blank').catch(() => undefined);
-    return no(`${lead} ${at.url}, which this browser may not open. ${standing.reason} The tab is now blank.`);
+    return no(`${lead} ${at.url}, which this browser may not open. ${refusal} The tab is now blank.`);
   }
 }
