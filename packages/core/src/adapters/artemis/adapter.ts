@@ -884,12 +884,24 @@ class ArtemisRun implements Run {
         // The Chrome it pairs with is the one signed in as the *serving*
         // account, wherever that Chrome is; an older server drops the field.
         ...(this.#input.chromeBrowser === true ? { chromeBrowser: true } : {}),
-        // The other browser a served run can be given, and the one that is the
-        // caller's own: the server publishes each verb back down this very
-        // connection and this client drives the browser paired with it. Sent
-        // whenever the run asked for it; an older server drops the field, and
-        // the run browses with whatever it was given instead.
-        ...(this.#input.extensionBrowser === true ? { extensionBrowser: true } : {}),
+        /*
+         * The other browser a served run can be given, and the one that is the
+         * caller's own: the server publishes each verb back down this very
+         * connection, and this client drives the browser paired with it.
+         *
+         * Asked for only when this client can actually answer. A server that
+         * honoured the request and then got no answer would hand the agent a
+         * browser tool set whose every verb waits out its deadline and refuses
+         * — a worse outcome than the dock browser it would otherwise have had.
+         * So the flag is gated on the client's own answering half being
+         * present, and `canRelayBrowser` is the one place that is decided.
+         *
+         * An older server drops the field either way, and the run browses with
+         * whatever it was given.
+         */
+        ...(this.#input.extensionBrowser === true && canRelayBrowser()
+          ? { extensionBrowser: true }
+          : {}),
         // Opt into the two behaviours a remote client needs and a script does
         // not: a disconnect detaches the run rather than killing it, and a
         // permission prompt comes back here to be answered instead of being
@@ -1864,6 +1876,41 @@ async function fetchServerSessions(
     });
   }
   return rows;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The client's half of the browser relay                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Whether this client can perform a browser verb a server sends back.
+ *
+ * `false` until something calls {@link setBrowserRelayClient}, and nothing does
+ * yet — the server half of the relay is finished (`server/browserRelay.ts`,
+ * the `artemis:push:browser-call` channel, `POST /api/v0/browser/answer`) and
+ * the client half is not. What remains is small and named: subscribe to that
+ * channel on the event stream a served window already holds, run each call
+ * through the machine's own `ExtensionPageDriver`, and post the result.
+ *
+ * A module-level switch rather than an adapter option because the answering
+ * half is a property of the *process*, not of one run or one server: one
+ * desktop has one paired browser, and a run's input has no business carrying
+ * whether this build knows how to drive it.
+ *
+ * Until it is set, a run that asked for the caller's browser simply does not
+ * ask the server for one, and browses with whatever the serving machine gives
+ * it. That is a lesser feature, not a broken one, which is the difference
+ * worth keeping.
+ */
+let browserRelayClient = false;
+
+/** See {@link browserRelayClient}. Called once, by whatever wires the answer loop. */
+export function setBrowserRelayClient(ready: boolean): void {
+  browserRelayClient = ready;
+}
+
+function canRelayBrowser(): boolean {
+  return browserRelayClient;
 }
 
 export function createArtemisAdapter(

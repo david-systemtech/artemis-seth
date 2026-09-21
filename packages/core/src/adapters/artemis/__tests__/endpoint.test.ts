@@ -402,15 +402,35 @@ describe('a resumed turn', () => {
     // The other browser a served run can have, and the one the client itself
     // drives: the server publishes each verb back down this connection. Same
     // `true`-or-absent spelling, so an older server simply drops the field.
+    const { setBrowserRelayClient } = await import('../adapter.js');
+    setBrowserRelayClient(true);
+    try {
+      const { origin, seen } = await serve((_request, response) => happyStream(response));
+
+      await drive(origin, { extensionBrowser: true });
+      await drive(origin, { extensionBrowser: false });
+
+      const asked = seen[0]?.body as { artemis?: Record<string, unknown> };
+      const silent = seen[1]?.body as { artemis?: Record<string, unknown> };
+      expect(asked.artemis?.['extensionBrowser']).toBe(true);
+      expect(silent.artemis).not.toHaveProperty('extensionBrowser');
+    } finally {
+      setBrowserRelayClient(false);
+    }
+  });
+
+  it('does not ask for a browser it cannot drive on this client’s behalf', async () => {
+    // A server that honoured the request and then got no answer would hand the
+    // agent a tool set whose every verb waits out its deadline and refuses.
+    // Not asking leaves the run with whatever the serving machine gives it,
+    // which is a lesser feature rather than a broken one.
     const { origin, seen } = await serve((_request, response) => happyStream(response));
 
     await drive(origin, { extensionBrowser: true });
-    await drive(origin, { extensionBrowser: false });
 
-    const asked = seen[0]?.body as { artemis?: Record<string, unknown> };
-    const silent = seen[1]?.body as { artemis?: Record<string, unknown> };
-    expect(asked.artemis?.['extensionBrowser']).toBe(true);
-    expect(silent.artemis).not.toHaveProperty('extensionBrowser');
+    expect((seen[0]?.body as { artemis?: Record<string, unknown> }).artemis).not.toHaveProperty(
+      'extensionBrowser',
+    );
   });
 });
 
