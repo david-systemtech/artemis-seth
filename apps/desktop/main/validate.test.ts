@@ -100,7 +100,8 @@ describe('validateRunsStart', () => {
 
   it('carries the four switches through, because a switch that dies here is drawn and does nothing', () => {
     // The Chrome, external-browser, fast and ultracode switches were set by
-    // the window and read by the adapter, and none of them was in this
+    // the window and read past this boundary - by the adapter, and by the
+    // host's browser-tool factory - and none of them was in this
     // whitelist - so for a month each was a control that changed nothing, and
     // an agent asked to use Chrome had never been told it could. The type
     // guard on the validator now refuses a field it has not been given; this
