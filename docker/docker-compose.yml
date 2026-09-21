@@ -84,6 +84,15 @@ services:
       # this container can reach — every mounted repository, every credential
       # in /data, every tool on PATH.
       # IS_SANDBOX: '1'
+      # Let a served Claude run drive a Chrome, through the Claude-in-Chrome
+      # extension. No browser is needed in this container: the CLI pairs with
+      # the extension through Anthropic's relay, *by account*, so the Chrome a
+      # run drives is whichever one is signed in to claude.ai as the serving
+      # account - on any machine. That is also the caution: every connection
+      # allowed an account can then act in that account owner's browser, with
+      # their logins. Right for a server that is all one person's; on a shared
+      # one it hands teammates each other's sessions. Off unless set to '1'.
+      # ARTEMIS_ALLOW_CHROME_BROWSER: '1'
       # How long a run whose client detached is kept before it is reaped, and
       # how long a permission prompt waits for an answer. Both are ceilings on
       # behaviour a completions client has to opt into per request; the defaults

@@ -1599,6 +1599,21 @@ export interface ArtemisChatExtensions {
   /** Spend materially more compute. Only on routes with `ultracode: true`. */
   readonly ultracode?: boolean;
   /**
+   * Let the agent drive the caller's own Chrome through the serving provider's
+   * bridge - {@link RunInput.chromeBrowser}, asked of another machine.
+   *
+   * A request the host may decline twice over, and says so under
+   * `artemis.ignored` when it does: the serving account's provider has to have
+   * a bridge (`capabilities.chromeBridge`), and **the host's operator has to
+   * have allowed it**. The second is not a formality. The bridge pairs by
+   * account, so what a served run drives is the Chrome signed in as *the
+   * serving account* - its owner's logged-in sessions, from a request made by
+   * whoever holds a connection that may use that account. Running code in the
+   * host's workspace is what a connection is for; acting in somebody's browser
+   * is more than that, and a host answers no until it is told otherwise.
+   */
+  readonly chromeBrowser?: boolean;
+  /**
    * Continue an earlier conversation. Absent starts a new one.
    *
    * The only piece of turn state a caller supplies, and it exists because
@@ -1865,6 +1880,9 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
     ...(typeof extensions['ultracode'] === 'boolean'
       ? { ultracode: extensions['ultracode'] as boolean }
       : {}),
+    // Only ever `true`: absent and `false` are the same request, so there is
+    // one spelling of it downstream.
+    ...(extensions['chromeBrowser'] === true ? { chromeBrowser: true } : {}),
     ...(typeof extensions['sessionId'] === 'string'
       ? { sessionId: extensions['sessionId'] as string }
       : {}),

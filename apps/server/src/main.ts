@@ -58,6 +58,15 @@
  *                          remains the interactive path and the file remains
  *                          the truth for every connection this does not name.
  *                          See `config.ts`.
+ *   ARTEMIS_ALLOW_CHROME_BROWSER   `1` lets a served run be connected to a
+ *                          Chrome (`artemis.chromeBrowser`). Off by default,
+ *                          and worth a thought before it is on: the bridge
+ *                          pairs by account, so the Chrome a run drives is the
+ *                          one signed in as the *serving account*, and every
+ *                          connection allowed that account can then act in its
+ *                          owner's browser. Right for a server whose accounts
+ *                          and connections are all one person's; on a shared
+ *                          one it hands teammates each other's logins.
  *   ARTEMIS_SIGNIN_TIMEOUT_MS   how long a sign-in driven from a client waits
  *                          for the person to finish before the login
  *                          subprocess is killed. Default 10m. See
@@ -199,6 +208,7 @@ async function serve(): Promise<void> {
     // what a headless deployment gives up — so the terminal routes answer 501
     // and a remote window's dock shows no shells rather than an error.
     ...(allowedHosts() === undefined ? {} : { allowedHosts: allowedHosts() as never }),
+    ...(process.env['ARTEMIS_ALLOW_CHROME_BROWSER'] === '1' ? { allowChromeBrowser: true } : {}),
     onError: (error) => {
       process.stderr.write(`server error: ${error instanceof Error ? error.message : String(error)}\n`);
     },

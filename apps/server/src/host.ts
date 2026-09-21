@@ -917,6 +917,7 @@ export function createHeadlessHost(
         ...(input.effort === undefined ? {} : { effort: input.effort }),
         ...(input.fastMode === undefined ? {} : { fastMode: input.fastMode }),
         ...(input.ultracode === undefined ? {} : { ultracode: input.ultracode }),
+        ...(input.chromeBrowser === true ? { chromeBrowser: true } : {}),
         ...(input.resumeSessionId === undefined
           ? {}
           : { resumeSessionId: input.resumeSessionId as never }),

@@ -879,6 +879,11 @@ class ArtemisRun implements Run {
         ...(this.#input.effort === undefined ? {} : { thinking: this.#input.effort }),
         ...(this.#input.fastMode === undefined ? {} : { fastMode: this.#input.fastMode }),
         ...(this.#input.ultracode === undefined ? {} : { ultracode: this.#input.ultracode }),
+        // A request the server may decline - its provider has no bridge, or its
+        // operator has not allowed one - and it says so under `artemis.ignored`.
+        // The Chrome it pairs with is the one signed in as the *serving*
+        // account, wherever that Chrome is; an older server drops the field.
+        ...(this.#input.chromeBrowser === true ? { chromeBrowser: true } : {}),
         // Opt into the two behaviours a remote client needs and a script does
         // not: a disconnect detaches the run rather than killing it, and a
         // permission prompt comes back here to be answered instead of being

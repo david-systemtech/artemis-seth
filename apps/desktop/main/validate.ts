@@ -1085,6 +1085,18 @@ function optionalAttachments(value: unknown, field: string): readonly Attachment
   }
 }
 
+/**
+ * Fields of `RunInput` a window has no say in.
+ *
+ * `alwaysOnSkills` is decided in the main process from the user's settings
+ * (`engine.ts` discards whatever it was handed and writes its own), so reading
+ * it here would only be a way for a renderer to ask for a skill by name.
+ */
+type NotTheRenderers = 'alwaysOnSkills';
+
+/** One entry per remaining field - see the literal in {@link validateRunInput}. */
+type RendererRunInput = { readonly [K in keyof Required<Omit<RunInput, NotTheRenderers>>]: unknown };
+
 function validateRunInput(value: unknown, field: string): RunInput {
   const input = requireObject(value, field);
 
@@ -1114,6 +1126,17 @@ function validateRunInput(value: unknown, field: string): RunInput {
     throw new ValidationError(`${field}.prompt`, `must be at most ${LIMITS.prompt} characters`);
   }
 
+  /*
+   * Every field of `RunInput`, accounted for - and the compiler is what checks.
+   *
+   * `compact` copies exactly the keys written here, so a field missing from
+   * this literal vanishes on its way through IPC with nothing to say so. That
+   * is how rewind shipped broken, and how the Chrome, external-browser, fast
+   * and ultracode switches went on being drawn in the window for a month while
+   * no run ever heard of them. `satisfies` below makes the next one a type
+   * error: add a field to `RunInput` and this file stops compiling until the
+   * field is either validated here or named in `NotTheRenderers`.
+   */
   return compact<RunInput>({
     providerId,
     profileId: requireId(input['profileId'], `${field}.profileId`),
@@ -1139,6 +1162,13 @@ function validateRunInput(value: unknown, field: string): RunInput {
     fallbackModel: optionalString(input['fallbackModel'], `${field}.fallbackModel`, LIMITS.model),
     permissionMode: permissionMode === null ? undefined : (permissionMode as RunInput['permissionMode']),
     effort: effort === null ? undefined : (effort as RunInput['effort']),
+    // Four switches, each a plain boolean the adapter reads as "on" only when
+    // it is exactly `true`. What they are allowed to *do* is the adapter's and
+    // the provider's to decide; this boundary only proves the type.
+    fastMode: optionalBoolean(input['fastMode'], `${field}.fastMode`),
+    ultracode: optionalBoolean(input['ultracode'], `${field}.ultracode`),
+    chromeBrowser: optionalBoolean(input['chromeBrowser'], `${field}.chromeBrowser`),
+    externalBrowser: optionalBoolean(input['externalBrowser'], `${field}.externalBrowser`),
     allowedTools: optionalStringArray(
       input['allowedTools'],
       `${field}.allowedTools`,
@@ -1161,7 +1191,7 @@ function validateRunInput(value: unknown, field: string): RunInput {
     title: optionalString(input['title'], `${field}.title`, LIMITS.label),
     includePartialMessages: optionalBoolean(input['includePartialMessages'], `${field}.includePartialMessages`),
     metadata: optionalJsonObject(input['metadata'], `${field}.metadata`, LIMITS.metadataNodes, LIMITS.metadataDepth),
-  });
+  } satisfies RendererRunInput);
 }
 
 /* -------------------------------------------------------------------------- */

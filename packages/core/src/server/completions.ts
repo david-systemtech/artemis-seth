@@ -140,6 +140,8 @@ export interface RunSource {
     readonly effort?: string;
     readonly fastMode?: boolean;
     readonly ultracode?: boolean;
+    /** Only ever `true`, and only once the route has allowed it - see `http.ts`. */
+    readonly chromeBrowser?: boolean;
     readonly resumeSessionId?: string;
     /**
      * Branch from `resumeSessionId` into a new session, leaving the original
@@ -1187,6 +1189,7 @@ export async function* runTurn(
         ...(turn.extensions.ultracode === undefined
           ? {}
           : { ultracode: turn.extensions.ultracode }),
+        ...(turn.extensions.chromeBrowser === true ? { chromeBrowser: true } : {}),
         ...(turn.extensions.sessionId === undefined
           ? {}
           : { resumeSessionId: turn.extensions.sessionId }),
