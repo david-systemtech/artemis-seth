@@ -115,6 +115,16 @@ describe('matchCommands', () => {
     expect(matched.map((match) => match.rank)).toEqual([0, 0, 0, 1, 1, 1, 3, 5]);
   });
 
+  it('leaves this terminal\'s own commands out when asked for the provider\'s only', () => {
+    // What the composer passes for a token in the middle of a sentence: only a
+    // provider command can be lifted to the front of the message on send, so
+    // only a provider command is offered there.
+    expect(usages(matchCommands('/c', providers, { providerOnly: true }))).toEqual([
+      '/compact',
+      '/artemis-skills:code-review',
+    ]);
+  });
+
   it('matches a word inside a name, which is how a bridged skill is reachable', () => {
     expect(usages(matchCommands('/review', providers))).toEqual(['/artemis-skills:code-review']);
     expect(usages(matchCommands('/gril', providers))).toEqual(['/artemis-skills:grilling']);

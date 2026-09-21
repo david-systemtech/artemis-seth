@@ -217,12 +217,23 @@ const ALIASES_BY_NAME = ((): ReadonlyMap<CommandName, readonly string[]> => {
  * Nothing else matches. Letters found scattered through a name are not a match,
  * because the point of the menu is that the highlighted row can be run without
  * reading it: `/mdoel` returns nothing, and the composer sends it to the agent.
+ *
+ * `providerOnly` leaves the TUI's own commands out. It is what the composer
+ * passes for a token in the middle of a sentence, where the only commands that
+ * can be honoured are the provider's: those are lifted to the front of the
+ * message on send, and `/quit` or `/new` cannot be — they are this terminal's,
+ * they take no arguments, and one of them offered mid-sentence would be a row
+ * that either did nothing or ended the conversation.
  */
-export function matchCommands(typed: string, providerCommands: readonly string[] = []): readonly CommandMatch[] {
+export function matchCommands(
+  typed: string,
+  providerCommands: readonly string[] = [],
+  options: { readonly providerOnly?: boolean } = {},
+): readonly CommandMatch[] {
   const needle = withoutSeparators(typed.replace(/^\//, '').toLowerCase());
   const matches: CommandMatch[] = [];
 
-  for (const spec of COMMANDS) {
+  for (const spec of options.providerOnly === true ? [] : COMMANDS) {
     const hit = matchName(needle, spec.name);
     const ranks: number[] = [];
     if (hit !== null) ranks.push(hit.word === 0 ? RANK_NAME : RANK_WORD);

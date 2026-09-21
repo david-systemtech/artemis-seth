@@ -162,7 +162,25 @@ describe('when the menu appears', () => {
     expect(options()).toEqual(['/cerebroartemis-skills']);
   });
 
-  it('stays shut for prose containing a slash', () => {
+  it('opens on a token in the middle of a sentence', () => {
+    // The gap this closed: a command is the verb of the sentence and it
+    // arrives when the sentence needs it, which is usually not first.
+    mount(<Composer />);
+
+    type('tidy the changelog /cer');
+
+    expect(options()).toEqual(['/cerebroartemis-skills']);
+  });
+
+  it('stays shut for a slash that is not the start of a word', () => {
+    mount(<Composer />);
+
+    type('and/or');
+
+    expect(menu()).toBeNull();
+  });
+
+  it('stays shut when the caret has moved past the token', () => {
     mount(<Composer />);
 
     type('fix /this typo');
@@ -230,11 +248,23 @@ describe('asking for the list when nobody has yet', () => {
     expect(refreshCommands).toHaveBeenCalledTimes(1);
   });
 
-  it('does not ask for prose that merely contains a slash', () => {
+  it('asks for a slash that starts a word anywhere in the draft', () => {
+    // The menu opens on a token wherever it sits, so a prefetch that only
+    // watched position 0 would leave the first mid-sentence `/` of a session
+    // looking at an empty list.
     setUp({ hasRun: false, commands: null });
     mount(<Composer />);
 
-    type('fix /this typo');
+    type('tidy the changelog /cer');
+
+    expect(refreshCommands).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not ask for a slash inside a word', () => {
+    setUp({ hasRun: false, commands: null });
+    mount(<Composer />);
+
+    type('an and/or question');
 
     expect(refreshCommands).not.toHaveBeenCalled();
   });
@@ -300,6 +330,49 @@ describe('keyboard precedence', () => {
     expect(field().value).toBe('/artemis-skills:cerebro ');
   });
 
+  it('accepts a mid-draft token with Tab and keeps the sentence around it', () => {
+    mount(<Composer />);
+    type('tidy the changelog /cer');
+
+    fireEvent.keyDown(field(), { key: 'Tab' });
+
+    // In place, not hoisted: what the user is reading while they type stays
+    // their own sentence. `send` does the moving.
+    expect(field().value).toBe('tidy the changelog /artemis-skills:cerebro ');
+  });
+
+  it('puts the caret after an accept that leaves the draft as it was, and only then', () => {
+    // Arrowing back into a finished command reopens the menu, and accepting it
+    // rewrites `/compact now` to `/compact now` — byte for byte. The caret must
+    // still land after the command, and the request must not linger to throw
+    // the caret back there on the next keystroke.
+    mount(<Composer />);
+    type('/compact now');
+    field().setSelectionRange(3, 3);
+    fireEvent.select(field());
+    expect(menu()).not.toBeNull();
+
+    fireEvent.keyDown(field(), { key: 'Tab' });
+    expect(field().value).toBe('/compact now');
+    expect(field().selectionStart).toBe('/compact '.length);
+
+    type('/compact now!');
+    expect(field().selectionStart).toBe('/compact now!'.length);
+  });
+
+  it('leaves Enter meaning send for a mid-draft token', () => {
+    // Enter accepting is right when the message *is* the command. In prose it
+    // would hijack the send of anyone who typed a path mid-sentence.
+    mount(<Composer />);
+    type('tidy the changelog /cer');
+    expect(menu()).not.toBeNull();
+
+    fireEvent.keyDown(field(), { key: 'Enter' });
+
+    expect(submitPrompt).toHaveBeenCalledTimes(1);
+    expect(submitPrompt.mock.calls[0]?.[0]).toBe('tidy the changelog /cer');
+  });
+
   it('moves the highlight with the arrows and wraps', () => {
     mount(<Composer />);
     type('/');
@@ -333,6 +406,23 @@ describe('keyboard precedence', () => {
     fireEvent.keyDown(field(), { key: 'ArrowUp' });
 
     expect(field().value).toBe('an earlier prompt');
+  });
+
+  it('reads a recalled draft at its end, not at the caret the sent one left', () => {
+    // Sending empties the field without moving the caret the menu reads, so
+    // recalling a longer draft used to read it mid-way: `hi`, sent, then Up to
+    // `/compact now` opened a menu over `/compact` and took the Enter meant to
+    // send it.
+    setUp({ promptHistory: ['/compact now'] });
+    mount(<Composer />);
+    type('hi');
+    fireEvent.keyDown(field(), { key: 'Enter' });
+    expect(field().value).toBe('');
+
+    fireEvent.keyDown(field(), { key: 'ArrowUp' });
+
+    expect(field().value).toBe('/compact now');
+    expect(menu()).toBeNull();
   });
 
   it('closes on Escape without interrupting the run or losing the draft', () => {
@@ -404,5 +494,36 @@ describe('the mouse', () => {
     fireEvent.mouseMove(railway);
 
     expect(selected()).toContain('use-railway');
+  });
+});
+
+describe('sending a command that is not at the front', () => {
+  it('lifts it to the front, with the rest of the draft as its arguments', () => {
+    // The provider honours a command in exactly one place, so a draft that
+    // ends with one has to be rearranged or the turn silently ignores it.
+    mount(<Composer />);
+    type('tidy the changelog /artemis-skills:cerebro');
+
+    fireEvent.keyDown(field(), { key: 'Enter' });
+
+    expect(submitPrompt.mock.calls[0]?.[0]).toBe('/artemis-skills:cerebro tidy the changelog');
+  });
+
+  it('leaves a draft that already leads with a command alone', () => {
+    mount(<Composer />);
+    type('/compact and then carry on');
+
+    fireEvent.keyDown(field(), { key: 'Enter' });
+
+    expect(submitPrompt.mock.calls[0]?.[0]).toBe('/compact and then carry on');
+  });
+
+  it('does not touch a path that is not a command', () => {
+    mount(<Composer />);
+    type('read /etc/hosts and tell me what is in it');
+
+    fireEvent.keyDown(field(), { key: 'Enter' });
+
+    expect(submitPrompt.mock.calls[0]?.[0]).toBe('read /etc/hosts and tell me what is in it');
   });
 });

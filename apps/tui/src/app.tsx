@@ -211,7 +211,7 @@ import {
   type SessionSummary,
 } from '@rx-artemis/protocol';
 import { formatDuration, formatRelative, formatUntil, isGroupId, oneLine, type TranscriptItem } from '@rx-artemis/transcript';
-import { isArchived } from '@rx-artemis/protocol';
+import { hoistSlashCommand, isArchived } from '@rx-artemis/protocol';
 
 import { browseRowLabel, browseRows, browseStart, recentDirectories, shortenPath } from './directories.js';
 import { needsYou, prunePool, railActivityFor, type Needing } from './pool.js';
@@ -3163,6 +3163,23 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
         return;
       }
       /*
+       * A provider command that is not the first thing in the message goes to
+       * the front, because the front is the only place a provider looks for
+       * one — everywhere else it is prose, and the turn ignores it without
+       * saying so. Everything the person wrote follows as its arguments.
+       *
+       * After `parseCommand` and not before: the commands this terminal answers
+       * itself are already handled above, and they are deliberately not lifted.
+       * They take no arguments a sentence could supply, and `/new` or `/quit`
+       * pulled out of the middle of a prompt would end a conversation nobody
+       * asked to end.
+       *
+       * Only ever the provider's own list, so a path and a fraction are left
+       * alone; `hoistSlashCommand` returns the text unchanged when nothing in
+       * it names a command.
+       */
+      const prompt = hoistSlashCommand(text, state.slashCommands);
+      /*
        * An image pasted into the box with Ctrl+V. There is no file for it —
        * the bytes came off the clipboard — so `attachments.ts` builds the same
        * `Attachment` from what is in hand. A provider that cannot take images
@@ -3196,7 +3213,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
        * `history.ts`, which is where that rule belongs.
        */
       history.append({
-        text,
+        text: prompt,
         cwd: state.settings.cwd,
         ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),
       });
@@ -3217,7 +3234,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
           const accepts = result.attachment.kind === 'image' ? state.capabilities.imageInput : state.capabilities.fileInput;
           return accepts ? [result.attachment] : [];
         });
-        const outcome = await conversation.send(text, [...attachments, ...named]);
+        const outcome = await conversation.send(prompt, [...attachments, ...named]);
         if (!outcome.ok) {
           setNotice(outcome.reason);
           // Not lost: a refused message keeps its attachments for the retry.
@@ -3228,6 +3245,7 @@ export function App({ launched, files }: AppProps): React.JSX.Element {
     [
       conversation,
       runCommand,
+      state.slashCommands,
       pendingAttachments,
       history,
       state.capabilities,
