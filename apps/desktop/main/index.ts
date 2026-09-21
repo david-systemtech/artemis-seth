@@ -69,8 +69,11 @@ import { BrowserHost } from './browser.js';
 import {
   agentBrowserServers,
   browserToolServer,
+  extensionBrowserToolServer,
   externalBrowserToolServer,
 } from './browserTools.js';
+import { createExtensionBridge, type ExtensionBridge } from './extensionBridge.js';
+import { openPairedBrowsers } from './pairedBrowsers.js';
 import { suggestedTaskToolServer } from './taskTools.js';
 import { banksForRun, isMasterEnabled, memoryToolServerOptions } from './memoryBanks.js';
 import { createServerHost, type ServerHost } from './server.js';
@@ -219,6 +222,8 @@ let stopBrowserForwarding: (() => void) | null = null;
 let stopPlanUsagePolling: (() => void) | null = null;
 let stopUpdater: (() => void) | null = null;
 let serverHost: ServerHost | null = null;
+let extensionBridge: ExtensionBridge | null = null;
+let stopExtensionRunCleanup: (() => void) | null = null;
 let routineHost: RoutineHost | null = null;
 let terminals: TerminalHost | null = null;
 const browsers = new BrowserHost();
@@ -428,6 +433,23 @@ async function bootstrap(): Promise<void> {
     log.error('Could not create the profiles directory', error);
   });
 
+  /*
+   * The extension bridge, before the engine, because a run's browser tools
+   * close over it — and before any window, so a pane that opens immediately
+   * finds a state to draw rather than an empty one it has to re-fetch.
+   *
+   * Started but not awaited for its *outcome* beyond binding: a port that is
+   * taken is a state the Browser pane renders, exactly as a taken server port
+   * is, and not a reason for Artemis to fail to open.
+   */
+  const pairedBrowsers = await openPairedBrowsers(userDataDir);
+  extensionBridge = createExtensionBridge({
+    store: pairedBrowsers,
+    bundledVersion: bundledExtension()?.version ?? null,
+    onStateChange: (state) => broadcast(IPC_PUSH.extensionBridgeState, state),
+  });
+  await extensionBridge.start();
+
   const sdkExecutablePath = bundledSdkExecutablePath();
   await engineHost.start({
     userDataDir,
@@ -479,6 +501,15 @@ async function bootstrap(): Promise<void> {
           // tool has already vetted the scheme, and this vets it again on the
           // way out because model output does not get a second-chance rule.
           external: () => externalBrowserToolServer((url) => openExternalSafely(url)),
+          /*
+           * The user's own Chrome, through the bridge the extension dialled
+           * in on. Built even when nothing is paired or connected: the driver
+           * answers every verb with a sentence saying so, which is a thing the
+           * agent can tell the user. Quietly handing back the dock browser
+           * instead would have it report on the wrong cookie jar and never
+           * mention the substitution.
+           */
+          extension: () => extensionBrowserToolServer(runId, requireExtensionBridge()),
         }),
         /*
          * Suggested tasks, on every run and under no preference.
@@ -564,6 +595,8 @@ async function bootstrap(): Promise<void> {
     server: serverHost,
     routines: routineHost,
     remoteAccess,
+    extensionBridge: requireExtensionBridge(),
+    bundledExtension,
   });
   stopEventForwarding = forwardAgentEvents(engineHost);
   stopSuggestionForwarding = forwardRunSuggestions(engineHost);
@@ -576,6 +609,23 @@ async function bootstrap(): Promise<void> {
    * notification says so once per question; when one is, the card in the
    * pane is the notification, and a system toast over it would be noise.
    */
+  /*
+   * A run that has ended lets go of its tab in the user's Chrome.
+   *
+   * The dock browser deliberately does *not* do this — its tab belongs to the
+   * user's strip and they may still be reading it — but a tab the extension
+   * opened lives in a tab group Artemis put there, and a week of conversations
+   * leaving one behind each is a browser nobody can find anything in.
+   *
+   * On the run's own event stream rather than in the tool factory, because the
+   * factory is called when a run starts and has no hook for when it stops.
+   */
+  stopExtensionRunCleanup = engineHost.ready
+    ? engineHost.require().subscribe((event) => {
+        if (event.type !== 'run.end') return;
+        extensionBridge?.endRun(event.runId);
+      })
+    : null;
   stopAskNotifying = engineHost.ready
     ? engineHost.require().subscribe((event) => {
         if (event.type !== 'permission.request') return;
@@ -628,6 +678,52 @@ async function bootstrap(): Promise<void> {
     // macOS: clicking the dock icon with no windows open should reopen one.
     if (BrowserWindow.getAllWindows().length === 0) createWindow(policy);
   });
+}
+
+/**
+ * The bridge, or a refusal that names the bug rather than crashing a run.
+ *
+ * `bootstrap` creates it before the engine and nothing builds a tool server
+ * before that, so `null` here is a startup-ordering mistake and not a state a
+ * user can reach. The throw is what makes such a mistake a test failure
+ * instead of a conversation whose browser tools silently did nothing.
+ */
+function requireExtensionBridge(): ExtensionBridge {
+  if (extensionBridge === null) {
+    throw new Error('The extension bridge was asked for before it was created.');
+  }
+  return extensionBridge;
+}
+
+/**
+ * The browser extension this build ships, if it ships one.
+ *
+ * A zip and a version, written into `resources/` by electron-builder's
+ * `extraResources` (see `electron-builder.yml`) from what the release
+ * workflow built. Two files rather than one so the version can be read
+ * without opening the archive: the pane compares it against what a paired
+ * browser reports, which happens on every connection.
+ *
+ * `null` in development, where the app is not packaged and there is no
+ * `resources/`, and in a packaged build whose extension step did not run. The
+ * Browser pane reads that as "there is nothing to save" and says so, which is
+ * the honest outcome — the alternative is a button that writes a zero-byte
+ * file and a user who loads it into Chrome.
+ */
+function bundledExtension(): { readonly zipPath: string; readonly version: string } | null {
+  if (!app.isPackaged) return null;
+  const directory = join(process.resourcesPath, 'extension');
+  try {
+    const zip = readdirSync(directory).find((name) => name.endsWith('.zip'));
+    if (zip === undefined) return null;
+    // `artemis-extension-2.19.1.zip` — the version is in the name, so nothing
+    // has to be unzipped and no second file has to be kept in step with it.
+    const version = /^artemis-extension-(.+)\.zip$/u.exec(zip)?.[1];
+    if (version === undefined) return null;
+    return { zipPath: join(directory, zip), version };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -690,6 +786,7 @@ app.on('before-quit', (event) => {
   stopSuggestionForwarding?.();
   stopTerminalForwarding?.();
   stopBrowserForwarding?.();
+  stopExtensionRunCleanup?.();
   stopPlanUsagePolling?.();
   stopUpdater?.();
   // Before the race below, and not part of it: an open listener keeps the port
@@ -697,6 +794,11 @@ app.on('before-quit', (event) => {
   // "address already in use" from the copy that is exiting. `dispose` drops
   // live connections rather than waiting for clients to hang up.
   void serverHost?.dispose();
+  // The bridge holds a bound loopback port, for the reason the server host's
+  // dispose is here: relaunching must not meet "address already in use" from
+  // the copy that is exiting, and the extension would be dialling a port held
+  // by a dead process.
+  void extensionBridge?.dispose();
   // Stops the minute tick and flushes the ledger's write chain, so the firing
   // the user just watched is on disk before the process exits.
   void routineHost?.dispose();

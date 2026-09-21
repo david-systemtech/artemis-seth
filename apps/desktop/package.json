@@ -2,7 +2,7 @@
   "name": "@rx-artemis/desktop",
   "version": "2.19.1",
   "private": true,
-  "description": "Artemis desktop application \u2014 Electron main, preload bridge and React renderer.",
+  "description": "Artemis desktop application — Electron main, preload bridge and React renderer.",
   "author": {
     "name": "Seth Torrence",
     "email": "seth@storrence.dev"
@@ -33,6 +33,7 @@
     "electron-store": "^11.0.2",
     "highlight.js": "^11.12.0",
     "node-pty": "^1.1.0",
+    "ws": "^8.21.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
@@ -50,6 +51,7 @@
     "@types/node": "^26.2.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^6.0.5",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",

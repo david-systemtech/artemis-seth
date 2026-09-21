@@ -32,6 +32,9 @@
  * contract asks for.
  */
 
+import { copyFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
+
 import {
   BrowserWindow,
   dialog,
@@ -91,6 +94,7 @@ import { createLogger } from './log.js';
 import { broadcastPlanUsageReading } from './planUsagePoll.js';
 import { grantPreview } from './preview.js';
 import type { BrowserHost } from './browser.js';
+import type { ExtensionBridge } from './extensionBridge.js';
 import { checkFiles, listDirectory, readTextFile } from './files.js';
 import { readPullRequests } from './github.js';
 import {
@@ -167,6 +171,11 @@ import {
   validateBrowserLayout,
   validateBrowserClose,
   validateBrowserList,
+  validateExtensionBridgePair,
+  validateExtensionBridgePolicy,
+  validateExtensionBridgeSaveBundle,
+  validateExtensionBridgeState,
+  validateExtensionBridgeUnpair,
   validateTerminalClose,
   validateTerminalList,
   validateTerminalReplay,
@@ -276,6 +285,16 @@ export interface IpcLayerOptions {
   readonly server: ServerHost;
   readonly routines: RoutineHost;
   readonly remoteAccess: RemoteAccess;
+  /** The socket the browser extension dials into. See `extensionBridge.ts`. */
+  readonly extensionBridge: ExtensionBridge;
+  /**
+   * The extension zip this build ships, looked up on demand.
+   *
+   * A thunk rather than a value because only the composition root knows where
+   * a packaged app keeps its resources, and this layer must not learn — it is
+   * the same reason every other path in here arrives already resolved.
+   */
+  readonly bundledExtension: () => { readonly zipPath: string; readonly version: string } | null;
 }
 
 /** Handle for tearing the IPC layer down again. */
@@ -290,7 +309,18 @@ export interface IpcLayer {
  * so a hot-reloaded main process has to be able to unregister.
  */
 export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
-  const { engine, policy, updater, terminals, browsers, server, routines, remoteAccess } = options;
+  const {
+    engine,
+    policy,
+    updater,
+    terminals,
+    browsers,
+    server,
+    routines,
+    remoteAccess,
+    extensionBridge,
+    bundledExtension,
+  } = options;
 
   /**
    * Drop the conversations a program started, leaving the person's own.
@@ -1176,6 +1206,66 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
     },
 
     /* ---------------------------------------------------------------- */
+    /* The extension bridge                                             */
+    /* ---------------------------------------------------------------- */
+
+    /*
+     * Five channels, and every one of them answers with the whole state.
+     *
+     * Not because the state is large — it is a handful of names and dates —
+     * but because these five change each other. Unpairing the last browser
+     * changes whether anything is connected, which changes what the Browser
+     * picker may offer; a wrong pairing code spends one of five attempts and
+     * may withdraw the offer. A pane that had to infer the second fact from
+     * the first would infer it wrongly on the day it mattered.
+     *
+     * Nothing here carries a browser's secret: `bridge.state()` builds its
+     * list through `pairedBrowsers.info`, which has no field for one. The
+     * response scanner in `redact.ts` sees an object of strings, numbers and
+     * booleans and has nothing to object to, which is the intended shape of
+     * that check — uneventful rather than load-bearing.
+     */
+
+    [IPC.extensionBridgeState]: {
+      validate: validateExtensionBridgeState,
+      handle: async () => ({ state: extensionBridge.state() }),
+    },
+
+    [IPC.extensionBridgePair]: {
+      validate: validateExtensionBridgePair,
+      handle: async (request) => ({ state: extensionBridge.offerPairing(request.offer) }),
+    },
+
+    [IPC.extensionBridgeUnpair]: {
+      validate: validateExtensionBridgeUnpair,
+      handle: async (request) => ({ state: await extensionBridge.unpair(request.browserId) }),
+    },
+
+    [IPC.extensionBridgePolicy]: {
+      validate: validateExtensionBridgePolicy,
+      handle: async (request) => ({ state: await extensionBridge.setPolicy(request.policy) }),
+    },
+
+    /*
+     * Write the bundled extension where the user can point Chrome at it.
+     *
+     * A directory picker and a copy, and the renderer names neither the source
+     * nor the destination — it says only that the user asked. The source is a
+     * file this build shipped; the destination is whatever the OS dialog came
+     * back with.
+     *
+     * A build with no bundled extension throws rather than writing nothing,
+     * because the button should not have been drawn: `bundledVersion` is
+     * `null` in that case and the pane says why instead of offering a save.
+     */
+    [IPC.extensionBridgeSaveBundle]: {
+      validate: validateExtensionBridgeSaveBundle,
+      handle: async (_request, context) => ({
+        savedTo: await saveExtensionBundle(bundledExtension(), context.window),
+      }),
+    },
+
+    /* ---------------------------------------------------------------- */
     /* Terminals                                                        */
     /* ---------------------------------------------------------------- */
 
@@ -1801,6 +1891,56 @@ async function pickDirectory(
   const check = await checkWorkingDirectory(picked);
   if (!check.ok) throw new WorkspaceError(check.message);
   return check.path;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The extension bundle                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Copy the bundled extension into a folder the user picks.
+ *
+ * A folder and not a file, for the four steps the pane spells out: Chrome's
+ * "Load unpacked" wants a *directory*, so what the user needs is somewhere to
+ * put the zip and then unzip it. Artemis does not unzip it here — a step that
+ * silently wrote a folder full of executable-adjacent files where the user
+ * pointed would be doing more than they asked, and Chrome will not load a
+ * folder the user has not seen. So: save it, say where, and let them open it.
+ *
+ * Rejected: offering to install it. There is no supported way to add an
+ * unpacked extension to Chrome from outside Chrome on macOS or Windows, and
+ * the ways that exist on Linux are per-distribution. Issue #436's plan is an
+ * unlisted Web Store listing for exactly this reason; until then the honest
+ * flow is four steps the user performs.
+ */
+async function saveExtensionBundle(
+  bundle: { readonly zipPath: string; readonly version: string } | null,
+  window: BrowserWindow | null,
+): Promise<string | null> {
+  if (bundle === null) {
+    throw new Error(
+      'This build of Artemis does not ship the browser extension. ' +
+        'Download it from the release page for this version instead.',
+    );
+  }
+
+  const options: OpenDialogOptions = {
+    title: 'Choose where to save the Artemis extension',
+    buttonLabel: 'Save here',
+    properties: [...DIRECTORY_PICKER_PROPERTIES],
+  };
+  const outcome =
+    window === null || window.isDestroyed()
+      ? await dialog.showOpenDialog(options)
+      : await dialog.showOpenDialog(window, options);
+
+  const folder = readPickedDirectory(outcome);
+  // A cancel is not a failure. The person changed their mind.
+  if (folder === null) return null;
+
+  const destination = join(folder, basename(bundle.zipPath));
+  await copyFile(bundle.zipPath, destination);
+  return destination;
 }
 
 /**

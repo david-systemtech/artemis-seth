@@ -182,6 +182,11 @@ import {
   type BrowserCommandRequest,
   type BrowserLayoutRequest,
   type BrowserListRequest,
+  type ExtensionBridgePairRequest,
+  type ExtensionBridgePolicyRequest,
+  type ExtensionBridgeSaveBundleRequest,
+  type ExtensionBridgeStateRequest,
+  type ExtensionBridgeUnpairRequest,
   type BrowserNavigateRequest,
   type BrowserOpenRequest,
   type FilesCheckRequest,
@@ -263,6 +268,16 @@ const LIMITS = {
   answers: 16,
   answerOptions: 16,
   answerNotes: 4_000,
+  /**
+   * Entries in one of a page policy's host-pattern lists, and the length of
+   * one entry.
+   *
+   * A bound on a corrupt or hostile payload rather than on a plausible one:
+   * someone naming the sites they are developing names a handful, and the
+   * default block list this sits alongside is thirty entries long.
+   */
+  siteItems: 512,
+  host: 253,
   metadataNodes: 256,
   metadataDepth: 8,
   jsonObjectNodes: 4_096,
@@ -416,6 +431,11 @@ function requireString(value: unknown, field: string, maxLength: number): string
 function optionalString(value: unknown, field: string, maxLength: number): string | undefined {
   if (value === undefined || value === null) return undefined;
   return requireString(value, field, maxLength);
+}
+
+function requireBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== 'boolean') throw new ValidationError(field, 'must be a boolean');
+  return value;
 }
 
 function optionalBoolean(value: unknown, field: string): boolean | undefined {
@@ -1162,15 +1182,19 @@ function validateRunInput(value: unknown, field: string): RunInput {
     fallbackModel: optionalString(input['fallbackModel'], `${field}.fallbackModel`, LIMITS.model),
     permissionMode: permissionMode === null ? undefined : (permissionMode as RunInput['permissionMode']),
     effort: effort === null ? undefined : (effort as RunInput['effort']),
-    // Four switches, each a plain boolean read downstream as "on" only when it
+    // Five switches, each a plain boolean read downstream as "on" only when it
     // is exactly `true`: `fastMode`, `ultracode` and `chromeBrowser` by the
-    // adapter, `chromeBrowser` and `externalBrowser` by the host's own tool
-    // factory (`agentBrowserServers`, which picks the run's browser tools).
-    // What each is allowed to *do* is theirs to decide; this boundary only
-    // proves the type.
+    // adapter, and `chromeBrowser`, `extensionBrowser` and `externalBrowser`
+    // by the host's own tool factory (`agentBrowserServers`, which picks the
+    // run's browser tools). What each is allowed to *do* is theirs to decide;
+    // this boundary only proves the type. In particular `extensionBrowser`
+    // being `true` is not a claim that a browser is paired — the picker
+    // disables it when none is, and the driver answers in words when the one
+    // that was paired is not there.
     fastMode: optionalBoolean(input['fastMode'], `${field}.fastMode`),
     ultracode: optionalBoolean(input['ultracode'], `${field}.ultracode`),
     chromeBrowser: optionalBoolean(input['chromeBrowser'], `${field}.chromeBrowser`),
+    extensionBrowser: optionalBoolean(input['extensionBrowser'], `${field}.extensionBrowser`),
     externalBrowser: optionalBoolean(input['externalBrowser'], `${field}.externalBrowser`),
     allowedTools: optionalStringArray(
       input['allowedTools'],
@@ -1699,6 +1723,71 @@ export function validateBrowserClose(raw: unknown): BrowserCloseRequest {
 export function validateBrowserList(raw: unknown): BrowserListRequest {
   requireRequest(raw);
   return {};
+}
+
+/* -------------------------------------------------------------------------- */
+/* The extension bridge                                                       */
+/* -------------------------------------------------------------------------- */
+
+export function validateExtensionBridgeState(raw: unknown): ExtensionBridgeStateRequest {
+  requireRequest(raw);
+  return {};
+}
+
+export function validateExtensionBridgePair(raw: unknown): ExtensionBridgePairRequest {
+  const request = requireRequest(raw);
+  const offer = request['offer'];
+  if (typeof offer !== 'boolean') throw new ValidationError('offer', 'must be a boolean');
+  return { offer };
+}
+
+export function validateExtensionBridgeUnpair(raw: unknown): ExtensionBridgeUnpairRequest {
+  const request = requireRequest(raw);
+  return { browserId: requireString(request['browserId'], 'browserId', LIMITS.id) };
+}
+
+/**
+ * The page policy, on its way from the editor to the browsers it governs.
+ *
+ * The only channel on this page whose payload later leaves the machine: main
+ * forwards it verbatim to every connected extension, which applies it against
+ * the address a tab actually has. So the bounds matter more than they look.
+ * Each list is capped at {@link LIMITS.siteItems} entries of
+ * {@link LIMITS.host} characters — a person listing their dev sites is naming
+ * a handful, and a payload naming ten thousand is either corrupt or an attempt
+ * to make the extension spend its afternoon matching them.
+ *
+ * What is *not* checked here is whether an entry is a plausible host pattern.
+ * `hostMatches` is total — an entry that matches nothing simply matches
+ * nothing — and a validator that rejected `*.example .com` would be the second
+ * place in the codebase that decides what a host pattern is, drifting from
+ * `browserDriver.ts`, which is the first.
+ */
+export function validateExtensionBridgePolicy(raw: unknown): ExtensionBridgePolicyRequest {
+  const request = requireRequest(raw);
+  const policy = requireObject(request['policy'], 'policy');
+  return {
+    policy: {
+      devSites: sites(policy['devSites'], 'policy.devSites'),
+      blockedSites: sites(policy['blockedSites'], 'policy.blockedSites'),
+      unblockedSites: sites(policy['unblockedSites'], 'policy.unblockedSites'),
+      evaluateEverywhere: requireBoolean(policy['evaluateEverywhere'], 'policy.evaluateEverywhere'),
+      deepReadEverywhere: requireBoolean(policy['deepReadEverywhere'], 'policy.deepReadEverywhere'),
+    },
+  };
+}
+
+export function validateExtensionBridgeSaveBundle(
+  raw: unknown,
+): ExtensionBridgeSaveBundleRequest {
+  requireRequest(raw);
+  return {};
+}
+
+/** One of a policy's host-pattern lists. */
+function sites(value: unknown, field: string): readonly string[] {
+  const list = optionalStringArray(value, field, LIMITS.siteItems, LIMITS.host);
+  return list ?? [];
 }
 
 const BROWSER_COMMANDS = new Set(['back', 'forward', 'reload', 'stop']);

@@ -311,6 +311,15 @@ export const RESPONSE_SCAN_POLICY: ScanPolicy = {
     'name',
     'instructions',
     'suggestion',
+    // A paired browser's name for itself — "Chrome on Windows" — which arrives
+    // from the extension and is prose shown to the user, exactly as `name` is.
+    // Here rather than left strict because the alternative is a Browser pane
+    // that refuses to load at all for anyone whose browser reported something
+    // credential-shaped, which is a denial of service and not a protection:
+    // the field is bounded to 80 characters in `extensionBridge.ts` and the
+    // secret it *could* have leaked has no key on the renderer's side of this
+    // boundary to ride out on.
+    'browsername',
   ]),
   // `metadata` is echoed straight back from the renderer's own `RunInput`.
   opaqueKeys: new Set(['metadata']),
