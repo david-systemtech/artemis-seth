@@ -121,7 +121,7 @@ beforeAll(async () => {
   // been typed into as the user's, so assigning `value` alone would exercise
   // a path nobody takes.
   const code = bridge.offerPairing(true).pairing?.code ?? '';
-  const options = await chrome.openPage(`chrome-extension://${ARTEMIS_EXTENSION_ID}/options.html`);
+  const options = await openOptionsPage(chrome);
   await options.evaluate(`(async () => {
     const type = (id, value) => {
       const field = document.getElementById(id);
@@ -512,9 +512,7 @@ describe.skipIf(binary === null)('two Chrome profiles paired with one Artemis', 
     await launched.awaitExtension();
 
     const code = bridge.offerPairing(true).pairing?.code ?? '';
-    const options = await launched.openPage(
-      `chrome-extension://${ARTEMIS_EXTENSION_ID}/options.html`,
-    );
+    const options = await openOptionsPage(launched);
     await options.evaluate(`(async () => {
       const type = (id, value) => {
         const field = document.getElementById(id);
@@ -928,6 +926,36 @@ async function launchChrome(binaryPath: string, extensionDir: string): Promise<C
       clearTimeout(gaveUp);
     },
   };
+}
+
+/**
+ * The extension's options page, with its own document really in it.
+ *
+ * Opening `chrome-extension://…/options.html` too early gets a document Chrome
+ * had nothing to serve: `readyState` reaches `complete` on the error page, and
+ * every `getElementById` on it answers `null`. Waiting for the service worker
+ * target removes most of that window and not all of it — on a loaded machine,
+ * with a second browser starting beside a suite of jsdom environments, the
+ * page still comes up empty sometimes, and what it costs is a pairing script
+ * failing on a line that looks correct.
+ *
+ * So the page is asked whether it is the page, and reloaded until it is. A
+ * reload rather than a second `json/new`: two targets at one URL would leave
+ * `openPage`'s lookup choosing between them, and it would keep choosing the
+ * broken one. The reload is fired from a timer so the evaluate that asks for
+ * it has somewhere to return to.
+ */
+async function openOptionsPage(browser: ChromeUnderTest): Promise<Page> {
+  const page = await browser.openPage(`chrome-extension://${ARTEMIS_EXTENSION_ID}/options.html`);
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if ((await page.evaluate<boolean>("document.getElementById('port') !== null")) === true) {
+      return page;
+    }
+    await page.evaluate('setTimeout(() => location.reload(), 0)');
+    await new Promise((done) => setTimeout(done, 500));
+    await until(async () => (await page.evaluate<string>('document.readyState')) === 'complete', 20_000);
+  }
+  throw new Error('the extension’s options page never loaded its own document');
 }
 
 /** Chrome writes its chosen port once it is ready, so this waits for both. */
