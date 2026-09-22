@@ -16,6 +16,11 @@ import {
   browserModeFromPrefs,
   browserModeUnavailable,
   effectiveBrowserMode,
+  effectiveBrowserSummary,
+  FOLLOW_WINDOW,
+  paneBrowserChoice,
+  paneBrowserOptions,
+  paneModeFor,
   type BrowserModeContext,
 } from './browserChoice';
 
@@ -246,5 +251,141 @@ describe('a mode becomes at most one boolean', () => {
         mode === 'embedded' ? 0 : 1,
       );
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The picker one conversation gets                                           */
+/* -------------------------------------------------------------------------- */
+
+describe('a conversation’s own browser picker', () => {
+  const window = { windowMode: 'embedded' as const, reach: 'per-conversation' as const };
+
+  it('offers the window’s four, and following the window above them', () => {
+    const rows = paneBrowserOptions({ ...window, context: context() });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      FOLLOW_WINDOW,
+      'embedded',
+      'extension',
+      'chrome',
+      'external',
+    ]);
+  });
+
+  it('says what following the window resolves to, because the words do not', () => {
+    // And the answer is not the window's own picker: under per-conversation
+    // reach a window set to My Chrome resolves to the built-in browser, which
+    // is the state this control exists to let somebody out of.
+    const rows = paneBrowserOptions({
+      windowMode: 'extension',
+      reach: 'per-conversation',
+      context: context(),
+    });
+
+    expect(rows[0]?.note).toContain('built-in browser');
+    expect(rows[0]?.disabled).toBeUndefined();
+  });
+
+  it('follows always-on to the paired Chrome instead', () => {
+    const rows = paneBrowserOptions({
+      windowMode: 'extension',
+      reach: 'always-on',
+      context: context(),
+    });
+
+    expect(rows[0]?.note).toContain('My Chrome');
+  });
+
+  it('disables an option that cannot work, and puts the reason where its note goes', () => {
+    // A menu row has nowhere to hang a tooltip that anybody would find, so the
+    // reason takes the note's place. It is the same sentence the window's
+    // picker shows.
+    const rows = paneBrowserOptions({ ...window, context: context({ anyPaired: false }) });
+    const extension = rows.find((row) => row.id === 'extension');
+
+    expect(extension?.disabled).toBe(true);
+    expect(extension?.note).toContain('No browser is paired yet');
+  });
+
+  it('disables Claude in Chrome on a provider that has never heard of it', () => {
+    const rows = paneBrowserOptions({ ...window, context: context({ providerId: 'codex' }) });
+
+    expect(rows.find((row) => row.id === 'chrome')?.disabled).toBe(true);
+    expect(rows.find((row) => row.id === 'external')?.disabled).toBeUndefined();
+  });
+
+  it('never disables following the window, which is always a thing to do', () => {
+    const rows = paneBrowserOptions({
+      windowMode: 'chrome',
+      reach: 'per-conversation',
+      context: context({ providerId: 'codex', anyPaired: false }),
+    });
+
+    expect(rows[0]?.disabled).toBeUndefined();
+  });
+});
+
+describe('what a conversation’s picker is set to', () => {
+  it('reads no choice as following the window', () => {
+    expect(paneBrowserChoice(null)).toBe(FOLLOW_WINDOW);
+    expect(paneBrowserChoice('extension')).toBe('extension');
+  });
+
+  it('writes following the window back as no choice, not as the window’s value', () => {
+    // The difference that makes the follow row a row rather than a fifth
+    // browser: a conversation following the default moves when the window
+    // changes, and one that picked the same browser does not.
+    expect(paneModeFor(FOLLOW_WINDOW)).toBeNull();
+    expect(paneModeFor('embedded')).toBe('embedded');
+  });
+});
+
+describe('what a status row says this conversation is on', () => {
+  it('names the effective browser, not the stored one', () => {
+    const summary = effectiveBrowserSummary({
+      windowMode: 'extension',
+      reach: 'per-conversation',
+      paneMode: null,
+      context: context(),
+    });
+
+    expect(summary.mode).toBe('embedded');
+    expect(summary.label).toBe('Built-in');
+  });
+
+  it('marks a conversation that is following the window', () => {
+    const following = effectiveBrowserSummary({
+      windowMode: 'embedded',
+      reach: 'per-conversation',
+      paneMode: null,
+      context: context(),
+    });
+    const chosen = effectiveBrowserSummary({
+      windowMode: 'embedded',
+      reach: 'per-conversation',
+      paneMode: 'embedded',
+      context: context(),
+    });
+
+    // The same browser, two states: only the first moves when the window's
+    // setting does, and the name alone cannot say which is which.
+    expect(following.label).toBe(chosen.label);
+    expect(following.inherited).toBe(true);
+    expect(chosen.inherited).toBe(false);
+  });
+
+  it('keeps naming the paired Chrome after it has gone away', () => {
+    // The rule from the split above, seen from the status row: the choice
+    // stands and the run explains itself, so a row that said "Built-in" here
+    // would be contradicting the browser tools.
+    const summary = effectiveBrowserSummary({
+      windowMode: 'embedded',
+      reach: 'per-conversation',
+      paneMode: 'extension',
+      context: context({ anyConnected: false }),
+    });
+
+    expect(summary.label).toBe('My Chrome');
   });
 });

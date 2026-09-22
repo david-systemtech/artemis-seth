@@ -128,10 +128,12 @@ beforeEach(() => {
     providers: [
       { id: 'claude', label: 'Claude', capabilities: NO_CAPABILITIES, models: [] },
       { id: 'codex', label: 'Codex', capabilities: NO_CAPABILITIES, models: [] },
+      { id: 'artemis', label: 'Artemis Server', capabilities: NO_CAPABILITIES, models: [] },
     ] as never,
     profiles: [
       { id: 'p1', label: 'Personal', providerId: 'claude' },
       { id: 'p2', label: 'Other', providerId: 'codex' },
+      { id: 'p3', label: 'A server', providerId: 'artemis' },
     ] as never,
     // Reset explicitly rather than trusting the module-scope defaults: under
     // `--localstorage-file`, a prefs blob written by an earlier local run
@@ -224,6 +226,31 @@ describe('how a conversation comes by the paired Chrome', () => {
   it('hands it to every conversation once always-on is chosen', async () => {
     setBrowserMode('extension');
     setExtensionReach('always-on');
+
+    await submitPrompt('hello');
+
+    expect(started).toEqual([{ extensionBrowser: true }]);
+  });
+
+  it('goes back to the window default when the conversation clears its choice', async () => {
+    // `setPaneBrowserMode(null)` is the follow row, and it must restore
+    // *following* rather than pin whatever the window happens to say now.
+    setBrowserMode('external');
+    setPaneBrowserMode('extension');
+    setPaneBrowserMode(null);
+
+    await submitPrompt('hello');
+
+    expect(started).toEqual([{ externalBrowser: true }]);
+  });
+
+  it('carries a conversation’s choice onto a run served by an Artemis Server', async () => {
+    // The served path reads the same field: the adapter puts
+    // `artemis.extensionBrowser` on the request, the server publishes each
+    // verb back down that connection, and this desktop drives its own browser.
+    setBrowserMode('embedded');
+    setPaneBrowserMode('extension');
+    setPaneState(focusedPane(), { activeProviderId: 'artemis', activeProfileId: 'p3' } as never);
 
     await submitPrompt('hello');
 

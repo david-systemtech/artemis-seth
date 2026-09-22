@@ -256,3 +256,107 @@ export function browserFlagsFor(mode: BrowserMode): {
       return {};
   }
 }
+
+/* -------------------------------------------------------------------------- */
+/* The control one conversation gets                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The extra option a *conversation's* picker has that the window's does not.
+ *
+ * "Follow the window default" is not a fifth browser, it is the absence of a
+ * choice — which is a different state from choosing whatever the window
+ * currently says, and the difference is what happens when the window changes.
+ * A conversation following the default moves with it; one that picked the dock
+ * browser keeps the dock browser. `SessionState.browserMode` spells the first
+ * `null`, and this is that `null` with a name a menu can carry.
+ */
+export const FOLLOW_WINDOW = 'follow';
+
+/** What a conversation's browser picker is set to. */
+export type PaneBrowserChoice = BrowserMode | typeof FOLLOW_WINDOW;
+
+/** Short enough for the trailing edge of a menu row. */
+export const BROWSER_MODE_SHORT_LABELS: Readonly<Record<BrowserMode, string>> = {
+  embedded: 'Built-in',
+  extension: 'My Chrome',
+  chrome: 'Claude in Chrome',
+  external: 'My browser',
+};
+
+/** One row of a conversation's browser picker. */
+export interface PaneBrowserOption {
+  readonly id: PaneBrowserChoice;
+  readonly label: string;
+  /** What choosing it does, or — when it is disabled — why it cannot be. */
+  readonly note: string;
+  readonly disabled?: true;
+}
+
+/** What the picker on a conversation is currently set to. */
+export function paneBrowserChoice(paneMode: BrowserMode | null): PaneBrowserChoice {
+  return paneMode ?? FOLLOW_WINDOW;
+}
+
+/** The mode a choice means, or `null` for "follow the window default". */
+export function paneModeFor(choice: PaneBrowserChoice): BrowserMode | null {
+  return choice === FOLLOW_WINDOW ? null : choice;
+}
+
+/**
+ * The five rows a conversation's browser picker draws.
+ *
+ * The same four the window offers, under the same rule — an option that cannot
+ * work is shown, disabled, carrying the reason — plus the one above them that
+ * says "whatever the window says". Shown rather than hidden for the reason
+ * every degraded control in this app is: a user who cannot find "My Chrome"
+ * concludes Artemis does not have it, where a dimmed row saying no browser is
+ * paired has taught them where to go.
+ *
+ * The follow row's note names what the window resolves to *right now*, because
+ * "follow the default" answers nothing on its own — and under
+ * `per-conversation` reach the answer is the built-in browser even when the
+ * window's own picker says My Chrome, which is exactly the state this control
+ * exists to let somebody out of.
+ */
+export function paneBrowserOptions(options: {
+  readonly windowMode: BrowserMode;
+  readonly reach: ExtensionReach;
+  readonly context: BrowserModeContext;
+}): readonly PaneBrowserOption[] {
+  const inherited = effectiveBrowserMode({ ...options, paneMode: null });
+  return [
+    {
+      id: FOLLOW_WINDOW,
+      label: 'Follow the window default',
+      note: `Currently ${BROWSER_MODE_LABELS[inherited]}.`,
+    },
+    ...BROWSER_MODES.map((mode): PaneBrowserOption => {
+      const unavailable = browserModeUnavailable(mode, options.context);
+      return {
+        id: mode,
+        label: BROWSER_MODE_LABELS[mode],
+        note: unavailable ?? BROWSER_MODE_NOTES[mode],
+        ...(unavailable === null ? {} : { disabled: true as const }),
+      };
+    }),
+  ];
+}
+
+/**
+ * What this conversation's browser is, in the words a status row uses.
+ *
+ * `inherited` is what lets the row say *(default)*. A user looking at two
+ * panes on the built-in browser needs to know which of them will move when
+ * they change the window's setting and which will not, and that is not
+ * recoverable from the browser's name.
+ */
+export function effectiveBrowserSummary(options: {
+  readonly windowMode: BrowserMode;
+  readonly reach: ExtensionReach;
+  readonly paneMode: BrowserMode | null;
+  readonly context: BrowserModeContext;
+}): { readonly mode: BrowserMode; readonly label: string; readonly inherited: boolean } {
+  const mode = effectiveBrowserMode(options);
+  return { mode, label: BROWSER_MODE_SHORT_LABELS[mode], inherited: options.paneMode === null };
+}
