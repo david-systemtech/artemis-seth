@@ -98,7 +98,7 @@ export const EXTENSION_KEY =
  */
 export const EXTENSION_ID = 'pbdboognedfpknmikiajchompjfjhdal';
 
-/** The five permissions, in the order the header argues for them. */
+/** The four permissions, in the order the header argues for them. */
 export const MANIFEST_PERMISSIONS = ['debugger', 'tabGroups', 'storage', 'alarms'] as const;
 
 /** The shape written to `dist/manifest.json`. */
