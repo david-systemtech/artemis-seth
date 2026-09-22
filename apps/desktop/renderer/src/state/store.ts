@@ -5040,6 +5040,122 @@ export function closePane(paneId: PaneId): void {
   savePrefs();
 }
 
+/**
+ * Where on another pane a dragged pane was dropped.
+ *
+ * The centre trades places with it. An edge takes the pane out of wherever it
+ * was and puts it on that side: `left` and `right` join the target's row, `up`
+ * and `down` add a full-width row above or below the target's — the same
+ * asymmetry {@link splitPane} has, because a row is the only thing the grid
+ * can put a pane "under".
+ */
+export type PaneDropZone = 'centre' | 'left' | 'right' | 'up' | 'down';
+
+/**
+ * The grid after a drop, or `null` if the drop would change nothing.
+ *
+ * Pure, so the drop targets can ask it of every zone while the drag is in
+ * flight and offer only the ones that would do something — the rule the
+ * session drop keeps for edges the grid has no room for. `mint` makes the row
+ * an `up` or `down` drop adds: the store's `createRow` for a real move, and a
+ * throwaway for a question, so asking does not spend row ids.
+ *
+ * "Nothing" is judged by pane ids alone. Dropping the lone pane of a row on the
+ * top edge of the row beneath it takes the row out and puts a new one back in
+ * the same place; that is the old picture, and writing it would only make the
+ * panel library lay it out again under a new row id.
+ */
+function arrangeMove(
+  grid: readonly PaneRow[],
+  paneId: PaneId,
+  targetId: PaneId,
+  zone: PaneDropZone,
+  mint: (panes: readonly Pane[]) => PaneRow,
+): PaneRow[] | null {
+  if (paneId === targetId) return null;
+  const from = locate(grid, paneId);
+  const to = locate(grid, targetId);
+  if (!from || !to) return null;
+
+  const moving = (grid[from.row] as PaneRow).panes[from.column] as Pane;
+  const target = (grid[to.row] as PaneRow).panes[to.column] as Pane;
+
+  let next: PaneRow[];
+  if (zone === 'centre') {
+    next = grid.map((row) =>
+      row.panes.some((p) => p.id === paneId || p.id === targetId)
+        ? {
+            ...row,
+            panes: row.panes.map((p) =>
+              p.id === paneId ? target : p.id === targetId ? moving : p,
+            ),
+          }
+        : row,
+    );
+  } else {
+    next = [];
+    for (const row of grid) {
+      const panes = row.panes.filter((p) => p.id !== paneId);
+      if (panes.length === 0) continue;
+      next.push(panes.length === row.panes.length ? row : { ...row, panes });
+    }
+    // Located again, because taking the pane out can shift the target left
+    // within its row or up a row.
+    const at = locate(next, targetId) as { readonly row: number; readonly column: number };
+    if (zone === 'left' || zone === 'right') {
+      const row = next[at.row] as PaneRow;
+      const panes = [...row.panes];
+      panes.splice(zone === 'right' ? at.column + 1 : at.column, 0, moving);
+      next[at.row] = { ...row, panes };
+    } else {
+      next.splice(zone === 'down' ? at.row + 1 : at.row, 0, mint([moving]));
+    }
+  }
+
+  const shape = (rows: readonly PaneRow[]): string =>
+    rows.map((row) => row.panes.map((p) => p.id).join(' ')).join('|');
+  return shape(next) === shape(grid) ? null : next;
+}
+
+/** Would dropping this pane there change the grid? Asked by the drop targets. */
+export function canMovePane(
+  paneId: PaneId,
+  targetId: PaneId,
+  zone: PaneDropZone,
+  state: AppState = useApp.getState(),
+): boolean {
+  return arrangeMove(state.grid, paneId, targetId, zone, (panes) => ({ id: '', panes })) !== null;
+}
+
+/**
+ * Move a pane to another place in the grid, by dropping it on another pane.
+ *
+ * The action behind dragging a caption. Nothing is opened, closed or handed
+ * over — the same conversations stay on screen, in the same `Pane` objects, so
+ * a run streaming into the moved pane carries on streaming into it — which is
+ * why the pane limit does not come into it.
+ *
+ * A row the pane leaves empty goes, as it does in {@link closePane}. Rows that
+ * survive keep their ids, so the panel library keeps their dividers where the
+ * user put them. The moved pane takes the focus: it is the one the user just
+ * had in hand.
+ *
+ * Returns whether the grid changed; see {@link arrangeMove} for what does not.
+ *
+ * Persisted the way {@link splitPane} and {@link closePane} persist theirs:
+ * the grid itself is window state, and `savePrefs` records what outlives it —
+ * the focused conversation's seeds, which the move changes, and the divider
+ * shares, which are keyed by position (`AppState.paneLayout`) and so need no
+ * rewriting when a different pane comes to occupy a place.
+ */
+export function movePane(paneId: PaneId, targetId: PaneId, zone: PaneDropZone): boolean {
+  const grid = arrangeMove(useApp.getState().grid, paneId, targetId, zone, createRow);
+  if (grid === null) return false;
+  useApp.setState({ grid, focusedPaneId: paneId });
+  savePrefs();
+  return true;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Selectors                                                                  */
 /* -------------------------------------------------------------------------- */

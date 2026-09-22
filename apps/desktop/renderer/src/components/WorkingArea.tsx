@@ -70,6 +70,18 @@
  * `lib/sessionDrag.ts`), so nothing intercepts pointer events the rest of the
  * time.
  *
+ * ## Moving a pane
+ *
+ * With more than one pane open, each caption is a handle: pick a pane up by the
+ * bar with its name on it and drop it on another pane. The centre swaps the
+ * two; an edge moves it to that side — beside the target in its row, or into a
+ * full-width row above or below it. The pane itself travels, not a copy of its
+ * conversation, so a run that is streaming keeps streaming through the move.
+ * See `movePane`.
+ *
+ * Same overlay, same rule: it mounts only while a pane is in hand, and never
+ * over the pane being carried.
+ *
  * ## Nothing here reads the transcript
  *
  * Same rule as the sidebar. This component re-renders when a pane is opened or
@@ -92,25 +104,29 @@ import {
 import { PanelRightOpenIcon, XIcon } from 'lucide-react';
 
 import { lastSegment } from '../lib/paths';
+import { isPaneDrag, readPaneDrag, startsOnControl, writePaneDrag } from '../lib/paneDrag';
 import { isSessionDrag, readSessionDrag, resolveSessionDrag } from '../lib/sessionDrag';
 import {
   DOCK_MIN_WIDTH,
   DOCK_SHEET_BELOW,
   SPLIT_MIN_HEIGHT,
   SPLIT_MIN_WIDTH,
+  canMovePane,
   canSplit,
   closePane,
   conversationName,
   focusPane,
+  movePane,
   openSessionBeside,
   paneCount,
   resumeSession,
   setDockSheetOpen,
   setPaneLayout,
   useApp,
+  type PaneDropZone,
 } from '../state/store';
 import { PaneProvider, usePane } from '../state/paneContext';
-import type { Pane, PaneRow } from '../state/pane';
+import type { Pane, PaneId, PaneRow } from '../state/pane';
 import { Composer } from './Composer';
 import { HandoffPicker } from './HandoffPicker';
 import { DockPane } from './DockPane';
@@ -209,6 +225,18 @@ function useStoredLayout(
 const HANDLE =
   'w-[7px] bg-transparent transition-colors hover:bg-beam/30 data-[state=drag]:bg-beam/50 data-[panel-group-direction=vertical]:h-[7px] data-[panel-group-direction=vertical]:w-full';
 
+/**
+ * What is being dragged over the grid, if anything.
+ *
+ * A session only needs to be recognised — which one is read on the drop. A
+ * pane carries its id, because the pane in hand must not offer itself as a
+ * target: dropping a pane on itself is not a move.
+ */
+type Drag = { readonly kind: 'session' } | { readonly kind: 'pane'; readonly paneId: PaneId };
+
+/** One value for every session drag, so re-entering does not re-render. */
+const SESSION_DRAG: Drag = { kind: 'session' };
+
 /* -------------------------------------------------------------------------- */
 /* The grid                                                                   */
 /* -------------------------------------------------------------------------- */
@@ -251,23 +279,51 @@ export function WorkingArea(): ReactElement {
    * the standard fix and the only one that survives a deep subtree.
    */
   const depth = useRef(0);
-  const [dragging, setDragging] = useState(false);
+  const [drag, setDrag] = useState<Drag | null>(null);
+  const pickUp = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const onDragEnter = useCallback((event: DragEvent<HTMLDivElement>) => {
     if (!isSessionDrag(event.dataTransfer)) return;
     depth.current += 1;
-    setDragging(true);
+    setDrag(SESSION_DRAG);
   }, []);
 
   const onDragLeave = useCallback((event: DragEvent<HTMLDivElement>) => {
     if (!isSessionDrag(event.dataTransfer)) return;
     depth.current = Math.max(0, depth.current - 1);
-    if (depth.current === 0) setDragging(false);
+    if (depth.current === 0) setDrag(null);
+  }, []);
+
+  /*
+   * A pane picked up by its caption.
+   *
+   * Heard here as the caption's `dragstart` bubbles past, which is the one
+   * moment besides the drop that the payload can be read — and the id is
+   * needed mid-drag, to keep the pane being carried from offering itself as a
+   * target. No enter/leave counting: the drag starts inside this area, so the
+   * first `dragenter` has no matching leave, and `dragend` always reaches the
+   * source, which is a descendant.
+   *
+   * The overlay mounts a tick later, not in the handler. Chromium snapshots
+   * the drag image and decides whether the drag goes ahead after `dragstart`
+   * returns, and a DOM change landing in that window can cancel it outright —
+   * the classic "drag ends the instant it starts".
+   */
+  const onDragStart = useCallback((event: DragEvent<HTMLDivElement>) => {
+    const paneId = readPaneDrag(event.dataTransfer);
+    if (paneId === null) return;
+    if (pickUp.current !== null) clearTimeout(pickUp.current);
+    pickUp.current = setTimeout(() => {
+      pickUp.current = null;
+      setDrag({ kind: 'pane', paneId });
+    }, 0);
   }, []);
 
   const endDrag = useCallback(() => {
     depth.current = 0;
-    setDragging(false);
+    if (pickUp.current !== null) clearTimeout(pickUp.current);
+    pickUp.current = null;
+    setDrag(null);
   }, []);
 
   const alone = grid.length === 1 && (grid[0] as PaneRow).panes.length === 1;
@@ -279,17 +335,18 @@ export function WorkingArea(): ReactElement {
         index={0}
         stored={stored}
         alone={alone}
-        dragging={dragging}
+        drag={drag}
         onSettled={endDrag}
       />
     ) : (
-      <RowStack grid={grid} stored={stored} dragging={dragging} onSettled={endDrag} />
+      <RowStack grid={grid} stored={stored} drag={drag} onSettled={endDrag} />
     );
 
   return (
     <div
       ref={area}
       className="relative flex min-h-0 min-w-0 flex-1"
+      onDragStart={onDragStart}
       onDragEnter={onDragEnter}
       onDragLeave={onDragLeave}
       onDrop={endDrag}
@@ -449,12 +506,12 @@ function DockSplit({ children }: { readonly children: ReactNode }): ReactElement
 function RowStack({
   grid,
   stored,
-  dragging,
+  drag,
   onSettled,
 }: {
   readonly grid: readonly PaneRow[];
   readonly stored: Readonly<Record<string, number>>;
-  readonly dragging: boolean;
+  readonly drag: Drag | null;
   readonly onSettled: () => void;
 }): ReactElement {
   const defaultLayout = useStoredLayout(
@@ -492,7 +549,7 @@ function RowStack({
               index={index}
               stored={stored}
               alone={false}
-              dragging={dragging}
+              drag={drag}
               onSettled={onSettled}
             />
           </ResizablePanel>
@@ -508,14 +565,14 @@ function PaneRowView({
   index,
   stored,
   alone,
-  dragging,
+  drag,
   onSettled,
 }: {
   readonly row: PaneRow;
   readonly index: number;
   readonly stored: Readonly<Record<string, number>>;
   readonly alone: boolean;
-  readonly dragging: boolean;
+  readonly drag: Drag | null;
   readonly onSettled: () => void;
 }): ReactElement {
   // A group with one panel is a divider with nothing to divide, and rendering
@@ -527,7 +584,7 @@ function PaneRowView({
       <PaneCell
         pane={row.panes[0] as Pane}
         alone={alone}
-        dragging={dragging}
+        drag={drag}
         onSettled={onSettled}
       />
     );
@@ -538,7 +595,7 @@ function PaneRowView({
       row={row}
       index={index}
       stored={stored}
-      dragging={dragging}
+      drag={drag}
       onSettled={onSettled}
     />
   );
@@ -549,13 +606,13 @@ function ColumnStack({
   row,
   index,
   stored,
-  dragging,
+  drag,
   onSettled,
 }: {
   readonly row: PaneRow;
   readonly index: number;
   readonly stored: Readonly<Record<string, number>>;
-  readonly dragging: boolean;
+  readonly drag: Drag | null;
   readonly onSettled: () => void;
 }): ReactElement {
   const defaultLayout = useStoredLayout(
@@ -584,7 +641,7 @@ function ColumnStack({
             <ResizableHandle withHandle aria-label="Resize the columns" className={HANDLE} />
           ) : null}
           <ResizablePanel id={pane.id} minSize={SPLIT_MIN_WIDTH} className="flex min-w-0">
-            <PaneCell pane={pane} alone={false} dragging={dragging} onSettled={onSettled} />
+            <PaneCell pane={pane} alone={false} drag={drag} onSettled={onSettled} />
           </ResizablePanel>
         </Fragment>
       ))}
@@ -596,22 +653,35 @@ function ColumnStack({
 /* One pane                                                                   */
 /* -------------------------------------------------------------------------- */
 
-/** A pane plus the drop overlay that covers it while a session is in flight. */
+/**
+ * A pane plus the drop overlay that covers it while a session or another pane
+ * is in flight. The pane being carried gets no overlay — it is dimmed instead,
+ * so the eye can see where it is being taken from.
+ */
 function PaneCell({
   pane,
   alone,
-  dragging,
+  drag,
   onSettled,
 }: {
   readonly pane: Pane;
   readonly alone: boolean;
-  readonly dragging: boolean;
+  readonly drag: Drag | null;
   readonly onSettled: () => void;
 }): ReactElement {
+  const carried = drag?.kind === 'pane' && drag.paneId === pane.id;
   return (
-    <div className="relative flex min-h-0 min-w-0 flex-1">
+    <div
+      className={cn(
+        'relative flex min-h-0 min-w-0 flex-1 transition-opacity',
+        carried && 'opacity-50',
+      )}
+    >
       <PaneColumn pane={pane} alone={alone} />
-      {dragging ? <DropZones pane={pane} onSettled={onSettled} /> : null}
+      {drag?.kind === 'session' ? <DropZones pane={pane} onSettled={onSettled} /> : null}
+      {drag?.kind === 'pane' && !carried ? (
+        <PaneDropZones moving={drag.paneId} pane={pane} onSettled={onSettled} />
+      ) : null}
     </div>
   );
 }
@@ -718,11 +788,33 @@ function PaneCaption({
   // not `resumeSessionId`.
   const title = usePane(conversationName);
   const project = cwd.trim().length > 0 ? lastSegment(cwd) : 'No project';
+  // Whether the press that may become a drag landed on the ✕. See
+  // `startsOnControl` for why `dragstart` cannot tell by itself.
+  const onControl = useRef(false);
 
   return (
     <div
+      /*
+        The caption is the pane's handle: pick it up and drop it on another
+        pane to move it there. The whole bar rather than a grip icon, because
+        the bar is what the user reaches for — it is the part of the pane with
+        the name on it. A click that does not travel is still a click: the
+        browser only starts a drag once the pointer moves, so focusing the pane
+        by clicking its caption is unchanged.
+      */
+      draggable
+      onPointerDown={(event) => {
+        onControl.current = startsOnControl(event.target, event.currentTarget);
+      }}
+      onDragStart={(event) => {
+        if (onControl.current) {
+          event.preventDefault();
+          return;
+        }
+        writePaneDrag(event.dataTransfer, pane.id);
+      }}
       className={cn(
-        'flex h-8 shrink-0 items-center gap-1.5 border-b px-2.5',
+        'flex h-8 shrink-0 cursor-grab items-center gap-1.5 border-b px-2.5 active:cursor-grabbing',
         focused ? 'border-beam/55 bg-wash' : 'border-hairline',
       )}
     >
@@ -747,7 +839,8 @@ function PaneCaption({
         label="Close this pane"
         size="icon-xs"
         onClick={() => closePane(pane.id)}
-        className="shrink-0 text-ink-faint"
+        // Not the caption's grab hand: pressing this closes, it does not lift.
+        className="shrink-0 cursor-default text-ink-faint"
       >
         <XIcon />
       </IconButton>
@@ -796,7 +889,7 @@ function DropZones({
         edges are declared after the centre for exactly that reason — later
         siblings win the hit test at the same stacking level.
       */}
-      <DropZone
+      <SessionZone
         zone="centre"
         pane={pane}
         onSettled={onSettled}
@@ -804,7 +897,7 @@ function DropZones({
         className="absolute inset-0"
       />
       {room ? (
-        <DropZone
+        <SessionZone
           zone="right"
           pane={pane}
           onSettled={onSettled}
@@ -814,7 +907,7 @@ function DropZones({
         />
       ) : null}
       {room ? (
-        <DropZone
+        <SessionZone
           zone="down"
           pane={pane}
           onSettled={onSettled}
@@ -827,16 +920,159 @@ function DropZones({
   );
 }
 
-function DropZone({
+/** A session target: what dropping a row from the sidebar here does. */
+function SessionZone({
   zone,
   pane,
+  ...rest
+}: {
+  readonly zone: Zone;
+  readonly pane: Pane;
+  readonly label: string;
+  readonly className: string;
+  readonly style?: CSSProperties;
+  readonly onSettled: () => void;
+}): ReactElement {
+  const land = useCallback(
+    (transfer: DataTransfer) => {
+      const payload = readSessionDrag(transfer);
+      if (!payload) return;
+      const session = resolveSessionDrag(payload, useApp.getState().sessions);
+      // The row can disappear mid-drag — a refresh lands, or the session is
+      // gone. Declining is the honest outcome; see `lib/sessionDrag.ts`.
+      if (!session) return;
+
+      if (zone === 'centre') resumeSession(session, pane);
+      else openSessionBeside(session, zone, pane);
+    },
+    [zone, pane],
+  );
+  return <DropZone zone={zone} accepts={isSessionDrag} land={land} {...rest} />;
+}
+
+/**
+ * Where a pane picked up by its caption can land on this one.
+ *
+ * All four edges and the centre, unlike a session's two edges: a move adds no
+ * pane, so the pane limit never takes an edge away, and a move has a pane
+ * *leaving* somewhere, so "on the left of this one" is a real place rather than
+ * a second spelling of "on the right of the one before". The centre swaps the
+ * two. Up and down are full-width rows, for the reason `PaneDropZone` gives.
+ *
+ * A zone that would change nothing — the left edge of the pane already to the
+ * carried pane's right — is not offered, the same rule the session targets
+ * keep for edges with no room behind them. See `canMovePane`.
+ *
+ * The side edges are declared last so they win the corners: a pane dropped
+ * into the top-left corner joins the row, which is the smaller change.
+ */
+function PaneDropZones({
+  moving,
+  pane,
+  onSettled,
+}: {
+  readonly moving: PaneId;
+  readonly pane: Pane;
+  readonly onSettled: () => void;
+}): ReactElement {
+  const offered = useApp((s) =>
+    PANE_ZONES.filter((zone) => canMovePane(moving, pane.id, zone, s)).join(' '),
+  );
+
+  return (
+    <div className="pointer-events-none absolute inset-0 z-30">
+      {PANE_ZONES.filter((zone) => offered.split(' ').includes(zone)).map((zone) => (
+        <PaneZone
+          key={zone}
+          zone={zone}
+          moving={moving}
+          pane={pane}
+          onSettled={onSettled}
+          {...PANE_ZONE_PLACES[zone]}
+        />
+      ))}
+    </div>
+  );
+}
+
+/** Declaration order is hit-test order, lowest first: centre, then rows, then sides. */
+const PANE_ZONES: readonly PaneDropZone[] = ['centre', 'up', 'down', 'left', 'right'];
+
+const PANE_ZONE_PLACES: Record<
+  PaneDropZone,
+  { readonly label: string; readonly className: string; readonly style?: CSSProperties }
+> = {
+  centre: { label: 'Swap with this pane', className: 'absolute inset-0' },
+  up: {
+    label: 'Move above, full width',
+    className: 'absolute inset-x-0 top-0',
+    style: { height: EDGE },
+  },
+  down: {
+    label: 'Move below, full width',
+    className: 'absolute inset-x-0 bottom-0',
+    style: { height: EDGE },
+  },
+  left: {
+    label: 'Move to the left',
+    className: 'absolute inset-y-0 left-0',
+    style: { width: EDGE },
+  },
+  right: {
+    label: 'Move to the right',
+    className: 'absolute inset-y-0 right-0',
+    style: { width: EDGE },
+  },
+};
+
+/** A pane target: what dropping a carried pane here does. */
+function PaneZone({
+  zone,
+  moving,
+  pane,
+  ...rest
+}: {
+  readonly zone: PaneDropZone;
+  readonly moving: PaneId;
+  readonly pane: Pane;
+  readonly label: string;
+  readonly className: string;
+  readonly style?: CSSProperties;
+  readonly onSettled: () => void;
+}): ReactElement {
+  const land = useCallback(
+    // The pane this zone was drawn for rather than a read of the payload: the
+    // two are the same id, and this one was already checked against the grid
+    // when the zone was offered. A pane that closed mid-drag is no longer in the
+    // grid, and `movePane` declines it.
+    () => {
+      movePane(moving, pane.id, zone);
+    },
+    [zone, moving, pane],
+  );
+  return <DropZone zone={zone} accepts={isPaneDrag} land={land} {...rest} />;
+}
+
+/**
+ * One drop target: the highlight, the label, and the HTML5 drop plumbing.
+ *
+ * What a drop *does* is the caller's — a session opens, a pane moves — and so
+ * is which drags it answers to. `accepts` is asked on every `dragover`, where
+ * only the drag's types are readable; `land` is handed the transfer on the drop,
+ * where the payload is.
+ */
+function DropZone({
+  zone,
+  accepts,
+  land,
   label,
   className,
   style,
   onSettled,
 }: {
-  readonly zone: Zone;
-  readonly pane: Pane;
+  readonly zone: Zone | PaneDropZone;
+  readonly accepts: (transfer: DataTransfer | null) => boolean;
+  readonly land: (transfer: DataTransfer) => void;
   readonly label: string;
   readonly className: string;
   readonly style?: CSSProperties;
@@ -848,33 +1084,28 @@ function DropZone({
     (event: DragEvent<HTMLDivElement>) => {
       event.preventDefault();
       // Stopped so the centre target underneath does not also handle it, which
-      // would open the session twice — once beside and once in place.
+      // would act twice — a session opened beside and in place, a pane moved
+      // and then swapped.
       event.stopPropagation();
       setOver(false);
       onSettled();
-
-      const payload = readSessionDrag(event.dataTransfer);
-      if (!payload) return;
-      const session = resolveSessionDrag(payload, useApp.getState().sessions);
-      // The row can disappear mid-drag — a refresh lands, or the session is
-      // gone. Declining is the honest outcome; see `lib/sessionDrag.ts`.
-      if (!session) return;
-
-      if (zone === 'centre') resumeSession(session, pane);
-      else openSessionBeside(session, zone, pane);
+      land(event.dataTransfer);
     },
-    [zone, pane, onSettled],
+    [land, onSettled],
   );
 
   return (
     <div
+      // Which target this is, for the suite and for anyone reading the DOM —
+      // the label only renders while the pointer is over it.
+      data-drop-zone={zone}
       style={style}
       onDragOver={(event) => {
         // `preventDefault` is what marks this element as a valid drop target.
         // Without it the browser refuses the drop and shows the "no entry"
         // cursor — the single most common way an HTML5 drop silently does
         // nothing.
-        if (!isSessionDrag(event.dataTransfer)) return;
+        if (!accepts(event.dataTransfer)) return;
         event.preventDefault();
         event.stopPropagation();
         event.dataTransfer.dropEffect = 'move';
