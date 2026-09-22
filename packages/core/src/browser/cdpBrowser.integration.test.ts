@@ -200,6 +200,75 @@ function build(limits?: Record<string, unknown>): ServerBrowser {
   });
 }
 
+/** One Chromium this file started, and what is needed to reach it and end it. */
+interface StartedChromium {
+  readonly process: ChildProcess;
+  readonly port: number;
+  readonly profile: string;
+}
+
+/**
+ * Start a headless Chromium on a free port with a profile of its own.
+ *
+ * A function rather than inline setup because one of these tests needs a
+ * *second* browser with different switches — site isolation, which is on by
+ * default in the full browser the image ships and off in the headless shell
+ * this suite runs, so the only way to exercise an out-of-process frame here is
+ * to ask for it.
+ *
+ * `--user-data-dir` is not optional: since Chrome 136 a `--remote-debugging-port`
+ * against the default profile is ignored. See `docker/browser.Dockerfile`.
+ */
+async function startChromium(extra: readonly string[]): Promise<StartedChromium> {
+  const port = await freePort();
+  const profile = await mkdtemp(join(tmpdir(), 'artemis-browser-test-'));
+  const process_ = spawn(
+    CHROMIUM as string,
+    [
+      '--headless',
+      '--no-sandbox',
+      '--disable-gpu',
+      '--disable-dev-shm-usage',
+      ...extra,
+      `--remote-debugging-port=${String(port)}`,
+      `--user-data-dir=${profile}`,
+      'about:blank',
+    ],
+    { stdio: 'ignore' },
+  );
+  await until('the browser to answer on its DevTools port', async () => {
+    const response = await fetch(`http://127.0.0.1:${String(port)}/json/version`);
+    return response.ok;
+  });
+  return { process: process_, port, profile };
+}
+
+/**
+ * End one, leaving nothing behind.
+ *
+ * `SIGTERM` and then, only if it will not go, `SIGKILL`. Not an over-careful
+ * two-step: a Chromium killed outright leaves its zygote and its renderers
+ * behind, reparented and running, because the pipe they watch for the browser
+ * process's death is never closed. `SIGTERM` gives the browser process the
+ * chance to take its own children down, which is the difference between a test
+ * run that cleans up after itself and one that leaves half a gigabyte on the
+ * machine.
+ */
+async function stopChromium(process_: ChildProcess | null): Promise<void> {
+  if (process_ === null) return;
+  const ended = new Promise<void>((resolve) => process_.once('exit', () => resolve()));
+  process_.kill('SIGTERM');
+  await Promise.race([ended, new Promise((resolve) => setTimeout(resolve, 5_000))]);
+  process_.kill('SIGKILL');
+}
+
+/** What a browser has open, asked of its own HTTP endpoint. */
+async function targetsOn(port: number): Promise<{ type: string; url: string }[]> {
+  const response = await fetch(`http://127.0.0.1:${String(port)}/json/list`);
+  const list = (await response.json()) as { type: string; url: string }[];
+  return list.map(({ type, url }) => ({ type, url }));
+}
+
 async function value<T>(result: Promise<{ ok: boolean; value?: T; reason?: string }>): Promise<T> {
   const settled = await result;
   if (!settled.ok) throw new Error(`refused: ${settled.reason ?? ''}`);
@@ -257,6 +326,20 @@ beforeAll(async () => {
       response.end('<!doctype html><html><body><p>inside the frame</p></body></html>');
       return;
     }
+    if (url === '/cross-frame') {
+      /*
+       * A page holding a frame on another *site*, which is what site isolation
+       * keys on — a different port is not enough, as measured. Under
+       * `--site-per-process` this frame is a target of its own, sharing this
+       * page's browser context, which is the case the sweep has to leave alone.
+       */
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end(
+        '<!doctype html><html><head><title>Host</title></head><body><p>the host page</p>' +
+          `<iframe src="http://site-b.test:${String(sitePort)}/frame"></iframe></body></html>`,
+      );
+      return;
+    }
     if (url === '/late-frame') {
       /*
        * A frame that starts loading *after* the page's load event.
@@ -303,63 +386,31 @@ beforeAll(async () => {
   });
   await new Promise<void>((resolve) => site?.listen(sitePort, '127.0.0.1', resolve));
 
-  cdpPort = await freePort();
-  profileDir = await mkdtemp(join(tmpdir(), 'artemis-browser-test-'));
-  chromium = spawn(
-    CHROMIUM,
-    [
-      '--headless',
-      '--no-sandbox',
-      '--disable-gpu',
-      '--disable-dev-shm-usage',
-      /*
-       * Chromium's own resolver, pointed at the test site for one name.
-       *
-       * This is what makes a real rebinding test possible: the driver is told
-       * (by an injected resolver) that `rebind.example` is public, and the
-       * browser really connects to 127.0.0.1 — which is the disagreement the
-       * `remoteIPAddress` check exists to catch, and the only way to produce it
-       * without an attacker's nameserver.
-       */
-      /*
-       * `metadata.google.internal` is mapped too, and that is the whole of what
-       * makes the frame test real: the name is on the list that has no switch,
-       * and pointing it at the test site means the frame genuinely loads and
-       * genuinely renders before the policy sees it — which is the situation
-       * being pinned, rather than a navigation that failed for want of a route.
-       */
-      '--host-resolver-rules=MAP rebind.example 127.0.0.1, MAP metadata.google.internal 127.0.0.1',
-      `--remote-debugging-port=${String(cdpPort)}`,
-      `--user-data-dir=${profileDir}`,
-      'about:blank',
-    ],
-    { stdio: 'ignore' },
-  );
-
-  await until('the browser to answer on its DevTools port', async () => {
-    const response = await fetch(`http://127.0.0.1:${String(cdpPort)}/json/version`);
-    return response.ok;
-  });
+  /*
+   * Chromium's own resolver, pointed at the test site for two names.
+   *
+   * `rebind.example` is what makes a real rebinding test possible: the driver
+   * is told (by an injected resolver) that it is public, and the browser really
+   * connects to 127.0.0.1 — which is the disagreement the `remoteIPAddress`
+   * check exists to catch, and the only way to produce it without an attacker's
+   * nameserver.
+   *
+   * `metadata.google.internal` is what makes the frame test real: the name is
+   * on the list that has no switch, and pointing it at the test site means the
+   * frame genuinely loads and genuinely renders before the policy sees it —
+   * which is the situation being pinned, rather than a navigation that failed
+   * for want of a route.
+   */
+  const started = await startChromium([
+    '--host-resolver-rules=MAP rebind.example 127.0.0.1, MAP metadata.google.internal 127.0.0.1',
+  ]);
+  chromium = started.process;
+  profileDir = started.profile;
+  cdpPort = started.port;
 }, 60_000);
 
 afterAll(async () => {
-  /*
-   * `SIGTERM` and then, only if it will not go, `SIGKILL`.
-   *
-   * Not an over-careful two-step: a Chromium killed outright leaves its zygote
-   * and its renderers behind, reparented and running, because the pipe they
-   * watch for the browser process's death is never closed. `SIGTERM` gives the
-   * browser process the chance to take its own children down, which is the
-   * difference between a test run that cleans up after itself and one that
-   * leaves half a gigabyte on the machine.
-   */
-  if (chromium !== null) {
-    const process_ = chromium;
-    const ended = new Promise<void>((resolve) => process_.once('exit', () => resolve()));
-    process_.kill('SIGTERM');
-    await Promise.race([ended, new Promise((resolve) => setTimeout(resolve, 5_000))]);
-    process_.kill('SIGKILL');
-  }
+  await stopChromium(chromium);
   await new Promise<void>((resolve) => {
     if (site === null) {
       resolve();
@@ -892,6 +943,62 @@ when('the lifecycle rules against a real Chromium', () => {
       await browser.dispose();
     }
   }, 30_000);
+
+  it('leaves a real out-of-process frame alone when it sweeps', async () => {
+    /*
+     * A second browser, with site isolation asked for.
+     *
+     * The headless shell this suite runs has it off, and off it a cross-site
+     * iframe stays inside the page and is not a target at all — so the bug
+     * being pinned is unreachable without `--site-per-process`. The full
+     * Chromium the image ships has it on by default, which is the deployment
+     * this matters on.
+     *
+     * The sweep used to own targets by "is it a lease's page?", which made
+     * every such frame a stranger and closed it on the next maintenance pass,
+     * within thirty seconds, from under an agent that was reading the page.
+     */
+    const isolated = await startChromium([
+      '--site-per-process',
+      '--host-resolver-rules=MAP site-a.test 127.0.0.1, MAP site-b.test 127.0.0.1',
+    ]);
+    try {
+      const browser = createServerBrowser({
+        endpoint: `http://127.0.0.1:${String(isolated.port)}`,
+        timers,
+        // Both names are the test site, and both are named so that the frame is
+        // refused by nothing: what is under test here is the sweep, not the
+        // policy. The resolver is injected for the same reason — these names
+        // exist only inside Chromium's own resolver rules.
+        limits: { allowHosts: ['127.0.0.1', 'site-a.test', 'site-b.test'] },
+        resolveHost: async (host) => (host.endsWith('.test') ? ['127.0.0.1'] : ['203.0.113.10']),
+      });
+      try {
+        const driver = browser.driver();
+        await value(driver.open(`http://site-a.test:${String(sitePort)}/cross-frame`));
+        await new Promise((resolve) => setTimeout(resolve, 800));
+
+        // The frame really is its own target, which is what makes the rest of
+        // this test mean anything.
+        const before = await targetsOn(isolated.port);
+        expect(before.filter((one) => one.type === 'iframe').map((one) => one.url)).toEqual([
+          `http://site-b.test:${String(sitePort)}/frame`,
+        ]);
+
+        await browser.maintain();
+
+        expect(await targetsOn(isolated.port)).toEqual(before);
+        // And the page it belongs to is still there and still readable.
+        expect((await value(driver.read())).text).toContain('the host page');
+        await driver.close();
+      } finally {
+        await browser.dispose();
+      }
+    } finally {
+      await stopChromium(isolated.process);
+      await rm(isolated.profile, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   it('leaves the browser running when it shuts down, and takes its own tabs with it', async () => {
     const browser = build();

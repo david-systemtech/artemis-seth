@@ -73,7 +73,10 @@ interface FakeElement {
 class FakeChromium {
   readonly calls: { method: string; params: Record<string, unknown>; sessionId?: string }[] = [];
   readonly contexts = new Set<string>();
-  readonly targets = new Map<string, { contextId: string | null; url: string; title: string }>();
+  readonly targets = new Map<
+    string,
+    { contextId: string | null; url: string; title: string; type?: string }
+  >();
   readonly sessions = new Map<string, string>();
 
   /** What the page answers with. */
@@ -116,6 +119,25 @@ class FakeChromium {
   addStrayTarget(contextId: string | null = 'ctx-stray'): string {
     const id = `target-stray-${String(this.#nextId++)}`;
     this.targets.set(id, { contextId, url: 'https://left-behind.example/', title: 'Left behind' });
+    if (contextId !== null) this.contexts.add(contextId);
+    return id;
+  }
+
+  /**
+   * A frame that is its own target, as site isolation makes of a cross-site
+   * iframe.
+   *
+   * It shares the `browserContextId` of the page that holds it — measured on
+   * Chromium 141 — which is the fact the sweep's ownership rule turns on.
+   */
+  addFrameTarget(contextId: string | null): string {
+    const id = `target-frame-${String(this.#nextId++)}`;
+    this.targets.set(id, {
+      contextId,
+      url: 'https://widget.example/embed',
+      title: '',
+      type: 'iframe',
+    });
     if (contextId !== null) this.contexts.add(contextId);
     return id;
   }
@@ -346,7 +368,7 @@ class FakeChromium {
         return {
           targetInfos: [...this.targets].map(([targetId, target]) => ({
             targetId,
-            type: 'page',
+            type: target.type ?? 'page',
             url: target.url,
             ...(target.contextId === null ? {} : { browserContextId: target.contextId }),
           })),
@@ -1624,6 +1646,38 @@ describe('the sweep on connecting', () => {
     // And the context it shares with this run's tab survives, because the run
     // is still using it.
     expect(chromium.targets.size).toBe(1);
+  });
+
+  it('leaves a frame of its own page alone, however out of process it is', async () => {
+    /*
+     * A cross-site iframe under site isolation is its own target, with its own
+     * target id and the *same* browser context as the page holding it. The rule
+     * used to be "any document target that is not a lease's page", which made
+     * every such frame a stranger: an agent looking at a page with an embedded
+     * map, a payment form or a video had it closed from under them on the next
+     * maintenance pass.
+     */
+    const browser = build();
+    await browser.driver().open('https://example.com/a');
+    const frame = chromium.addFrameTarget('ctx-1');
+
+    await browser.maintain();
+
+    expect(chromium.targets.has(frame)).toBe(true);
+    expect(chromium.contexts.has('ctx-1')).toBe(true);
+  });
+
+  it('closes a frame target in a context it does not own', async () => {
+    // The other side of the same rule. A frame belonging to a predecessor's
+    // page is as much a leftover as the page was.
+    const browser = build();
+    await browser.driver().open('https://example.com/a');
+    const stray = chromium.addFrameTarget('ctx-stray');
+
+    await browser.maintain();
+
+    expect(chromium.targets.has(stray)).toBe(false);
+    expect(chromium.contexts.has('ctx-stray')).toBe(false);
   });
 });
 
