@@ -150,6 +150,26 @@ function assistantText(text: string, id = 'msg-a'): SDKMessage {
   } as unknown as SDKMessage;
 }
 
+function userEcho(text: string, uuid: string): SDKMessage {
+  return {
+    type: 'user',
+    message: { role: 'user', content: text },
+    session_id: 'sess-abc',
+    uuid,
+    parent_tool_use_id: null,
+  } as unknown as SDKMessage;
+}
+
+function toolResultEcho(uuid: string): SDKMessage {
+  return {
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] },
+    session_id: 'sess-abc',
+    uuid,
+    parent_tool_use_id: null,
+  } as unknown as SDKMessage;
+}
+
 async function drain(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
   const out: AgentEvent[] = [];
   for await (const event of events) out.push(event);
@@ -221,6 +241,75 @@ describe('a turn the CLI opens on its own', () => {
       text: 'The subagent returned early.',
     });
     expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+  });
+
+  it('pins the seam to the opening message once the CLI echoes it, when the count ran ahead of the write', async () => {
+    // Measured 2026-09-22 on a served read-now: the count at init said 998,
+    // the file said 999 a few milliseconds later, and the rebuilt transcript
+    // drew every message but the one just sent. Here the store lags the same
+    // way: five messages at init, six by the time the echo arrives.
+    const { fake, adopted } = await processHoldingWork();
+    sdkMock.stored = new Array<unknown>(5).fill({ type: 'user', uuid: 'older' });
+
+    fake.messages.push(INIT);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    const turn = adopted[0] as Run;
+    await vi.waitFor(() => expect(turn.historyOffset).toBe(5));
+
+    // The write lands, and the CLI echoes the message that opened the turn.
+    sdkMock.stored = [...sdkMock.stored, { type: 'user', uuid: 'opening-1' }];
+    fake.messages.push(userEcho('try this wireguard config for singapore instead', 'opening-1'));
+
+    await vi.waitFor(() => expect(turn.historyOffset).toBe(6));
+
+    fake.messages.push(assistantText('Reading the config.', 'msg-3'));
+    fake.messages.push(RESULT);
+    const events = await drain(turn.events);
+    expect(events.at(-1)).toMatchObject({ type: 'run.end', reason: 'completed' });
+  });
+
+  it('keeps a seam the count got right, and pins it exactly once', async () => {
+    const { fake, adopted } = await processHoldingWork();
+    sdkMock.stored = [
+      ...new Array<unknown>(5).fill({ type: 'user', uuid: 'older' }),
+      { type: 'user', uuid: 'opening-1' },
+    ];
+
+    fake.messages.push(INIT);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    const turn = adopted[0] as Run;
+    await vi.waitFor(() => expect(turn.historyOffset).toBe(6));
+
+    fake.messages.push(userEcho('go on', 'opening-1'));
+    // A tool result is not a prompt: it does not re-pin, whatever it is called.
+    fake.messages.push(toolResultEcho('opening-1'));
+    fake.messages.push(assistantText('ok', 'msg-3'));
+    fake.messages.push(RESULT);
+    await drain(turn.events);
+
+    expect(turn.historyOffset).toBe(6);
+    // One read at init, one to pin; the tool result cost none.
+    expect(sdkMock.reads).toHaveLength(2);
+  });
+
+  it('keeps the counted seam when the echoed message never appears in the store', async () => {
+    const { fake, adopted } = await processHoldingWork();
+    sdkMock.stored = new Array<unknown>(5).fill({ type: 'user', uuid: 'older' });
+
+    fake.messages.push(INIT);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    const turn = adopted[0] as Run;
+    await vi.waitFor(() => expect(turn.historyOffset).toBe(5));
+
+    fake.messages.push(userEcho('a message the store never files', 'ghost'));
+    fake.messages.push(assistantText('ok', 'msg-3'));
+    fake.messages.push(RESULT);
+    await drain(turn.events);
+
+    // Tried six times after the count, then left as counted - no worse than
+    // before. Waited out in full so the retries do not bleed into the next test.
+    await vi.waitFor(() => expect(sdkMock.reads).toHaveLength(7), { timeout: 2000 });
+    expect(turn.historyOffset).toBe(5);
   });
 
   it('leaves the seam unknown when the store cannot be read, and the turn untouched', async () => {
