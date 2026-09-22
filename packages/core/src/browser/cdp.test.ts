@@ -7,6 +7,11 @@
  * an address, which is exactly what `http://browser:9222` produces — so the
  * name is resolved here and the address is what asks. A regression would look
  * like "the browser service is down" and would be nothing of the kind.
+ *
+ * The container at the other end of that address is read here too, for the same
+ * reason and with the same symptom: the flags it starts Chromium with decide
+ * whether there is a port to resolve to at all, and getting them wrong reads
+ * from this side as a browser that is down.
  */
 
 import { readFileSync, readdirSync } from 'node:fs';
@@ -262,6 +267,39 @@ describe('turning a compose file’s address into an endpoint', () => {
       vi.unstubAllGlobals();
       vi.useRealTimers();
     }
+  });
+});
+
+describe('the container the endpoint is supposed to be on', () => {
+  /*
+   * The one part of this feature no test can drive: there is no Docker where it
+   * was written. What can be checked is the flag whose absence makes everything
+   * above unreachable, and it is worth checking because the failure is total and
+   * silent — the port is simply never opened, and every symptom points at the
+   * network instead.
+   */
+  const dockerfile = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '../../../../docker/browser.Dockerfile'),
+    'utf8',
+  );
+
+  it('gives Chromium a profile of its own, or the DevTools port never opens', () => {
+    /*
+     * Since Chrome 136, `--remote-debugging-port` is ignored unless a
+     * non-default `--user-data-dir` is given as well. Debian bookworm's
+     * chromium is well past 136, so a CMD with the port and without the profile
+     * is a container that listens on nothing at all.
+     */
+    const command = dockerfile.slice(dockerfile.indexOf('CMD ['));
+    expect(command).toContain('--remote-debugging-port=9222');
+    expect(command).toContain('--user-data-dir=/home/browser/profile');
+  });
+
+  it('makes that profile directory, owned by the user that has to write it', () => {
+    // Chromium runs as `browser`, which cannot create a directory under a home
+    // it does not own — and a profile it cannot write is a browser that exits.
+    expect(dockerfile).toContain('mkdir -p /home/browser/profile');
+    expect(dockerfile).toContain('chown -R browser:browser /home/browser');
   });
 });
 

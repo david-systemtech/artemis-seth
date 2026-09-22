@@ -50,7 +50,13 @@ RUN apt-get update \
 # somebody else's code, and this one is pointed at the open web by an agent.
 # The home directory is where Chromium writes its profile, so it has to be
 # writable and it has to be the user's own.
-RUN useradd --create-home --shell /usr/sbin/nologin browser
+#
+# `profile` is made here rather than left to Chromium, because it has to exist
+# and be owned by `browser` before the CMD below points `--user-data-dir` at it.
+# See that flag for why the default profile will not do.
+RUN useradd --create-home --shell /usr/sbin/nologin browser \
+  && mkdir -p /home/browser/profile \
+  && chown -R browser:browser /home/browser
 USER browser
 WORKDIR /home/browser
 
@@ -68,6 +74,41 @@ EXPOSE 9222
 #                               authority over this browser and has no auth of
 #                               its own.
 #   --remote-debugging-port     where. Matches ARTEMIS_BROWSER_CDP_URL.
+#   --user-data-dir             without this the DevTools port is not opened at
+#     =/home/browser/profile    all. Since Chrome 136, `--remote-debugging-port`
+#                               and `--remote-debugging-pipe` are **ignored**
+#                               unless a non-default profile directory is also
+#                               given — a deliberate change, made because a
+#                               debugging port over the user's real profile
+#                               hands every cookie in it to whatever can reach
+#                               the port. Debian bookworm's chromium is well
+#                               past 136, so without this flag the container
+#                               listens on nothing, the HEALTHCHECK below fails
+#                               for ever, and the server can never connect.
+#                               An explicit path rather than a `--temp-profile`
+#                               style flag: the directory is created above and
+#                               owned by this user, so there is one place the
+#                               profile can be and it is not a surprise.
+#
+#                               MEASURED, and the measurement does not settle
+#                               it either way — which is worth stating rather
+#                               than implying. On 2026-09-22, Playwright's
+#                               `chromium_headless_shell` 141 was started with
+#                               `--remote-debugging-port` and **no**
+#                               `--user-data-dir`: the port opened within a
+#                               second and answered `/json/version`, and no
+#                               `~/.config/chromium` was created. That is the
+#                               headless *shell*, which makes itself a
+#                               throwaway profile directory and so satisfies
+#                               the rule without being told to. The image below
+#                               runs the **full** browser under `--headless=new`,
+#                               which uses `~/.config/chromium` — the default
+#                               profile, which is exactly what the rule
+#                               refuses. There is no Docker here and no Debian
+#                               chromium to try it against, so this flag is
+#                               reasoned from the rule and from a binary that
+#                               sidesteps it, not proved on the one that does
+#                               not.
 #   --no-sandbox                Chromium's own sandbox needs privileges a
 #                               hardened container does not give it. The
 #                               container is the sandbox instead, which is why
@@ -94,6 +135,7 @@ CMD ["chromium", \
      "--headless=new", \
      "--remote-debugging-address=0.0.0.0", \
      "--remote-debugging-port=9222", \
+     "--user-data-dir=/home/browser/profile", \
      "--no-sandbox", \
      "--disable-dev-shm-usage", \
      "--disable-gpu", \
