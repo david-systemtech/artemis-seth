@@ -14,18 +14,23 @@ import { BROWSER_TOOL_SERVER, servedBrowserServers } from './servedBrowser.js';
 
 function builders(): {
   asked: string[];
-  build: { server: () => never; extension: () => never };
+  /** Which browser the relayed builder was asked for, if it was asked. */
+  forBrowser: (string | undefined)[];
+  build: { server: () => never; extension: (browserId: string | undefined) => never };
 } {
   const asked: string[] = [];
+  const forBrowser: (string | undefined)[] = [];
   return {
     asked,
+    forBrowser,
     build: {
       server: () => {
         asked.push('server');
         return 'the server browser' as never;
       },
-      extension: () => {
+      extension: (browserId: string | undefined) => {
         asked.push('extension');
+        forBrowser.push(browserId);
         return 'the caller’s browser' as never;
       },
     },
@@ -49,6 +54,24 @@ describe('which browser a served run gets', () => {
       artemisBrowser: 'the caller’s browser',
     });
     expect(asked).toEqual(['extension']);
+  });
+
+  it('carries which of the caller’s browsers they named, without reading it', () => {
+    // An id the client issued, for a list this machine has never seen. There
+    // is nothing here that could check it and nothing that should try.
+    const { forBrowser, build } = builders();
+
+    servedBrowserServers({ extensionBrowser: true, extensionBrowserId: 'b-work' }, build);
+
+    expect(forBrowser).toEqual(['b-work']);
+  });
+
+  it('carries nothing when the caller named no browser', () => {
+    const { forBrowser, build } = builders();
+
+    servedBrowserServers({ extensionBrowser: true }, build);
+
+    expect(forBrowser).toEqual([undefined]);
   });
 
   it('gives a Chrome-bridge run nothing at all, and builds nothing', () => {

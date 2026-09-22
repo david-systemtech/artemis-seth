@@ -242,3 +242,83 @@ describe('what this driver claims it can do', () => {
     });
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* Which of the caller's browsers                                             */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * A caller may have a work Chrome and a personal one paired with their client,
+ * and nothing on the serving machine can tell them apart: the list of pairings
+ * is on the client. So what is pinned here is that the choice is *carried* —
+ * on every call, not only the first — and never interpreted.
+ */
+describe('the browser a served run drives', () => {
+  it('rides on every call, because the client keeps nothing between them', async () => {
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1', 'b-work');
+
+    void driver.open();
+    void driver.read();
+    void driver.close();
+
+    expect(published.map((one) => one.call.browserId)).toEqual(['b-work', 'b-work', 'b-work']);
+  });
+
+  it('is absent when the run named none, which means whichever is open', async () => {
+    const { relay, published } = relayWatching();
+
+    void relay.driverFor('conn-a', 'run-1').read();
+
+    expect(published[0]?.call).not.toHaveProperty('browserId');
+  });
+
+  it('takes the name the agent answered with and sends that instead', async () => {
+    /*
+     * The ask-then-choose flow over the relay. The refusal that asked came
+     * from the client's own driver and named the browsers; the model's answer
+     * is a name, and a name is what crosses — the client is the only side that
+     * can turn one into a pairing.
+     */
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1');
+
+    void driver.open('https://example.com', 'Personal');
+    void driver.read();
+
+    expect(published.map((one) => one.call.browserId)).toEqual(['Personal', 'Personal']);
+  });
+
+  it('keeps that answer even when the open it came with then failed', async () => {
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1');
+
+    const opening = driver.open('https://example.com/missing', 'Personal');
+    relay.answer('conn-a', lastCallId(published), { ok: false, reason: 'that page 404ed' });
+    expect((await opening).ok).toBe(false);
+    void driver.read();
+
+    expect(published.at(-1)?.call.browserId).toBe('Personal');
+  });
+
+  it('replaces a browser the run started with when the agent names another', async () => {
+    // A conversation set to "whichever is open" that then asked is the common
+    // case; a conversation pointed at one that then asked is a user changing
+    // their mind mid-turn, and the most recent statement wins.
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1', 'b-work');
+
+    void driver.open(undefined, 'Personal');
+
+    expect(published.at(-1)?.call.browserId).toBe('Personal');
+  });
+
+  it('ignores an empty name, which is not a choice', async () => {
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1', 'b-work');
+
+    void driver.open(undefined, '   ');
+
+    expect(published.at(-1)?.call.browserId).toBe('b-work');
+  });
+});

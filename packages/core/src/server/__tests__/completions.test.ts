@@ -2170,14 +2170,19 @@ describe('POST /v1/chat/completions', () => {
     return { server, relay, published, url: `http://127.0.0.1:${port}/v1/chat/completions` };
   }
 
-  async function askForClientBrowser(options: { relay: boolean; allowed?: boolean }) {
+  async function askForClientBrowser(
+    options: { relay: boolean; allowed?: boolean; browserId?: string },
+  ) {
     const source = fakeRuns([{ type: 'run.end', reason: 'completed', result: 'ok' }]);
     const { server, url } = await serveRelay(options, source);
     try {
       const response = await post(url, {
         model: 'work-max/opus',
         messages: [{ role: 'user', content: 'hi' }],
-        artemis: { extensionBrowser: true },
+        artemis: {
+          extensionBrowser: true,
+          ...(options.browserId === undefined ? {} : { extensionBrowserId: options.browserId }),
+        },
       });
       expect(response.status).toBe(200);
       const body = (await response.json()) as { artemis: { ignored?: readonly string[] } };
@@ -2202,6 +2207,27 @@ describe('POST /v1/chat/completions', () => {
     // asking for a browser nobody can be asked about.
     const { input } = await askForClientBrowser({ relay: true });
     expect(input).toMatchObject({ connectionId: CONNECTION.id });
+  });
+
+  it('carries which of the caller’s browsers they named, for the relay to address', () => {
+    // A caller may have a work Chrome and a personal one paired with their
+    // client. The serving machine has never seen that list and resolves
+    // nothing; it carries the id to the relay and no further.
+    return askForClientBrowser({ relay: true, browserId: 'b-work' }).then(({ input }) => {
+      expect(input).toMatchObject({ extensionBrowser: true, extensionBrowserId: 'b-work' });
+    });
+  });
+
+  it('drops the browser id with the browser, rather than naming it separately', async () => {
+    // A browser choice without a browser is part of the one thing the host
+    // declined, not a second thing — so `artemis.ignored` says the one.
+    const { ignored, input } = await askForClientBrowser({
+      relay: true,
+      allowed: false,
+      browserId: 'b-work',
+    });
+    expect(ignored).toEqual(['artemis.extensionBrowser']);
+    expect(input).not.toHaveProperty('extensionBrowserId');
   });
 
   it('declines the caller’s browser, and says so, when the operator turned it off', async () => {

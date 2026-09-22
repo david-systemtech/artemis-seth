@@ -58,6 +58,16 @@ const PAIRED_AND_AWAKE: ExtensionBridgeState = {
   bundledVersion: null,
 };
 
+/** Three profiles paired, one of them shut: the case the names exist for. */
+const TWO_PAIRED: ExtensionBridgeState = {
+  ...PAIRED_AND_AWAKE,
+  browsers: [
+    { browserId: 'b-work', browserName: 'Work', pairedAt: 1, connected: true },
+    { browserId: 'b-personal', browserName: 'Personal', pairedAt: 2, connected: true },
+    { browserId: 'b-laptop', browserName: 'Laptop', pairedAt: 3, connected: false },
+  ],
+};
+
 async function renderPane(options: {
   readonly providerId?: string;
   readonly bridge?: ExtensionBridgeState | null;
@@ -207,6 +217,46 @@ describe('choosing one', () => {
     });
 
     expect(useApp.getState().browserMode).toBe('external');
+    expect(useApp.getState().browserExtensionId).toBeNull();
+  });
+
+  it('records which browser, when a named row is the one chosen', async () => {
+    // A person may want every new conversation on their work profile by
+    // default, and a window setting that could only say "my Chrome" would
+    // leave that to whichever Chrome connected first.
+    await renderPane({ bridge: TWO_PAIRED });
+
+    await act(async () => {
+      option('My Chrome: Personal').click();
+    });
+
+    expect(useApp.getState().browserMode).toBe('extension');
+    expect(useApp.getState().browserExtensionId).toBe('b-personal');
+  });
+
+  it('clears the browser again when the plain row is chosen', async () => {
+    // The plain row means whichever is open, which is a different setting from
+    // whichever was last named — and leaving a stale id behind would make the
+    // two indistinguishable.
+    await renderPane({ bridge: TWO_PAIRED });
+
+    await act(async () => {
+      option('My Chrome: Personal').click();
+    });
+    await act(async () => {
+      option('My Chrome \\(Artemis extension\\)').click();
+    });
+
+    expect(useApp.getState().browserExtensionId).toBeNull();
+  });
+
+  it('draws a row per paired browser, and disables the one that is shut', async () => {
+    await renderPane({ bridge: TWO_PAIRED });
+
+    expect(option('My Chrome: Work').hasAttribute('disabled')).toBe(false);
+    expect(option('My Chrome: Personal').hasAttribute('disabled')).toBe(false);
+    expect(option('My Chrome: Laptop').hasAttribute('disabled')).toBe(true);
+    expect(await reasonFor('My Chrome: Laptop')).toContain('Laptop is not connected');
   });
 });
 

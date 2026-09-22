@@ -440,6 +440,32 @@ describe('the browser on the machine that started the run', () => {
     expect(calls[0]?.scope).toEqual({ connectionId: 'conn-1' });
   });
 
+  it('puts the browser the caller named on every verb it publishes', async () => {
+    /*
+     * A caller may have a work Chrome and a personal one paired with their
+     * client, and nothing on this machine can tell them apart — the list is
+     * theirs. So the id rides on each call and the client resolves it; a
+     * server that sent it once would be a server whose second verb went to
+     * whichever browser happened to be open.
+     */
+    const { calls } = watchCalls();
+    installQuery();
+    const handle = await host.runSource.startRun(
+      started({
+        extensionBrowser: true,
+        extensionBrowserId: 'b-work',
+        connectionId: 'conn-1',
+      } as never),
+    );
+
+    const driver = host.browserRelay.driverFor('conn-1', String(handle.runId), 'b-work');
+    void driver.open();
+    void driver.read();
+
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls.map((one) => one.payload['browserId'])).toEqual(['b-work', 'b-work']);
+  });
+
   it('closes the run’s tab when the run ends', async () => {
     /*
      * Nothing in the `agentToolServers` seam calls `PageDriver.close`: the

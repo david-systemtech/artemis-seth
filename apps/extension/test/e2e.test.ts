@@ -106,6 +106,10 @@ describe.skipIf(binary === null)('the extension in a real browser', () => {
       type('port', ${JSON.stringify(String(artemis.port))});
       document.getElementById('save-port').click();
       await new Promise((r) => setTimeout(r, 200));
+      // The name is typed over whatever the field offered, which is the whole
+      // point of it being a field: "Chrome on Linux" is a reasonable draft for
+      // the first browser somebody pairs and useless for the second.
+      type('browser-label', 'Work');
       type('code', ${JSON.stringify(artemis.pairingCode)});
       document.getElementById('pair').click();
     })()`);
@@ -125,7 +129,9 @@ describe.skipIf(binary === null)('the extension in a real browser', () => {
   it('pairs from the options page and shows that it is connected to Artemis', async () => {
     const opening = (artemis as FakeArtemis).connections[0]?.opening;
     expect(opening).toMatchObject({ type: 'pair', version: 1, code: (artemis as FakeArtemis).pairingCode });
-    expect((opening as { browserName: string }).browserName).toMatch(/ on /u);
+    // The label the user typed, not what the browser says about itself. Two
+    // Chrome profiles on one machine both say "Chrome on Linux".
+    expect((opening as { browserName: string }).browserName).toBe('Work');
 
     expect(await awaitText(options as Cdp, 'status', 'Connected to Artemis')).toBe('Connected to Artemis');
   });

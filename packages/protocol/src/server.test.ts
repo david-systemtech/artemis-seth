@@ -113,6 +113,27 @@ describe('readChatExtensions', () => {
     expect(readChatExtensions({})).toEqual({});
   });
 
+  it('carries which of the caller’s browsers a run should drive', () => {
+    expect(
+      readChatExtensions({ artemis: { extensionBrowser: true, extensionBrowserId: 'b-work' } }),
+    ).toEqual({ extensionBrowser: true, extensionBrowserId: 'b-work' });
+  });
+
+  it('drops a browser id with no request to use a browser at all', () => {
+    // It names nothing the run will do, and carrying it would leave the host
+    // holding a choice it must then remember to ignore.
+    expect(readChatExtensions({ artemis: { extensionBrowserId: 'b-work' } })).toEqual({});
+  });
+
+  it('drops a browser id that is not a string, or is empty', () => {
+    expect(
+      readChatExtensions({ artemis: { extensionBrowser: true, extensionBrowserId: 7 } }),
+    ).toEqual({ extensionBrowser: true });
+    expect(
+      readChatExtensions({ artemis: { extensionBrowser: true, extensionBrowserId: '' } }),
+    ).toEqual({ extensionBrowser: true });
+  });
+
   it('carries a requested permission mode, and drops a non-string one', () => {
     expect(readChatExtensions({ artemis: { permissionMode: 'acceptEdits' } })).toEqual({
       permissionMode: 'acceptEdits',

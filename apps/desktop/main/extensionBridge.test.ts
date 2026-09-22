@@ -144,6 +144,17 @@ class FakeExtension {
     });
   }
 
+  /**
+   * How many messages are waiting unread.
+   *
+   * For asserting that a browser was told *nothing*: `next()` can only prove
+   * what arrived, and the interesting claim with two browsers paired is that
+   * the one a verb was not addressed to heard none of it.
+   */
+  pending(): number {
+    return this.#inbox.length;
+  }
+
   /** Wait for the socket to close, which is how a refusal ends. */
   async untilClosed(): Promise<void> {
     if (this.closed) return;
@@ -886,5 +897,197 @@ describe('the port', () => {
     await second.start();
 
     expect(second.state().listening).toEqual({ kind: 'port-in-use', port });
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Several browsers                                                           */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * The comment this suite retired said "the first connected browser, and there
+ * is normally exactly one". It was true until somebody paired a work Chrome
+ * and a personal one, at which point every conversation drove whichever had
+ * connected first and nothing anywhere said so. What is pinned here is that
+ * Artemis now drives the browser it was told to, or asks — and never
+ * substitutes.
+ */
+describe('choosing between paired browsers', () => {
+  it('sends a verb to the browser it names, not to the one that connected first', async () => {
+    const { bridge, port } = await bridgeOn();
+    const work = await pair(bridge, port, { browserName: 'Work' });
+    const personal = await pair(bridge, port, { browserName: 'Personal' });
+
+    const answering = bridge.call('run-1', 'c-1', { verb: 'read' }, 2_000, personal.browserId);
+    const call = await personal.extension.next();
+    personal.extension.send({ type: 'result', id: 'c-1', result: { ok: true, value: 'personal' } });
+
+    expect(call).toMatchObject({ id: 'c-1', runKey: 'run-1', verb: 'read' });
+    expect(await answering).toEqual({ status: 'answered', result: { ok: true, value: 'personal' } });
+    // And the other browser was not asked anything at all.
+    expect(work.extension.pending()).toBe(0);
+  });
+
+  it('names a browser that is paired and whose Chrome is shut', async () => {
+    // A different answer from "nothing is connected": something else may well
+    // be, and using it would be acting as the wrong signed-in person.
+    const { bridge, port } = await bridgeOn();
+    const work = await pair(bridge, port, { browserName: 'Work' });
+    await pair(bridge, port, { browserName: 'Personal' });
+    work.extension.socket.close();
+    await work.extension.untilClosed();
+
+    expect(await bridge.call('run-1', 'c-2', { verb: 'read' }, 500, work.browserId)).toEqual({
+      status: 'browser-asleep',
+      browserName: 'Work',
+    });
+  });
+
+  it('says a browser id answers to nothing when it has been unpaired', async () => {
+    const { bridge, port } = await bridgeOn();
+    const work = await pair(bridge, port, { browserName: 'Work' });
+    await bridge.unpair(work.browserId);
+    await pair(bridge, port, { browserName: 'Personal' });
+
+    expect(await bridge.call('run-1', 'c-3', { verb: 'read' }, 500, work.browserId)).toEqual({
+      status: 'no-such-browser',
+    });
+  });
+
+  it('uses the one connected browser silently when nothing named one', async () => {
+    // Somebody with one browser never meets any of this.
+    const { bridge, port } = await bridgeOn();
+    const { extension } = await pair(bridge, port, { browserName: 'Work' });
+
+    const answering = bridge.call('run-1', 'c-4', { verb: 'read' }, 2_000);
+    await extension.next();
+    extension.send({ type: 'result', id: 'c-4', result: { ok: true, value: 'work' } });
+
+    expect(await answering).toEqual({ status: 'answered', result: { ok: true, value: 'work' } });
+  });
+
+  it('asks which, by name, when nothing named one and two are open', async () => {
+    // There is no defensible pick: first-connected is an artefact of what
+    // order somebody opened two windows in.
+    const { bridge, port } = await bridgeOn();
+    await pair(bridge, port, { browserName: 'Work' });
+    await pair(bridge, port, { browserName: 'Personal' });
+
+    const outcome = await bridge.call('run-1', 'c-5', { verb: 'open' }, 500);
+
+    expect(outcome).toEqual({ status: 'ambiguous', browserNames: ['Work', 'Personal'] });
+  });
+
+  it('stops asking once one of the two is closed', async () => {
+    const { bridge, port } = await bridgeOn();
+    const work = await pair(bridge, port, { browserName: 'Work' });
+    const personal = await pair(bridge, port, { browserName: 'Personal' });
+    work.extension.socket.close();
+    await work.extension.untilClosed();
+
+    const answering = bridge.call('run-1', 'c-6', { verb: 'read' }, 2_000);
+    await personal.extension.next();
+    personal.extension.send({ type: 'result', id: 'c-6', result: { ok: true, value: 'personal' } });
+
+    expect(await answering).toMatchObject({ status: 'answered' });
+  });
+
+  it('reports every paired browser, named, with whether it is connected', async () => {
+    // What the driver turns a name into an id with, and what it says which
+    // browser was chosen from.
+    const { bridge, port } = await bridgeOn();
+    const work = await pair(bridge, port, { browserName: 'Work' });
+    const personal = await pair(bridge, port, { browserName: 'Personal' });
+    personal.extension.socket.close();
+    await personal.extension.untilClosed();
+
+    expect(bridge.browsers()).toEqual([
+      { browserId: work.browserId, browserName: 'Work', connected: true },
+      { browserId: personal.browserId, browserName: 'Personal', connected: false },
+    ]);
+  });
+
+  it('still tells every connected browser a run has ended', async () => {
+    /*
+     * Deliberate, and the reason is in `endRun`'s own comment: the bridge does
+     * not record which browser a run used, an unknown run key is a no-op in
+     * the extension, and a wrong guess at "which one" would leave a tab behind
+     * in somebody's Chrome for every conversation.
+     */
+    const { bridge, port } = await bridgeOn();
+    const work = await pair(bridge, port, { browserName: 'Work' });
+    const personal = await pair(bridge, port, { browserName: 'Personal' });
+
+    bridge.endRun('run-1');
+
+    for (const seen of [await work.extension.next(), await personal.extension.next()]) {
+      expect(seen).toMatchObject({ type: 'call', runKey: 'run-1', verb: 'close' });
+    }
+  });
+});
+
+describe('renaming a paired browser', () => {
+  it('changes what it is called without disturbing its connection', async () => {
+    // The id is what everything addresses and the name is what everything
+    // shows, which is why a rename is not a re-pairing.
+    const { bridge, port } = await bridgeOn();
+    const { browserId, extension } = await pair(bridge, port, { browserName: 'Chrome on Linux' });
+
+    const state = await bridge.rename(browserId, 'Work');
+
+    expect(state.browsers[0]).toMatchObject({ browserId, browserName: 'Work', connected: true });
+    expect(extension.closed).toBe(false);
+  });
+
+  it('strips and bounds a name exactly as a pairing does', async () => {
+    // One `nameOf`, two ways in. A second rule here would let a name that a
+    // pairing refused arrive through a rename.
+    const { bridge, port } = await bridgeOn();
+    const { browserId } = await pair(bridge, port);
+
+    const state = await bridge.rename(browserId, `  Wo\u0000rk\u001b  ${'x'.repeat(200)}`);
+
+    const name = state.browsers[0]?.browserName ?? '';
+    expect(name.startsWith('Work')).toBe(true);
+    expect(name.length).toBe(80);
+  });
+
+  it('keeps the name a rename gave it when that browser reconnects', async () => {
+    /*
+     * The extension sends its own stored label in every `hello`, and Artemis
+     * does not take it. A rename in the Browser pane is the user's more recent
+     * statement about what they call this browser, and a reconnect that
+     * overwrote it would undo every rename the next time Chrome restarted.
+     */
+    const { bridge, port } = await bridgeOn();
+    const { browserId, secret, extension } = await pair(bridge, port, { browserName: 'Chrome on Linux' });
+    await bridge.rename(browserId, 'Work');
+    extension.socket.close();
+    await extension.untilClosed();
+
+    await reconnect(port, browserId, secret);
+
+    expect(bridge.state().browsers[0]?.browserName).toBe('Work');
+  });
+
+  it('writes the new name down, so it survives Artemis restarting', async () => {
+    // The store is the only copy Artemis has: the extension sends its own
+    // label on every connection and Artemis does not take it, precisely so a
+    // rename holds.
+    const { bridge, port } = await bridgeOn();
+    const { browserId } = await pair(bridge, port, { browserName: 'Chrome on Linux' });
+
+    await bridge.rename(browserId, 'Work');
+    const reopened = await openPairedBrowsers(directory);
+
+    expect(reopened.find(browserId)?.browserName).toBe('Work');
+  });
+
+  it('answers with the state when the id names nothing, rather than failing', async () => {
+    // The pane may be a moment behind a browser unpaired in another window,
+    // and the answer to that is the state, which no longer lists it.
+    const { bridge } = await bridgeOn();
+
+    expect((await bridge.rename('not-a-browser', 'Work')).browsers).toEqual([]);
   });
 });

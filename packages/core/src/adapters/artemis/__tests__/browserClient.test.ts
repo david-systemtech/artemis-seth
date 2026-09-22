@@ -548,3 +548,91 @@ describe('the stream is open only while a run needs it', () => {
     expect(client.owns('run-1')).toBe(false);
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* Which of this machine's browsers a relayed call is for                      */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * The server holds the choice and restates it on every call, because this side
+ * builds a driver per call and keeps nothing between them. What is pinned here
+ * is that the choice reaches the *driver* — which is the only thing on this
+ * machine that can turn a name into a pairing, and the only thing that can
+ * refuse in words when it cannot.
+ */
+describe('a call that names one of this machine’s browsers', () => {
+  it('builds the driver for the browser the server named', async () => {
+    const asked: (string | undefined)[] = [];
+    const { driver } = fakeDriver();
+
+    await performBrowserCall((_runKey, browserId) => {
+      asked.push(browserId);
+      return driver;
+    }, call({ browserId: 'b-work' }));
+
+    expect(asked).toEqual(['b-work']);
+  });
+
+  it('builds it for no browser in particular when the call names none', async () => {
+    const asked: (string | undefined)[] = [];
+    const { driver } = fakeDriver();
+
+    await performBrowserCall((_runKey, browserId) => {
+      asked.push(browserId);
+      return driver;
+    }, call());
+
+    expect(asked).toEqual([undefined]);
+  });
+
+  it('passes a name through unchanged, because only the driver holds the list', async () => {
+    // The agent answered "Personal" to a question the driver on this machine
+    // asked. The server cannot translate that into an id, having never seen
+    // the pairings, so it sends the word back as it was given.
+    const asked: (string | undefined)[] = [];
+    const { driver } = fakeDriver();
+
+    await performBrowserCall((_runKey, browserId) => {
+      asked.push(browserId);
+      return driver;
+    }, call({ browserId: 'Personal', verb: 'open' } as never));
+
+    expect(asked).toEqual(['Personal']);
+  });
+
+  it('names the run as well, so one served run is one tab', async () => {
+    const asked: string[] = [];
+    const { driver } = fakeDriver();
+
+    await performBrowserCall((runKey) => {
+      asked.push(runKey);
+      return driver;
+    }, call({ runKey: 'run-9' }));
+
+    expect(asked).toEqual(['run-9']);
+  });
+
+  it('drops a call whose browser field is not a string, rather than typing one as one', async () => {
+    // Off the wire, so it can be anything. Whether a browser answers to a
+    // given name is the driver's question and it answers in a sentence; a
+    // field of the wrong *type* is not a name at all.
+    const performed: string[] = [];
+    const { driver } = fakeDriver();
+    const server = fakeServer();
+    const client = createBrowserCallClient({
+      root: ROOT,
+      headers: () => ({}),
+      driverFor: (runKey) => {
+        performed.push(runKey);
+        return driver;
+      },
+      fetch: server.fetch,
+    });
+    client.own('run-1');
+
+    await server.send({ ...call(), browserId: 7 } as never);
+
+    expect(performed).toEqual([]);
+    client.stop();
+  });
+});
