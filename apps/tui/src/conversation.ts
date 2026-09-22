@@ -594,7 +594,9 @@ export class Conversation {
   /** The run that most recently ended; background work it started is stopped through it. */
   #lastRunId: RunId | undefined;
   /** What the next `start()` must carry, once, to wind the session back. */
-  #rewindArmed: { readonly messageId: string; readonly fork: boolean } | undefined;
+  #rewindArmed:
+    | { readonly messageId: string; readonly fork: boolean; readonly fromStart: boolean }
+    | undefined;
   /**
    * The rows the arm took off the screen, and where they were taken from.
    *
@@ -951,7 +953,15 @@ export class Conversation {
     this.transcript.truncateFrom(cutId);
     this.transcript.flush();
 
-    this.#rewindArmed = { messageId, fork: plan.fork };
+    // The opening prompt has nothing in front of it for a truncating resume to
+    // re-enter at, and the Claude adapter refuses one aimed there. Winding back
+    // to before the conversation is starting a new one, so the next turn goes
+    // out without the session at all. `loadHistory` replays the whole stored
+    // conversation, so the first prompt on screen is the first there is.
+    const fromStart = !ids
+      .slice(0, cutAt)
+      .some((id) => this.transcript.getItem(id)?.kind === 'user');
+    this.#rewindArmed = { messageId, fork: plan.fork, fromStart };
     this.#rewindDropped = [...dropped, ...(this.#rewindDropped ?? [])];
     this.#rewindCutAt = cutAt;
     this.#notify();
@@ -1237,11 +1247,13 @@ export class Conversation {
       ...(settings.effort === undefined ? {} : { effort: settings.effort }),
       ...(settings.fastMode === true ? { fastMode: true } : {}),
       ...(settings.ultracode === true ? { ultracode: true } : {}),
-      ...(this.#sessionId === undefined ? {} : { resumeSessionId: this.#sessionId }),
+      ...(this.#sessionId === undefined || rewind?.fromStart === true
+        ? {}
+        : { resumeSessionId: this.#sessionId }),
       // The armed rewind, and only alongside the session it truncates —
       // `rewindToMessageId` is ignored without `resumeSessionId`, and an arm
       // that outlived its session would be a request about nothing.
-      ...(rewind === undefined || this.#sessionId === undefined
+      ...(rewind === undefined || rewind.fromStart || this.#sessionId === undefined
         ? {}
         : {
             rewindToMessageId: rewind.messageId,
@@ -1966,7 +1978,9 @@ export class Conversation {
       ...(this.#turnTokens === undefined || this.#turnTokens <= 0
         ? {}
         : { turnTokens: this.#turnTokens }),
-      ...(this.#rewindArmed === undefined ? {} : { rewindArmed: this.#rewindArmed }),
+      ...(this.#rewindArmed === undefined
+        ? {}
+        : { rewindArmed: { messageId: this.#rewindArmed.messageId, fork: this.#rewindArmed.fork } }),
       ...(this.#filesChanged === undefined ? {} : { filesChanged: this.#filesChanged }),
     };
   }

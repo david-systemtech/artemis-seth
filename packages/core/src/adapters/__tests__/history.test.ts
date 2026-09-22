@@ -544,6 +544,26 @@ describe('resolveRewindPoint', () => {
     expect(resolveRewindPoint(CHAIN, 'u1')).toBeNull();
   });
 
+  it('does not vouch for a turn that a task notification followed', () => {
+    // A background task finished after the answer: the CLI wrote the
+    // notification and the model answered it. Neither is a prompt, but
+    // neither is u2's turn, and declaring the turn over them is what the CLI
+    // rejects with "Resume rejected by --resume-drops-turn:". The cut still
+    // resolves; it just goes out unvalidated.
+    const notified = [
+      ...CHAIN,
+      prompt('<task-notification><task-id>t9</task-id></task-notification>', 'n1'),
+      assistant([{ type: 'text', text: 'the task finished' }], 'a3'),
+    ];
+    expect(resolveRewindPoint(notified, 'u2')).toEqual({ resumeSessionAt: 'a1' });
+  });
+
+  it('still vouches for a turn that was stopped part-way', () => {
+    // The interrupt marker is the stopped turn's own, and the CLI skips it.
+    const stopped = [...CHAIN, prompt('[Request interrupted by user]', 'x1')];
+    expect(resolveRewindPoint(stopped, 'u2')?.dropsTurn).toBe('u2');
+  });
+
   it('does not mistake a tool result for a turn boundary', () => {
     // r1 rides a user envelope but nobody asked it — if it counted as a
     // prompt, rewinding to u2 would drop "two turns" and lose the
