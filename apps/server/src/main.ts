@@ -72,6 +72,56 @@
  *                          subprocess is killed. Default 10m. See
  *                          `server/signin.ts` in core.
  *
+ * ---------------------------------------------------------------------------
+ * THE BROWSER BESIDE THE SERVER
+ * ---------------------------------------------------------------------------
+ *
+ * A served run has no window, so an agent building a web app here could run the
+ * tests and not look at the page. Point this process at a headless Chromium and
+ * it gets the `artemisBrowser` tools — the same tool names the desktop's dock
+ * browser answers to, over a browser that is signed in to nothing. Off unless
+ * the first variable is set, and with it unset nothing else changes. The
+ * browser runs in its own container: see `docker/docker-compose.yml`, which
+ * ships the service commented out, and `docs/SERVER-BROWSER.md`.
+ *
+ *   ARTEMIS_BROWSER_CDP_URL   where that Chromium's DevTools port is, e.g.
+ *                          `ws://browser:9222` or `http://browser:9222`. A
+ *                          plain http or ws address is resolved through
+ *                          `/json/version`; a full `ws://…/devtools/browser/…`
+ *                          endpoint is used as it stands. The host name is
+ *                          resolved to an address first, because Chromium
+ *                          refuses a DevTools HTTP request whose Host header is
+ *                          a name. Unset means no browser tools at all, which
+ *                          is the default and is not an error.
+ *   ARTEMIS_BROWSER_MAX_CONTEXTS   how many conversations may have a browser
+ *                          open at once. Default 2. A third is refused with a
+ *                          sentence it can act on, rather than queued. Each
+ *                          context is an isolated profile: separate cookies and
+ *                          storage, so two runs testing the same app do not
+ *                          share a login.
+ *   ARTEMIS_BROWSER_IDLE_MINUTES   minutes without a browser tool call before
+ *                          a conversation's tab is closed and its memory given
+ *                          back. Default 10. The run is told on its next call.
+ *   ARTEMIS_BROWSER_TAB_MEMORY_MB   heap one tab may hold before the watchdog
+ *                          closes it, least recently used first. Default 500.
+ *                          The container's own memory limit is the backstop
+ *                          behind this and should stay set.
+ *   ARTEMIS_BROWSER_ALLOW_HOSTS   comma-separated internal hosts the agent may
+ *                          open, on top of loopback and `artemis-server`. This
+ *                          browser sits inside the operator's network, so the
+ *                          public internet is open to it and everything
+ *                          private is shut unless named here. Cloud metadata
+ *                          addresses are refused whatever this says. Both
+ *                          rules hold for every frame of a page, so a page
+ *                          embedding an internal host is refused whole.
+ *   ARTEMIS_BROWSER_IDLE_EXIT   `0` stops this process asking Chromium to exit
+ *                          after five minutes with nothing open. On by
+ *                          default, because a process that has exited holds no
+ *                          memory and the recommended compose service restarts
+ *                          it; turn it off only where nothing will. Turning it
+ *                          off does not keep the pages — the contexts still
+ *                          close — it only leaves the process up.
+ *
  * Every request still authenticates with a connection token; nothing here
  * relaxes that. See the core ledger for how sessions are scoped per token.
  *
@@ -95,7 +145,13 @@ import { mkdir } from 'node:fs/promises';
 
 import { DEFAULT_SERVER_PORT, isValidServerPort, summariseWorkspace } from '@rx-artemis/protocol';
 import type { ServerConnection, ServerWorkspace } from '@rx-artemis/protocol';
-import { createArtemisServer, signInCommand } from '@rx-artemis/core';
+import {
+  createArtemisServer,
+  createServerBrowser,
+  limitsFromEnvironment,
+  signInCommand,
+  type ServerBrowser,
+} from '@rx-artemis/core';
 
 import type { HeadlessConfig } from './config.js';
 import {
@@ -147,6 +203,25 @@ function signInTimeoutMs(): number | undefined {
   return Number.isFinite(declared) && declared > 0 ? declared : undefined;
 }
 
+/**
+ * The headless browser beside this server, when one is configured.
+ *
+ * Nothing is dialled here and nothing is started: the object holds an address
+ * and its limits, and the first `browser_open` of the first run is what opens a
+ * socket. So a server whose runs never touch a browser pays for this exactly
+ * what a server with the variable unset pays — which is what makes it safe to
+ * build on a variable rather than on a probe.
+ */
+function serverBrowser(): ServerBrowser | undefined {
+  const url = process.env['ARTEMIS_BROWSER_CDP_URL'];
+  if (url === undefined || url.trim().length === 0) return undefined;
+  return createServerBrowser({
+    endpoint: url.trim(),
+    limits: limitsFromEnvironment(process.env),
+    log: (line) => process.stderr.write(`${line}\n`),
+  });
+}
+
 async function serve(): Promise<void> {
   const dir = dataDir();
   await mkdir(dir, { recursive: true });
@@ -173,7 +248,8 @@ async function serve(): Promise<void> {
   // shared: the router authorises against it, and a routine firing looks its
   // own connection up through the same live view.
   const readConnections = connectionReader(dir, config.connections);
-  const host = createHeadlessHost(dir, readConnections);
+  const browser = serverBrowser();
+  const host = createHeadlessHost(dir, readConnections, browser);
   await Promise.all([host.ledger.load(), host.routines.load()]);
 
   const server = createArtemisServer({
@@ -209,6 +285,9 @@ async function serve(): Promise<void> {
     // and a remote window's dock shows no shells rather than an error.
     ...(allowedHosts() === undefined ? {} : { allowedHosts: allowedHosts() as never }),
     ...(process.env['ARTEMIS_ALLOW_CHROME_BROWSER'] === '1' ? { allowChromeBrowser: true } : {}),
+    // A capability line, not a switch: it tells a client this machine can look
+    // at a page. What actually gives a run the tools is `host.ts`.
+    ...(browser === undefined ? {} : { serverBrowser: true }),
     onError: (error) => {
       process.stderr.write(`server error: ${error instanceof Error ? error.message : String(error)}\n`);
     },

@@ -1365,6 +1365,24 @@ export interface ServerConnectionInfo {
    */
   readonly acceptsAttachments: boolean;
   /**
+   * This server has a browser a run can drive.
+   *
+   * A capability line in the same class as {@link acceptsAttachments}, and
+   * present for the same reason: "the field was missing" and "the answer is no"
+   * must not be two things a client has to tell apart. A server older than the
+   * server browser sends neither, and a client reading `=== true` lands on the
+   * safe answer either way.
+   *
+   * Unlike {@link acceptsAttachments} this is a property of the *deployment*
+   * rather than of the build: it is true only where an operator set
+   * `ARTEMIS_BROWSER_CDP_URL` and a headless Chromium is running beside the
+   * server. A client reads it to say "this machine can look at a page" instead
+   * of leaving a user to wonder why the agent will not open one. It says
+   * nothing about whether a given *run* gets the tools: a run connected to a
+   * Chrome does not, because the provider's own bridge is already driving one.
+   */
+  readonly serverBrowser: boolean;
+  /**
    * Epoch ms this token stops working, when it has one. Absent means never.
    *
    * Told to the client rather than merely enforced, because the difference
@@ -1376,8 +1394,26 @@ export interface ServerConnectionInfo {
   readonly expiresAt?: number;
 }
 
-/** Strip a connection down to what its own client may see. */
-export function describeConnection(connection: ServerConnection): ServerConnectionInfo {
+/** What the *host* can do, as opposed to what this token may. */
+export interface ServerHostCapabilities {
+  /** A headless browser is configured beside this server. See {@link ServerConnectionInfo.serverBrowser}. */
+  readonly serverBrowser?: boolean;
+}
+
+/**
+ * Strip a connection down to what its own client may see.
+ *
+ * `host` carries the lines that are true of the deployment rather than of the
+ * token. They are reported on the same body because that is the one call a
+ * client makes at startup to find out what it was handed, and a second round
+ * trip to learn whether the machine has a browser would be a second thing to
+ * get wrong. Omitted by every caller that has nothing to add, which reads as
+ * no.
+ */
+export function describeConnection(
+  connection: ServerConnection,
+  host: ServerHostCapabilities = {},
+): ServerConnectionInfo {
   return {
     id: connection.id,
     label: connection.label,
@@ -1391,6 +1427,9 @@ export function describeConnection(connection: ServerConnection): ServerConnecti
     // server that has this line can send attachments, and the per-route and
     // per-account refusals happen later, where the account is known.
     acceptsAttachments: true,
+    // A property of the deployment: an operator who set no browser URL has no
+    // browser, however this build was compiled.
+    serverBrowser: host.serverBrowser === true,
     ...(connection.expiresAt === undefined ? {} : { expiresAt: connection.expiresAt }),
   };
 }

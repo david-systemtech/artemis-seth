@@ -99,6 +99,131 @@ services:
       # (6h, 15m) suit a laptop that sleeps and a person who answers prompts.
       # ARTEMIS_DETACHED_RUN_TTL_MS: '21600000'
       # ARTEMIS_PERMISSION_PARK_MS: '900000'
+      #
+      # ----------------------------------------------------------------------
+      # A browser beside the server (see the `browser` service below)
+      # ----------------------------------------------------------------------
+      # With this set, a served run gets the `artemisBrowser` tools over the
+      # headless Chromium in the `browser` service: open a page, read it, click,
+      # type, screenshot, and read the console, the network log, the cookies and
+      # the storage. Unset — the default — a served run has no browser tools and
+      # nothing else about this deployment changes.
+      #
+      # The name is resolved to an address before the DevTools port is asked
+      # anything, because Chromium refuses an HTTP request to that port whose
+      # Host header is a name. Write the service name here anyway; the server
+      # does the resolving.
+      # ARTEMIS_BROWSER_CDP_URL: 'http://browser:9222'
+      #
+      # The limits. Every one of these is a number, not a switch: the rules
+      # themselves cannot be turned off, because the failure they exist to
+      # prevent is a browser holding memory for pages nobody is looking at.
+      # Defaults shown.
+      #
+      # How many conversations may have a browser open at once. A third is
+      # refused with a sentence the agent can act on.
+      # ARTEMIS_BROWSER_MAX_CONTEXTS: '2'
+      # Minutes without a browser tool call before that conversation's tab is
+      # closed and its memory given back. The run is told on its next call.
+      # ARTEMIS_BROWSER_IDLE_MINUTES: '10'
+      # Heap one tab may hold before the watchdog closes it. The `mem_limit` on
+      # the browser service below is the backstop behind this; keep it set.
+      # ARTEMIS_BROWSER_TAB_MEMORY_MB: '500'
+      # `0` stops the server asking Chromium to exit after five minutes with
+      # nothing open. Leave it on: `restart: unless-stopped` below is what
+      # brings the browser back, and a process that has exited holds no memory,
+      # which is the only way to be sure a leaked renderer is really gone.
+      # ARTEMIS_BROWSER_IDLE_EXIT: '1'
+      #
+      # Internal hosts the agent may open, comma-separated, on top of loopback
+      # and `artemis-server`. This browser sits inside your network and can
+      # route to everything the container can, so the rule is the opposite of a
+      # normal block list: the public internet is open, and anything private is
+      # shut unless you name it here. Cloud metadata addresses are refused
+      # whatever this says.
+      #
+      # Both rules apply to every frame of a page and not only to the page, so
+      # a page that embeds an internal host is refused whole — a frame is as
+      # readable through browser_screenshot as the page around it. If you need
+      # such a page, the host goes here.
+      # ARTEMIS_BROWSER_ALLOW_HOSTS: 'staging.internal,192.168.1.50'
+    # Uncomment together with the `browser` service and the `networks` block at
+    # the foot of this file. The server has to be on both networks: `default`
+    # for its published port, `browser` to reach the browser at all.
+    # networks:
+    #   - default
+    #   - browser
+
+  # --------------------------------------------------------------------------
+  # The browser. Off by default; uncomment this service, the variables above,
+  # and the `networks:` block at the foot of the file, then:
+  #
+  #   docker compose -f docker/docker-compose.yml up -d --build browser
+  #
+  # Nothing in here is Artemis. It is a Chromium with a DevTools port, and the
+  # server is the only thing that can reach it.
+  # --------------------------------------------------------------------------
+  # browser:
+  #   build:
+  #     context: ..
+  #     dockerfile: docker/browser.Dockerfile
+  #   container_name: artemis-browser
+  #   # The point of the restart policy, not a courtesy: the server asks
+  #   # Chromium to *exit* after five minutes with nothing open, because a
+  #   # process that has exited holds no memory and Chromium does not hand a
+  #   # freed heap back to the system readily. This line is what brings it back
+  #   # for the next page. If you change it to something that will not restart
+  #   # the container, set ARTEMIS_BROWSER_IDLE_EXIT=0 on the server as well.
+  #   restart: unless-stopped
+  #   # A browser that leaks takes itself down rather than the agents. The
+  #   # server has no limit of its own and has been OOM-killed by a session that
+  #   # ran a headless browser among other things; this is the fence around that.
+  #   # The per-tab ceiling above is the first line of defence and this is the
+  #   # backstop, because CDP can only report a tab's *heap*, which is a floor
+  #   # on what a renderer really holds.
+  #   mem_limit: 1g
+  #   # Chromium's renderers want more than Docker's default 64 MB of /dev/shm.
+  #   # The image passes --disable-dev-shm-usage instead, which spends disk
+  #   # rather than the memory this limit exists to bound. Raise this only if
+  #   # you drop that flag.
+  #   # shm_size: 1gb
+  #   # No `ports:`. The DevTools port is total authority over this browser and
+  #   # has no authentication of its own — publishing it would hand that
+  #   # authority to anything that could reach the host.
+  #   networks:
+  #     - browser
+  #   # Nothing of yours is mounted here. The browser reads your dev servers
+  #   # over the network like any other client, and a page it loads should not
+  #   # be one filesystem hop from your repositories.
+
+# volumes and networks
+# ----------------------------------------------------------------------------
+# `browser` is a network with exactly two containers on it: the server, and the
+# browser. That is the whole reachability story, and it is worth being plain
+# about what it does and does not buy.
+#
+# It buys: nothing else on this host, and nothing outside it, can reach the
+# DevTools port. It does not buy a one-way link — Docker's bridge networks are
+# symmetrical, so the browser can also reach the server, which is the point
+# (`http://artemis-server:3000` is the dev server the agent is testing).
+#
+# What it cannot do is filter what a *page* asks for. The server refuses to
+# navigate to a private address it was not told about, re-checks after every
+# redirect, and judges every frame of the page including one the agent wrote
+# itself — but a `fetch`, an `XMLHttpRequest`, an `<img src>`, a stylesheet or a
+# beacon inside a loaded page happens in Chromium's own network stack, below
+# anything the DevTools protocol can veto without putting an Artemis round trip
+# in front of every subresource of every page. None of those renders anything or
+# is read back through a tool, so what they can do is reach an address rather
+# than report what is there — but it is still a GET your network will see. If
+# your network has things on it that an unauthenticated GET would damage, the
+# fence is at the network level and nowhere else: give the browser an egress
+# rule that allows the server and the public internet and denies the rest of
+# your private space. On plain Docker that is an iptables rule or a proxy; under
+# Kubernetes it is a NetworkPolicy. See docs/SERVER-BROWSER.md.
+# networks:
+#   browser:
+#     driver: bridge
 
 volumes:
   artemis-data:

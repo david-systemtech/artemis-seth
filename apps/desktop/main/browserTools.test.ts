@@ -45,6 +45,32 @@ function stateWith(over: Partial<BrowserState> = {}): BrowserState {
   };
 }
 
+/**
+ * The parts of a `webContents` the driver reaches for beyond driving the page.
+ *
+ * The driver now listens to a tab — console lines, failed loads — and registers
+ * that tab with its session's request observer, so a fake page needs an id, a
+ * session and the two event methods. All inert: what these tests are about is
+ * the decisions, and the listening itself is pinned in
+ * `embeddedPageDriver.test.ts` against fakes that answer.
+ */
+function fakeListening(): Record<string, unknown> {
+  return {
+    id: 1,
+    session: FAKE_SESSION,
+    on: () => undefined,
+  };
+}
+
+/** One session object for every fake page, since the recorder is keyed by it. */
+const FAKE_SESSION = {
+  webRequest: {
+    onSendHeaders: () => undefined,
+    onCompleted: () => undefined,
+    onErrorOccurred: () => undefined,
+  },
+};
+
 /** A context that records what a page would have been asked, and answers. */
 function fakeContext(over: Partial<BrowserToolContext> = {}): {
   context: BrowserToolContext;
@@ -65,6 +91,7 @@ function fakeContext(over: Partial<BrowserToolContext> = {}): {
     host: {
       contentsFor: () =>
         ({
+          ...fakeListening(),
           isLoading: () => false,
           executeJavaScript: async (script: string) => {
             scripts.push(script);
@@ -184,6 +211,7 @@ describe('failures are answers', () => {
     const { context } = fakeContext();
     // A page where `querySelector` finds nothing returns false from the script.
     vi.spyOn(context.host, 'contentsFor').mockReturnValue({
+      ...fakeListening(),
       isLoading: () => false,
       executeJavaScript: async () => false,
       once: () => undefined,

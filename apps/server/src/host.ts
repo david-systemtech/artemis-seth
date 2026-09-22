@@ -70,9 +70,11 @@ import {
   machineBankPrompt,
   managedEnvKeys,
   memoryToolServer,
+  pageToolServer,
   registryPath,
   resolveContentPlugins,
   resolveSkills,
+  servedBrowserServers,
   skillRootsFor,
   MEMORY_TOOL_SERVER,
   DuplicateProfileLabelError,
@@ -92,6 +94,7 @@ import {
   type RemoteRunGuard,
   type RunSource,
   type ServerProfileRecord,
+  type ServerBrowser,
   type ServerRoutineStore,
   type SessionLedger,
   type SessionSource,
@@ -193,6 +196,15 @@ export function createHeadlessHost(
    * account and never serve.
    */
   connections: () => readonly ServerConnection[] = () => [],
+  /**
+   * The headless Chromium beside this server, when an operator configured one.
+   *
+   * Absent is the default and means a served run gets no browser tools at all
+   * — see `servedBrowserServers` in core for why that is an absent tool rather
+   * than a tool that refuses. Built by `main.ts` from
+   * `ARTEMIS_BROWSER_CDP_URL`; nothing is dialled until a run opens a page.
+   */
+  browser?: ServerBrowser,
 ): HeadlessHost {
   const providers = createDefaultProviderRegistry({
     claude: {
@@ -202,7 +214,7 @@ export function createHeadlessHost(
        * headless deployment has to give. `memoryTools` is declared below and
        * captured, not called, until a run starts.
        */
-      agentToolServers: (_runId, input) => memoryTools(input),
+      agentToolServers: (runId, input) => hostToolServers(runId, input),
       /*
        * The provider started a turn nobody asked for — register it.
        *
@@ -231,7 +243,7 @@ export function createHeadlessHost(
      * `engine.ts`, which says the same thing about the same pair.
      */
     local: {
-      agentToolServers: (_runId, input) => memoryTools(input),
+      agentToolServers: (runId, input) => hostToolServers(runId, input),
     },
   });
   const managed = [...new Set(providers.list().flatMap((adapter) => managedEnvKeys(adapter.credentials)))];
@@ -324,6 +336,15 @@ export function createHeadlessHost(
      * are few, so the memory is cheap next to the reply it saves.
      */
     historyLimit: 50_000,
+    /*
+     * Where a served run's browser tab is closed. See `runBrowsers` below on
+     * why the tab cannot simply wait for the idle rule: it holds one of the
+     * server's two browser contexts, and a conversation taking three turns
+     * would otherwise meet a limit meant for three conversations.
+     */
+    onLifecycle: (event) => {
+      if (event.kind === 'run.ended') releaseBrowser(String(event.runId));
+    },
   });
 
   const catalogue = createCatalogue({
@@ -774,6 +795,76 @@ export function createHeadlessHost(
       );
       return undefined;
     }
+  };
+
+  /* ------------------------------------------------------------------ */
+  /* The server's browser                                               */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Every run that has been given a browser, so its tab can be closed again.
+   *
+   * A driver holds a lease on one of the server's two browser contexts, and
+   * nothing in the contract closes it: `PageDriver.close` exists and neither
+   * host calls it, because on the desktop the tab belongs to the user's dock
+   * and outlives the run. Here it does not — the tab is nobody's — so a lease
+   * left open would hold a context against the cap until the idle rule
+   * expired it, and three quick turns would meet a limit meant for three
+   * conversations. The registry's lifecycle feed is where a run ends, so that
+   * is where the tab closes.
+   *
+   * A context closing with its run is the design doc's own rule. It means a
+   * page does not survive to the next turn: an agent that wants to look again
+   * calls `browser_open` with the address, which is a sentence in the tool's
+   * description rather than a failure.
+   */
+  const runBrowsers = new Map<string, { close: () => Promise<void> }>();
+
+  /**
+   * One run's browser tools, or nothing.
+   *
+   * Nothing for a provider that does not take this host's tool servers, and
+   * nothing for a run that asked for a Chrome — see `servedBrowserServers` in
+   * core, which holds that table and is where the third driver will land.
+   */
+  const browserTools = (
+    runId: string,
+    input: RunInput,
+  ): Record<string, ReturnType<typeof pageToolServer>> | undefined => {
+    if (browser === undefined || !takesHostTools(input.providerId)) return undefined;
+    return servedBrowserServers(input, {
+      server: () => {
+        const driver = browser.driver();
+        runBrowsers.set(runId, { close: () => driver.close() });
+        return pageToolServer(driver);
+      },
+    });
+  };
+
+  /**
+   * Everything this host hands a run, as one record.
+   *
+   * `undefined` rather than an empty object when there is nothing, because
+   * that is what the adapters read as "this host offers no tool servers".
+   */
+  const hostToolServers = (
+    runId: string,
+    input: RunInput,
+  ): Record<string, ReturnType<typeof memoryToolServer>> | undefined => {
+    const servers = { ...memoryTools(input), ...browserTools(runId, input) };
+    return Object.keys(servers).length === 0 ? undefined : servers;
+  };
+
+  /** Close the tab a finished run was holding. Safe for a run that had none. */
+  const releaseBrowser = (runId: string): void => {
+    const held = runBrowsers.get(runId);
+    if (held === undefined) return;
+    runBrowsers.delete(runId);
+    void held.close().catch((error: unknown) => {
+      process.stderr.write(
+        `browser: could not close the tab for run ${runId}: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    });
   };
 
   /**
@@ -1235,6 +1326,9 @@ export function createHeadlessHost(
       // from under its own history row on the way down.
       await routines.dispose();
       await runs.disposeAll();
+      // After the runs, so a tab a turn was still using is closed by its own
+      // run ending rather than out from under it.
+      await browser?.dispose();
       await ledger.flush();
       await workspaces.disposeAll();
     },

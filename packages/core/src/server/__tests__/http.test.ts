@@ -363,10 +363,28 @@ describe('a connection is the identity', () => {
       // composer reads before it sends: a server without it drops attachments
       // in silence, so its absence has to mean no.
       acceptsAttachments: true,
+      // And the line that is true of the deployment rather than of the build:
+      // this server was given no browser, so a client is told so rather than
+      // being left to guess from the absence of a field.
+      serverBrowser: false,
     });
     // The caller already has it; putting it in a body puts it in every log and
     // proxy between here and them.
     expect(JSON.stringify(reply.body)).not.toContain(TOKEN);
+  });
+
+  it('says so when this host has a browser a run can drive', async () => {
+    // A property of the deployment rather than of the build: a client reads it
+    // to say "this machine can look at a page" instead of leaving a user to
+    // wonder why the agent will not open one.
+    const reply = await handleServerRequest(request('/api/v0/connection', authorized), {
+      connections: [CONNECTION, NARROW],
+      version: '1.1.1',
+      catalogue,
+      startedAt: 1_700_000_000_000,
+      serverBrowser: true,
+    });
+    expect(reply.body).toMatchObject({ serverBrowser: true });
   });
 
   it('reports a scratch connection as able to run turns', async () => {
