@@ -612,10 +612,18 @@ describe('a call that names one of this machine’s browsers', () => {
     expect(asked).toEqual(['run-9']);
   });
 
-  it('drops a call whose browser field is not a string, rather than typing one as one', async () => {
-    // Off the wire, so it can be anything. Whether a browser answers to a
-    // given name is the driver's question and it answers in a sentence; a
-    // field of the wrong *type* is not a name at all.
+  it('drops a call whose browser field is not a selector, rather than acting on it', async () => {
+    /*
+     * Off the wire, so it can be anything. Whether a browser answers to a given
+     * name is the driver's question and it answers in a sentence; what is
+     * checked here is only that the field is a bounded line of text, by the
+     * same reader the server applied on the way in.
+     *
+     * The whole call is dropped rather than the field. Dropping only the field
+     * would quietly turn a call for the user's work profile into a call for
+     * whichever browser is open — the one substitution this feature exists to
+     * prevent — and the server's own deadline then answers the agent in words.
+     */
     const performed: string[] = [];
     const { driver } = fakeDriver();
     const server = fakeServer();
@@ -630,9 +638,34 @@ describe('a call that names one of this machine’s browsers', () => {
     });
     client.own('run-1');
 
-    await server.send({ ...call(), browserId: 7 } as never);
+    for (const browserId of [7, '', 'x'.repeat(201), 'Wo\u0000rk', 'Work\u009f']) {
+      await server.send({ ...call(), browserId } as never);
+    }
 
     expect(performed).toEqual([]);
+    client.stop();
+  });
+
+  it('performs a call whose browser field is a selector at the bound', async () => {
+    // The other side of the same rule: the bound is where a selector stops
+    // being one, not where it starts.
+    const asked: (string | undefined)[] = [];
+    const { driver } = fakeDriver();
+    const server = fakeServer();
+    const client = createBrowserCallClient({
+      root: ROOT,
+      headers: () => ({}),
+      driverFor: (_runKey, browserId) => {
+        asked.push(browserId);
+        return driver;
+      },
+      fetch: server.fetch,
+    });
+    client.own('run-1');
+
+    await server.send({ ...call(), browserId: 'x'.repeat(200) } as never);
+
+    expect(asked).toEqual(['x'.repeat(200)]);
     client.stop();
   });
 });

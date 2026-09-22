@@ -481,6 +481,44 @@ export const BRIDGE_DEFAULT_PORT = 47_615;
  */
 export const ARTEMIS_EXTENSION_ID = 'pbdboognedfpknmikiajchompjfjhdal';
 
+/**
+ * Longest a browser selector may be, in characters.
+ *
+ * A selector is either an id Artemis issued — thirty-two hex characters — or a
+ * browser name, which is bounded at eighty where it is stored. Two hundred is
+ * generous for both and small enough that the string cannot be a payload: it
+ * crosses a network on a served conversation, is compared against every
+ * pairing on the client, and ends up in a refusal sentence a model reads. None
+ * of those is a place for a kilobyte somebody chose.
+ */
+export const BROWSER_SELECTOR_MAX = 200;
+
+/**
+ * One browser selector off the wire, or `null` for anything that is not plainly
+ * one.
+ *
+ * Shared by the two places a selector arrives from somewhere else — the
+ * `artemis.extensionBrowserId` field of a chat request, and the `browserId` of
+ * a relayed call — so the two cannot come to disagree about what they accept.
+ * They face opposite directions and that is the point: a client that bounded
+ * one way and a server that bounded the other would leave a selector one of
+ * them stores and the other refuses to act on.
+ *
+ * Trimmed, because a name is a thing a person typed and a trailing space is not
+ * part of what they call their browser. Control characters are refused rather
+ * than stripped: the stripping rule for a *stored* name lives in
+ * `extensionBridge.ts`, and a second copy of it out here would be a second
+ * answer to "what is this browser called".
+ */
+export function readBrowserSelector(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > BROWSER_SELECTOR_MAX) return null;
+  // C0, DEL and C1: everything that is not text, in any encoding this crosses.
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(trimmed)) return null;
+  return trimmed;
+}
+
 /** Extension → Artemis, first message of a first connection. */
 export interface BridgePairRequest {
   readonly type: 'pair';

@@ -45,6 +45,7 @@
 
 import {
   createSseDecoder,
+  readBrowserSelector,
   REMOTE_BROWSER_ANSWER_PATH,
   REMOTE_EVENTS_PATH,
   type DriverResult,
@@ -405,14 +406,22 @@ function readCall(data: string | undefined): ServerBrowserCall | null {
   if (typeof raw['runKey'] !== 'string' || raw['runKey'].length === 0) return null;
   if (typeof raw['verb'] !== 'string') return null;
   /*
-   * `browserId` is proved to be a string when it is there, and no further:
+   * `browserId` is proved to be a selector when it is there, and no further:
    * whether any browser answers to it is the driver's to say, in a sentence,
-   * and it says it better than a parser could. A field of the wrong *type* is
-   * dropped with the call, because passing it on would mean typing a
-   * non-string as one the whole way down.
+   * and it says it better than a parser could. What is checked is that it is a
+   * bounded line of text — {@link readBrowserSelector}, the same reader the
+   * server applied to `artemis.extensionBrowserId` on the way in, so the two
+   * ends of this cannot come to disagree.
+   *
+   * A field that fails it drops the whole call rather than the field. Dropping
+   * only the field would silently turn a call for the user's work profile into
+   * a call for whichever browser is open, which is the one substitution this
+   * whole feature exists to prevent; dropping the call leaves the server's own
+   * deadline to answer the agent in words.
    */
-  const browser = raw['browserId'];
-  if (browser !== undefined && (typeof browser !== 'string' || browser.length === 0)) return null;
+  if (raw['browserId'] !== undefined && readBrowserSelector(raw['browserId']) === null) {
+    return null;
+  }
   return parsed as ServerBrowserCall;
 }
 

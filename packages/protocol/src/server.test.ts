@@ -134,6 +134,48 @@ describe('readChatExtensions', () => {
     ).toEqual({ extensionBrowser: true });
   });
 
+  it('bounds the browser id, because it is a selector and not a payload', () => {
+    // It crosses a network, is compared against every pairing on the client,
+    // and ends up quoted in a refusal a model reads. None of those is a place
+    // for a kilobyte somebody chose. A run that sent one drives whichever of
+    // their browsers is open, which is what a served run meant before the
+    // field existed.
+    expect(
+      readChatExtensions({
+        artemis: { extensionBrowser: true, extensionBrowserId: 'x'.repeat(201) },
+      }),
+    ).toEqual({ extensionBrowser: true });
+    expect(
+      readChatExtensions({
+        artemis: { extensionBrowser: true, extensionBrowserId: 'x'.repeat(200) },
+      }),
+    ).toMatchObject({ extensionBrowserId: 'x'.repeat(200) });
+  });
+
+  it('drops a browser id carrying control characters', () => {
+    // A selector is one line of text. Stripping instead of refusing would be a
+    // second answer to "what is this browser called", and the first one lives
+    // where the name is stored.
+    expect(
+      readChatExtensions({
+        artemis: { extensionBrowser: true, extensionBrowserId: 'Wo\u0000rk' },
+      }),
+    ).toEqual({ extensionBrowser: true });
+    expect(
+      readChatExtensions({
+        artemis: { extensionBrowser: true, extensionBrowserId: 'Work\u009f' },
+      }),
+    ).toEqual({ extensionBrowser: true });
+  });
+
+  it('trims a browser id, because a trailing space is not part of a name', () => {
+    expect(
+      readChatExtensions({
+        artemis: { extensionBrowser: true, extensionBrowserId: '  Work  ' },
+      }),
+    ).toMatchObject({ extensionBrowserId: 'Work' });
+  });
+
   it('carries a requested permission mode, and drops a non-string one', () => {
     expect(readChatExtensions({ artemis: { permissionMode: 'acceptEdits' } })).toEqual({
       permissionMode: 'acceptEdits',

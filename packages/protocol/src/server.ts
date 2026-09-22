@@ -68,6 +68,7 @@
  */
 
 import { readAttachments, type Attachment } from './attachment.js';
+import { readBrowserSelector } from './browserDriver.js';
 import type { AuthStatusInfo } from './ipc.js';
 import type { PlanUsage } from './usage.js';
 import type { AgentEvent } from './events.js';
@@ -1962,12 +1963,12 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
     ...(extensions['extensionBrowser'] === true ? { extensionBrowser: true } : {}),
     // Only beside the flag it qualifies. A browser id with no request to use a
     // browser names nothing the run will do, and carrying it would leave the
-    // host holding a choice it must then remember to ignore.
-    ...(extensions['extensionBrowser'] === true &&
-    typeof extensions['extensionBrowserId'] === 'string' &&
-    extensions['extensionBrowserId'].length > 0
-      ? { extensionBrowserId: extensions['extensionBrowserId'] as string }
-      : {}),
+    // host holding a choice it must then remember to ignore. Bounded by
+    // `readBrowserSelector`, which is the same reader the relayed call on the
+    // other side of this exchange is held to.
+    ...browserSelectorOrNothing(
+      extensions['extensionBrowser'] === true ? extensions['extensionBrowserId'] : undefined,
+    ),
     ...(typeof extensions['sessionId'] === 'string'
       ? { sessionId: extensions['sessionId'] as string }
       : {}),
@@ -1998,6 +1999,20 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
         )),
     ...readRemoteOptions(extensions['remote']),
   };
+}
+
+/**
+ * The browser a run should drive, present only when the caller sent a readable
+ * one.
+ *
+ * A setting, so it is read like one: a value the caller spelled wrong is a
+ * value they did not send, and the run drives whichever of their browsers is
+ * open — which is what every served run meant before this field existed. The
+ * alternative would be a 400 for a field that has a perfectly good default.
+ */
+function browserSelectorOrNothing(value: unknown): { extensionBrowserId?: string } {
+  const selector = readBrowserSelector(value);
+  return selector === null ? {} : { extensionBrowserId: selector };
 }
 
 /**
