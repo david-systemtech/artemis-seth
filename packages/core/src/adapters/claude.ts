@@ -2540,6 +2540,35 @@ function startsTurn(message: SDKMessage): boolean {
 }
 
 /**
+ * Whether a message is a person's prompt - the kind that opens a turn.
+ *
+ * A user-role message that is not a tool result and not the CLI's own
+ * synthesis: a queued message being taken up after an interrupt, a task
+ * notification, a steer. The first of these after a turn's `init` is the one
+ * that opened it, and the seam belongs right after it.
+ */
+function opensTurn(message: SDKMessage): message is SDKUserMessage & { readonly uuid: string } {
+  if (message.type !== 'user') return false;
+  if (typeof message.uuid !== 'string' || message.uuid.length === 0) return false;
+  // A subagent's prompt is filed under the tool call that spawned it, on a
+  // sidechain; only the main thread's prompt opens a turn.
+  if (message.parent_tool_use_id !== null && message.parent_tool_use_id !== undefined) return false;
+  if ('isReplay' in message && message.isReplay === true) return false;
+  if (message.isSynthetic === true) return false;
+  const content = message.message.content;
+  if (typeof content === 'string') return content.length > 0;
+  if (!Array.isArray(content) || content.length === 0) return false;
+  // Text, an image, a document: any of these is a prompt. A tool result is
+  // the CLI answering itself, and never opens a turn.
+  const blocks = content as readonly { readonly type?: unknown }[];
+  return !blocks.some((block) => block.type === 'tool_result');
+}
+
+/** How many times, and how far apart, the store is read for an echoed opening message. */
+const SEAM_PIN_ATTEMPTS = 6;
+const SEAM_PIN_RETRY_MS = 50;
+
+/**
  * Whether an event puts the main agent's own words in front of the user.
  *
  * Read as "has anything been said", so each exclusion is a thing that is on
@@ -2914,6 +2943,13 @@ class ClaudeProcess {
   readonly #decisionWaiters: (() => void)[] = [];
 
   /**
+   * A turn the CLI opened on its own whose opening message has not yet been
+   * seen on the stream. Set with the timed count in {@link #ensureTurn},
+   * cleared by {@link #pinSeam} once the echo of that message names it.
+   */
+  #seamToPin: ClaudeTurn | undefined;
+
+  /**
    * Whether the agent has said anything to the user since the user last had the
    * floor, and whether a question has already been handed back since then.
    *
@@ -3178,8 +3214,10 @@ class ClaudeProcess {
       forkSession: false,
       attachments: undefined,
     });
-    // Before the CLI has written a word of the turn — see the method.
+    // Before the CLI has written a word of the turn — see the method. A first
+    // answer, corrected by {@link #pinSeam} when the opening message is echoed.
     void this.#measureSeam(turn);
+    this.#seamToPin = turn;
 
     this.#deps.diagnostic?.(
       `Run ${runId}: the provider started a turn of its own on session ${this.#sessionId ?? '—'}.`,
@@ -3227,6 +3265,51 @@ class ClaudeProcess {
         error,
       );
     }
+  }
+
+  /**
+   * Correct the seam from the opening message's own position.
+   *
+   * {@link #measureSeam} counts at the `init`, and the count is only right if
+   * the CLI's write of the message that opened the turn is on disk by then -
+   * which it was on 2026-09-18 and was not on 2026-09-22, when a served
+   * read-now rebuilt a transcript one message short. The CLI echoes that
+   * message on the stream with the uuid it was filed under, so its place in
+   * the store can be looked up rather than inferred from a clock: the seam is
+   * that index plus one. The write may still be a few milliseconds behind the
+   * echo, so the read is tried a handful of times; a message that never
+   * appears leaves the count as it was, which is no worse than before.
+   */
+  async #pinSeam(turn: ClaudeTurn, uuid: string): Promise<void> {
+    const sessionId = this.#sessionId ?? this.#input.resumeSessionId;
+    if (sessionId === undefined) return;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < SEAM_PIN_ATTEMPTS; attempt += 1) {
+      let stored: readonly { readonly uuid?: unknown }[] = [];
+      try {
+        stored = await readStoredMessages(this.#input.env, sessionId, this.#input.cwd);
+      } catch (error) {
+        // A read that throws is a read that did not find the message. Mid-append
+        // is one face of the same lag the retries exist for, so try again.
+        lastError = error;
+      }
+      const at = stored.findIndex((message) => message.uuid === uuid);
+      if (at >= 0) {
+        const seam = at + 1;
+        if (turn.historyOffset !== undefined && turn.historyOffset !== seam) {
+          this.#deps.diagnostic?.(
+            `Run ${turn.runId}: the seam counted ${String(turn.historyOffset)} at init; the opening message is at ${String(seam)}.`,
+          );
+        }
+        turn.pinHistoryOffset(seam);
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, SEAM_PIN_RETRY_MS));
+    }
+    this.#deps.diagnostic?.(
+      `Run ${turn.runId}: the message that opened this turn never appeared in the store; keeping the counted seam.`,
+      ...(lastError === undefined ? [] : [describe(lastError)]),
+    );
   }
 
   /* -------------------------------- attaching ------------------------------ */
@@ -4749,6 +4832,21 @@ class ClaudeProcess {
     // mapper that is finished with the old state.
     if (startsTurn(message)) this.#ensureTurn();
 
+    // The first prompt echoed after that `init` is the message that opened the
+    // turn; its place in the store is where the seam belongs — see the method.
+    if (this.#seamToPin !== undefined) {
+      if (opensTurn(message)) {
+        const turn = this.#seamToPin;
+        this.#seamToPin = undefined;
+        void this.#pinSeam(turn, message.uuid);
+      } else if (message.type === 'assistant' || message.type === 'stream_event') {
+        // The opener comes before the turn's own output. Once the model has
+        // spoken, a later prompt on this turn is a steer, not the opener, and
+        // pinning to it would put the seam in the middle of the turn.
+        this.#seamToPin = undefined;
+      }
+    }
+
     /*
      * After `#ensureTurn`, so a steer the CLI parked and is now running as
      * a turn of its own reports its delivery on *that* turn's stream rather
@@ -5131,7 +5229,12 @@ class ClaudeProcess {
     this.#eventQueue.push(event);
     // Nothing follows `run.end`: the stream terminates with it, which is what
     // lets a consumer's `for await` finish on its own.
-    if (event.type === 'run.end') this.#eventQueue.close();
+    if (event.type === 'run.end') {
+      this.#eventQueue.close();
+      // A turn that ended without its opening message being echoed does not
+      // get pinned by the next turn's opener: that one belongs to the next turn.
+      this.#seamToPin = undefined;
+    }
   }
 
   /**
@@ -5550,6 +5653,23 @@ class ClaudeTurn implements Run {
   }
 
   /**
+   * Record the seam exactly: the position of the message that opened this
+   * turn, plus one.
+   *
+   * Overrides {@link noteHistoryOffset}, which is a count taken on a clock:
+   * at the turn's `init`, which on 2026-09-22 (CLI 2.1.276) came before the
+   * CLI's write of the opening message had reached the file. Measured on a
+   * served read-now: the count said 998, the file said 999 a few milliseconds
+   * later, and the rebuilt transcript drew every message but the one the
+   * person had just sent - the run's own stream never carries the message that
+   * opened it, so a seam one short leaves it to nobody. This number is not a
+   * guess about timing: it is where the opening message *is*.
+   */
+  pinHistoryOffset(count: number): void {
+    this.#historyOffset = count;
+  }
+
+  /**
    * This turn's own stream, not the process's current one.
    *
    * Captured at construction so a consumer still draining turn one is
@@ -5807,14 +5927,22 @@ async function countStoredMessages(
   sessionId: SessionId,
   cwd: string | undefined,
 ): Promise<number> {
+  return (await readStoredMessages(env, sessionId, cwd)).length;
+}
+
+/** The stored messages themselves, for a caller that needs to find one by uuid. */
+async function readStoredMessages(
+  env: EnvBundle,
+  sessionId: SessionId,
+  cwd: string | undefined,
+): Promise<readonly { readonly uuid?: unknown }[]> {
   const configDir = readEnv(env, CLAUDE_CONFIG_DIR_ENV);
   try {
-    const stored = await withClaudeConfigDir(
+    return await withClaudeConfigDir(
       configDir,
       () => sdkGetSessionMessages(sessionId, { ...(cwd === undefined ? {} : { dir: cwd }) }),
-      'countSessionMessages',
+      'readSessionMessages',
     );
-    return stored.length;
   } catch (error) {
     throw adapterError('unknown', `Could not read that session: ${describe(error)}`, {
       cause: error,
