@@ -281,15 +281,78 @@ describe('a turn the CLI opens on its own', () => {
     await vi.waitFor(() => expect(turn.historyOffset).toBe(6));
 
     fake.messages.push(userEcho('go on', 'opening-1'));
-    // A tool result is not a prompt: it does not re-pin, whatever it is called.
-    fake.messages.push(toolResultEcho('opening-1'));
+    await vi.waitFor(() => expect(sdkMock.reads).toHaveLength(2));
     fake.messages.push(assistantText('ok', 'msg-3'));
     fake.messages.push(RESULT);
     await drain(turn.events);
 
     expect(turn.historyOffset).toBe(6);
-    // One read at init, one to pin; the tool result cost none.
+    // One read at init, one to pin.
     expect(sdkMock.reads).toHaveLength(2);
+  });
+
+  it('is not pinned by a tool result, a synthetic message or a replay, only by the prompt', async () => {
+    const { fake, adopted } = await processHoldingWork();
+    sdkMock.stored = [
+      ...new Array<unknown>(5).fill({ type: 'user', uuid: 'older' }),
+      { type: 'user', uuid: 'result-1' },
+      { type: 'user', uuid: 'synthetic-1' },
+      { type: 'user', uuid: 'replay-1' },
+      { type: 'user', uuid: 'opening-1' },
+    ];
+
+    fake.messages.push(INIT);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    const turn = adopted[0] as Run;
+    await vi.waitFor(() => expect(turn.historyOffset).toBe(9));
+
+    // All three arrive while the turn is still waiting for its opener. None
+    // of them is it: had any been taken for it, the seam would move to its
+    // position and a read would show in the log.
+    fake.messages.push(toolResultEcho('result-1'));
+    fake.messages.push({ ...userEcho('(synthetic)', 'synthetic-1'), isSynthetic: true } as SDKMessage);
+    fake.messages.push({ ...userEcho('(replay)', 'replay-1'), isReplay: true } as SDKMessage);
+    fake.messages.push(assistantText('thinking', 'msg-2'));
+    // A wrongly taken opener reads the store within a tick; three retry
+    // periods is ample to be sure none of them did.
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    expect(sdkMock.reads).toHaveLength(1);
+    expect(turn.historyOffset).toBe(9);
+
+    fake.messages.push(userEcho('the real prompt', 'opening-1'));
+    await vi.waitFor(() => expect(sdkMock.reads).toHaveLength(2));
+    expect(turn.historyOffset).toBe(9);
+
+    fake.messages.push(assistantText('ok', 'msg-3'));
+    fake.messages.push(RESULT);
+    await drain(turn.events);
+  });
+
+  it('does not let a turn whose opener never showed borrow the next turn\'s', async () => {
+    const { fake, adopted } = await processHoldingWork();
+    sdkMock.stored = new Array<unknown>(5).fill({ type: 'user', uuid: 'older' });
+
+    // A turn the CLI opened and closed without echoing a prompt at all.
+    fake.messages.push(INIT);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    const first = adopted[0] as Run;
+    await vi.waitFor(() => expect(first.historyOffset).toBe(5));
+    fake.messages.push(assistantText('a note to self', 'msg-2'));
+    fake.messages.push(RESULT);
+    await drain(first.events);
+
+    // The next turn's prompt pins the next turn, and only that one.
+    sdkMock.stored = [...sdkMock.stored, { type: 'user', uuid: 'second-opener' }];
+    fake.messages.push(INIT);
+    await vi.waitFor(() => expect(adopted).toHaveLength(2));
+    const second = adopted[1] as Run;
+    fake.messages.push(userEcho('now this', 'second-opener'));
+    await vi.waitFor(() => expect(second.historyOffset).toBe(6));
+    expect(first.historyOffset).toBe(5);
+
+    fake.messages.push(assistantText('ok', 'msg-3'));
+    fake.messages.push(RESULT);
+    await drain(second.events);
   });
 
   it('keeps the counted seam when the echoed message never appears in the store', async () => {

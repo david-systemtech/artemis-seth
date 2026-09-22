@@ -2554,9 +2554,11 @@ function opensTurn(message: SDKMessage): message is SDKUserMessage & { readonly 
   if (message.isSynthetic === true) return false;
   const content = message.message.content;
   if (typeof content === 'string') return content.length > 0;
-  if (!Array.isArray(content)) return false;
+  if (!Array.isArray(content) || content.length === 0) return false;
+  // Text, an image, a document: any of these is a prompt. A tool result is
+  // the CLI answering itself, and never opens a turn.
   const blocks = content as readonly { readonly type?: unknown }[];
-  return blocks.some((block) => block.type === 'text') && !blocks.some((block) => block.type === 'tool_result');
+  return !blocks.some((block) => block.type === 'tool_result');
 }
 
 /** How many times, and how far apart, the store is read for an echoed opening message. */
@@ -5217,7 +5219,12 @@ class ClaudeProcess {
     this.#eventQueue.push(event);
     // Nothing follows `run.end`: the stream terminates with it, which is what
     // lets a consumer's `for await` finish on its own.
-    if (event.type === 'run.end') this.#eventQueue.close();
+    if (event.type === 'run.end') {
+      this.#eventQueue.close();
+      // A turn that ended without its opening message being echoed does not
+      // get pinned by the next turn's opener: that one belongs to the next turn.
+      this.#seamToPin = undefined;
+    }
   }
 
   /**
