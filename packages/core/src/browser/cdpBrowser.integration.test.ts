@@ -668,6 +668,39 @@ when('every verb against a real Chromium', () => {
     expect(await refusal(driver.evaluate('missingThing.go()'))).toContain('ReferenceError');
   });
 
+  it('bounds an expression that never finishes, whichever way it does not', async () => {
+    /*
+     * Both shapes, against the real browser, because CDP bounds one of them and
+     * not the other. Measured on Chromium 141 with `timeout: 1000`:
+     * `while (true) {}` rejects after 1008 ms with `-32603 Internal error`, and
+     * `new Promise(() => {})` under `awaitPromise` never answers at all —
+     * `timeout` bounds execution, not the wait for a promise to settle. The
+     * second is the one an agent writes by accident.
+     *
+     * Fifteen seconds is above the driver's ten-second deadline and below
+     * `CdpConnection`'s thirty, so this fails if either bound is the one doing
+     * the work. The loop is expected to come back at about ten and the promise
+     * at about ten; both are asserted the same way because to the agent they
+     * are the same fact.
+     */
+    const fresh = browser.driver();
+    await value(fresh.open(`${origin}/`));
+    try {
+      for (const expression of ['while (true) {}', 'new Promise(() => {})']) {
+        const began = Date.now();
+        const said = await refusal(fresh.evaluate(expression));
+        expect(said).toContain('did not finish within 10 seconds');
+        expect(Date.now() - began).toBeLessThan(15_000);
+      }
+
+      // And the page really is unharmed, which is what the refusal claims.
+      expect(await value(fresh.evaluate('1 + 1'))).toBe(2);
+      expect((await value(fresh.read())).text).toContain('Orders');
+    } finally {
+      await fresh.close();
+    }
+  }, 60_000);
+
   it('says so when a value cannot cross the protocol', async () => {
     // Chromium refuses these at the protocol level rather than answering with
     // something unserialisable, so what the agent gets is the browser's own

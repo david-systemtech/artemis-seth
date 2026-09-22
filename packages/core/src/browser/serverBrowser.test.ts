@@ -94,6 +94,8 @@ class FakeChromium {
   navigationFailures = new Map<string, string>();
   /** A `Page.navigate` the browser rejects rather than answers. See the case below. */
   navigationErrors = new Map<string, string>();
+  /** Methods this browser accepts and never replies to. See {@link #handle}. */
+  neverAnswers = new Set<string>();
   evaluated: (expression: string) => Record<string, unknown> = () => ({
     result: { type: 'string', value: 'ok' },
   });
@@ -195,6 +197,17 @@ class FakeChromium {
     const params = (message['params'] ?? {}) as Record<string, unknown>;
     const sessionId = message['sessionId'] as string | undefined;
     this.calls.push({ method, params, ...(sessionId === undefined ? {} : { sessionId }) });
+
+    /*
+     * A call the browser never answers at all.
+     *
+     * Measured on Chromium 141: `Runtime.evaluate` with `awaitPromise` on a
+     * promise that never settles is exactly this — `timeout` bounds execution
+     * and not the wait, so nothing ever comes back. This is how that is stood
+     * in for, and the reply is withheld rather than delayed because a delay is
+     * a race and this is not.
+     */
+    if (this.neverAnswers.has(method)) return;
 
     let result: Record<string, unknown> | Error;
     try {
@@ -1102,6 +1115,46 @@ describe('cookies, storage and an expression', () => {
     chromium.evaluated = () => ({ result: { type: 'object', subtype: 'node' } });
     const { driver } = await openAt();
     expect(reasonOf(await driver.evaluate('document.body'))).toContain('cannot be returned as data');
+  });
+
+  it('gives up on an expression the browser never answers for', async () => {
+    /*
+     * The half of the bound CDP does not supply. Measured on Chromium 141:
+     * `Runtime.evaluate`'s `timeout` terminates a runaway *synchronous*
+     * expression but does not bound the wait for a promise, so
+     * `new Promise(() => {})` under `awaitPromise` produces no answer at all.
+     * Without a deadline of this file's own the agent would wait out
+     * `CdpConnection`'s thirty seconds and be told the browser had not
+     * answered, which is a different and wrong thing to say.
+     */
+    const { driver } = await openAt();
+    chromium.neverAnswers.add('Runtime.evaluate');
+
+    const said = reasonOf(await driver.evaluate('new Promise(() => {})'));
+
+    expect(said).toContain('did not finish within 10 seconds');
+    // And it says the page survived it, because an agent told otherwise opens
+    // a new one for no reason.
+    expect(said).toContain('The page itself is unharmed');
+    // The deadline was this file's, on the injected clock, and bounded.
+    expect(timers.waits).toContain(10_000);
+  });
+
+  it('says an expression ran too long, rather than passing on “Internal error”', async () => {
+    /*
+     * What Chromium answers when its own `timeout` stops a runaway loop,
+     * measured on 141: `{"code": -32603, "message": "Internal error"}` after
+     * the timeout elapses. Handing that to a model teaches it nothing.
+     */
+    chromium.evaluated = () => {
+      throw new Error('Internal error');
+    };
+    const { driver } = await openAt();
+
+    const said = reasonOf(await driver.evaluate('while (true) {}'));
+
+    expect(said).toContain('did not finish within 10 seconds');
+    expect(said).not.toContain('Internal error');
   });
 
   it('offers all five deep verbs, because it is signed in to nothing', async () => {
