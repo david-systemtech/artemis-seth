@@ -90,6 +90,11 @@ jobs:
   extension:
     needs: gates
     runs-on: ubuntu-latest
+    # Whether there is an artifact to download. The build matrix reads it so
+    # that "this checkout has no extension" and "the download failed" are two
+    # different things there — see the download step for why that matters.
+    outputs:
+      built: ${{ steps.package.outputs.built }}
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -99,11 +104,25 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec tsx scripts/package-extension.ts
-      - uses: actions/upload-artifact@v7
+      # The script exits 0 either way: an absent `apps/extension` is a branch
+      # that predates it, not a broken build. What it leaves behind is the
+      # difference, so that is what is reported.
+      - id: package
+        shell: bash
+        run: |
+          if compgen -G 'apps/desktop/build/extension/*.zip' > /dev/null; then
+            echo 'built=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'built=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::No browser extension was packaged; the desktop builds will ship without one.'
+          fi
+      - if: steps.package.outputs.built == 'true'
+        uses: actions/upload-artifact@v7
         with:
           name: extension
-          # Not `error`: an absent extension is a state this workflow supports.
-          if-no-files-found: ignore
+          # `error` now: the step above has already established there is a file,
+          # so nothing here is the supported empty case any more.
+          if-no-files-found: error
           path: apps/desktop/build/extension/*.zip
 
   build:
@@ -175,14 +194,31 @@ jobs:
       - run: pnpm run build
       # Into the directory `electron-builder.yml`'s `extraResources` copies
       # from, so every platform's package carries the same archive the release
-      # page offers. `merge-multiple` is not needed — one artifact — and the
-      # download is a no-op when the extension job uploaded nothing, which
-      # leaves the committed README alone and ships no zip.
-      - uses: actions/download-artifact@v8
-        continue-on-error: true
+      # page offers.
+      #
+      # Conditional, and deliberately **not** error-tolerant. It was
+      # `continue-on-error: true`, which made one state of the world out of
+      # two: "this checkout has no extension", which is supported, and "the
+      # download failed", which is not. The second shipped desktop packages
+      # whose "Get the extension" button does nothing while the release page
+      # still carried the zip — a mismatch nothing in the run would have
+      # reported. The `extension` job now says which it is, and a download that
+      # was promised a file and did not get one fails the build.
+      - if: needs.extension.outputs.built == 'true'
+        uses: actions/download-artifact@v8
         with:
           name: extension
           path: apps/desktop/build/extension
+      # And a last look before packaging, because `extraResources` copies
+      # whatever is there without comment. A build that believed it had the
+      # extension and has not must not become a release.
+      - if: needs.extension.outputs.built == 'true'
+        shell: bash
+        run: |
+          if ! compgen -G 'apps/desktop/build/extension/*.zip' > /dev/null; then
+            echo '::error::The extension artifact downloaded no zip, so this package would ship without one.'
+            exit 1
+          fi
       - run: pnpm --filter @rx-artemis/desktop exec electron-builder ${{ matrix.build-args }} --publish never
       # The terminal UI, as one self-contained tarball for this runner's
       # platform — see scripts/package-tui.ts. Not on Windows: the TUI has
