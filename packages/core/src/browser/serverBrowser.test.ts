@@ -230,6 +230,13 @@ class FakeChromium {
     if (method === 'Page.navigate') {
       const url = String(params['url']);
       if (this.navigationFailures.has(url) || this.navigationErrors.has(url)) return;
+      const sameDocument = this.sameDocumentOn.get(url);
+      if (sameDocument !== undefined) {
+        queueMicrotask(() => {
+          this.arriveWithinDocumentAt(url, sameDocument, sessionId);
+        });
+        return;
+      }
       queueMicrotask(() => {
         this.arriveAt(this.redirects.get(url) ?? url, sessionId);
       });
@@ -251,6 +258,38 @@ class FakeChromium {
 
   /** Where the page goes next, and the events Chromium sends on the way. */
   navigatesOnClick: string | null = null;
+
+  /**
+   * Addresses a `Page.navigate` reaches without loading anything: url → frame.
+   *
+   * A fragment on the page already open. See {@link arriveWithinDocumentAt} for
+   * what Chromium was measured to send for one, and for the event this fake
+   * deliberately leaves out.
+   */
+  sameDocumentOn = new Map<string, string>();
+
+  /**
+   * A same-document arrival, as Chromium 141 sends one — minus one event.
+   *
+   * Measured: `frameStartedNavigating`, `frameStartedLoading`,
+   * `navigatedWithinDocument`, `frameStoppedLoading`, and never a
+   * `loadEventFired` or a `frameNavigated`. `frameStoppedLoading` is withheld
+   * here on purpose: on that build it would end the wait by itself, which would
+   * make a test that used it pass for a reason that is a property of one
+   * browser rather than of this driver.
+   */
+  arriveWithinDocumentAt(url: string, frameId: string, sessionId: string): void {
+    const target = this.sessions.get(sessionId);
+    if (target !== undefined) {
+      this.targets.set(target, {
+        contextId: this.targets.get(target)?.contextId ?? null,
+        url,
+        title: this.title,
+      });
+    }
+    this.emit('Page.frameStartedLoading', { frameId }, sessionId);
+    this.emit('Page.navigatedWithinDocument', { frameId, url }, sessionId);
+  }
 
   /**
    * The events one arrival produces, in Chromium's own order.
@@ -1582,6 +1621,60 @@ describe('waiting for a page to settle', () => {
     chromium.emit('Page.frameStoppedLoading', { frameId: TOP_FRAME }, session);
 
     expect((await driver.read()).ok).toBe(true);
+  });
+
+  it('ends a navigation that only changed the fragment, which loads no document', async () => {
+    /*
+     * The hash-routed single-page application: `browser_navigate` from
+     * `https://example.com/orders` to `https://example.com/orders#/settings` is
+     * a *same-document* navigation, and Chromium commits nothing for it.
+     *
+     * Measured on Chromium 141: such a navigation produces
+     * `frameStartedNavigating`, `frameStartedLoading`,
+     * `navigatedWithinDocument` and `frameStoppedLoading` — and never a
+     * `loadEventFired`. The fake deliberately withholds `frameStoppedLoading`
+     * here, because that event is a property of one browser build and this
+     * verb's answer must not be: what ends the wait is the event that says the
+     * address arrived.
+     *
+     * A verb that never came back would fail this by timing out, which is the
+     * honest shape for it.
+     */
+    const { driver } = await openAt('https://example.com/orders');
+    const session = chromium.sessionIds()[0] as string;
+    const fragment = 'https://example.com/orders#/settings';
+    chromium.sameDocumentOn.set(fragment, TOP_FRAME);
+
+    const at = await driver.navigate(fragment);
+
+    expect(at).toEqual({ ok: true, value: { url: fragment, title: 'Orders' } });
+    // No document was loaded, so nothing waited on the real clock either.
+    expect(chromium.called('Page.navigate').at(-1)).toEqual({ url: fragment });
+  });
+
+  it('does not let a page’s own pushState cut short a load somebody asked for', async () => {
+    /*
+     * The other side of the same rule. A navigation to a real document is under
+     * way; the page it is leaving calls `history.pushState` on a timer. That is
+     * not the answer to what `navigate` asked, and ending the wait on it would
+     * report the old page as though the new one had arrived.
+     */
+    const { driver } = await openAt('https://example.com/orders');
+    const session = chromium.sessionIds()[0] as string;
+
+    // Nothing is navigating: the wait below is `settle`'s, not `navigate`'s.
+    chromium.emit('Page.frameStartedLoading', { frameId: TOP_FRAME }, session);
+    chromium.emit(
+      'Page.navigatedWithinDocument',
+      { frameId: TOP_FRAME, url: 'https://example.com/orders#/late' },
+      session,
+    );
+    const reading = driver.read();
+    // Only a real end to the load lets the verb through.
+    await Promise.resolve();
+    chromium.emit('Page.loadEventFired', { timestamp: 1 }, session);
+
+    expect((await reading).ok).toBe(true);
   });
 
   it('does not leave the next verb waiting when the browser refuses the navigation', async () => {

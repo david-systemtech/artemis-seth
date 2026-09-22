@@ -553,6 +553,39 @@ when('every verb against a real Chromium', () => {
     await fresh.close();
   }, 30_000);
 
+  it('comes straight back from a navigation that only changes the fragment', async () => {
+    /*
+     * The hash-routed single-page application, which is the ordinary case for
+     * anything built on a hash router: `browser_navigate` to
+     * `http://host/#/settings` from `http://host/` is a *same-document*
+     * navigation, and Chromium commits no new document for it.
+     *
+     * Timed rather than merely awaited, because the failure this guards is a
+     * verb that answers correctly and takes the full twenty-second settle to do
+     * it. Five seconds is far above what a local page takes and far below the
+     * timeout, so it separates the two without pinning a number.
+     *
+     * Worth knowing what this test does and does not distinguish. On Chromium
+     * 141 a fragment navigation also fires a top-frame
+     * `Page.frameStoppedLoading`, which ends the wait on its own — measured, and
+     * it is why this passes at about twenty milliseconds whether or not
+     * `Page.navigatedWithinDocument` is wired to end it. What this pins is the
+     * outcome against a real browser; the fake-CDP suite is where the wiring
+     * itself is pinned, by withholding the event this build happens to send.
+     */
+    await value(driver.navigate(`${origin}/`));
+    const began = Date.now();
+    const at = await value(driver.navigate(`${origin}/#/settings`));
+    expect(at.url).toBe(`${origin}/#/settings`);
+    expect(Date.now() - began).toBeLessThan(5_000);
+
+    // And again, fragment to fragment, which commits even less.
+    const second = Date.now();
+    expect((await value(driver.navigate(`${origin}/#/orders`))).url).toBe(`${origin}/#/orders`);
+    expect(Date.now() - second).toBeLessThan(5_000);
+    await value(driver.navigate(`${origin}/`));
+  }, 60_000);
+
   it('refuses a selector that matches nothing, in a sentence', async () => {
     expect(await refusal(driver.click('.absent'))).toBe('Nothing matches .absent on this page.');
   });

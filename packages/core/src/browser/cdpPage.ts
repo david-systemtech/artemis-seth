@@ -264,6 +264,18 @@ export class CdpPage {
   /** Resolvers waiting for a navigation to *begin*. See {@link settle}. */
   #startWaiters: (() => void)[] = [];
   #loading = false;
+  /**
+   * Which {@link navigate} armed the wait that is outstanding, or `null`.
+   *
+   * A counter rather than a flag because the navigation listener can start a
+   * *second* navigation while handling the first — the policy sends a refused
+   * page to `about:blank` from inside `Page.navigatedWithinDocument` — and an
+   * event belonging to the first must not release the wait belonging to the
+   * second. Comparing the generation it captured against the one that is
+   * current is what tells those apart.
+   */
+  #navigateWait: number | null = null;
+  #navigations = 0;
   /** How long to wait, and how. Injected so no test waits in real time. */
   readonly #sleep: (ms: number) => Promise<void>;
   /**
@@ -445,8 +457,14 @@ export class CdpPage {
    * or a cached document can fire `Page.loadEventFired` between the call and
    * the subscription. Arming first turns a race that hangs for twenty seconds
    * into no race at all.
+   *
+   * Armed with a generation, so that the one navigation whose end cannot be a
+   * load event — a fragment change, which loads nothing — can be ended by the
+   * event that does say it arrived. See `Page.navigatedWithinDocument` in
+   * {@link #listen}.
    */
   async navigate(url: string): Promise<void> {
+    this.#navigateWait = ++this.#navigations;
     const settled = this.#awaitLoad();
     let result: Record<string, unknown>;
     try {
@@ -919,6 +937,7 @@ export class CdpPage {
 
   #releaseLoad(): void {
     this.#loading = false;
+    this.#navigateWait = null;
     for (const waiter of this.#loadWaiters.splice(0, this.#loadWaiters.length)) waiter();
   }
 
@@ -1014,10 +1033,45 @@ export class CdpPage {
       });
     });
 
+    /*
+     * A same-document navigation, which is a navigation `Page.navigate` can be
+     * asked for and which commits no document at all.
+     *
+     * The case is the ordinary one for anything on a hash router:
+     * `browser_navigate` to `http://localhost:5173/#/settings` from
+     * `http://localhost:5173/`. Measured on Chromium 141 (2026-09-22), a
+     * `Page.navigate` to a fragment on the page already loaded produces, in
+     * this order and inside ten milliseconds:
+     *
+     *   Page.frameStartedNavigating   → the new address
+     *   Page.frameStartedLoading      → the top frame
+     *   (Page.navigate answers, and its result carries **no `loaderId`** —
+     *    the discriminator, since a cross-document navigation's does)
+     *   Page.navigatedWithinDocument  → the new address
+     *   Page.frameStoppedLoading      → the top frame
+     *
+     * and **no `Page.loadEventFired` and no `Page.frameNavigated` ever**. So of
+     * the three ways {@link #awaitLoad} ends, the load event never comes and
+     * the only one left on that build is `frameStoppedLoading` — which does
+     * fire, so `browser_navigate` really does come straight back today.
+     *
+     * Releasing here anyway, and the reason is that the alternative is a
+     * twenty-second verb resting on an event Chromium is under no obligation to
+     * send for a navigation that loaded nothing. This is the direct answer to
+     * the question `navigate` asked — "has the address I asked for arrived?" —
+     * where `frameStoppedLoading` is an inference from the frame going quiet.
+     *
+     * Only for a wait `Page.navigate` armed: a page moving itself with
+     * `history.pushState` while a *real* document is loading must not be able
+     * to cut that load short. And only when the generation has not changed
+     * underneath, because {@link #onNavigated} is where a refused address is
+     * sent to `about:blank`, which arms a wait of its own.
+     */
     on('Page.navigatedWithinDocument', (params) => {
       const top = this.#isTopFrame(params['frameId']);
       if (typeof params['url'] !== 'string' || params['url'].length === 0) return;
       const frameId = params['frameId'];
+      const armed = this.#navigateWait;
       this.#onNavigated?.({
         url: params['url'],
         address: top
@@ -1025,6 +1079,7 @@ export class CdpPage {
           : (typeof frameId === 'string' ? this.#frameAddresses.get(frameId) ?? null : null),
         top,
       });
+      if (top && armed !== null && this.#navigateWait === armed) this.#releaseLoad();
     });
 
     /*
