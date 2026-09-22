@@ -7,6 +7,11 @@
  * an address, which is exactly what `http://browser:9222` produces — so the
  * name is resolved here and the address is what asks. A regression would look
  * like "the browser service is down" and would be nothing of the kind.
+ *
+ * The container at the other end of that address is read here too, for the same
+ * reason and with the same symptom: the flags it starts Chromium with decide
+ * whether there is a port to resolve to at all, and getting them wrong reads
+ * from this side as a browser that is down.
  */
 
 import { readFileSync, readdirSync } from 'node:fs';
@@ -189,6 +194,20 @@ describe('turning a compose file’s address into an endpoint', () => {
     expect(endpoint).toBe('ws://127.0.0.1:9222/devtools/browser/abc');
   });
 
+  it('brackets an IPv6 address in a full devtools endpoint too', async () => {
+    /*
+     * The failure this pins is silent. `ws:` is a special scheme, so the WHATWG
+     * host parser refuses a bare IPv6 literal — and `URL.hostname =` does not
+     * throw when it refuses, it leaves the old host alone. Without the
+     * brackets the endpoint comes back still naming `browser`, which is the
+     * one thing resolving it was for.
+     */
+    const endpoint = await resolveCdpEndpoint('ws://browser:9222/devtools/browser/abc', {
+      lookup: async () => 'fd00::5',
+    });
+    expect(endpoint).toBe('ws://[fd00::5]:9222/devtools/browser/abc');
+  });
+
   it('brackets an IPv6 address when it asks', async () => {
     const asked: string[] = [];
     await resolveCdpEndpoint('http://browser:9222', {
@@ -216,6 +235,71 @@ describe('turning a compose file’s address into an endpoint', () => {
     await expect(
       resolveCdpEndpoint('http://browser:9222', { lookup, fetchJson: async () => ({ ok: true }) }),
     ).rejects.toThrow('did not name a webSocketDebuggerUrl');
+  });
+
+  it('gives up on an endpoint that accepts the connection and then says nothing', async () => {
+    /*
+     * The one place on the connect path with nothing above it: this runs before
+     * any `CdpConnection` exists, so none of that class's deadlines apply. A
+     * half-started container, or a proxy holding the request open, used to hang
+     * the run's first `browser_open` for the life of the run.
+     *
+     * The stub honours the signal and does nothing else, which is exactly the
+     * endpoint being described — so what settles this promise is the deadline
+     * or nothing at all.
+     */
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal('fetch', async (_url: string, init?: { signal?: AbortSignal }) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(new DOMException('This operation was aborted', 'AbortError'));
+          });
+        });
+      });
+      const resolving = resolveCdpEndpoint('http://browser:9222', { lookup });
+      const said = expect(resolving).rejects.toThrow(
+        'The browser at http://172.20.0.3:9222/json/version did not answer within 10 seconds.',
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      await said;
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('the container the endpoint is supposed to be on', () => {
+  /*
+   * The one part of this feature no test can drive: there is no Docker where it
+   * was written. What can be checked is the flag whose absence makes everything
+   * above unreachable, and it is worth checking because the failure is total and
+   * silent — the port is simply never opened, and every symptom points at the
+   * network instead.
+   */
+  const dockerfile = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '../../../../docker/browser.Dockerfile'),
+    'utf8',
+  );
+
+  it('gives Chromium a profile of its own, or the DevTools port never opens', () => {
+    /*
+     * Since Chrome 136, `--remote-debugging-port` is ignored unless a
+     * non-default `--user-data-dir` is given as well. Debian bookworm's
+     * chromium is well past 136, so a CMD with the port and without the profile
+     * is a container that listens on nothing at all.
+     */
+    const command = dockerfile.slice(dockerfile.indexOf('CMD ['));
+    expect(command).toContain('--remote-debugging-port=9222');
+    expect(command).toContain('--user-data-dir=/home/browser/profile');
+  });
+
+  it('makes that profile directory, owned by the user that has to write it', () => {
+    // Chromium runs as `browser`, which cannot create a directory under a home
+    // it does not own — and a profile it cannot write is a browser that exits.
+    expect(dockerfile).toContain('mkdir -p /home/browser/profile');
+    expect(dockerfile).toContain('chown -R browser:browser /home/browser');
   });
 });
 

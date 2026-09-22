@@ -79,8 +79,17 @@ const MAX_TEXT = 40_000;
  * every other message put together, and the interesting part of it is the
  * first line. Clipping per entry rather than only in total is what keeps one
  * loud entry from pushing every other one out of the listing.
+ *
+ * **Exported, and applied twice.** Clipping here alone bounds what the *model*
+ * reads and nothing else: a driver's console buffer keeps two hundred entries,
+ * so a page logging hundred-kilobyte lines could hold twenty megabytes in a
+ * process the user cannot restart without losing their work, and every byte of
+ * it would be thrown away at render. So each driver clips as it pushes, to this
+ * number, and its buffer is bounded in characters as well as in entries. This
+ * is the one place the number lives, so the two drivers and this renderer
+ * cannot drift into disagreeing about it.
  */
-const MAX_ENTRY = 2_000;
+export const MAX_ENTRY_CHARS = 2_000;
 
 /* -------------------------------------------------------------------------- */
 /* Results                                                                    */
@@ -148,7 +157,7 @@ function clip(text: string, max: number): string {
  * the entry readable and keeps one entry visibly one entry.
  */
 function indented(text: string): string {
-  return clip(text, MAX_ENTRY).replace(/\n/gu, '\n      ');
+  return clip(text, MAX_ENTRY_CHARS).replace(/\n/gu, '\n      ');
 }
 
 /**
@@ -286,7 +295,7 @@ function renderStorage(snapshot: StorageSnapshot): string {
     const width = columns(keys);
     return [
       `${label} — ${String(keys.length)} ${plural(keys.length, 'key', 'keys')}`,
-      ...keys.map((key) => `  ${key.padEnd(width)} = ${clip(values[key] ?? '', MAX_ENTRY)}`),
+      ...keys.map((key) => `  ${key.padEnd(width)} = ${clip(values[key] ?? '', MAX_ENTRY_CHARS)}`),
     ];
   };
 
@@ -641,7 +650,10 @@ export function pageTools(driver: PageDriver) {
       async ({ selector, text }) =>
         settled(
           () => driver.type(selector, text),
-          () => say(`Typed into ${selector}.`),
+          // With the address, as a click reports it: a framework listening for
+          // `change` may submit on the value it just received, and a model
+          // told only "typed" would go on reading a page that is already gone.
+          (at) => say(`Typed into ${selector}. Now at ${whereIs(at)}.`),
         ),
     ),
 

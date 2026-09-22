@@ -201,6 +201,10 @@ class Lease implements PageLease {
     return this.browser.resolveHost;
   }
 
+  log(line: string): void {
+    this.browser.note(line);
+  }
+
   current(): CdpPage | null {
     return this.page;
   }
@@ -272,6 +276,18 @@ class ServerBrowserImpl implements ServerBrowser {
     const lease = new Lease(this, this.timers.now());
     this.#leases.add(lease);
     return cdpPageDriver(lease);
+  }
+
+  /**
+   * Operational news from a lease.
+   *
+   * The navigation policy is the only caller: a page whose frame reached a
+   * refused address is something an operator wants in the log whatever the
+   * agent is told, because it is the shape a prompt injection that went looking
+   * for the metadata service leaves behind.
+   */
+  note(line: string): void {
+    this.#log(line);
   }
 
   /* ---------------------------------------------------------------- */
@@ -500,12 +516,35 @@ class ServerBrowserImpl implements ServerBrowser {
    * It also gets the popup case right for free: a window a page opens with
    * `window.open` lives in *our* context, and closing it needs it to be
    * recognised as ours-but-unwanted rather than as a stranger's.
+   *
+   * ## What is closed, exactly
+   *
+   * A target is **ours, and left alone, when its `browserContextId` is one of
+   * our leases' context ids** — page or `iframe` alike. What this closes is:
+   *
+   *  - every document target in a context we do not own, and then that context;
+   *  - a stray *page* in a context we do own that is not the lease's own tab —
+   *    a window a page opened with `window.open`, which no tool could name.
+   *
+   * **Never an `iframe` whose context we own**, and that is a correction. A
+   * cross-site frame under site isolation is its own target with its own
+   * `targetId`, sharing the `browserContextId` of the page that holds it
+   * (measured on Chromium 141: it is listed by both `Target.getTargets` and
+   * `/json/list`). The rule used to be "any document target that is not a
+   * lease's `page.targetId`", which made every such frame a stranger and closed
+   * it on the next pass — so an agent looking at a page with an embedded map,
+   * a payment form or a video had it disappear from under them within thirty
+   * seconds, on a timer, with the page left as it was.
+   *
+   * A tab mid-setup is the other thing spared, for the reason above: a page
+   * target in a context we claimed but that no lease is driving *yet* belongs
+   * to a run three round trips into `openFor`.
    */
   async #sweep(): Promise<void> {
     const cdp = this.#cdp;
     if (cdp === null || !cdp.open) return;
-    // The tabs the leases are actually driving. Anything else in one of our
-    // contexts is a window a page opened, which no tool could name.
+    // The tabs the leases are actually driving. A *page* in one of our contexts
+    // that is not one of these is a window a page opened.
     const ours = new Set([...this.#leases].map((one) => one.page?.targetId).filter((id): id is string => id !== undefined));
 
     let targets: unknown;
@@ -522,13 +561,6 @@ class ServerBrowserImpl implements ServerBrowser {
       const info = one as { targetId?: unknown; type?: unknown; browserContextId?: unknown };
       const targetId = typeof info.targetId === 'string' ? info.targetId : null;
       if (targetId === null || ours.has(targetId)) continue;
-      const contextId = typeof info.browserContextId === 'string' ? info.browserContextId : null;
-      /*
-       * A target in a context we claimed but that no lease is driving yet is a
-       * tab mid-setup. Left alone; the run that is building it will record it a
-       * round trip from now, and closing it would be closing our own work.
-       */
-      if (contextId !== null && this.#ourContexts.has(contextId) && !this.#hasPage(contextId)) continue;
       /*
        * Documents only: `page`, and the two other kinds that render one.
        * `browser`, `service_worker`, `shared_worker` and `other` targets belong
@@ -537,7 +569,20 @@ class ServerBrowserImpl implements ServerBrowser {
        * testing works at all.
        */
       if (info.type !== 'page' && info.type !== 'iframe' && info.type !== 'webview') continue;
-      if (contextId !== null && !this.#ourContexts.has(contextId)) strayContexts.add(contextId);
+      const contextId = typeof info.browserContextId === 'string' ? info.browserContextId : null;
+
+      if (contextId !== null && this.#ourContexts.has(contextId)) {
+        // A frame of one of our own pages: its target id is not the lease's,
+        // and it is not a stranger either. Nothing here may close it.
+        if (info.type !== 'page') continue;
+        // A tab still being set up. See the note above.
+        if (!this.#hasPage(contextId)) continue;
+        await cdp.call('Target.closeTarget', { targetId }).catch(() => undefined);
+        this.#log(`browser sweep closed a window a page opened (${targetId}).`);
+        continue;
+      }
+
+      if (contextId !== null) strayContexts.add(contextId);
       await cdp.call('Target.closeTarget', { targetId }).catch(() => undefined);
       this.#log(`browser sweep closed a target this server does not own (${targetId}).`);
     }

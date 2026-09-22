@@ -388,7 +388,17 @@ export interface PageDriver {
    */
   evaluate(expression: string): Promise<DriverResult<unknown>>;
 
-  /** Close this run's page and let go of whatever it held. */
+  /**
+   * The run has finished with this browser: let go of whatever it held.
+   *
+   * Whether the *page* ends with it is the implementation's to decide, and the
+   * two answers in the tree differ. A driver over a tab nobody owns closes it;
+   * a driver over a tab in the user's own window does not, because a
+   * conversation ending is no reason to take a page away from someone reading
+   * it. What every implementation must do is release what the *driver* added —
+   * its listeners, its buffers, its slot in whatever is recording — because one
+   * is built per run and nothing else will.
+   */
   close(): Promise<void>;
 }
 

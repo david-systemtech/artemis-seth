@@ -33,6 +33,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { hostOf, type PageDriver } from '@rx-artemis/protocol';
 
 import type { CdpTransport } from './cdp.js';
+import { MAX_ENTRY_CHARS } from './pageTools.js';
 import { createServerBrowser, type BrowserTimers, type ServerBrowser } from './serverBrowser.js';
 import { isAddressLiteral } from './serverBrowserPolicy.js';
 
@@ -73,7 +74,10 @@ interface FakeElement {
 class FakeChromium {
   readonly calls: { method: string; params: Record<string, unknown>; sessionId?: string }[] = [];
   readonly contexts = new Set<string>();
-  readonly targets = new Map<string, { contextId: string | null; url: string; title: string }>();
+  readonly targets = new Map<
+    string,
+    { contextId: string | null; url: string; title: string; type?: string }
+  >();
   readonly sessions = new Map<string, string>();
 
   /** What the page answers with. */
@@ -88,6 +92,10 @@ class FakeChromium {
   redirects = new Map<string, string>();
   /** A navigation that fails outright, as `Page.navigate`'s `errorText`. */
   navigationFailures = new Map<string, string>();
+  /** A `Page.navigate` the browser rejects rather than answers. See the case below. */
+  navigationErrors = new Map<string, string>();
+  /** Methods this browser accepts and never replies to. See {@link #handle}. */
+  neverAnswers = new Set<string>();
   evaluated: (expression: string) => Record<string, unknown> = () => ({
     result: { type: 'string', value: 'ok' },
   });
@@ -114,6 +122,25 @@ class FakeChromium {
   addStrayTarget(contextId: string | null = 'ctx-stray'): string {
     const id = `target-stray-${String(this.#nextId++)}`;
     this.targets.set(id, { contextId, url: 'https://left-behind.example/', title: 'Left behind' });
+    if (contextId !== null) this.contexts.add(contextId);
+    return id;
+  }
+
+  /**
+   * A frame that is its own target, as site isolation makes of a cross-site
+   * iframe.
+   *
+   * It shares the `browserContextId` of the page that holds it — measured on
+   * Chromium 141 — which is the fact the sweep's ownership rule turns on.
+   */
+  addFrameTarget(contextId: string | null): string {
+    const id = `target-frame-${String(this.#nextId++)}`;
+    this.targets.set(id, {
+      contextId,
+      url: 'https://widget.example/embed',
+      title: '',
+      type: 'iframe',
+    });
     if (contextId !== null) this.contexts.add(contextId);
     return id;
   }
@@ -171,6 +198,17 @@ class FakeChromium {
     const sessionId = message['sessionId'] as string | undefined;
     this.calls.push({ method, params, ...(sessionId === undefined ? {} : { sessionId }) });
 
+    /*
+     * A call the browser never answers at all.
+     *
+     * Measured on Chromium 141: `Runtime.evaluate` with `awaitPromise` on a
+     * promise that never settles is exactly this — `timeout` bounds execution
+     * and not the wait, so nothing ever comes back. This is how that is stood
+     * in for, and the reply is withheld rather than delayed because a delay is
+     * a race and this is not.
+     */
+    if (this.neverAnswers.has(method)) return;
+
     let result: Record<string, unknown> | Error;
     try {
       result = this.#answer(method, params, sessionId);
@@ -204,7 +242,14 @@ class FakeChromium {
 
     if (method === 'Page.navigate') {
       const url = String(params['url']);
-      if (this.navigationFailures.has(url)) return;
+      if (this.navigationFailures.has(url) || this.navigationErrors.has(url)) return;
+      const sameDocument = this.sameDocumentOn.get(url);
+      if (sameDocument !== undefined) {
+        queueMicrotask(() => {
+          this.arriveWithinDocumentAt(url, sameDocument, sessionId);
+        });
+        return;
+      }
       queueMicrotask(() => {
         this.arriveAt(this.redirects.get(url) ?? url, sessionId);
       });
@@ -226,6 +271,38 @@ class FakeChromium {
 
   /** Where the page goes next, and the events Chromium sends on the way. */
   navigatesOnClick: string | null = null;
+
+  /**
+   * Addresses a `Page.navigate` reaches without loading anything: url → frame.
+   *
+   * A fragment on the page already open. See {@link arriveWithinDocumentAt} for
+   * what Chromium was measured to send for one, and for the event this fake
+   * deliberately leaves out.
+   */
+  sameDocumentOn = new Map<string, string>();
+
+  /**
+   * A same-document arrival, as Chromium 141 sends one — minus one event.
+   *
+   * Measured: `frameStartedNavigating`, `frameStartedLoading`,
+   * `navigatedWithinDocument`, `frameStoppedLoading`, and never a
+   * `loadEventFired` or a `frameNavigated`. `frameStoppedLoading` is withheld
+   * here on purpose: on that build it would end the wait by itself, which would
+   * make a test that used it pass for a reason that is a property of one
+   * browser rather than of this driver.
+   */
+  arriveWithinDocumentAt(url: string, frameId: string, sessionId: string): void {
+    const target = this.sessions.get(sessionId);
+    if (target !== undefined) {
+      this.targets.set(target, {
+        contextId: this.targets.get(target)?.contextId ?? null,
+        url,
+        title: this.title,
+      });
+    }
+    this.emit('Page.frameStartedLoading', { frameId }, sessionId);
+    this.emit('Page.navigatedWithinDocument', { frameId, url }, sessionId);
+  }
 
   /**
    * The events one arrival produces, in Chromium's own order.
@@ -258,6 +335,39 @@ class FakeChromium {
     }
     this.emit('Page.frameNavigated', { frame: { id: TOP_FRAME, url } }, sessionId);
     this.emit('Page.loadEventFired', { timestamp: 1 }, sessionId);
+    // After the load event, as Chromium sends it: measured on 141, the top
+    // frame's `frameStoppedLoading` follows `loadEventFired` by a millisecond,
+    // which is what makes it safe as a second way to clear the wait.
+    this.emit('Page.frameStoppedLoading', { frameId: TOP_FRAME }, sessionId);
+  }
+
+  /**
+   * A frame *inside* the page arriving somewhere, in the same order.
+   *
+   * The response first, because it carries the address that frame's document
+   * was served from and the policy reads it when `frameNavigated` asks. The
+   * frame keeps its own `frameStartedLoading` and `frameStoppedLoading`, which
+   * is the pair the page's own load must not be confused by.
+   */
+  frameArrivesAt(
+    url: string,
+    sessionId: string,
+    options?: { readonly frameId?: string; readonly servedFrom?: string },
+  ): void {
+    const frameId = options?.frameId ?? 'frame-inside';
+    this.emit('Page.frameStartedLoading', { frameId }, sessionId);
+    this.emit(
+      'Network.responseReceived',
+      {
+        requestId: `sub-${String(this.#nextId++)}`,
+        type: 'Document',
+        frameId,
+        response: { status: 200, remoteIPAddress: options?.servedFrom ?? this.servedFrom(url) },
+      },
+      sessionId,
+    );
+    this.emit('Page.frameNavigated', { frame: { id: frameId, parentId: TOP_FRAME, url } }, sessionId);
+    this.emit('Page.frameStoppedLoading', { frameId }, sessionId);
   }
 
   /**
@@ -311,7 +421,7 @@ class FakeChromium {
         return {
           targetInfos: [...this.targets].map(([targetId, target]) => ({
             targetId,
-            type: 'page',
+            type: target.type ?? 'page',
             url: target.url,
             ...(target.contextId === null ? {} : { browserContextId: target.contextId }),
           })),
@@ -327,6 +437,7 @@ class FakeChromium {
       case 'Runtime.enable':
       case 'Log.enable':
       case 'Network.enable':
+      case 'Target.setAutoAttach':
       case 'Emulation.setDeviceMetricsOverride':
       case 'DOM.focus':
       case 'Input.dispatchMouseEvent':
@@ -337,6 +448,10 @@ class FakeChromium {
 
       case 'Page.navigate': {
         const asked = String(params['url']);
+        const refused = this.navigationErrors.get(asked);
+        // A CDP-level rejection rather than an `errorText`: the socket died, or
+        // the target went away. Different from a page that would not load.
+        if (refused !== undefined) throw new Error(refused);
         const failure = this.navigationFailures.get(asked);
         if (failure !== undefined) return { errorText: failure };
         const targetId = sessionId === undefined ? undefined : this.sessions.get(sessionId);
@@ -466,12 +581,15 @@ class FakeTimers implements BrowserTimers {
 
 let chromium: FakeChromium;
 let timers: FakeTimers;
+/** What the server would have written to its stderr. */
+let logged: string[];
 
 function build(limits?: Parameters<typeof createServerBrowser>[0]['limits']): ServerBrowser {
   return createServerBrowser({
     endpoint: 'ws://browser:9222/devtools/browser/fake',
     dial: async () => chromium.dial(),
     endpointDeps: { lookup: async () => '172.20.0.3' },
+    log: (line) => logged.push(line),
     resolveHost: async (host) => {
       const answer = dns.get(host);
       if (answer === null) throw new Error(`getaddrinfo ENOTFOUND ${host}`);
@@ -502,6 +620,7 @@ function reasonOf(result: { ok: boolean; reason?: string }): string {
 beforeEach(() => {
   chromium = new FakeChromium();
   timers = new FakeTimers();
+  logged = [];
   dns = new Map();
   chromium.elements.set('button[type="submit"]', { box: [10, 20, 110, 20, 110, 60, 10, 60] });
   chromium.elements.set('#email', { box: [0, 0, 200, 0, 200, 30, 0, 30], kind: 'field' });
@@ -803,6 +922,37 @@ describe('the console', () => {
     // The oldest go first: what an agent asks about is what just happened.
     expect(said.ok && said.value[0]?.text).toBe('line 60');
   });
+
+  it('clips one enormous line rather than keeping all of it', async () => {
+    /*
+     * Two hundred entries is not two hundred lines' worth of memory. One
+     * `console.log` of a serialised application state is routinely a hundred
+     * kilobytes, so a full buffer of them is twenty megabytes held for a
+     * listing that would have shown the first two thousand characters of each
+     * anyway. The bound is entries × chars, and this is the second half.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.emit(
+      'Runtime.consoleAPICalled',
+      { type: 'log', args: [{ value: 'x'.repeat(100_000) }] },
+      session,
+    );
+    chromium.emit(
+      'Runtime.exceptionThrown',
+      { exceptionDetails: { exception: { description: 'y'.repeat(100_000) } } },
+      session,
+    );
+    chromium.emit('Log.entryAdded', { entry: { level: 'error', text: 'z'.repeat(100_000) } }, session);
+
+    const said = await driver.console();
+    const texts = said.ok ? said.value.map((one) => one.text) : [];
+    expect(texts).toHaveLength(3);
+    for (const text of texts) {
+      expect(text).toHaveLength(MAX_ENTRY_CHARS + 1);
+      expect(text.endsWith('…')).toBe(true);
+    }
+  });
 });
 
 describe('the network log', () => {
@@ -965,6 +1115,46 @@ describe('cookies, storage and an expression', () => {
     chromium.evaluated = () => ({ result: { type: 'object', subtype: 'node' } });
     const { driver } = await openAt();
     expect(reasonOf(await driver.evaluate('document.body'))).toContain('cannot be returned as data');
+  });
+
+  it('gives up on an expression the browser never answers for', async () => {
+    /*
+     * The half of the bound CDP does not supply. Measured on Chromium 141:
+     * `Runtime.evaluate`'s `timeout` terminates a runaway *synchronous*
+     * expression but does not bound the wait for a promise, so
+     * `new Promise(() => {})` under `awaitPromise` produces no answer at all.
+     * Without a deadline of this file's own the agent would wait out
+     * `CdpConnection`'s thirty seconds and be told the browser had not
+     * answered, which is a different and wrong thing to say.
+     */
+    const { driver } = await openAt();
+    chromium.neverAnswers.add('Runtime.evaluate');
+
+    const said = reasonOf(await driver.evaluate('new Promise(() => {})'));
+
+    expect(said).toContain('did not finish within 10 seconds');
+    // And it says the page survived it, because an agent told otherwise opens
+    // a new one for no reason.
+    expect(said).toContain('The page itself is unharmed');
+    // The deadline was this file's, on the injected clock, and bounded.
+    expect(timers.waits).toContain(10_000);
+  });
+
+  it('says an expression ran too long, rather than passing on “Internal error”', async () => {
+    /*
+     * What Chromium answers when its own `timeout` stops a runaway loop,
+     * measured on 141: `{"code": -32603, "message": "Internal error"}` after
+     * the timeout elapses. Handing that to a model teaches it nothing.
+     */
+    chromium.evaluated = () => {
+      throw new Error('Internal error');
+    };
+    const { driver } = await openAt();
+
+    const said = reasonOf(await driver.evaluate('while (true) {}'));
+
+    expect(said).toContain('did not finish within 10 seconds');
+    expect(said).not.toContain('Internal error');
   });
 
   it('offers all five deep verbs, because it is signed in to nothing', async () => {
@@ -1248,10 +1438,10 @@ describe('the address behind a name', () => {
     expect(reasonOf(refused)).toContain('The tab is now blank.');
   });
 
-  it('ignores the address a subframe was served from', async () => {
-    // An advert in an iframe reaching a private address is the network's
-    // business. Treating it as the page's would refuse pages for what their
-    // third parties did.
+  it('does not take a frame’s address for the page’s own', async () => {
+    // A response for a frame says where *that frame* came from. Letting it
+    // overwrite the page's would check the page's name against a machine that
+    // never served it, which refuses pages at random and misses real ones.
     const { driver } = await openAt();
     const session = chromium.sessionIds()[0] as string;
     chromium.emit(
@@ -1369,6 +1559,190 @@ describe('a page that moves itself', () => {
   });
 });
 
+/* -------------------------------------------------------------------------- */
+/* A frame inside the page is judged exactly as the page is                    */
+/* -------------------------------------------------------------------------- */
+
+describe('a frame inside the page', () => {
+  it('refuses the whole page when it loads a cloud metadata address', async () => {
+    /*
+     * The one the agent can write itself. `browser_evaluate` appending an
+     * `<iframe src="http://169.254.169.254/…">` used to be invisible to every
+     * gate, while `browser_screenshot` rendered it and `browser_click` — which
+     * aims at viewport coordinates — could drive it.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.frameArrivesAt('http://169.254.169.254/latest/meta-data/', session);
+    await Promise.resolve();
+
+    const refused = await driver.read();
+    expect(reasonOf(refused)).toContain(
+      'A frame inside the page loaded http://169.254.169.254/latest/meta-data/',
+    );
+    expect(reasonOf(refused)).toContain('cloud metadata address');
+    expect(reasonOf(refused)).toContain('The tab is now blank.');
+    expect(chromium.called('Page.navigate').at(-1)).toEqual({ url: 'about:blank' });
+    // And the operator hears about it, because nothing else in the transcript
+    // reaches them and this is what a prompt injection going for the metadata
+    // service looks like from outside.
+    expect(logged.some((line) => line.includes('169.254.169.254'))).toBe(true);
+  });
+
+  it('is judged on the machine that served it, not only on its name', async () => {
+    /*
+     * A frame is checked against its *own* remote address, which is the only
+     * thing that can see a public name in an `<iframe src>` that Chromium
+     * actually fetched from inside the operator's network.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.frameArrivesAt('https://widget.example/embed', session, { servedFrom: '10.0.0.5' });
+    await Promise.resolve();
+
+    const refused = await driver.read();
+    expect(reasonOf(refused)).toContain('resolves to 10.0.0.5');
+    expect(reasonOf(refused)).toContain('A frame inside the page loaded https://widget.example/embed');
+  });
+
+  it('is judged through the target it becomes when it is out of process', async () => {
+    /*
+     * Measured on Chromium 141: under site isolation — which the full browser
+     * in `docker/browser.Dockerfile` has on — a cross-site iframe is its own
+     * target and reports nothing on the page's `Page` domain. It arrives as an
+     * attach carrying no url, and the url follows on a `targetInfoChanged`.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    const targetInfo = { targetId: 'target-frame', type: 'iframe', url: '' };
+    chromium.emit(
+      'Target.attachedToTarget',
+      { sessionId: 'session-frame', targetInfo },
+      session,
+    );
+    chromium.emit(
+      'Target.targetInfoChanged',
+      { targetInfo: { ...targetInfo, url: 'http://metadata.google.internal/computeMetadata/v1/' } },
+      session,
+    );
+    await Promise.resolve();
+
+    const refused = await driver.read();
+    expect(reasonOf(refused)).toContain('http://metadata.google.internal/computeMetadata/v1/');
+    expect(reasonOf(refused)).toContain('cloud metadata address');
+  });
+
+  it('is left alone when it is somewhere this browser may go', async () => {
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.frameArrivesAt('https://widget.example/embed', session);
+    await Promise.resolve();
+    expect((await driver.read()).ok).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Waiting for a load, and stopping waiting                                    */
+/* -------------------------------------------------------------------------- */
+
+describe('waiting for a page to settle', () => {
+  it('is not held up by a frame that starts loading after the page has loaded', async () => {
+    /*
+     * The twenty-second stall. A lazy embed, an advert, a frame some analytics
+     * script injects — anything that starts loading after `loadEventFired` —
+     * used to set the page's own loading flag, and nothing cleared it: the load
+     * event had already been and gone, and `Page.frameStoppedLoading` was never
+     * subscribed. Every verb after that waited out the full settle timeout.
+     *
+     * This test fails by timing out rather than by asserting, which is the
+     * honest shape for it: the bug is that the verb never comes back.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.emit('Page.frameStartedLoading', { frameId: 'frame-advert' }, session);
+
+    expect((await driver.read()).ok).toBe(true);
+  });
+
+  it('stops waiting when the top frame stops loading without a load event', async () => {
+    // A document that commits and then ends without firing `load` — one the
+    // page replaced, or one that failed part-way — produces
+    // `frameStoppedLoading` and no `loadEventFired`.
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.emit('Page.frameStartedLoading', { frameId: TOP_FRAME }, session);
+    chromium.emit('Page.frameStoppedLoading', { frameId: TOP_FRAME }, session);
+
+    expect((await driver.read()).ok).toBe(true);
+  });
+
+  it('ends a navigation that only changed the fragment, which loads no document', async () => {
+    /*
+     * The hash-routed single-page application: `browser_navigate` from
+     * `https://example.com/orders` to `https://example.com/orders#/settings` is
+     * a *same-document* navigation, and Chromium commits nothing for it.
+     *
+     * Measured on Chromium 141: such a navigation produces
+     * `frameStartedNavigating`, `frameStartedLoading`,
+     * `navigatedWithinDocument` and `frameStoppedLoading` — and never a
+     * `loadEventFired`. The fake deliberately withholds `frameStoppedLoading`
+     * here, because that event is a property of one browser build and this
+     * verb's answer must not be: what ends the wait is the event that says the
+     * address arrived.
+     *
+     * A verb that never came back would fail this by timing out, which is the
+     * honest shape for it.
+     */
+    const { driver } = await openAt('https://example.com/orders');
+    const session = chromium.sessionIds()[0] as string;
+    const fragment = 'https://example.com/orders#/settings';
+    chromium.sameDocumentOn.set(fragment, TOP_FRAME);
+
+    const at = await driver.navigate(fragment);
+
+    expect(at).toEqual({ ok: true, value: { url: fragment, title: 'Orders' } });
+    // No document was loaded, so nothing waited on the real clock either.
+    expect(chromium.called('Page.navigate').at(-1)).toEqual({ url: fragment });
+  });
+
+  it('does not let a page’s own pushState cut short a load somebody asked for', async () => {
+    /*
+     * The other side of the same rule. A navigation to a real document is under
+     * way; the page it is leaving calls `history.pushState` on a timer. That is
+     * not the answer to what `navigate` asked, and ending the wait on it would
+     * report the old page as though the new one had arrived.
+     */
+    const { driver } = await openAt('https://example.com/orders');
+    const session = chromium.sessionIds()[0] as string;
+
+    // Nothing is navigating: the wait below is `settle`'s, not `navigate`'s.
+    chromium.emit('Page.frameStartedLoading', { frameId: TOP_FRAME }, session);
+    chromium.emit(
+      'Page.navigatedWithinDocument',
+      { frameId: TOP_FRAME, url: 'https://example.com/orders#/late' },
+      session,
+    );
+    const reading = driver.read();
+    // Only a real end to the load lets the verb through.
+    await Promise.resolve();
+    chromium.emit('Page.loadEventFired', { timestamp: 1 }, session);
+
+    expect((await reading).ok).toBe(true);
+  });
+
+  it('does not leave the next verb waiting when the browser refuses the navigation', async () => {
+    // The wait is armed before `Page.navigate` is sent, deliberately — so a
+    // call that is rejected rather than answered has to release it. The socket
+    // dying mid-navigation is the case: the next verb must not pay for it.
+    const { driver } = await openAt();
+    chromium.navigationErrors.set('https://example.com/gone', 'Target closed.');
+
+    const refused = await driver.navigate('https://example.com/gone');
+    expect(reasonOf(refused)).toContain('Target closed.');
+    expect((await driver.read()).ok).toBe(true);
+  });
+});
+
 describe('a click whose navigation starts late', () => {
   it('waits a moment for it rather than reporting the page it left', async () => {
     /*
@@ -1450,6 +1824,38 @@ describe('the sweep on connecting', () => {
     // And the context it shares with this run's tab survives, because the run
     // is still using it.
     expect(chromium.targets.size).toBe(1);
+  });
+
+  it('leaves a frame of its own page alone, however out of process it is', async () => {
+    /*
+     * A cross-site iframe under site isolation is its own target, with its own
+     * target id and the *same* browser context as the page holding it. The rule
+     * used to be "any document target that is not a lease's page", which made
+     * every such frame a stranger: an agent looking at a page with an embedded
+     * map, a payment form or a video had it closed from under them on the next
+     * maintenance pass.
+     */
+    const browser = build();
+    await browser.driver().open('https://example.com/a');
+    const frame = chromium.addFrameTarget('ctx-1');
+
+    await browser.maintain();
+
+    expect(chromium.targets.has(frame)).toBe(true);
+    expect(chromium.contexts.has('ctx-1')).toBe(true);
+  });
+
+  it('closes a frame target in a context it does not own', async () => {
+    // The other side of the same rule. A frame belonging to a predecessor's
+    // page is as much a leftover as the page was.
+    const browser = build();
+    await browser.driver().open('https://example.com/a');
+    const stray = chromium.addFrameTarget('ctx-stray');
+
+    await browser.maintain();
+
+    expect(chromium.targets.has(stray)).toBe(false);
+    expect(chromium.contexts.has('ctx-stray')).toBe(false);
   });
 });
 

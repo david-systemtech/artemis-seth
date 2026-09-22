@@ -141,6 +141,11 @@ services:
       # normal block list: the public internet is open, and anything private is
       # shut unless you name it here. Cloud metadata addresses are refused
       # whatever this says.
+      #
+      # Both rules apply to every frame of a page and not only to the page, so
+      # a page that embeds an internal host is refused whole — a frame is as
+      # readable through browser_screenshot as the page around it. If you need
+      # such a page, the host goes here.
       # ARTEMIS_BROWSER_ALLOW_HOSTS: 'staging.internal,192.168.1.50'
     # Uncomment together with the `browser` service and the `networks` block at
     # the foot of this file. The server has to be on both networks: `default`
@@ -203,15 +208,19 @@ services:
 # (`http://artemis-server:3000` is the dev server the agent is testing).
 #
 # What it cannot do is filter what a *page* asks for. The server refuses to
-# navigate to a private address it was not told about, and re-checks after every
-# redirect — but an `<img src>` or a `fetch()` inside a loaded page happens in
-# Chromium's own network stack, below anything the DevTools protocol can veto
-# without putting an Artemis round trip in front of every subresource of every
-# page. If your network has things on it that an unauthenticated GET would
-# damage, the fence is at the network level and nowhere else: give the browser
-# an egress rule that allows the server and the public internet and denies the
-# rest of your private space. On plain Docker that is an iptables rule or a
-# proxy; under Kubernetes it is a NetworkPolicy. See docs/SERVER-BROWSER.md.
+# navigate to a private address it was not told about, re-checks after every
+# redirect, and judges every frame of the page including one the agent wrote
+# itself — but a `fetch`, an `XMLHttpRequest`, an `<img src>`, a stylesheet or a
+# beacon inside a loaded page happens in Chromium's own network stack, below
+# anything the DevTools protocol can veto without putting an Artemis round trip
+# in front of every subresource of every page. None of those renders anything or
+# is read back through a tool, so what they can do is reach an address rather
+# than report what is there — but it is still a GET your network will see. If
+# your network has things on it that an unauthenticated GET would damage, the
+# fence is at the network level and nowhere else: give the browser an egress
+# rule that allows the server and the public internet and denies the rest of
+# your private space. On plain Docker that is an iptables rule or a proxy; under
+# Kubernetes it is a NetworkPolicy. See docs/SERVER-BROWSER.md.
 # networks:
 #   browser:
 #     driver: bridge

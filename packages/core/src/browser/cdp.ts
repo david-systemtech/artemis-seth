@@ -40,6 +40,10 @@
  * socket closes. A browser that goes away mid-verb must produce a sentence the
  * agent can read; a promise that never settles would park the turn until the
  * run's own deadline hours later.
+ *
+ * That rule covers the discovery `GET` as well, and it has to: an endpoint that
+ * accepts a TCP connection and never answers `/json/version` is met *before*
+ * any of the above exists — see {@link defaultFetchJson}.
  */
 
 import { lookup } from 'node:dns/promises';
@@ -372,7 +376,13 @@ export async function resolveCdpEndpoint(configured: string, deps: EndpointDeps 
   // — including a bare `ws://host:port` — has to ask the browser for its UUID.
   if ((scheme === 'ws' || scheme === 'wss') && parsed.pathname.startsWith('/devtools/')) {
     const dialled = new URL(trimmed);
-    dialled.hostname = address;
+    // Bracketed, exactly as the discovery branch below does it, and for a
+    // reason that is invisible without it: `ws:` is a *special* scheme, so the
+    // WHATWG host parser refuses a bare IPv6 literal — and the `hostname`
+    // setter fails **silently**. It does not throw; it leaves the old host in
+    // place, so `ws://browser:9222/devtools/browser/<uuid>` behind an IPv6
+    // address would be dialled by the name the resolution was meant to remove.
+    dialled.hostname = bracketed(address);
     return dialled.toString();
   }
 
@@ -407,10 +417,54 @@ async function resolveAddress(host: string, deps: EndpointDeps): Promise<string>
   }
 }
 
+/**
+ * `GET` the discovery document, on a deadline.
+ *
+ * The deadline is the point. {@link resolveCdpEndpoint} is awaited on the
+ * connect path, *before* a {@link CdpConnection} exists, so it is outside
+ * everything the header's "a dead socket is an answer, not a hang" rule covers:
+ * an endpoint that accepts the TCP connection and then says nothing — a
+ * half-started container, a proxy holding the request open, a browser wedged
+ * before its HTTP server answers — would hang the run's first `browser_open`
+ * for as long as the run lives. The same ten seconds the socket handshake gets,
+ * because it is the same question asked one layer down.
+ *
+ * An `AbortController` and a timer rather than `AbortSignal.timeout`, which
+ * says this in one line. Two reasons, and the second is the one that decided
+ * it: this file already owns the idiom twice ({@link webSocketDialer} and
+ * `CdpConnection.call`), and `AbortSignal.timeout` schedules on Node's internal
+ * timers rather than the global `setTimeout`, so no test can reach it without
+ * spending the ten seconds for real.
+ *
+ * The timer is cleared only after the body has been read, so a response whose
+ * body never ends is bounded too — that is the shape a wedged proxy actually
+ * has, and a deadline on the headers alone would not catch it.
+ */
 async function defaultFetchJson(url: string): Promise<unknown> {
-  const response = await fetch(url, { headers: { accept: 'application/json' } });
-  if (!response.ok) {
-    throw new Error(`${url} answered ${String(response.status)}.`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, DIAL_TIMEOUT_MS);
+  // A pending discovery must not be the reason a server cannot exit.
+  timer.unref?.();
+  try {
+    const response = await fetch(url, {
+      headers: { accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`${url} answered ${String(response.status)}.`);
+    }
+    return await response.json();
+  } catch (error) {
+    // Said in the words the dialler uses for the same failure one layer up: an
+    // operator reading this has a browser that is reachable and not answering,
+    // which is a different fault from one that is not there at all.
+    if (controller.signal.aborted) {
+      throw new Error(`The browser at ${url} did not answer within 10 seconds.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-  return response.json();
 }

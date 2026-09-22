@@ -64,6 +64,16 @@ const log = createLogger('browser-tools');
 
 export type { BrowserToolContext } from './embeddedPageDriver.js';
 
+/**
+ * What the end of a run has to call.
+ *
+ * Re-exported from here because this is the seam the composition root already
+ * imports for browsers: `index.ts` should not have to know that the driver
+ * behind these tools is a file of its own. See `embeddedPageDriver.ts` on what
+ * accumulates on a tab without it.
+ */
+export { releaseEmbeddedDriver } from './embeddedPageDriver.js';
+
 /* -------------------------------------------------------------------------- */
 /* Results                                                                    */
 /* -------------------------------------------------------------------------- */

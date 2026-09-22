@@ -64,10 +64,26 @@
  * session, so this file installs exactly one observer per session and fans out
  * by `webContentsId` — see {@link SessionRecorder}. Nothing is recorded for a
  * tab no driver is watching.
+ *
+ * ## A driver is per run, and the run's end has to let go of it
+ *
+ * One driver is built for each run, and each one attaches two handlers and a
+ * buffer to the tab it drives. `close` is what takes them off again, and on
+ * this driver `close` does **not** end the page — the tab belongs to the user's
+ * dock and a conversation finishing is no reason to take a page away from
+ * someone reading it. Those two facts were run together once, into "the desktop
+ * never calls close", and the result was a `console-message` handler and a
+ * buffer per turn accumulating on one `webContents` in a process the user
+ * cannot restart without losing their work. So: `index.ts` subscribes to
+ * `run.end` and calls {@link releaseEmbeddedDriver}, and the page stays where
+ * it is.
  */
 
 import type { Session } from 'electron';
 
+// The one place the per-entry console bound lives, so this driver, the server's
+// and the renderer that prints them cannot drift into three numbers.
+import { MAX_ENTRY_CHARS } from '@rx-artemis/core';
 import {
   browserUrlFor,
   type BrowserId,
@@ -99,6 +115,15 @@ const LOAD_TIMEOUT_MS = 20_000;
  * limit in a process the user cannot restart without losing their work. The
  * oldest go first: what an agent asks about is nearly always what just
  * happened. Console keeps fewer because one entry can be a whole stack trace.
+ *
+ * The console bound is **entries × characters**, and it needs both halves. Two
+ * hundred entries is not two hundred lines' worth of memory: one `console.log`
+ * of a serialised application state is routinely a hundred kilobytes, which
+ * makes a full buffer twenty megabytes — in the process the user cannot restart
+ * without losing their work, and for a listing that would have shown the first
+ * two thousand characters of each. So each entry is clipped to
+ * {@link MAX_ENTRY_CHARS} as it is pushed, which is the number `pageTools.ts`
+ * renders with.
  */
 const MAX_CONSOLE = 200;
 const MAX_NETWORK = 400;
@@ -190,6 +215,18 @@ function push<T>(buffer: T[], entry: T, max: number): void {
 }
 
 /**
+ * One console entry's text, cut to the bound before it is kept.
+ *
+ * Cut here rather than only where the tools render it, because what sits
+ * between two `browser_console` calls sits in this process. The ellipsis is the
+ * same mark the renderer uses, so a clipped entry reads as clipped wherever it
+ * is seen.
+ */
+function clipped(text: string): string {
+  return text.length > MAX_ENTRY_CHARS ? `${text.slice(0, MAX_ENTRY_CHARS)}…` : text;
+}
+
+/**
  * One session's request observer, shared by every tab on that session.
  *
  * Exists because `webRequest`'s listeners are per session and single-slot: a
@@ -206,6 +243,8 @@ function push<T>(buffer: T[], entry: T, max: number): void {
 export class SessionRecorder {
   readonly #session: Session;
   readonly #buffers = new Map<number, NetworkEntry[]>();
+  /** Tab → how many drivers are watching it. See {@link watch}. */
+  readonly #watchers = new Map<number, number>();
   /** Request id → what was known when it went out, so a finish can be dated. */
   readonly #inFlight = new Map<number, { readonly at: number; readonly kind: string }>();
   #installed = false;
@@ -214,14 +253,31 @@ export class SessionRecorder {
     this.#session = session;
   }
 
-  /** Begin recording for a tab. Idempotent: watching twice keeps one buffer. */
+  /**
+   * Begin recording for a tab. Watching twice keeps one buffer, and counts.
+   *
+   * Counted because the drivers that watch a tab now let go of it — a run
+   * ending releases its driver, see {@link releaseEmbeddedDriver} — and two
+   * drivers can be watching the same tab at once. Without the count, the first
+   * of them to finish would delete the buffer the second is still filling, and
+   * `browser_network` would answer that run with nothing for the rest of its
+   * life. Balanced by construction: each {@link Watch} calls this once and its
+   * `release` calls {@link forget} once.
+   */
   watch(webContentsId: number): void {
     if (!this.#buffers.has(webContentsId)) this.#buffers.set(webContentsId, []);
+    this.#watchers.set(webContentsId, (this.#watchers.get(webContentsId) ?? 0) + 1);
     this.#install();
   }
 
-  /** Stop recording for a tab and let go of what it held. */
+  /** One watcher has finished. The buffer goes when the last one does. */
   forget(webContentsId: number): void {
+    const left = (this.#watchers.get(webContentsId) ?? 0) - 1;
+    if (left > 0) {
+      this.#watchers.set(webContentsId, left);
+      return;
+    }
+    this.#watchers.delete(webContentsId);
     this.#buffers.delete(webContentsId);
   }
 
@@ -364,14 +420,65 @@ const CONSOLE_LEVELS: Readonly<Record<string, ConsoleEntry['level']>> = {
 };
 
 /**
+ * Every driver a live run is holding, so the end of the run can release them.
+ * ============================================================================
+ *
+ * A driver is built **per run**, and each one it builds attaches a
+ * `console-message` handler, a `did-fail-load` handler and a console buffer to
+ * the tab — see {@link EmbeddedPageDriver.#listen}. Only {@link
+ * EmbeddedPageDriver.close} takes them off again, and nothing used to call it:
+ * the contract's `close` was read as "do not end the tab", which is right, and
+ * then also as "do nothing", which is not. A conversation's twentieth turn
+ * therefore left twenty `console-message` handlers on one `webContents`, twenty
+ * buffers filling in parallel, and a `webRequest` slot that no run would ever
+ * give back — in the process the user cannot restart without losing their work.
+ *
+ * A registry here rather than a field on the composition root because the
+ * factory is called when a run *starts* and has no hook for when it stops; the
+ * run's own event stream has one. `apps/desktop/main/index.ts` subscribes to
+ * `run.end` and calls {@link releaseEmbeddedDriver}, which is the same shape
+ * `apps/server/src/host.ts` uses to close a served run's tab.
+ *
+ * A `Set` per run and not one driver, because `browserToolServer` and
+ * {@link browserTools} may each build one for the same run and both of them
+ * listen.
+ */
+const liveDrivers = new Map<RunId, Set<EmbeddedPageDriver>>();
+
+/**
+ * A run has ended: let go of everything its drivers attached to the dock.
+ *
+ * Not a close of any tab, and that distinction is the whole point. The page
+ * stays exactly where the user can see it and keeps its place in their tab
+ * strip; what goes is the listening — see {@link EmbeddedPageDriver.close}.
+ *
+ * Safe to call for a run that never opened a browser, which is most of them.
+ */
+export function releaseEmbeddedDriver(runId: RunId): void {
+  const drivers = liveDrivers.get(runId);
+  // Deleted before the loop: releasing a driver takes it out of this map too,
+  // and mutating the entry while iterating it is how one gets missed.
+  liveDrivers.delete(runId);
+  if (drivers === undefined) return;
+  for (const driver of drivers) driver.release();
+}
+
+/**
  * One run's hands on the browser tab in the dock.
  *
  * Built per run by the composition root, closing over that run's id: a tool
  * therefore acts on the browser belonging to its own conversation, and the
  * model has no way to name a different one because no verb takes an id.
+ *
+ * Recorded in {@link liveDrivers} on the way out, so that the end of the run
+ * can take back what the driver attaches to the tab.
  */
 export function embeddedPageDriver(runId: RunId, context: BrowserToolContext): PageDriver {
-  return new EmbeddedPageDriver(runId, context);
+  const driver = new EmbeddedPageDriver(runId, context);
+  const live = liveDrivers.get(runId) ?? new Set<EmbeddedPageDriver>();
+  live.add(driver);
+  liveDrivers.set(runId, live);
+  return driver;
 }
 
 class EmbeddedPageDriver implements PageDriver {
@@ -573,15 +680,35 @@ class EmbeddedPageDriver implements PageDriver {
   /**
    * Let go of the tab without ending it.
    *
-   * Deliberately not a close. The tab belongs to the user's dock and has a tab
-   * in their strip; `BrowserHost.close` is the only thing that ends a page, and
-   * a conversation finishing is not a reason to take a page out from under
-   * someone who is reading it. What this releases is what the driver added:
-   * the console listener and the tab's slot in the session's recorder.
+   * Deliberately not a close **of the page**, and that is the only half of it
+   * that is deliberate. The tab belongs to the user's dock and has a tab in
+   * their strip; `BrowserHost.close` is the only thing that ends a page, and a
+   * conversation finishing is not a reason to take a page out from under
+   * someone who is reading it. What this releases is what the *driver* added:
+   * the console and load-failure listeners, its buffer, and the tab's slot in
+   * the session's recorder.
+   *
+   * It is called, and it used to not be — see {@link liveDrivers}. "The desktop
+   * does not end the tab" had quietly become "the desktop does not release",
+   * which left a handler and a buffer on the `webContents` for every turn of
+   * every conversation.
    */
   async close(): Promise<void> {
+    this.release();
+  }
+
+  /**
+   * The same thing, without the promise.
+   *
+   * {@link releaseEmbeddedDriver} runs inside an event subscription, which has
+   * nobody to await it and nothing to do with a rejection. Nothing below
+   * throws — `Watch.release` catches a destroyed `webContents` itself — so
+   * there is no promise here worth making.
+   */
+  release(): void {
     this.#watch?.release();
     this.#watch = null;
+    liveDrivers.get(this.#runId)?.delete(this);
   }
 
   /* ------------------------------------------------------------------ */
@@ -612,7 +739,7 @@ class EmbeddedPageDriver implements PageDriver {
         buffer,
         {
           level: CONSOLE_LEVELS[details.level] ?? 'log',
-          text: details.message,
+          text: clipped(details.message),
           ...(details.sourceId === ''
             ? {}
             : { source: `${details.sourceId}:${String(details.lineNumber)}` }),
@@ -652,12 +779,21 @@ class EmbeddedPageDriver implements PageDriver {
         try {
           contents.off('console-message', onConsole);
           contents.off('did-fail-load', onFailedLoad);
-          recorder.forget(contents.id);
         } catch (error) {
           // A `webContents` that has been destroyed throws on `off`. There is
           // nothing left to detach from in that case, which is the outcome
           // being asked for.
           log.debug('Could not detach from a browser tab', error);
+        } finally {
+          /*
+           * In a `finally`, because it is the half that is *not* on the tab.
+           * The recorder is a long-lived object on the session: its watcher
+           * count and its buffer for this tab outlive the `webContents`
+           * entirely, so throwing past this line leaked both — permanently, and
+           * exactly for the tabs most likely to hit it, the ones the user
+           * closed while an agent was driving them.
+           */
+          recorder.forget(contents.id);
         }
       },
     };

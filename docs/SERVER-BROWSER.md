@@ -111,6 +111,20 @@ So the rule is the opposite of a normal block list:
   `metadata.google.internal`. What is behind them is the host machine's own
   credentials, which is not something an operator can mean to allow.
 
+Those two sentences are about **every frame of the page, not only the page**. A
+frame is as readable through `browser_screenshot` — Chromium renders cross-origin
+frames into the same image — and as clickable through `browser_click`, which aims
+at viewport coordinates, as the page around it. And the agent can write one:
+`browser_evaluate` appending an `<iframe src="…">` is a navigation no tool call
+names. So a frame is judged exactly as the page is, and **a page one of whose
+frames is refused is refused whole**: the tab goes to `about:blank` and the agent
+is told on its next call. That does refuse a page for an address a third party
+embedded — there is nothing that could tell the agent's `<iframe>` from the
+document's — and for a browser sitting inside your network that is the right way
+round. A page you need that embeds an internal host is a host to put in
+`ARTEMIS_BROWSER_ALLOW_HOSTS`; the metadata list is the part of it with no
+switch.
+
 ### A name is not an address
 
 Applying those rules to the spelling of the host would be a spelling check:
@@ -130,19 +144,34 @@ times, to two different things.
    every load. This is the only one that catches a name which resolved publicly
    when Artemis looked and privately by the time the browser fetched it.
 
-Checked before navigating, on **every** navigation the browser makes — including
-a `<meta http-equiv="refresh">`, a `history.pushState`, or a timer calling
-`location.assign`, none of which any tool asked for — and again before every
-verb acts. A page that got somewhere it should not be is left on `about:blank`,
-and the agent is told on its next call.
+Checked before navigating, on **every** navigation the browser makes in **every**
+frame — including a `<meta http-equiv="refresh">`, a `history.pushState`, a timer
+calling `location.assign`, and an `<iframe>` that appears after the page has
+loaded, none of which any tool asked for — and again before every verb acts. A
+page that got somewhere it should not be is left on `about:blank`, and the agent
+is told on its next call.
+
+A cross-site frame under site isolation is a separate process with its own
+DevTools target, and it reports nothing on the page's own `Page` domain. The tab
+auto-attaches to those, so they are judged through the target they became rather
+than being invisible. What such a frame does not carry is the address it was
+served from, so it is held by its name and by the metadata list; a frame that
+stays in the page is held by its name **and** by the machine its own document
+really came from, which is the rebinding check one frame down.
 
 ### What that does not cover, and what does
 
 The policy gates **navigation**. It does **not** gate the requests a loaded page
-makes: an `<img src>` or a `fetch()` to a private address happens inside
-Chromium's own network stack, below anything the DevTools protocol lets a client
-veto without putting an Artemis round trip in front of every subresource of
-every page.
+makes for itself: a `fetch`, an `XMLHttpRequest`, an `<img src>`, a stylesheet,
+a font, a `sendBeacon`. Those reach an address without navigating anything, so
+none of the events above fires for them, and vetoing them would mean an Artemis
+round trip in front of every subresource of every page.
+
+That is a narrower hole than it sounds, and the difference is worth being plain
+about. A frame could be *read back* — rendered into a screenshot, clicked, typed
+into. A `fetch()` cannot: nothing renders it and no verb returns it, so what a
+sub-request can do is reach an address, not report what it found. It is still a
+`GET` your network will see.
 
 Nor can the third check say anything about a document with **no** remote
 address — a `data:` page, or one served from a cache. Those are held by the
@@ -224,6 +253,32 @@ hand on 2026-09-21:
   the fix is a relay in front — `socat TCP-LISTEN:9222,fork,reuseaddr
   TCP:127.0.0.1:9223` — which was measured to preserve everything the server
   needs.
+
+And on 2026-09-22, against the same headless shell:
+
+- **`--user-data-dir` is in the image's CMD and is not optional.** Since Chrome
+  136 a `--remote-debugging-port` is ignored unless a non-default profile
+  directory is given with it. The measurement does not settle it: started with
+  the port and *without* the flag, the headless shell opened the port in about a
+  second and created no `~/.config/chromium`, because it makes itself a
+  throwaway profile and so satisfies the rule without being told to. The image
+  runs the **full** browser under `--headless=new`, which uses the default
+  profile — the case the rule refuses. So the flag is reasoned from the rule and
+  from a binary that sidesteps it, and the only thing that would prove it is a
+  build of this image, which there is still no Docker here to do.
+- **A cross-site frame is its own target when site isolation is on.** Under
+  `--site-per-process` an iframe on another site reported no
+  `Page.frameNavigated` on the page's session and did not appear in
+  `Page.getFrameTree`; with `Target.setAutoAttach` it arrived as
+  `Target.attachedToTarget` with `type: "iframe"` and an empty url, and the url
+  followed on `Target.targetInfoChanged`, as did every later navigation of it.
+  Without site isolation — the headless shell's default — the same frame stayed
+  in the page's frame tree and reported `Page.frameNavigated` with a `parentId`.
+  The navigation policy handles both, because the image runs a browser that has
+  site isolation on and the test suite runs one that does not.
+- **`Page.frameStoppedLoading` for the top frame follows `loadEventFired`**, by
+  about a millisecond, which is what makes it safe to treat as a second way to
+  decide a page has settled rather than an earlier one.
 
 The driver itself is exercised against a real Chromium by
 `packages/core/src/browser/cdpBrowser.integration.test.ts`, which skips itself

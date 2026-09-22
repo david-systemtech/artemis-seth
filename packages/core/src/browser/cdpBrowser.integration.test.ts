@@ -200,6 +200,75 @@ function build(limits?: Record<string, unknown>): ServerBrowser {
   });
 }
 
+/** One Chromium this file started, and what is needed to reach it and end it. */
+interface StartedChromium {
+  readonly process: ChildProcess;
+  readonly port: number;
+  readonly profile: string;
+}
+
+/**
+ * Start a headless Chromium on a free port with a profile of its own.
+ *
+ * A function rather than inline setup because one of these tests needs a
+ * *second* browser with different switches — site isolation, which is on by
+ * default in the full browser the image ships and off in the headless shell
+ * this suite runs, so the only way to exercise an out-of-process frame here is
+ * to ask for it.
+ *
+ * `--user-data-dir` is not optional: since Chrome 136 a `--remote-debugging-port`
+ * against the default profile is ignored. See `docker/browser.Dockerfile`.
+ */
+async function startChromium(extra: readonly string[]): Promise<StartedChromium> {
+  const port = await freePort();
+  const profile = await mkdtemp(join(tmpdir(), 'artemis-browser-test-'));
+  const process_ = spawn(
+    CHROMIUM as string,
+    [
+      '--headless',
+      '--no-sandbox',
+      '--disable-gpu',
+      '--disable-dev-shm-usage',
+      ...extra,
+      `--remote-debugging-port=${String(port)}`,
+      `--user-data-dir=${profile}`,
+      'about:blank',
+    ],
+    { stdio: 'ignore' },
+  );
+  await until('the browser to answer on its DevTools port', async () => {
+    const response = await fetch(`http://127.0.0.1:${String(port)}/json/version`);
+    return response.ok;
+  });
+  return { process: process_, port, profile };
+}
+
+/**
+ * End one, leaving nothing behind.
+ *
+ * `SIGTERM` and then, only if it will not go, `SIGKILL`. Not an over-careful
+ * two-step: a Chromium killed outright leaves its zygote and its renderers
+ * behind, reparented and running, because the pipe they watch for the browser
+ * process's death is never closed. `SIGTERM` gives the browser process the
+ * chance to take its own children down, which is the difference between a test
+ * run that cleans up after itself and one that leaves half a gigabyte on the
+ * machine.
+ */
+async function stopChromium(process_: ChildProcess | null): Promise<void> {
+  if (process_ === null) return;
+  const ended = new Promise<void>((resolve) => process_.once('exit', () => resolve()));
+  process_.kill('SIGTERM');
+  await Promise.race([ended, new Promise((resolve) => setTimeout(resolve, 5_000))]);
+  process_.kill('SIGKILL');
+}
+
+/** What a browser has open, asked of its own HTTP endpoint. */
+async function targetsOn(port: number): Promise<{ type: string; url: string }[]> {
+  const response = await fetch(`http://127.0.0.1:${String(port)}/json/list`);
+  const list = (await response.json()) as { type: string; url: string }[];
+  return list.map(({ type, url }) => ({ type, url }));
+}
+
 async function value<T>(result: Promise<{ ok: boolean; value?: T; reason?: string }>): Promise<T> {
   const settled = await result;
   if (!settled.ok) throw new Error(`refused: ${settled.reason ?? ''}`);
@@ -252,6 +321,58 @@ beforeAll(async () => {
       );
       return;
     }
+    if (url === '/frame') {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><html><body><p>inside the frame</p></body></html>');
+      return;
+    }
+    if (url === '/cross-frame') {
+      /*
+       * A page holding a frame on another *site*, which is what site isolation
+       * keys on — a different port is not enough, as measured. Under
+       * `--site-per-process` this frame is a target of its own, sharing this
+       * page's browser context, which is the case the sweep has to leave alone.
+       */
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end(
+        '<!doctype html><html><head><title>Host</title></head><body><p>the host page</p>' +
+          `<iframe src="http://site-b.test:${String(sitePort)}/frame"></iframe></body></html>`,
+      );
+      return;
+    }
+    if (url === '/late-frame') {
+      /*
+       * A frame that starts loading *after* the page's load event.
+       *
+       * The shape of a lazy embed, an advert, or a frame an analytics script
+       * injects — and the shape that used to leave the page's loading flag set
+       * with nothing on the way to clear it, so every later verb waited out the
+       * twenty-second settle. Appended on `load` and then on a timer, so there
+       * is no ordering to be lucky about.
+       */
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end(
+        '<!doctype html><html><head><title>Late</title></head><body><p>the frame comes later</p>' +
+          '<script>window.addEventListener("load", function () {' +
+          '  setTimeout(function () {' +
+          '    var f = document.createElement("iframe");' +
+          '    f.id = "late"; f.src = "/frame";' +
+          '    document.body.appendChild(f);' +
+          '  }, 50);' +
+          '});</script></body></html>',
+      );
+      return;
+    }
+    if (url === '/secret') {
+      // Something a screenshot of would be worth taking: what a metadata
+      // endpoint answers with is plain text, and this stands in for it.
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end(
+        '<!doctype html><html><body style="margin:0;background:#000;color:#0f0;font-size:40px">' +
+          `<p>${'AKIA-NOT-A-REAL-CREDENTIAL '.repeat(40)}</p></body></html>`,
+      );
+      return;
+    }
     if (url === '/api/missing') {
       response.writeHead(404, { 'content-type': 'text/plain' });
       response.end('no');
@@ -265,56 +386,31 @@ beforeAll(async () => {
   });
   await new Promise<void>((resolve) => site?.listen(sitePort, '127.0.0.1', resolve));
 
-  cdpPort = await freePort();
-  profileDir = await mkdtemp(join(tmpdir(), 'artemis-browser-test-'));
-  chromium = spawn(
-    CHROMIUM,
-    [
-      '--headless',
-      '--no-sandbox',
-      '--disable-gpu',
-      '--disable-dev-shm-usage',
-      /*
-       * Chromium's own resolver, pointed at the test site for one name.
-       *
-       * This is what makes a real rebinding test possible: the driver is told
-       * (by an injected resolver) that `rebind.example` is public, and the
-       * browser really connects to 127.0.0.1 — which is the disagreement the
-       * `remoteIPAddress` check exists to catch, and the only way to produce it
-       * without an attacker's nameserver.
-       */
-      '--host-resolver-rules=MAP rebind.example 127.0.0.1',
-      `--remote-debugging-port=${String(cdpPort)}`,
-      `--user-data-dir=${profileDir}`,
-      'about:blank',
-    ],
-    { stdio: 'ignore' },
-  );
-
-  await until('the browser to answer on its DevTools port', async () => {
-    const response = await fetch(`http://127.0.0.1:${String(cdpPort)}/json/version`);
-    return response.ok;
-  });
+  /*
+   * Chromium's own resolver, pointed at the test site for two names.
+   *
+   * `rebind.example` is what makes a real rebinding test possible: the driver
+   * is told (by an injected resolver) that it is public, and the browser really
+   * connects to 127.0.0.1 — which is the disagreement the `remoteIPAddress`
+   * check exists to catch, and the only way to produce it without an attacker's
+   * nameserver.
+   *
+   * `metadata.google.internal` is what makes the frame test real: the name is
+   * on the list that has no switch, and pointing it at the test site means the
+   * frame genuinely loads and genuinely renders before the policy sees it —
+   * which is the situation being pinned, rather than a navigation that failed
+   * for want of a route.
+   */
+  const started = await startChromium([
+    '--host-resolver-rules=MAP rebind.example 127.0.0.1, MAP metadata.google.internal 127.0.0.1',
+  ]);
+  chromium = started.process;
+  profileDir = started.profile;
+  cdpPort = started.port;
 }, 60_000);
 
 afterAll(async () => {
-  /*
-   * `SIGTERM` and then, only if it will not go, `SIGKILL`.
-   *
-   * Not an over-careful two-step: a Chromium killed outright leaves its zygote
-   * and its renderers behind, reparented and running, because the pipe they
-   * watch for the browser process's death is never closed. `SIGTERM` gives the
-   * browser process the chance to take its own children down, which is the
-   * difference between a test run that cleans up after itself and one that
-   * leaves half a gigabyte on the machine.
-   */
-  if (chromium !== null) {
-    const process_ = chromium;
-    const ended = new Promise<void>((resolve) => process_.once('exit', () => resolve()));
-    process_.kill('SIGTERM');
-    await Promise.race([ended, new Promise((resolve) => setTimeout(resolve, 5_000))]);
-    process_.kill('SIGKILL');
-  }
+  await stopChromium(chromium);
   await new Promise<void>((resolve) => {
     if (site === null) {
       resolve();
@@ -435,6 +531,61 @@ when('every verb against a real Chromium', () => {
     await value(driver.navigate(`${origin}/`));
   });
 
+  it('is not held up by a frame that loads after the page did', async () => {
+    /*
+     * The twenty-second stall, against a real Chromium. `/late-frame` appends
+     * an iframe once the page's load event has been and gone, so the frame's
+     * `Page.frameStartedLoading` arrives with no `loadEventFired` left to clear
+     * it. Every verb from there used to wait out the full settle.
+     *
+     * Timed rather than merely awaited: a test that only asserted the answer
+     * would pass in twenty seconds, which is the bug.
+     */
+    const fresh = browser.driver();
+    await value(fresh.open(`${origin}/late-frame`));
+    // Long enough for the frame to have started, which is what breaks it.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    const began = Date.now();
+    const page = await value(fresh.read());
+    expect(page.text).toContain('the frame comes later');
+    expect(Date.now() - began).toBeLessThan(5_000);
+    await fresh.close();
+  }, 30_000);
+
+  it('comes straight back from a navigation that only changes the fragment', async () => {
+    /*
+     * The hash-routed single-page application, which is the ordinary case for
+     * anything built on a hash router: `browser_navigate` to
+     * `http://host/#/settings` from `http://host/` is a *same-document*
+     * navigation, and Chromium commits no new document for it.
+     *
+     * Timed rather than merely awaited, because the failure this guards is a
+     * verb that answers correctly and takes the full twenty-second settle to do
+     * it. Five seconds is far above what a local page takes and far below the
+     * timeout, so it separates the two without pinning a number.
+     *
+     * Worth knowing what this test does and does not distinguish. On Chromium
+     * 141 a fragment navigation also fires a top-frame
+     * `Page.frameStoppedLoading`, which ends the wait on its own — measured, and
+     * it is why this passes at about twenty milliseconds whether or not
+     * `Page.navigatedWithinDocument` is wired to end it. What this pins is the
+     * outcome against a real browser; the fake-CDP suite is where the wiring
+     * itself is pinned, by withholding the event this build happens to send.
+     */
+    await value(driver.navigate(`${origin}/`));
+    const began = Date.now();
+    const at = await value(driver.navigate(`${origin}/#/settings`));
+    expect(at.url).toBe(`${origin}/#/settings`);
+    expect(Date.now() - began).toBeLessThan(5_000);
+
+    // And again, fragment to fragment, which commits even less.
+    const second = Date.now();
+    expect((await value(driver.navigate(`${origin}/#/orders`))).url).toBe(`${origin}/#/orders`);
+    expect(Date.now() - second).toBeLessThan(5_000);
+    await value(driver.navigate(`${origin}/`));
+  }, 60_000);
+
   it('refuses a selector that matches nothing, in a sentence', async () => {
     expect(await refusal(driver.click('.absent'))).toBe('Nothing matches .absent on this page.');
   });
@@ -516,6 +667,39 @@ when('every verb against a real Chromium', () => {
   it('says what the page threw rather than answering nothing', async () => {
     expect(await refusal(driver.evaluate('missingThing.go()'))).toContain('ReferenceError');
   });
+
+  it('bounds an expression that never finishes, whichever way it does not', async () => {
+    /*
+     * Both shapes, against the real browser, because CDP bounds one of them and
+     * not the other. Measured on Chromium 141 with `timeout: 1000`:
+     * `while (true) {}` rejects after 1008 ms with `-32603 Internal error`, and
+     * `new Promise(() => {})` under `awaitPromise` never answers at all —
+     * `timeout` bounds execution, not the wait for a promise to settle. The
+     * second is the one an agent writes by accident.
+     *
+     * Fifteen seconds is above the driver's ten-second deadline and below
+     * `CdpConnection`'s thirty, so this fails if either bound is the one doing
+     * the work. The loop is expected to come back at about ten and the promise
+     * at about ten; both are asserted the same way because to the agent they
+     * are the same fact.
+     */
+    const fresh = browser.driver();
+    await value(fresh.open(`${origin}/`));
+    try {
+      for (const expression of ['while (true) {}', 'new Promise(() => {})']) {
+        const began = Date.now();
+        const said = await refusal(fresh.evaluate(expression));
+        expect(said).toContain('did not finish within 10 seconds');
+        expect(Date.now() - began).toBeLessThan(15_000);
+      }
+
+      // And the page really is unharmed, which is what the refusal claims.
+      expect(await value(fresh.evaluate('1 + 1'))).toBe(2);
+      expect((await value(fresh.read())).text).toContain('Orders');
+    } finally {
+      await fresh.close();
+    }
+  }, 60_000);
 
   it('says so when a value cannot cross the protocol', async () => {
     // Chromium refuses these at the protocol level rather than answering with
@@ -661,6 +845,65 @@ when('the navigation policy against a real redirect', () => {
     }
   }, 30_000);
 
+  it('refuses the page when the agent puts a metadata address in a frame', async () => {
+    /*
+     * The bypass the top-frame-only policy had, end to end. Nothing hostile is
+     * on the page: `browser_evaluate` writes the `<iframe>` itself, the frame
+     * really loads, and before this it was invisible to every gate while
+     * staying perfectly readable — `Page.captureScreenshot` renders cross-origin
+     * frames, and `Input.dispatchMouseEvent` aims at viewport coordinates.
+     */
+    const driver = browser.driver();
+    await value(driver.open(`${origin}/`));
+    await value(
+      driver.evaluate(
+        `document.body.insertAdjacentHTML('beforeend', '<iframe id="sneaky" width="1280" height="800" src="http://metadata.google.internal:${String(sitePort)}/secret"></iframe>')`,
+      ),
+    );
+    // The frame loads and arrives; nothing Artemis did is waiting on it.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    const said = await refusal(driver.read());
+    expect(said).toContain('A frame inside the page loaded');
+    expect(said).toContain('metadata.google.internal');
+    expect(said).toContain('cloud metadata address');
+
+    // Really blanked, rather than loaded with the agent merely told not to look.
+    const at = await value(driver.open());
+    expect(at.url).toBe('about:blank');
+    expect(await value(driver.evaluate('document.querySelectorAll("iframe").length'))).toBe(0);
+
+    /*
+     * And what a screenshot holds now is an empty tab rather than that
+     * document. Measured here on Chromium 141: the `/secret` page fills the
+     * viewport and comes back as about 246 kB of JPEG, and a blank tab as
+     * 6.8 kB, so twenty kilobytes separates the two by a wide margin without
+     * pinning an exact encoder output.
+     */
+    const image = await value(driver.screenshot());
+    expect(Buffer.from(image.data, 'base64').length).toBeLessThan(20_000);
+    await driver.close();
+  }, 30_000);
+
+  it('refuses the page when a frame reaches an internal host nobody named', async () => {
+    // The same rule for the ordinary case: `localhost` reaches the same test
+    // site as `127.0.0.1` and is deliberately not on this browser's allow-list,
+    // so it is an address that is genuinely reachable and genuinely refused.
+    const driver = browser.driver();
+    await value(driver.open(`${origin}/`));
+    await value(
+      driver.evaluate(
+        `document.body.insertAdjacentHTML('beforeend', '<iframe src="http://localhost:${String(sitePort)}/frame"></iframe>')`,
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    const said = await refusal(driver.read());
+    expect(said).toContain('A frame inside the page loaded');
+    expect(said).toContain('inside the operator’s own network');
+    await driver.close();
+  }, 30_000);
+
   it('refuses a cloud metadata address whatever the allow-list says', async () => {
     const allowing = createServerBrowser({
       endpoint: `http://127.0.0.1:${String(cdpPort)}`,
@@ -766,6 +1009,62 @@ when('the lifecycle rules against a real Chromium', () => {
       await browser.dispose();
     }
   }, 30_000);
+
+  it('leaves a real out-of-process frame alone when it sweeps', async () => {
+    /*
+     * A second browser, with site isolation asked for.
+     *
+     * The headless shell this suite runs has it off, and off it a cross-site
+     * iframe stays inside the page and is not a target at all — so the bug
+     * being pinned is unreachable without `--site-per-process`. The full
+     * Chromium the image ships has it on by default, which is the deployment
+     * this matters on.
+     *
+     * The sweep used to own targets by "is it a lease's page?", which made
+     * every such frame a stranger and closed it on the next maintenance pass,
+     * within thirty seconds, from under an agent that was reading the page.
+     */
+    const isolated = await startChromium([
+      '--site-per-process',
+      '--host-resolver-rules=MAP site-a.test 127.0.0.1, MAP site-b.test 127.0.0.1',
+    ]);
+    try {
+      const browser = createServerBrowser({
+        endpoint: `http://127.0.0.1:${String(isolated.port)}`,
+        timers,
+        // Both names are the test site, and both are named so that the frame is
+        // refused by nothing: what is under test here is the sweep, not the
+        // policy. The resolver is injected for the same reason — these names
+        // exist only inside Chromium's own resolver rules.
+        limits: { allowHosts: ['127.0.0.1', 'site-a.test', 'site-b.test'] },
+        resolveHost: async (host) => (host.endsWith('.test') ? ['127.0.0.1'] : ['203.0.113.10']),
+      });
+      try {
+        const driver = browser.driver();
+        await value(driver.open(`http://site-a.test:${String(sitePort)}/cross-frame`));
+        await new Promise((resolve) => setTimeout(resolve, 800));
+
+        // The frame really is its own target, which is what makes the rest of
+        // this test mean anything.
+        const before = await targetsOn(isolated.port);
+        expect(before.filter((one) => one.type === 'iframe').map((one) => one.url)).toEqual([
+          `http://site-b.test:${String(sitePort)}/frame`,
+        ]);
+
+        await browser.maintain();
+
+        expect(await targetsOn(isolated.port)).toEqual(before);
+        // And the page it belongs to is still there and still readable.
+        expect((await value(driver.read())).text).toContain('the host page');
+        await driver.close();
+      } finally {
+        await browser.dispose();
+      }
+    } finally {
+      await stopChromium(isolated.process);
+      await rm(isolated.profile, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   it('leaves the browser running when it shuts down, and takes its own tabs with it', async () => {
     const browser = build();
