@@ -548,3 +548,114 @@ describe('the agent answering the question', () => {
     expect(seen[0]?.browserId).toBeUndefined();
   });
 });
+
+describe('a run the user pinned to one browser', () => {
+  /*
+   * The `browser` argument answers a question, and a conversation somebody set
+   * in the picker was never asked one. If a model could move it, a page the
+   * agent is reading could get the next turn run as a different signed-in
+   * person — and on the desktop the move is written back into the pane, so it
+   * would outlive the turn that made it.
+   */
+  it('refuses to be moved onto another browser by a tool call', async () => {
+    const { host, seen } = fakeHost(
+      { status: 'answered', result: { ok: true, value: { url: '', title: '' } } },
+      [WORK, PERSONAL],
+    );
+    const driver = extensionPageDriver(RUN, host, { browser: 'b-work' });
+
+    const result = await driver.open('https://example.com', 'Personal');
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toContain('“Work”');
+    expect(result.reason).toContain('“Personal”');
+    expect(result.reason).toContain('Do not work around this');
+    // And nothing was driven: not the browser it named, and not the one it has.
+    expect(seen).toEqual([]);
+  });
+
+  it('carries on in the browser it was pinned to afterwards', async () => {
+    const { host, seen } = fakeHost(
+      { status: 'answered', result: { ok: true, value: { url: '', title: '' } } },
+      [WORK, PERSONAL],
+    );
+    const driver = extensionPageDriver(RUN, host, { browser: 'b-work' });
+
+    await driver.open(undefined, 'Personal');
+    await driver.read();
+
+    expect(seen.map((one) => one.browserId)).toEqual(['b-work']);
+  });
+
+  it('tells nobody a browser was chosen, because none was', async () => {
+    // The push that moves a pane is for an answer to a question. A refused
+    // move is not one, and a pane that adopted it would have been moved by the
+    // model after all.
+    const chosen: string[] = [];
+    const { host } = fakeHost(
+      { status: 'answered', result: { ok: true, value: { url: '', title: '' } } },
+      [WORK, PERSONAL],
+    );
+
+    await extensionPageDriver(RUN, host, {
+      browser: 'b-work',
+      onChosen: (browserId) => chosen.push(browserId),
+    }).open(undefined, 'Personal');
+
+    expect(chosen).toEqual([]);
+  });
+
+  it('lets the model name the browser it is already on, by id or by name', async () => {
+    // Not a move, so not a refusal: a model repeating what it was told would
+    // otherwise learn that its own answer had not taken.
+    const { host, seen } = fakeHost(
+      { status: 'answered', result: { ok: true, value: { url: '', title: '' } } },
+      [WORK, PERSONAL],
+    );
+    const driver = extensionPageDriver(RUN, host, { browser: 'b-work' });
+
+    const byName = await driver.open(undefined, 'Work');
+    const byId = await driver.open(undefined, 'b-work');
+
+    expect(byName.ok).toBe(true);
+    expect(byId.ok).toBe(true);
+    expect(seen.map((one) => one.browserId)).toEqual(['b-work', 'b-work']);
+  });
+
+  it('refuses a second, different answer once the agent has answered once', async () => {
+    const { host, seen } = fakeHost(
+      { status: 'answered', result: { ok: true, value: { url: '', title: '' } } },
+      [WORK, PERSONAL],
+    );
+    const driver = extensionPageDriver(RUN, host);
+
+    await driver.open(undefined, 'Work');
+    const again = await driver.open(undefined, 'Personal');
+
+    expect(again.ok).toBe(false);
+    expect(seen.map((one) => one.browserId)).toEqual(['b-work']);
+  });
+
+  it('says the conversation’s browser is gone rather than moving onto a live one', async () => {
+    /*
+     * A pinned browser that has been unpaired. The more useful of the two
+     * sentences is the one about the browser this conversation lost — telling
+     * the user to choose again — rather than one about the browser the model
+     * happened to name.
+     */
+    const { host, seen } = fakeHost(
+      { status: 'answered', result: { ok: true, value: { url: '', title: '' } } },
+      [PERSONAL],
+    );
+    const driver = extensionPageDriver(RUN, host, { browser: 'b-work' });
+
+    const result = await driver.open(undefined, 'Personal');
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toContain('no longer paired');
+    expect(seen).toEqual([]);
+  });
+});
+

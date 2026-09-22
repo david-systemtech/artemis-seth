@@ -51,6 +51,12 @@
  * sentence reaches the model unchanged, and the model's answer comes back as a
  * name on `browser_open`. A name and an id look alike from here, and that is
  * fine: this file passes whichever it was given, and the client resolves it.
+ *
+ * The answer is taken once, and only for a run that arrived without a browser.
+ * A caller who sent `artemis.extensionBrowserId` pinned that conversation to
+ * one of their own browsers, and a model that could move it afterwards could
+ * act as a different signed-in person because a page it was reading suggested
+ * it. See {@link RelayedPageDriver.open}.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -106,6 +112,21 @@ const NO_CLIENT =
   'started it from — so it is reachable only while their Artemis is running ' +
   'and connected. Ask them to open Artemis, and say when it is back. Until ' +
   'then you have no browser at all — do not describe pages you have not seen.';
+
+/**
+ * What the model is told when it names a browser for a conversation that
+ * already has one.
+ *
+ * Unnamed on purpose, unlike the desktop driver's version of this sentence.
+ * The selector in force here may be an id the caller's client issued, and this
+ * machine has never seen the list that would turn it into a name — printing
+ * the id instead would be a sentence the user cannot read either.
+ */
+const ALREADY_CHOSEN =
+  'This conversation is already set to one of the browsers on the user’s machine, ' +
+  'so it cannot be moved to another one from here. Carry on in the browser it has, ' +
+  'or tell the user what you wanted the other one for — changing it is done in the ' +
+  'conversation’s own Browser row, by them. Do not work around this.';
 
 function timedOut(seconds: number): string {
   return (
@@ -312,7 +333,8 @@ class RelayedPageDriver implements PageDriver {
   }
 
   /**
-   * Open this run's page, and take the agent's answer to "which browser?".
+   * Open this run's page, and take the agent's answer to "which browser?" —
+   * once, and only for a run that had no browser.
    *
    * Remembered here, on the server, rather than on the client: the client
    * builds a driver per relayed call and holds nothing between them, so the
@@ -320,10 +342,23 @@ class RelayedPageDriver implements PageDriver {
    * kept even when the open then fails, for the reason the desktop's driver
    * keeps it — a name that was answered is an answer, and a page that would not
    * load is a page.
+   *
+   * A run that arrived with `artemis.extensionBrowserId` was never asked the
+   * question, so the argument is refused for it: the caller pinned that
+   * conversation to one of their browsers, and a model that could move it
+   * could act as a different signed-in person because a page suggested it.
+   * Repeating the selector already in force is not a move and carries on
+   * quietly; comparison is textual, because the two spellings a selector can
+   * have — an id and a name — are only comparable on the client.
    */
   async open(url?: string, browser?: string): Promise<DriverResult<PageLocation>> {
     const named = browser?.trim() ?? '';
-    if (named.length > 0) this.#browser = named;
+    if (named.length > 0) {
+      if (this.#browser === null) this.#browser = named;
+      else if (this.#browser.trim().toLowerCase() !== named.toLowerCase()) {
+        return { ok: false, reason: ALREADY_CHOSEN };
+      }
+    }
     return this.#ask<PageLocation>(
       url === undefined ? { verb: 'open' } : { verb: 'open', url },
       LOAD_TIMEOUT_MS,
@@ -392,4 +427,4 @@ class RelayedPageDriver implements PageDriver {
 }
 
 /** The refusal sentences, exported for the tests that pin them. */
-export const RELAY_REFUSALS = { NO_CLIENT, timedOut } as const;
+export const RELAY_REFUSALS = { NO_CLIENT, timedOut, ALREADY_CHOSEN } as const;

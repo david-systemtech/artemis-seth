@@ -301,16 +301,57 @@ describe('the browser a served run drives', () => {
     expect(published.at(-1)?.call.browserId).toBe('Personal');
   });
 
-  it('replaces a browser the run started with when the agent names another', async () => {
-    // A conversation set to "whichever is open" that then asked is the common
-    // case; a conversation pointed at one that then asked is a user changing
-    // their mind mid-turn, and the most recent statement wins.
+  it('refuses to move a run the caller pinned, and drives nothing while refusing', async () => {
+    /*
+     * The argument answers a question, and a run that arrived with
+     * `artemis.extensionBrowserId` was never asked one. A model that could
+     * move such a conversation could act as a different signed-in person
+     * because a page it was reading suggested it — so the open does not happen
+     * at all, in the browser it named or in the one it has.
+     */
     const { relay, published } = relayWatching();
     const driver = relay.driverFor('conn-a', 'run-1', 'b-work');
 
-    void driver.open(undefined, 'Personal');
+    const result = await driver.open(undefined, 'Personal');
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe(RELAY_REFUSALS.ALREADY_CHOSEN);
+    expect(published).toHaveLength(0);
+  });
+
+  it('keeps driving the pinned browser after refusing the move', async () => {
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1', 'b-work');
+
+    await driver.open(undefined, 'Personal');
+    void driver.read();
+
+    expect(published.at(-1)?.call.browserId).toBe('b-work');
+  });
+
+  it('lets the agent name the same browser again, which is not a move', async () => {
+    // A model repeating its own answer has asked for nothing, and refusing it
+    // would teach it that its answer did not take.
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1', 'Personal');
+
+    void driver.open(undefined, '  personal ');
 
     expect(published.at(-1)?.call.browserId).toBe('Personal');
+  });
+
+  it('refuses a second, different answer from a run that already answered once', async () => {
+    // The question is asked once and answered once. Nothing asked again, so a
+    // second name is not an answer to anything.
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1');
+
+    void driver.open(undefined, 'Work');
+    const again = await driver.open(undefined, 'Personal');
+
+    expect(again.ok).toBe(false);
+    expect(published.at(-1)?.call.browserId).toBe('Work');
   });
 
   it('ignores an empty name, which is not a choice', async () => {

@@ -40,7 +40,9 @@
  * *page* is broken, which sends it looking for a bug that is not there.
  *
  * The last of the six is the only refusal here that asks for something. See
- * {@link chooseBrowser}.
+ * {@link chooseBrowser}. There is a seventh that is not about the browser
+ * being unreachable at all — see {@link alreadyChosen}, which is about who is
+ * allowed to decide.
  *
  * ## Which browser, and how it is named
  *
@@ -50,6 +52,12 @@
  * it. A driver holds a *selector* rather than an id: the picker supplies an id,
  * a model answering "which browser?" supplies a name, and this file resolves
  * either against the bridge's list. The bridge itself only ever sees an id.
+ *
+ * A model may name a browser **once**, and only for a run that had none. The
+ * argument is an answer to a question, not a control: a conversation the user
+ * pinned to their work profile must not be moved to their personal one by a
+ * tool call, because the thing asking for the move may be a page the agent is
+ * reading. See {@link ExtensionPageDriver.open}.
  *
  * ## Timeouts are per verb, not per driver
  *
@@ -303,6 +311,26 @@ function chooseBrowser(names: readonly string[]): string {
   );
 }
 
+/**
+ * What the model is told when it names a browser for a conversation that
+ * already has one.
+ *
+ * The argument answers a question, and this conversation was not asked one:
+ * somebody chose its browser in the picker, or answered the question already.
+ * Either way that is a statement about whose logins this conversation acts
+ * with, made by the only party entitled to make it — so the remedy named here
+ * is the control the *user* has, and the model is told plainly that the choice
+ * is not its own to change.
+ */
+function alreadyChosen(current: string, asked: string): string {
+  return (
+    `This conversation is set to the browser called ${quoted(current)}, so it cannot ` +
+    `be moved to ${quoted(asked)} from here. Carry on in ${quoted(current)}, or tell the ` +
+    'user what you wanted the other browser for — changing it is done in the ' +
+    'conversation’s own Browser row, by them. Do not work around this.'
+  );
+}
+
 /** A name inside the curly quotes the rest of Artemis's copy uses. */
 function quoted(text: string): string {
   return `“${text}”`;
@@ -399,8 +427,16 @@ class ExtensionPageDriver implements PageDriver {
   }
 
   /**
-   * Open this run's page, and — the first time the agent names one — decide
-   * which browser the rest of the conversation happens in.
+   * Open this run's page, and — the first time the agent names one, and only
+   * then — decide which browser the rest of the conversation happens in.
+   *
+   * **Once.** The `browser` argument exists to answer a question Artemis
+   * asked, and a run that already has a browser was not asked one. Honouring
+   * it a second time would let a model move a conversation the user pinned to
+   * their work profile onto their personal one — and on the desktop that
+   * choice is written back into the pane, so every later turn would run there
+   * too. A page the agent is reading is untrusted input, and "move to the
+   * other browser" is a thing a page could ask for.
    *
    * The choice is taken before the verb rather than after it, and it sticks
    * even when the open then fails. A name that resolved is the user's answer
@@ -413,8 +449,25 @@ class ExtensionPageDriver implements PageDriver {
     if (named !== null) {
       const found = this.#find(named);
       if (found === null) return { ok: false, reason: this.#unknownBrowser(named) };
-      this.#browser = found.browserId;
-      this.#onChosen?.(found.browserId);
+      if (this.#browser === null) {
+        this.#browser = found.browserId;
+        this.#onChosen?.(found.browserId);
+      } else {
+        /*
+         * Already set. Naming the *same* browser is not a move and carries on
+         * in silence — a model that repeats its own answer has not asked for
+         * anything. Naming another one is refused.
+         *
+         * A pinned browser that no longer resolves falls through instead of
+         * refusing here, so the model gets `#send`'s sentence about the
+         * browser this conversation lost rather than one about the browser it
+         * just named. That is the more useful of the two.
+         */
+        const current = this.#find(this.#browser);
+        if (current !== null && current.browserId !== found.browserId) {
+          return { ok: false, reason: alreadyChosen(current.browserName, found.browserName) };
+        }
+      }
     }
     return this.#send<PageLocation>(
       url === undefined ? { verb: 'open' } : { verb: 'open', url },
@@ -596,4 +649,5 @@ export const EXTENSION_REFUSALS = {
   noSuchBrowser,
   browserAsleep,
   chooseBrowser,
+  alreadyChosen,
 } as const;
