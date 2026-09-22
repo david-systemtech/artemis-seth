@@ -1,6 +1,26 @@
 Internal build — unsigned, on purpose. Every artifact here is built on the
 machine it targets, and boots before it ships.
 
+## What's new in 2.20.0
+
+Any conversation can drive a browser you are signed in to, through an Artemis extension of our own. Also: a Chrome switch that reaches the CLI at last, a rewind that starts over, panes you can drag, and a message you sent mid-turn no longer vanishing on read now.
+
+**A browser of your own, for any conversation.** Settings > Browser offers the Artemis extension as a zip to load unpacked in Chrome, and pairs it with a short code shown once. From then on the extension connects to Artemis on this machine only, proves the pairing on every connection, and works in a tab group of its own that is closed when the conversation ends. Claude, Codex or a local model, on this machine or served from an Artemis Server, can open, read, click, type, screenshot and read the console, cookies and errors of a page there, as the account that browser is signed in to. On a served conversation the agent on the server acts and the client that started the run passes it on, with a switch on the server to refuse that. The rules live in the browser rather than being trusted from the caller: full access on development sites you list, read-only elsewhere, a block list you can edit, and JavaScript only where you allow it.
+
+**More than one Chrome.** Each pairing has a name you give it, so a work profile and a personal one are told apart. The Browser row in a conversation's menu offers each by name, or "whichever is open". With nothing chosen and two connected, the agent is told to ask you which, and the answer is kept for the conversation. A conversation set to one browser cannot be moved to another by the agent; changing it is yours to do from that row.
+
+**A server can have a browser too.** Artemis Server can drive a Chromium of its own, in a container beside it, with the same tools and rules, and a heap watchdog, tab and context limits so it cannot run away with the machine. The design and the settings are in `docs/SERVER-BROWSER.md`.
+
+**The Chrome switch reaches the CLI.** The window's Chrome switch, fast mode, ultracode and "open in my browser" were dropped on the way to a local run, and a served run could not ask for Chrome at all. All four now arrive, and a served run can ask for Claude's own Chrome when the operator allows it. A Chrome signed in to a different account is named as such, rather than the run failing silently.
+
+**Rewinding to the first message starts over.** It used to error, since nothing comes before the first prompt. It now opens a new conversation with the message back in the composer. A turn followed by a background task's report can be rewound as well.
+
+**Drag a pane by its caption.** With several conversations open, a pane's caption is a drag handle: drop it on the centre of another pane to swap, on the left or right edge to sit beside it, on the top or bottom edge for a row of its own.
+
+**The message you send mid-turn survives read now.** On a served conversation, sending a message while the agent was working and pressing read now rebuilt the transcript without that message. The seam between the stored history and the live run was counted a few milliseconds early, so the message fell on neither side. It is now pinned to the message itself.
+
+**Update the server with the app:** the served browser relay, the server-side Chrome switch, the multi-browser selector and the read-now fix all run on the server, and reach a served conversation only from a 2.20.0 server.
+
 ## What's new in 2.19.1
 
 Two fixes for things that looked as though the agent had said, or done, something it had not.
