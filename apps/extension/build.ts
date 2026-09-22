@@ -194,8 +194,11 @@ function crc32(buffer: Buffer): number {
 
 /* -------------------------------------------------------------------------- */
 
-// `pnpm --filter @rx-artemis/extension build` lands here.
-if (process.argv[1] !== undefined && import.meta.url === `file://${process.argv[1]}`) {
+// `pnpm --filter @rx-artemis/extension build` lands here. Compared as URLs,
+// because `argv[1]` is a path and `import.meta.url` is a URL: on Windows the
+// path is `C:\…` and the URL is `file:///C:/…`, and a string comparison of the
+// two never matched, so `tsx build.ts` there exited 0 having built nothing.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const out = await buildExtension();
   process.stdout.write(`extension built into ${out}\n`);
 }
