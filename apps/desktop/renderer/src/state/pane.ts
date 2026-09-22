@@ -68,6 +68,7 @@ import type {
   SessionSummary,
   UsageSnapshot,
 } from '@rx-artemis/protocol';
+import type { BrowserMode } from './browserChoice';
 import type { WorkspaceNames } from '../lib/extensions';
 import { detectArtifact } from '../lib/artifact';
 import { detectFileEdit } from '@rx-artemis/transcript';
@@ -255,6 +256,20 @@ export interface SessionState extends MirroredState {
   readonly fastMode: boolean;
   /** Ask the next run to spend materially more compute, where supported. */
   readonly ultracode: boolean;
+  /**
+   * Which browser *this conversation* drives, or `null` to follow the window.
+   *
+   * `null` and "the same as the window's" are deliberately different states.
+   * A conversation that never expressed a preference keeps following the
+   * window's when that changes; one that chose the dock browser keeps the dock
+   * browser. It is also what makes the per-conversation reach setting mean
+   * anything: under it, a window set to the paired Chrome hands it to the
+   * conversations that asked and to no others. See `browserChoice.ts`.
+   *
+   * Pane state and not window state, unlike the default beside it, because
+   * this is the one browser question that *is* per conversation.
+   */
+  readonly browserMode: BrowserMode | null;
 
   readonly forkOnResume: boolean;
   readonly resumeSessionId: SessionId | null;

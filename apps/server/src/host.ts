@@ -30,8 +30,10 @@
  *    attended work no longer has to.
  */
 
+import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+
 
 import type {
   AgentEvent,
@@ -55,6 +57,7 @@ import {
 import {
   RunError,
   checkAuthStatus,
+  createBrowserRelay,
   createCatalogue,
   createDefaultProviderRegistry,
   createPushFeed,
@@ -92,6 +95,7 @@ import {
   type PushFeed,
   type RemoteAccessEvent,
   type RemoteRunGuard,
+  type BrowserRelay,
   type RunSource,
   type ServerProfileRecord,
   type ServerBrowser,
@@ -170,6 +174,13 @@ export interface HeadlessHost {
   readonly skillsAdmin: SkillsAdmin;
   /** Every push the server can stream to a remote client. See `server/feed.ts`. */
   readonly feed: PushFeed;
+  /**
+   * Where a served run's browser verbs go, and where their answers arrive.
+   *
+   * Handed to `createArtemisServer` so the answer route can settle a call. See
+   * `server/browserRelay.ts`.
+   */
+  readonly browserRelay: BrowserRelay;
   /** Interrupt-on-disconnect for bridge-started runs. See `server/guard.ts`. */
   readonly guard: RemoteRunGuard;
   /**
@@ -337,13 +348,31 @@ export function createHeadlessHost(
      */
     historyLimit: 50_000,
     /*
-     * Where a served run's browser tab is closed. See `runBrowsers` below on
-     * why the tab cannot simply wait for the idle rule: it holds one of the
-     * server's two browser contexts, and a conversation taking three turns
-     * would otherwise meet a limit meant for three conversations.
+     * The one hook that tells a tool server its run is over.
+     *
+     * Nothing in the `agentToolServers` seam does: the factory is called when
+     * a run starts and is handed the run id and its input, and there is no
+     * matching call when the run stops — so a `PageDriver` built there is
+     * never closed by anything the seam knows about. For the relayed browser
+     * that means a tab left open in the user's Chrome per served conversation,
+     * for ever. The server's own browser has the same need for a different
+     * reason - see `runBrowsers` below: its tab holds one of a small number of
+     * contexts, and a conversation taking three turns would otherwise meet a
+     * limit meant for three conversations.
+     *
+     * `releaseRelayedBrowser` is declared below and captured, not called,
+     * until a run ends — which is necessarily long after both exist. Same
+     * arrangement the `onContinuation` wiring above uses, and for the same
+     * reason: the registry and the things that read it are mutually recursive
+     * and one of them has to be second.
      */
     onLifecycle: (event) => {
-      if (event.kind === 'run.ended') releaseBrowser(String(event.runId));
+      if (event.kind === 'run.ended') {
+        // Both browsers a served run can hold, whichever it had: a tab in the
+        // caller's own Chrome, and a context in the server's headless one.
+        releaseRelayedBrowser(String(event.runId));
+        releaseBrowser(String(event.runId));
+      }
     },
   });
 
@@ -511,6 +540,46 @@ export function createHeadlessHost(
    * its profile.
    */
   const feed = createPushFeed();
+
+  /**
+   * The browser relay: a served run's verbs, sent to the client that started it.
+   *
+   * On the feed rather than on the run's own event stream, scoped to one
+   * connection by id — see `server/browserRelay.ts` for why a question must
+   * not be replayable and must not be answerable by a second client watching
+   * the same run.
+   *
+   * `runsByConnection` is what a tool factory reads. The factory is called
+   * when a run starts and is given the run id and its input, neither of which
+   * carries a connection — so the route's connection id is recorded against a
+   * run id minted before `runs.start`, and dropped when the run ends.
+   */
+  const relayOwners = new Map<string, string>();
+  const relay = createBrowserRelay({
+    publish: (connectionId, call) => {
+      feed.publish('artemis:push:browser-call', call, { connectionId });
+    },
+  });
+
+  /**
+   * A served run has ended: shut its tab and forget who owned it.
+   *
+   * The close travels the same way every other verb does — published to the
+   * connection that started the run, performed by that client's own extension
+   * driver — so the tab the agent opened in somebody's Chrome goes away with
+   * the conversation rather than accumulating one per turn. Nothing waits for
+   * the answer: the run is over and there is nobody to report it to.
+   *
+   * Forgetting is second and unconditional. A driver built after this point
+   * would publish to a connection nothing is listening on any more.
+   */
+  function releaseRelayedBrowser(runId: string): void {
+    const owner = relayOwners.get(runId);
+    if (owner === undefined) return;
+    relayOwners.delete(runId);
+    void relay.driverFor(owner, runId).close();
+  }
+
   runs.subscribe((event) => {
     const profileId = runs.get(event.runId)?.profileId;
     feed.publish(
@@ -825,19 +894,36 @@ export function createHeadlessHost(
    *
    * Nothing for a provider that does not take this host's tool servers, and
    * nothing for a run that asked for a Chrome — see `servedBrowserServers` in
-   * core, which holds that table and is where the third driver will land.
+   * core, which holds that table for both the caller's own Chrome and this
+   * server's headless one.
    */
   const browserTools = (
     runId: string,
     input: RunInput,
   ): Record<string, ReturnType<typeof pageToolServer>> | undefined => {
-    if (browser === undefined || !takesHostTools(input.providerId)) return undefined;
+    if (!takesHostTools(input.providerId)) return undefined;
+    /*
+     * Two builders, each offered only when it could work. The caller's own
+     * Chrome needs a connection to relay to: a run relaying to nobody would
+     * hand the agent a tool set whose every verb refuses, which is right when
+     * a client has gone away and wrong when there was never a client to begin
+     * with. The server's headless browser needs an operator to have configured
+     * one. `servedBrowserServers` picks between them.
+     */
+    const owner = relayOwners.get(String(runId));
     return servedBrowserServers(input, {
-      server: () => {
-        const driver = browser.driver();
-        runBrowsers.set(runId, { close: () => driver.close() });
-        return pageToolServer(driver);
-      },
+      ...(owner === undefined
+        ? {}
+        : { extension: () => pageToolServer(relay.driverFor(owner, String(runId))) }),
+      ...(browser === undefined
+        ? {}
+        : {
+            server: () => {
+              const driver = browser.driver();
+              runBrowsers.set(runId, { close: () => driver.close() });
+              return pageToolServer(driver);
+            },
+          }),
     });
   };
 
@@ -999,7 +1085,20 @@ export function createHeadlessHost(
       // Pulled in the background and at most every so often: the run starts on
       // the copies already here, and the next one gets whatever this fetched.
       void skillRegistry.sources().then((sources) => skillSources.syncInBackground(sources));
+      /*
+       * The run id is minted here rather than by the registry, and only
+       * because of the browser relay: the tool factory is called *during*
+       * `runs.start` and is given the run id, so the connection this run
+       * belongs to has to be recorded against that id before the call. Every
+       * other path is unaffected — the registry accepts a supplied id exactly
+       * as the desktop's optimistic UI relies on.
+       */
+      const runId = `run-${randomUUID()}` as RunId;
+      if (input.extensionBrowser === true && input.connectionId !== undefined) {
+        relayOwners.set(String(runId), input.connectionId);
+      }
       return runs.start({
+        runId,
         providerId: input.providerId as ProviderId,
         profileId: input.profileId as ProfileId,
         cwd: input.cwd,
@@ -1009,6 +1108,7 @@ export function createHeadlessHost(
         ...(input.fastMode === undefined ? {} : { fastMode: input.fastMode }),
         ...(input.ultracode === undefined ? {} : { ultracode: input.ultracode }),
         ...(input.chromeBrowser === true ? { chromeBrowser: true } : {}),
+        ...(input.extensionBrowser === true ? { extensionBrowser: true } : {}),
         ...(input.resumeSessionId === undefined
           ? {}
           : { resumeSessionId: input.resumeSessionId as never }),
@@ -1318,6 +1418,7 @@ export function createHeadlessHost(
         Promise.resolve(banks.setScope(slug, scope)),
     },
     feed,
+    browserRelay: relay,
     guard,
     recordAccess: (event) => accessLog.record(event),
     dispose: async () => {

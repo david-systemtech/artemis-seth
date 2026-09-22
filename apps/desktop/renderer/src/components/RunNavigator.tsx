@@ -67,6 +67,7 @@ import {
   activeProviderLabel,
   activeThinkingLevel,
   isLive,
+  browserModeContext,
   learnedContextWindow,
   openSettings,
   planRecommendation,
@@ -75,6 +76,7 @@ import {
   setRunLocation,
   setFastMode,
   setModel,
+  setPaneBrowserMode,
   setPermissionMode,
   setProfile,
   setThinkingLevel,
@@ -88,6 +90,13 @@ import {
   type ModelPressure,
 } from '../state/modelFacts';
 import { hiddenModelCount, navigatorColumns, navigatorFooter, navigatorModelRows } from '../state/runNavigator';
+import {
+  effectiveBrowserSummary,
+  paneBrowserChoice,
+  paneBrowserOptions,
+  paneModeFor,
+  type PaneBrowserChoice,
+} from '../state/browserChoice';
 import {
   groupServedAccounts,
   scopedToServedAccount,
@@ -1055,6 +1064,97 @@ function EffortColumn(): ReactElement | null {
 /* Footer                                                                     */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * This conversation's browser.
+ *
+ * Here rather than only in Settings because it is a *per conversation*
+ * question, and it is the only setting in the app whose default is "each
+ * conversation decides" — so without a control on the conversation, the
+ * shipped default meant nobody could decide at all. It sits beside the
+ * permission level for the same reason that one is offered here: both finish
+ * the sentence "what will the next prompt do", and neither should need a trip
+ * to Settings to answer.
+ *
+ * The rows come from `paneBrowserOptions`, which applies the same
+ * shown-disabled-with-the-reason rule the window's picker does. An option that
+ * cannot work is not hidden: a user who cannot find "My Chrome" concludes
+ * Artemis does not have it, where a dimmed row saying no browser is paired has
+ * told them where to go. Pairing itself stays in Settings → Browser, which is
+ * a thing you do once.
+ *
+ * Note what the trigger shows: the *effective* browser, with `(default)` when
+ * this conversation has not chosen. Two panes both on the built-in browser can
+ * be in different states — one following the window, one having picked it —
+ * and only the first moves when the window's setting does.
+ *
+ * Exported for its test, as {@link ModelFactRow} is: the navigator is a
+ * Finder-column popover over four stores, and mounting the whole of it to ask
+ * what one row offers would be a test about the popover.
+ */
+export function BrowserRow(): ReactElement {
+  const pane = usePaneRef();
+  const providerId = usePane((s) => s.activeProviderId);
+  const paneMode = usePane((s) => s.browserMode);
+  const windowMode = useApp((s) => s.browserMode);
+  const reach = useApp((s) => s.extensionReach);
+  // The list, not a derived object: a selector that built one would return a
+  // new value on every store notification, which `useApp` compares by identity.
+  const pairedBrowsers = useApp((s) => s.extensionBridge?.browsers);
+
+  const context = browserModeContext(pairedBrowsers, providerId);
+  const options = paneBrowserOptions({ windowMode, reach, context });
+  const summary = effectiveBrowserSummary({ windowMode, reach, paneMode, context });
+
+  return (
+    <DropdownMenuSub>
+      {/* The chevron's `ml-auto` is killed for the reason the permission row
+          gives: two `ml-auto` elements in one flex row share the free space,
+          and only the value should push. */}
+      <DropdownMenuSubTrigger className="h-6 gap-2 px-2 py-0 text-2xs [&>svg:last-child]:ml-0">
+        <span className="text-ink-faint">Browser</span>
+        <span className="ml-auto truncate text-ink">
+          {summary.label}
+          {summary.inherited ? <span className="text-ink-faint"> (default)</span> : null}
+        </span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent
+        className={cn(
+          'w-72 rounded-xl',
+          '[&_[data-slot=dropdown-menu-radio-item]]:rounded-md',
+          '[&_[data-slot=dropdown-menu-radio-item]:focus]:bg-wash-strong',
+          '[&_[data-slot=dropdown-menu-radio-item][data-state=checked]]:bg-wash',
+        )}
+      >
+        <DropdownMenuLabel className="text-2xs text-ink-faint">
+          Which browser should this conversation use?
+        </DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={paneBrowserChoice(paneMode)}
+          onValueChange={(value) => setPaneBrowserMode(paneModeFor(value as PaneBrowserChoice), pane)}
+        >
+          {options.map((option) => (
+            <DropdownMenuRadioItem
+              key={option.id}
+              value={option.id}
+              disabled={option.disabled ?? false}
+              className="items-start text-2xs"
+            >
+              <span className="flex min-w-0 flex-col">
+                <span className="text-ink">{option.label}</span>
+                {/* The note doubles as the reason on a disabled row, which is
+                    where a menu can put one — a tooltip inside an open menu is
+                    a second hover nobody finds. */}
+                <span className="text-2xs leading-snug text-ink-faint">{option.note}</span>
+              </span>
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
+
 /** Shared chrome for a footer row: label, then control at the trailing edge. */
 function ShapeRow({
   label,
@@ -1176,6 +1276,15 @@ function NavigatorFooter(): ReactElement | null {
           </DropdownMenuSubContent>
         </DropdownMenuSub>
       ) : null}
+
+      {/*
+        Which browser this conversation drives — the one run setting that is
+        per conversation *and* has a window default behind it, which is why its
+        list carries a fifth row the window's does not. The trailing value is
+        the effective answer rather than the stored one, so a conversation
+        following a default that resolves to something else says so.
+      */}
+      <BrowserRow />
 
       {window !== undefined ? (
         /*

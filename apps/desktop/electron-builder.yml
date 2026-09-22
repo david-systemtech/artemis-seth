@@ -16,6 +16,25 @@ files:
   - out/**/*
   - package.json
 
+# The browser extension, as a zip the app can hand over with no network.
+#
+# `extraResources` rather than `asarUnpack` because nothing executes it: it is
+# a file the user saves and then loads into Chrome by hand, so it wants to be a
+# real path under `resources/` and not a member of the archive. `main/index.ts`
+# reads the version out of its *file name* rather than opening it, which is how
+# the Browser pane can say a paired browser's extension is behind without
+# unzipping anything on every launch.
+#
+# The directory is committed (holding only a README) so this copy always has a
+# source. A build that has not run `scripts/package-extension.ts` ships no zip,
+# and the pane says this copy of Artemis does not have the extension rather
+# than offering a button that saves nothing.
+extraResources:
+  - from: build/extension
+    to: extension
+    filter:
+      - '**/*.zip'
+
 # Neither of these can be read out of the archive. The Agent SDK spawns its own
 # binaries; node-pty has to `dlopen` a `.node` binding and, on macOS and Linux,
 # `exec` the `spawn-helper` beside it — and there is no path into an asar that
@@ -24,8 +43,9 @@ asarUnpack:
   - '**/node_modules/@anthropic-ai/claude-agent-sdk/**'
   - '**/node_modules/node-pty/**'
 
-# Nothing is shipped beside the asar. Artemis used to vendor the cerebro CLI
-# here for bootstrap; it no longer needs one — reading, installing, describing
+# Nothing *executable* is shipped beside the asar — the browser-extension zip
+# above is a file the user saves, not code this app runs. Artemis used to
+# vendor the cerebro CLI here for bootstrap; it no longer needs one — reading, installing, describing
 # and writing a bank are core's, and the single job left for a CLI (wiring a
 # bank into stock Claude Code) is done by the bank's own embedded copy. See
 # main/memoryBanks.ts.

@@ -114,6 +114,7 @@ import {
   installRunWatchdog,
   installSettingsMenuFeed,
   installBrowserFeed,
+  installExtensionBridgeFeed,
   installTerminalFeed,
   startSessionFeed,
   interruptRun,
@@ -211,6 +212,10 @@ export function App(): ReactElement {
     // pages main is still holding, and a page that navigates during that
     // adoption pushes its state on this channel.
     const stopBrowserFeed = installBrowserFeed();
+    // Which browsers Artemis may drive, and which of them are awake. Read once
+    // and then followed: a browser connects when the user opens Chrome, which
+    // is not a moment any component could have known to ask about.
+    const stopExtensionBridgeFeed = installExtensionBridgeFeed();
     // The macOS menu bar's Settings… item. Nothing races here — the click can
     // only arrive after the app is up — but it is torn down with the rest.
     const stopSettingsMenuFeed = installSettingsMenuFeed();
@@ -234,6 +239,7 @@ export function App(): ReactElement {
       stopUsageFeed();
       stopTerminalFeed();
       stopBrowserFeed();
+      stopExtensionBridgeFeed();
       stopSettingsMenuFeed();
     };
   }, []);

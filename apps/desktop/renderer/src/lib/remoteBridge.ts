@@ -65,6 +65,7 @@ import type {
   ServerTerminalBody,
   ServerTerminalReplayBody,
   ServerTerminalsBody,
+  ExtensionBridgeState,
   SessionSummary,
   TerminalEvent,
   UpdateState,
@@ -72,6 +73,7 @@ import type {
 } from '@rx-artemis/protocol';
 import {
   createSseDecoder,
+  DEFAULT_PAGE_POLICY,
   REMOTE_EVENTS_PATH,
   REMOTE_LIVE_WORK_PATH,
   REMOTE_RUNS_PATH,
@@ -100,6 +102,22 @@ const absent = <T,>(message: string): IpcResult<T> => ({
 
 const BROWSER_REASON =
   'The browser dock renders in the serving machine’s own window and does not cross the remote wire.';
+const EXTENSION_BRIDGE_REASON =
+  'Browsers pair with the Artemis running on their own machine, and this window is served by another one.';
+/**
+ * What a served window is told about the extension bridge: nothing is here.
+ *
+ * Not an error, and not an empty object either — a state whose every field
+ * says the same true thing, so the pane renders its "nothing is paired" copy
+ * rather than a spinner that never resolves.
+ */
+const EXTENSION_BRIDGE_ELSEWHERE: ExtensionBridgeState = {
+  listening: { kind: 'stopped' },
+  browsers: [],
+  pairing: null,
+  policy: DEFAULT_PAGE_POLICY,
+  bundledVersion: null,
+};
 const FILES_REASON =
   'That file lives on the serving machine, and this connection has no channel for reading its disk.';
 const LOCAL_SETTINGS_REASON =
@@ -1068,6 +1086,31 @@ export function createRemoteBridge(
       close: async () => absent(BROWSER_REASON),
       list: async () => ok({ browsers: [] }),
       onEvent: () => () => undefined,
+    },
+
+    /*
+     * Rule 3 again, and here the shape of the request is the whole argument.
+     *
+     * Pairing a browser means typing a code into an extension that dials a
+     * socket on the machine Artemis is running on. A window served over the
+     * wire is looking at a *different* machine's bridge, and a code it minted
+     * there could only be typed into a Chrome standing next to that machine —
+     * which is not where the person reading this window is.
+     *
+     * So this surface reports the truth for the connection it is: nothing is
+     * listening here, nothing is paired here. The Browser pane draws that as
+     * "this is managed on the machine Artemis runs on", and the picker
+     * disables the extension option with the same reason it uses for an
+     * unpaired local one. A served *run* still reaches the caller's own
+     * browser — through the relay, not through this interface.
+     */
+    extensionBridge: {
+      state: async () => ok({ state: EXTENSION_BRIDGE_ELSEWHERE }),
+      pair: async () => absent(EXTENSION_BRIDGE_REASON),
+      unpair: async () => absent(EXTENSION_BRIDGE_REASON),
+      policy: async () => absent(EXTENSION_BRIDGE_REASON),
+      saveBundle: async () => absent(DIALOG_REASON),
+      onState: () => () => undefined,
     },
 
     usagePlan: {

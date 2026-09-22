@@ -67,6 +67,20 @@
  *                          owner's browser. Right for a server whose accounts
  *                          and connections are all one person's; on a shared
  *                          one it hands teammates each other's logins.
+ *   ARTEMIS_ALLOW_CLIENT_BROWSER   `0` stops a served run driving the
+ *                          *caller's own* browser (`artemis.extensionBrowser`).
+ *                          **On by default**, which is the opposite of the
+ *                          switch above and deliberately so. That one reaches
+ *                          a Chrome on this machine, signed in as this
+ *                          machine's account, which is somebody else's browser
+ *                          and why a host says no until told otherwise. This
+ *                          one reaches a browser paired with the client that
+ *                          sent the request, over the connection it arrived
+ *                          on: the caller is asking a run they started to use
+ *                          a browser only their own client can reach, and no
+ *                          other connection can see the verbs or answer them.
+ *                          Set it to `0` for a server whose runs should touch
+ *                          no browser at all.
  *   ARTEMIS_SIGNIN_TIMEOUT_MS   how long a sign-in driven from a client waits
  *                          for the person to finish before the login
  *                          subprocess is killed. Default 10m. See
@@ -285,6 +299,14 @@ async function serve(): Promise<void> {
     // and a remote window's dock shows no shells rather than an error.
     ...(allowedHosts() === undefined ? {} : { allowedHosts: allowedHosts() as never }),
     ...(process.env['ARTEMIS_ALLOW_CHROME_BROWSER'] === '1' ? { allowChromeBrowser: true } : {}),
+    // An *off* switch, so only the explicit `0` is read. Anything else —
+    // unset, `1`, a typo — leaves it on, which is the documented default and
+    // the one a caller asking for their own browser expects.
+    ...(process.env['ARTEMIS_ALLOW_CLIENT_BROWSER'] === '0' ? { allowClientBrowser: false } : {}),
+    // The relay that carries a served run's browser verbs back to the client
+    // that started it. Present unconditionally: what it can reach is decided
+    // per request, by the flag above and by whether the run asked.
+    browserRelay: host.browserRelay,
     // A capability line, not a switch: it tells a client this machine can look
     // at a page. What actually gives a run the tools is `host.ts`.
     ...(browser === undefined ? {} : { serverBrowser: true }),

@@ -220,6 +220,32 @@ export interface RunInput {
   readonly chromeBrowser?: boolean;
 
   /**
+   * Let the agent drive the user's own Chrome through the **Artemis**
+   * extension, rather than through the provider's own bridge.
+   *
+   * Where {@link chromeBrowser} hands the run to Claude's own integration and
+   * gets out of the way, this keeps Artemis's `artemisBrowser` tool set and
+   * points it at a browser the user paired with Artemis: the same six verbs
+   * plus the developer's five, under the same tool names, for **every**
+   * provider — Claude, Codex, OpenCode or a local model — and whichever account
+   * the conversation runs as. That is the whole reason it exists; see issue
+   * #436, which lists what each of the older routes cannot cover.
+   *
+   * A request rather than a guarantee, like {@link chromeBrowser}: a run that
+   * asks for it when no browser is paired, or when the paired browser's Chrome
+   * is closed, still starts. Its browser tools answer every verb with a
+   * sentence saying the extension is not connected and what the user should do
+   * about it, which is a thing the agent can say out loud — a run refused at
+   * the door would only be a mystery.
+   *
+   * On a served conversation the browser is on the *client's* machine, and the
+   * verbs travel back down the connection the client already holds. The server
+   * honours this only when its operator has not turned it off; see
+   * `ARTEMIS_ALLOW_CLIENT_BROWSER`.
+   */
+  readonly extensionBrowser?: boolean;
+
+  /**
    * Open pages in the user's default browser instead of the host's embedded
    * one.
    *
@@ -227,8 +253,11 @@ export interface RunInput {
    * embedded tool set shrinks to "open a URL for the user", pages land in the
    * browser the user actually lives in (their logins, their password manager),
    * and the read-back tools that only make sense against an embedded page are
-   * not offered. Meaningless alongside {@link chromeBrowser}, which replaces
-   * the embedded tools with a richer bridge to the same browser.
+   * not offered. Meaningless alongside {@link chromeBrowser} or
+   * {@link extensionBrowser}, either of which reaches the same browser with
+   * more than an open: the decision table in `browserTools.ts` resolves the
+   * order once, so a stored preference that says two things does not have to
+   * be resolved anywhere else.
    */
   readonly externalBrowser?: boolean;
 

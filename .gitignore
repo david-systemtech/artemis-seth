@@ -45,3 +45,8 @@ coverage/
 
 # Python bytecode from the design scripts.
 __pycache__/
+
+# The browser-extension zip `scripts/package-extension.ts` writes for packaging.
+# The directory is tracked (electron-builder's extraResources needs it to
+# exist); the archive inside it is a build output.
+apps/desktop/build/extension/*.zip

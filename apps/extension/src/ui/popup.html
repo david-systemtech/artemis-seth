@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Artemis</title>
+    <link rel="stylesheet" href="ui.css" />
+    <style>
+      body {
+        width: 320px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="status"><span class="dot" id="dot"></span><span id="status">Loading…</span></div>
+    <p class="detail" id="detail"></p>
+
+    <h2>Pages open here</h2>
+    <section>
+      <table>
+        <tbody id="runs"></tbody>
+      </table>
+    </section>
+
+    <div class="row">
+      <button id="stop" class="danger" type="button">Stop Artemis</button>
+      <button id="resume" class="primary" type="button" hidden>Reconnect</button>
+      <button id="options" type="button">Options</button>
+    </div>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

@@ -150,6 +150,12 @@ import {
   type BrowserEvent,
   type BrowserLayoutRequest,
   type BrowserListRequest,
+  type ExtensionBridgePairRequest,
+  type ExtensionBridgePolicyRequest,
+  type ExtensionBridgeSaveBundleRequest,
+  type ExtensionBridgeState,
+  type ExtensionBridgeStateRequest,
+  type ExtensionBridgeUnpairRequest,
   type BrowserNavigateRequest,
   type BrowserOpenRequest,
   BROWSER_EVENT_TYPES,
@@ -397,6 +403,37 @@ function isRoutinesState(value: unknown): value is RoutinesState {
   );
 }
 
+/**
+ * Shape check for a pushed {@link ExtensionBridgeState}.
+ *
+ * Shallow, like every guard on this page: it proves the payload is the kind of
+ * object the renderer's reducers assume, not that its contents are true. The
+ * sender is the main process, which is trusted; what this catches is a channel
+ * carrying something else entirely after a refactor, which is the failure
+ * these guards exist for.
+ */
+function isExtensionBridgeState(value: unknown): value is ExtensionBridgeState {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as {
+    listening?: unknown;
+    browsers?: unknown;
+    pairing?: unknown;
+    policy?: unknown;
+    bundledVersion?: unknown;
+  };
+  const listening = candidate.listening as { kind?: unknown } | null | undefined;
+  return (
+    typeof listening === 'object' &&
+    listening !== null &&
+    typeof listening.kind === 'string' &&
+    Array.isArray(candidate.browsers) &&
+    (candidate.pairing === null || typeof candidate.pairing === 'object') &&
+    typeof candidate.policy === 'object' &&
+    candidate.policy !== null &&
+    (candidate.bundledVersion === null || typeof candidate.bundledVersion === 'string')
+  );
+}
+
 function isServerState(value: unknown): value is ServerState {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as {
@@ -566,6 +603,12 @@ const runSuggestions = createPushChannel<RunSuggestion>({
   channel: IPC_PUSH.runSuggestion,
   label: 'artemis.runs.onSuggestion',
   isValid: isRunSuggestion,
+});
+
+const extensionBridgeStates = createPushChannel<ExtensionBridgeState>({
+  channel: IPC_PUSH.extensionBridgeState,
+  label: 'artemis.extensionBridge.onState',
+  isValid: isExtensionBridgeState,
 });
 
 // A renderer reload destroys the JavaScript context without unwinding this
@@ -835,6 +878,30 @@ const bridge: ArtemisBridge = Object.freeze({
     close: (request: BrowserCloseRequest) => invoke(IPC.browserClose, request),
     list: (request: BrowserListRequest) => invoke(IPC.browserList, request),
     onEvent: browserEvents.subscribe,
+  }),
+
+  /**
+   * Which browsers of the user's own Artemis may drive, and what they may do.
+   *
+   * Note the shape of this namespace against the one above it: there is no
+   * verb. Nothing here opens a page, reads one or clicks anything, and the
+   * renderer holds no way to put a message on the extension's socket. Five
+   * literal channels about *settings* — pair, unpair, policy, the bundle — and
+   * a subscription to the state they change.
+   *
+   * No method takes or returns a paired browser's secret. That value is minted
+   * in main, written to a file only main reads, and answered for on the wire
+   * by main; SECURITY.md's first claim is that no secret crosses this boundary,
+   * and the way this namespace keeps it is by having nowhere to put one.
+   */
+  extensionBridge: Object.freeze({
+    state: (request: ExtensionBridgeStateRequest) => invoke(IPC.extensionBridgeState, request),
+    pair: (request: ExtensionBridgePairRequest) => invoke(IPC.extensionBridgePair, request),
+    unpair: (request: ExtensionBridgeUnpairRequest) => invoke(IPC.extensionBridgeUnpair, request),
+    policy: (request: ExtensionBridgePolicyRequest) => invoke(IPC.extensionBridgePolicy, request),
+    saveBundle: (request: ExtensionBridgeSaveBundleRequest) =>
+      invoke(IPC.extensionBridgeSaveBundle, request),
+    onState: extensionBridgeStates.subscribe,
   }),
 
   /**

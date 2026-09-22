@@ -86,6 +86,8 @@ import type {
   BrowserOpenRequest,
   BrowserOpenResponse,
 } from './browser.js';
+import type { PagePolicy } from './browserDriver.js';
+import type { ExtensionBridgeState } from './extensionBridge.js';
 import type {
   TerminalCloseRequest,
   TerminalCloseResponse,
@@ -281,6 +283,29 @@ export const IPC = {
   /** Destroy the view. The only thing that does; see `BrowserCloseRequest`. */
   browserClose: 'artemis:browser:close',
   browserList: 'artemis:browser:list',
+
+  /**
+   * The Artemis extension's bridge: pairing, the paired browsers, the policy.
+   *
+   * A separate namespace from `browser:` above, which is about the dock's
+   * `WebContentsView`s. Nothing here opens or reads a page — the agent does
+   * that through its tools, in main, behind the permission prompt. These five
+   * are the settings surface: what is listening, which browsers are paired,
+   * the code being shown, and what a paired browser is allowed to do.
+   *
+   * What is *not* here is the browsers' secrets. The renderer never sees one,
+   * cannot pair on a browser's behalf, and cannot make a call on the wire. See
+   * `ExtensionBridgeState`.
+   */
+  extensionBridgeState: 'artemis:extension-bridge:state',
+  /** Start offering a pairing code, or withdraw the one on screen. */
+  extensionBridgePair: 'artemis:extension-bridge:pair',
+  /** Forget a browser, and cut its connection if it has one. */
+  extensionBridgeUnpair: 'artemis:extension-bridge:unpair',
+  /** Save the page policy, and push it to every connected browser. */
+  extensionBridgePolicy: 'artemis:extension-bridge:policy',
+  /** Write the bundled extension zip somewhere the user chooses. */
+  extensionBridgeSaveBundle: 'artemis:extension-bridge:save-bundle',
 
   terminalStart: 'artemis:terminal:start',
   terminalWrite: 'artemis:terminal:write',
@@ -917,6 +942,18 @@ export const IPC_PUSH = {
    * followed.
    */
   runSuggestion: 'artemis:push:run-suggestion',
+  /**
+   * Carries an {@link ExtensionBridgeState} whenever the extension bridge's
+   * changes.
+   *
+   * Pushed for {@link serverState}'s reason exactly: everything interesting
+   * happens while nobody is asking. A browser connects when the user opens
+   * Chrome, disconnects when they close it, and a pairing code expires on a
+   * timer — none of which the renderer could have known to poll for, and all
+   * of which are the substance of the pane. The countdown on screen is drawn
+   * from `pairing.expiresAt` rather than pushed per second.
+   */
+  extensionBridgeState: 'artemis:push:extension-bridge-state',
 } as const;
 
 /** Union of every request/response channel name. */
@@ -1912,6 +1949,86 @@ export interface GithubPullRequestsResponse {
    * exist, and the popover says something different for each.
    */
   readonly results: readonly PullRequestResult[];
+}
+
+/* -------------------------------------------------------------------------- */
+/* The extension bridge                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Read the bridge's whole state.
+ *
+ * Empty, and every one of its siblings answers with the same whole state
+ * rather than with what it changed. Four channels that each returned a
+ * fragment would leave the pane stitching them together and getting it subtly
+ * wrong — unpairing the last browser changes whether anything is connected,
+ * which changes what the picker may offer. One shape, one source.
+ */
+export type ExtensionBridgeStateRequest = Record<string, never>;
+
+/** The whole of what Settings draws. Carries no secret; see the type. */
+export interface ExtensionBridgeStateResponse {
+  readonly state: ExtensionBridgeState;
+}
+
+/**
+ * Show a pairing code, or withdraw the one on screen.
+ *
+ * One channel for both because they are the same switch. `offer: false` is
+ * what closing the dialog does, and it matters that it exists: a code left
+ * live because a pane was closed is a code somebody else could still spend.
+ */
+export interface ExtensionBridgePairRequest {
+  readonly offer: boolean;
+}
+
+export interface ExtensionBridgePairResponse {
+  readonly state: ExtensionBridgeState;
+}
+
+/** Forget one browser. Cuts its connection if it has one. */
+export interface ExtensionBridgeUnpairRequest {
+  readonly browserId: string;
+}
+
+export interface ExtensionBridgeUnpairResponse {
+  readonly state: ExtensionBridgeState;
+}
+
+/**
+ * Save the page policy.
+ *
+ * The whole policy every time, not a patch. It is five short lists and two
+ * booleans, and a patch protocol over something that small buys nothing but a
+ * second way for the editor and the store to disagree.
+ */
+export interface ExtensionBridgePolicyRequest {
+  readonly policy: PagePolicy;
+}
+
+export interface ExtensionBridgePolicyResponse {
+  readonly state: ExtensionBridgeState;
+}
+
+/**
+ * Put the bundled extension somewhere the user can point Chrome at.
+ *
+ * Main chooses the folder, through the OS dialog, for the reason every other
+ * path in this contract is main's: the renderer names no filesystem location,
+ * ever. It only says "the user asked for this".
+ */
+export type ExtensionBridgeSaveBundleRequest = Record<string, never>;
+
+export interface ExtensionBridgeSaveBundleResponse {
+  /**
+   * Where it was written, or `null` when the user cancelled the dialog.
+   *
+   * A cancel is not an error: nothing failed, the person changed their mind.
+   * A build with no bundled extension *is* an error and comes back as one,
+   * because the button should not have been offered — see
+   * `ExtensionBridgeState.bundledVersion`.
+   */
+  readonly savedTo: string | null;
 }
 
 /** Open one stored session. */
@@ -3393,6 +3510,11 @@ export type IpcRequestMap = {
   [IPC.browserLayout]: BrowserLayoutRequest;
   [IPC.browserClose]: BrowserCloseRequest;
   [IPC.browserList]: BrowserListRequest;
+  [IPC.extensionBridgeState]: ExtensionBridgeStateRequest;
+  [IPC.extensionBridgePair]: ExtensionBridgePairRequest;
+  [IPC.extensionBridgeUnpair]: ExtensionBridgeUnpairRequest;
+  [IPC.extensionBridgePolicy]: ExtensionBridgePolicyRequest;
+  [IPC.extensionBridgeSaveBundle]: ExtensionBridgeSaveBundleRequest;
   [IPC.terminalStart]: TerminalStartRequest;
   [IPC.terminalWrite]: TerminalWriteRequest;
   [IPC.terminalResize]: TerminalResizeRequest;
@@ -3516,6 +3638,11 @@ export type IpcResponseMap = {
   [IPC.browserLayout]: BrowserLayoutResponse;
   [IPC.browserClose]: BrowserCloseResponse;
   [IPC.browserList]: BrowserListResponse;
+  [IPC.extensionBridgeState]: ExtensionBridgeStateResponse;
+  [IPC.extensionBridgePair]: ExtensionBridgePairResponse;
+  [IPC.extensionBridgeUnpair]: ExtensionBridgeUnpairResponse;
+  [IPC.extensionBridgePolicy]: ExtensionBridgePolicyResponse;
+  [IPC.extensionBridgeSaveBundle]: ExtensionBridgeSaveBundleResponse;
   [IPC.terminalStart]: TerminalStartResponse;
   [IPC.terminalWrite]: TerminalWriteResponse;
   [IPC.terminalResize]: TerminalResizeResponse;
@@ -3638,6 +3765,7 @@ export type IpcPushMap = {
   [IPC_PUSH.serverState]: ServerState;
   [IPC_PUSH.routinesState]: RoutinesState;
   [IPC_PUSH.runSuggestion]: RunSuggestion;
+  [IPC_PUSH.extensionBridgeState]: ExtensionBridgeState;
 };
 
 /** Payload type for a push channel. */
@@ -4120,6 +4248,35 @@ export interface ArtemisBridge {
     list(request: BrowserListRequest): Promise<IpcResult<BrowserListResponse>>;
     /** Navigation and death, for every browser at once. See {@link terminal.onEvent}. */
     onEvent(listener: (event: BrowserEvent) => void): Unsubscribe;
+  };
+
+  /**
+   * The Artemis extension's bridge, as the Browser settings pane uses it.
+   *
+   * Everything here is about *which* browsers may be driven, never about
+   * driving one: there is no verb on this interface, and the renderer holds no
+   * way to put a message on the socket. An agent's browsing goes through tools
+   * in main and the permission prompt, exactly as it does for the dock.
+   *
+   * Nothing here returns a paired browser's secret, and nothing accepts one.
+   * Pairing happens between main and the extension; the renderer's part is to
+   * show a code and to say when the user is done with a browser.
+   */
+  readonly extensionBridge: {
+    /** What is listening, what is paired, what is connected. For the first paint. */
+    state(request: ExtensionBridgeStateRequest): Promise<IpcResult<ExtensionBridgeStateResponse>>;
+    /** Show a pairing code, or withdraw the one on screen. */
+    pair(request: ExtensionBridgePairRequest): Promise<IpcResult<ExtensionBridgePairResponse>>;
+    /** Forget a browser. Its live connection, if any, is cut. */
+    unpair(request: ExtensionBridgeUnpairRequest): Promise<IpcResult<ExtensionBridgeUnpairResponse>>;
+    /** Save the page policy and push it to every connected browser. */
+    policy(request: ExtensionBridgePolicyRequest): Promise<IpcResult<ExtensionBridgePolicyResponse>>;
+    /** Write the bundled extension zip to a folder the user picks. */
+    saveBundle(
+      request: ExtensionBridgeSaveBundleRequest,
+    ): Promise<IpcResult<ExtensionBridgeSaveBundleResponse>>;
+    /** Every change to the above. See {@link IPC_PUSH.extensionBridgeState}. */
+    onState(listener: (state: ExtensionBridgeState) => void): Unsubscribe;
   };
 
   /**

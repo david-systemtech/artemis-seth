@@ -65,7 +65,19 @@ describe('the two-band nav', () => {
       // that a switch can make as standing as an instruction), and Memory banks
       // is what the agents keep for themselves — still the pane the built-in
       // prompt in Instructions sends people to.
-      ['profiles', 'models', 'runs', 'agents', 'skills', 'memory-banks', 'permissions', 'appearance'],
+      // Browser directly under Permissions & access, because that is where
+      // somebody who just met a disabled "My Chrome" option looks next.
+      [
+        'profiles',
+        'models',
+        'runs',
+        'agents',
+        'skills',
+        'memory-banks',
+        'permissions',
+        'browser',
+        'appearance',
+      ],
       // Key managers opens the second band because it is what the first one
       // reaches for: Instructions offers a bank "from a key manager", and this
       // is the pane behind that offer. Remote directly under Server: the same
@@ -107,14 +119,15 @@ describe('ids are frozen addresses', () => {
   });
 
   it('sends the historical addresses to their merged homes', () => {
-    // The browser switches are permission questions now. `cerebro` is the
-    // CLI's name for a pane that is no longer about the CLI: it followed the
-    // banks into Instructions and out again, and it still has to land on them
-    // wherever they are. Everything else answers for itself.
-    expect(resolveSettingsSection('browser')).toBe('permissions');
+    // `cerebro` is the CLI's name for a pane that is no longer about the CLI:
+    // it followed the banks into Instructions and out again, and it still has
+    // to land on them wherever they are. Everything else answers for itself —
+    // including `browser`, which is an address that came back: it named two
+    // switches that moved in with the permission modes, and it now names the
+    // pane behind the one browser option that has to be set up.
     expect(resolveSettingsSection('cerebro')).toBe('memory-banks');
     for (const id of ALL_SECTIONS) {
-      if (id === 'browser' || id === 'cerebro') continue;
+      if (id === 'cerebro') continue;
       expect(resolveSettingsSection(id)).toBe(id);
     }
   });
@@ -122,7 +135,6 @@ describe('ids are frozen addresses', () => {
   it('never lists a historical address as a nav row', () => {
     // One room, one door: the old ids resolve, they do not duplicate.
     const ids = navIds();
-    expect(ids).not.toContain('browser');
     expect(ids).not.toContain('cerebro');
     expect(new Set(ids).size).toBe(ids.length);
   });

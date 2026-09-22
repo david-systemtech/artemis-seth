@@ -370,6 +370,123 @@ const started = (overrides: Partial<StartRunInput> = {}): StartRunInput => ({
   ...overrides,
 });
 
+/* -------------------------------------------------------------------------- */
+/* The browser on the caller's machine                                        */
+/* -------------------------------------------------------------------------- */
+
+describe('the browser on the machine that started the run', () => {
+  /** Everything the feed carried on the browser-call channel, with its scope. */
+  function watchCalls(): { calls: { payload: Record<string, unknown>; scope: Record<string, unknown> }[] } {
+    const calls: { payload: Record<string, unknown>; scope: Record<string, unknown> }[] = [];
+    host.feed.subscribe((event) => {
+      if (event.channel !== 'artemis:push:browser-call') return;
+      calls.push({
+        payload: event.payload as Record<string, unknown>,
+        scope: event.scope as unknown as Record<string, unknown>,
+      });
+    });
+    return { calls };
+  }
+
+  it('gives a run that asked for it the browser tools, under the contracted name', async () => {
+    const query = installQuery();
+
+    await host.runSource.startRun(started({ extensionBrowser: true, connectionId: 'conn-1' } as never));
+
+    // `artemisBrowser`, whatever is behind it: permission rules and skills
+    // address `mcp__artemisBrowser__browser_open`, and a run that moved from a
+    // desktop to a server must not lose an allow-list built under the other.
+    const servers = (query.options()['mcpServers'] ?? {}) as Record<string, unknown>;
+    expect(Object.keys(servers)).toContain('artemisBrowser');
+  });
+
+  it('gives no browser to a run that asked for one with no connection to relay to', async () => {
+    // Which is every run that did not come through the completions route — a
+    // routine firing, say. A tool set whose every verb refuses would be worse
+    // than none: the agent would spend a turn discovering it.
+    const query = installQuery();
+
+    await host.runSource.startRun(started({ extensionBrowser: true } as never));
+
+    const servers = (query.options()['mcpServers'] ?? {}) as Record<string, unknown>;
+    expect(Object.keys(servers)).not.toContain('artemisBrowser');
+  });
+
+  it('gives no browser to a run that did not ask', async () => {
+    const query = installQuery();
+
+    await host.runSource.startRun(started({ connectionId: 'conn-1' } as never));
+
+    const servers = (query.options()['mcpServers'] ?? {}) as Record<string, unknown>;
+    expect(Object.keys(servers)).not.toContain('artemisBrowser');
+  });
+
+  it('publishes each verb to the connection that started the run, and nobody else', async () => {
+    const { calls } = watchCalls();
+    const query = installQuery();
+    const handle = await host.runSource.startRun(
+      started({ extensionBrowser: true, connectionId: 'conn-1' } as never),
+    );
+
+    // The tool server the run was given, driving the relayed browser.
+    const servers = (query.options()['mcpServers'] ?? {}) as Record<string, unknown>;
+    expect(servers['artemisBrowser']).toBeDefined();
+    void host.browserRelay.driverFor('conn-1', String(handle.runId)).read();
+
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]?.payload).toMatchObject({ object: 'artemis.browser.call', verb: 'read' });
+    // The scope axis that names a connection rather than describing an
+    // audience — a question a second client could see is one it could answer.
+    expect(calls[0]?.scope).toEqual({ connectionId: 'conn-1' });
+  });
+
+  it('closes the run’s tab when the run ends', async () => {
+    /*
+     * Nothing in the `agentToolServers` seam calls `PageDriver.close`: the
+     * factory is handed a run id when the run starts and there is no matching
+     * call when it stops. Without the registry's lifecycle hook that is a tab
+     * left open in somebody's Chrome per served conversation, for ever.
+     */
+    const { calls } = watchCalls();
+    const query = installQuery();
+    const handle = await host.runSource.startRun(
+      started({ extensionBrowser: true, connectionId: 'conn-1' } as never),
+    );
+    await query.prompts().next();
+
+    query.fake().messages.push(INIT(cwd));
+    query.fake().messages.push(RESULT);
+
+    await vi.waitFor(() => {
+      const closing = calls.find((one) => one.payload['verb'] === 'close');
+      expect(closing).toBeDefined();
+      expect(closing?.payload).toMatchObject({ runKey: String(handle.runId) });
+      expect(closing?.scope).toEqual({ connectionId: 'conn-1' });
+    });
+  });
+
+  it('asks nothing of a client once the run it owned has ended', async () => {
+    // The owner is forgotten with the close, so a driver built afterwards
+    // publishes to a connection nothing is listening on any more.
+    const { calls } = watchCalls();
+    const query = installQuery();
+    const handle = await host.runSource.startRun(
+      started({ extensionBrowser: true, connectionId: 'conn-1' } as never),
+    );
+    await query.prompts().next();
+    query.fake().messages.push(INIT(cwd));
+    query.fake().messages.push(RESULT);
+    await vi.waitFor(() => expect(calls.some((one) => one.payload['verb'] === 'close')).toBe(true));
+
+    const before = calls.length;
+    // A second run ending on the same id changes nothing: there is no owner.
+    await host.runs.dispose(handle.runId);
+    await new Promise((done) => setTimeout(done, 50));
+
+    expect(calls).toHaveLength(before);
+  });
+});
+
 describe('the memory banks this machine carries', () => {
   it('describes a bank to the account it is attached to, and to no other', async () => {
     await registerBank('cortex', await writeBank('cortex'), {

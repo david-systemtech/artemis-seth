@@ -8,8 +8,9 @@
  * browser beside an Artemis Server, and the user's own Chrome through the
  * Artemis extension all implement. This file is what only the desktop can
  * supply: the Electron driver behind the embedded browser
- * (`embeddedPageDriver.ts`), the open-only server for a user who prefers their
- * own browser, and the table that decides between them.
+ * (`embeddedPageDriver.ts`), the driver that speaks to the paired Chrome over
+ * the extension bridge (`extensionPageDriver.ts`), the open-only server for a
+ * user who prefers their own browser, and the table that decides between them.
  *
  * ## Why an in-process MCP server
  *
@@ -56,6 +57,7 @@ import { pageToolInstructions, pageTools, pageToolServer } from '@rx-artemis/cor
 import { browserUrlFor, type RunId } from '@rx-artemis/protocol';
 
 import { embeddedPageDriver, type BrowserToolContext } from './embeddedPageDriver.js';
+import { extensionPageDriver, type ExtensionDriverHost } from './extensionPageDriver.js';
 import { createLogger } from './log.js';
 
 const log = createLogger('browser-tools');
@@ -213,31 +215,76 @@ const EXTERNAL_INSTRUCTIONS =
 /**
  * The one decision table for a run's browser tools.
  *
- * | `chromeBrowser` | `externalBrowser` | The agent gets                      |
- * |-----------------|-------------------|-------------------------------------|
- * | true            | —                 | nothing from Artemis — the CLI's own Chrome bridge |
- * | false           | true              | the open-only external server       |
- * | false           | false             | the embedded dock browser           |
+ * | `chromeBrowser` | `extensionBrowser` | `externalBrowser` | The agent gets   |
+ * |-----------------|--------------------|-------------------|------------------|
+ * | true            | —                  | —                 | nothing from Artemis — the CLI's own Chrome bridge |
+ * | false           | true               | —                 | the extension-backed `artemisBrowser` |
+ * | false           | false              | true              | the open-only external server |
+ * | false           | false              | false             | the embedded dock browser |
  *
- * Chrome wins over external because it is the stronger form of the same
- * preference: both mean "the user's own browser", and the bridge can also read
- * what it opened. Handing the CLI's tool set a sibling `browser_open` would
- * give the model two tools with one name's worth of purpose and let it pick
- * the one that cannot see.
+ * Read top to bottom, and the order is the argument. Chrome wins over
+ * everything because it is not a variation on Artemis's tools, it is the
+ * *absence* of them: the CLI brings its own set, and handing it a sibling
+ * `browser_open` would give the model two tools with one name's worth of
+ * purpose and let it pick the one that cannot see. The extension wins over
+ * external for the reason Chrome used to: both mean "the user's own browser",
+ * and only one of them can read what it opened. External wins over embedded
+ * because it is the only one of the two the user had to ask for.
+ *
+ * Nothing here decides whether the extension is *reachable*. A run whose
+ * browser is unpaired or whose Chrome is closed still gets this server, and
+ * every verb of it answers with the sentence that says so — a refusal the
+ * agent can repeat to the user beats a tool set that silently became the dock
+ * browser, which is how an agent ends up reporting on the wrong cookie jar.
+ *
+ * The renderer holds the other half of that rule and states it the same way:
+ * `effectiveBrowserMode` in `renderer/src/state/browserChoice.ts` drops a
+ * *window default* that cannot work — the picker is already showing it
+ * disabled with the reason — and keeps a *conversation's own choice* of the
+ * extension, precisely so that this file's refusal is what the user hears.
+ * The two halves have to agree, because between them they decide whether an
+ * agent is told the truth or handed a different browser without comment.
  *
  * A function of the input rather than inline in the composition root so the
  * table is testable without Electron — the builders are injected precisely so
- * a test can hand in markers and assert which one was asked for.
+ * a test can hand in markers and assert which one was asked for, and they are
+ * thunks so that a mode which is not chosen is never built.
  */
 export function agentBrowserServers(
-  input: { readonly chromeBrowser?: boolean; readonly externalBrowser?: boolean },
+  input: {
+    readonly chromeBrowser?: boolean;
+    readonly extensionBrowser?: boolean;
+    readonly externalBrowser?: boolean;
+  },
   build: {
     readonly embedded: () => McpServerConfig;
     readonly external: () => McpServerConfig;
+    readonly extension: () => McpServerConfig;
   },
 ): Record<string, McpServerConfig> | undefined {
   if (input.chromeBrowser === true) return undefined;
+  if (input.extensionBrowser === true) return { artemisBrowser: build.extension() };
   return { artemisBrowser: input.externalBrowser === true ? build.external() : build.embedded() };
+}
+
+/**
+ * Build one run's browser tools over the user's own Chrome.
+ *
+ * The third of the three builders the table above chooses between, here rather
+ * than in the composition root for the same reason the other two are: the
+ * bridge is a main-process object holding a socket, and `@rx-artemis/core` may
+ * not know it exists.
+ */
+export function extensionBrowserToolServer(
+  runId: RunId,
+  bridge: ExtensionDriverHost,
+): McpServerConfig {
+  return pageToolServer(extensionPageDriver(runId, bridge));
+}
+
+/** The extension variant's tool definitions. Addressable for the same reason {@link browserTools} is. */
+export function extensionBrowserTools(runId: RunId, bridge: ExtensionDriverHost) {
+  return pageTools(extensionPageDriver(runId, bridge));
 }
 
 function messageOf(error: unknown): string {

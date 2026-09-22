@@ -61,7 +61,9 @@ import type {
 import {
   ARTEMIS_RELEASES_URL,
   assignProfileSlugs,
+  BRIDGE_DEFAULT_PORT,
   browserUrlFor,
+  DEFAULT_PAGE_POLICY,
   DEFAULT_SERVER_PORT,
   nextFireAt,
   modelRoute,
@@ -75,6 +77,7 @@ import {
   type BrowserEvent,
   type BrowserInfo,
   type BrowserState,
+  type ExtensionBridgeState,
 } from '@rx-artemis/protocol';
 import { newId } from './id';
 
@@ -2646,6 +2649,68 @@ export function createMockBridge(): ArtemisBridge {
         onEvent: (listener: (event: BrowserEvent) => void) => {
           listeners.add(listener);
           return () => listeners.delete(listener);
+        },
+      };
+    })(),
+
+    /**
+     * The extension bridge, faked as the state the pane has most work to do in.
+     *
+     * One browser paired and connected, running an extension a minor version
+     * behind the one this build ships — which is the case with the most on
+     * screen at once: a live row, an "update the extension" line, and a picker
+     * whose extension option is enabled. Pairing mints a fixed code rather than
+     * a random one so a screenshot in dev is reproducible, and unpairing
+     * actually removes the row, because "does the empty state draw" is the
+     * other question worth being able to answer without an extension to hand.
+     */
+    extensionBridge: (() => {
+      let state: ExtensionBridgeState = {
+        listening: { kind: 'listening', port: BRIDGE_DEFAULT_PORT },
+        browsers: [
+          {
+            browserId: 'mock-browser-1',
+            browserName: 'Chrome on macOS',
+            pairedAt: Date.now() - 6 * 24 * 60 * 60 * 1000,
+            connected: true,
+            extensionVersion: '2.18.0',
+            lastSeenAt: Date.now() - 90_000,
+          },
+        ],
+        pairing: null,
+        policy: { ...DEFAULT_PAGE_POLICY, devSites: ['*.test', 'staging.example.com'] },
+        bundledVersion: '2.19.1',
+      };
+      const listeners = new Set<(next: ExtensionBridgeState) => void>();
+      const settle = (next: ExtensionBridgeState): ExtensionBridgeState => {
+        state = next;
+        for (const listener of [...listeners]) listener(state);
+        return state;
+      };
+
+      return {
+        state: async () => ok({ state }),
+        pair: async ({ offer }) =>
+          ok({
+            state: settle({
+              ...state,
+              pairing: offer ? { code: 'K7P2MXQ4', expiresAt: Date.now() + 5 * 60 * 1000 } : null,
+            }),
+          }),
+        unpair: async ({ browserId }) =>
+          ok({
+            state: settle({
+              ...state,
+              browsers: state.browsers.filter((one) => one.browserId !== browserId),
+            }),
+          }),
+        policy: async ({ policy }) => ok({ state: settle({ ...state, policy }) }),
+        saveBundle: async () => ok({ savedTo: '/Users/you/Downloads/artemis-extension-2.19.1.zip' }),
+        onState: (listener: (next: ExtensionBridgeState) => void) => {
+          listeners.add(listener);
+          return () => {
+            listeners.delete(listener);
+          };
         },
       };
     })(),

@@ -26,6 +26,14 @@
  */
 
 export {
+  createBrowserRelay,
+  RELAY_REFUSALS,
+  type AnswerOutcome,
+  type BrowserRelay,
+  type BrowserRelayOptions,
+} from './browserRelay.js';
+
+export {
   createCatalogue,
   DEFAULT_CATALOGUE_TTL_MS,
   type Catalogue,

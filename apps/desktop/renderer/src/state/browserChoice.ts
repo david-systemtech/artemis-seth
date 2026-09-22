@@ -1,0 +1,362 @@
+/**
+ * Which browser a conversation gets, as one choice instead of two switches.
+ * ============================================================================
+ *
+ * Artemis has four answers to "whose browser is the agent using", and until
+ * now the user expressed them with two independent switches — "Browse with
+ * your Chrome" and "Open pages in your default browser" — whose four
+ * combinations were three answers and one that meant nothing. Adding the
+ * Artemis extension would have made it three switches and eight combinations
+ * for four answers, so the switches become a picker.
+ *
+ * The four are genuinely exclusive. A run gets one set of browser tools; the
+ * decision table in `main/browserTools.ts` already resolves any overlap and
+ * has to, because a run input can arrive from a server. What this module does
+ * is make the *question* single-valued at the place a person answers it, so
+ * the table never has to.
+ *
+ * ## Two settings, and they answer different questions
+ *
+ * {@link BrowserMode} is "which browser", a window preference, as its two
+ * predecessors were: the extension bridges one browser at a time, and a
+ * per-pane version of this would invite two columns to fight over it.
+ *
+ * {@link ExtensionReach} is "how do conversations *get* the paired browser",
+ * and it exists because driving somebody's signed-in Chrome is a bigger grant
+ * than the other three modes. Per conversation is the default — the choice is
+ * there in every conversation and off until it is made — and always-on is for
+ * the person who has decided once. David runs always-on; the default stays
+ * per-conversation, which is his decision of 2026-09-21 in issue #436.
+ *
+ * ## Nothing here reads a store
+ *
+ * Every function takes what it needs and returns a value. That is what makes
+ * the migration and the availability rules testable without standing up a
+ * 13,000-line store, and it is where the interesting mistakes would otherwise
+ * hide: the migration runs once, in the field, on data nobody can re-read.
+ */
+
+import type { ProviderId } from '@rx-artemis/protocol';
+
+/** Which browser an agent drives. Exactly one per run. */
+export type BrowserMode =
+  /** The `WebContentsView` in the Artemis dock. Its own session, no logins. */
+  | 'embedded'
+  /** The user's own Chrome, through the Artemis extension. */
+  | 'extension'
+  /** The user's own Chrome, through Claude's own bridge. Claude only. */
+  | 'chrome'
+  /** The user's default browser, opened at and not read. */
+  | 'external';
+
+/** Every mode, in the order the picker draws them. */
+export const BROWSER_MODES: readonly BrowserMode[] = [
+  'embedded',
+  'extension',
+  'chrome',
+  'external',
+];
+
+/** How conversations get the paired browser. */
+export type ExtensionReach = 'per-conversation' | 'always-on';
+
+/** What a mode is called on screen. */
+export const BROWSER_MODE_LABELS: Readonly<Record<BrowserMode, string>> = {
+  embedded: 'Artemis’s built-in browser',
+  extension: 'My Chrome (Artemis extension)',
+  chrome: 'Claude in Chrome',
+  external: 'Open in my browser (open only)',
+};
+
+/** One sentence each, saying what happens. */
+export const BROWSER_MODE_NOTES: Readonly<Record<BrowserMode, string>> = {
+  embedded:
+    'A tab inside the Artemis window. Signed in to nothing, and the agent can read, click and type in it.',
+  extension:
+    'Your real Chrome, with your logins. The agent works in a tab group it keeps to itself, and some sites are refused.',
+  chrome:
+    'Claude drives your Chrome through the Claude in Chrome extension. Claude conversations only, on this machine.',
+  external:
+    'Pages open in your default browser for you to look at. The agent cannot read them.',
+};
+
+/* -------------------------------------------------------------------------- */
+/* Migration                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The stored preference, from whichever version of it is on disk.
+ *
+ * Artemis's preferences have no schema version — every field is independently
+ * optional and defensively read — so a migration here is a fallback chain
+ * rather than a numbered step. `browserMode` wins when it is there; otherwise
+ * the two old switches are read in the order the decision table reads them,
+ * which is what makes the answer the same one the user was already getting.
+ *
+ * Both switches on meant "Chrome", because `agentBrowserServers` gave Chrome
+ * the run and suppressed the host's tools entirely — so a user who had both
+ * ticked was using Chrome, whatever the second switch looked like it said.
+ * Migrating them to `external` would quietly take away the browser they had.
+ */
+export function browserModeFromPrefs(prefs: {
+  readonly browserMode?: string;
+  readonly agentChrome?: boolean;
+  readonly openWebExternally?: boolean;
+}): BrowserMode {
+  const stored = prefs.browserMode;
+  if (stored !== undefined && isBrowserMode(stored)) return stored;
+  if (prefs.agentChrome === true) return 'chrome';
+  if (prefs.openWebExternally === true) return 'external';
+  return 'embedded';
+}
+
+export function isBrowserMode(value: unknown): value is BrowserMode {
+  return typeof value === 'string' && (BROWSER_MODES as readonly string[]).includes(value);
+}
+
+export function isExtensionReach(value: unknown): value is ExtensionReach {
+  return value === 'per-conversation' || value === 'always-on';
+}
+
+/* -------------------------------------------------------------------------- */
+/* What a mode can do right now                                               */
+/* -------------------------------------------------------------------------- */
+
+/** What the picker knows about the machine when it decides what to offer. */
+export interface BrowserModeContext {
+  /** The provider the conversation is running as. */
+  readonly providerId: ProviderId | null;
+  /** Whether any browser has been paired with Artemis. */
+  readonly anyPaired: boolean;
+  /** Whether a paired browser is connected right now. */
+  readonly anyConnected: boolean;
+}
+
+/**
+ * Why a mode cannot be chosen, or `null` when it can.
+ *
+ * A sentence and not a boolean, because a disabled option with no reason is a
+ * dead end: the user can see that Artemis will not let them have the thing and
+ * has nothing to act on. Each of these names what to do about it.
+ */
+export function browserModeUnavailable(
+  mode: BrowserMode,
+  context: BrowserModeContext,
+): string | null {
+  if (mode === 'chrome' && context.providerId !== 'claude') {
+    return 'Only Claude conversations can use the Claude in Chrome extension.';
+  }
+  if (mode === 'extension') {
+    if (!context.anyPaired) return 'No browser is paired yet. Pair one in Settings → Browser.';
+    if (!context.anyConnected) {
+      return 'The paired browser is not connected. Open Chrome with the Artemis extension enabled.';
+    }
+  }
+  return null;
+}
+
+/**
+ * The mode a conversation will actually run with.
+ *
+ * Three inputs and one answer, in this order:
+ *
+ *  1. What *this conversation* chose, if it chose anything. A pane override is
+ *     the most specific statement anybody made.
+ *  2. Otherwise the window's mode — except that a window set to `extension`
+ *     under *per conversation* does not hand the paired browser to a
+ *     conversation that has not asked. That is the whole difference between
+ *     the two reach settings, and it lives here so that nothing downstream has
+ *     to remember it.
+ *  3. Falling back to the embedded browser, which is the one that grants
+ *     nothing.
+ *
+ * Then, a mode that cannot work here may be dropped for the embedded browser —
+ * and whether it is turns on one question, which is **not** how loudly the
+ * user asked for it. It is whether the run itself can say what went wrong.
+ *
+ *  - **A window default is dropped.** Nobody is waiting on an answer: the
+ *    picker draws that option disabled with its reason beside it, so a run
+ *    started under it is not where anyone should discover the problem, and the
+ *    dock browser is a browser that works.
+ *  - **A conversation's own choice of the extension is kept.** Artemis builds
+ *    the extension tool server for it regardless — see `agentBrowserServers`
+ *    in `apps/desktop/main/browserTools.ts`, which states this rule from the
+ *    other side — and every verb of that server refuses in a sentence the
+ *    agent can repeat: pair a browser, or open Chrome. Handing the run the
+ *    dock browser instead would have it browse a session signed in to nothing
+ *    and report on it as though it were the user's Chrome, which is the exact
+ *    failure the wording in `pageTools.ts` exists to prevent.
+ *  - **A conversation's own choice of Chrome is still dropped**, and that is
+ *    what makes this a rule about self-explanation rather than about
+ *    insistence. `chromeBrowser` is the *absence* of Artemis's tools: the CLI
+ *    brings its own. On a provider with no bridge there is no driver to refuse
+ *    in words, so the run would have no browser at all and nothing would say
+ *    so — which is the failure this fallback was written for.
+ */
+export function effectiveBrowserMode(options: {
+  readonly windowMode: BrowserMode;
+  readonly reach: ExtensionReach;
+  readonly paneMode: BrowserMode | null;
+  readonly context: BrowserModeContext;
+}): BrowserMode {
+  const chosen =
+    options.paneMode ??
+    (options.windowMode === 'extension' && options.reach === 'per-conversation'
+      ? 'embedded'
+      : options.windowMode);
+  if (browserModeUnavailable(chosen, options.context) === null) return chosen;
+  // Unavailable. Kept only when this conversation asked for it *and* the run
+  // will explain itself; see the note above on why those are two conditions
+  // and not one.
+  return options.paneMode === chosen && explainsItsOwnAbsence(chosen) ? chosen : 'embedded';
+}
+
+/**
+ * Whether a run given this mode, on a machine where it cannot work, will say
+ * so in words the agent can pass on.
+ *
+ * True of the extension alone. Artemis owns that driver, so an unpaired or
+ * closed browser becomes a refusal per verb rather than a silence. The other
+ * three either always work (`embedded`, `external`) or are the absence of
+ * Artemis's tools (`chrome`), and nothing can be refused by a driver that was
+ * never built.
+ */
+function explainsItsOwnAbsence(mode: BrowserMode): boolean {
+  return mode === 'extension';
+}
+
+/* -------------------------------------------------------------------------- */
+/* Onto the run input                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The three booleans a mode sets, with at most one of them `true`.
+ *
+ * Absent rather than `false` for the ones that are off, matching how the two
+ * switches have always crossed IPC: a field that is there and false and a
+ * field that is not there mean the same thing to every reader, and the shorter
+ * payload is the one whose tests have always pinned it.
+ *
+ * `embedded` sets nothing at all, which is what the decision table reads as
+ * the dock browser.
+ */
+export function browserFlagsFor(mode: BrowserMode): {
+  readonly chromeBrowser?: true;
+  readonly extensionBrowser?: true;
+  readonly externalBrowser?: true;
+} {
+  switch (mode) {
+    case 'chrome':
+      return { chromeBrowser: true };
+    case 'extension':
+      return { extensionBrowser: true };
+    case 'external':
+      return { externalBrowser: true };
+    case 'embedded':
+      return {};
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* The control one conversation gets                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The extra option a *conversation's* picker has that the window's does not.
+ *
+ * "Follow the window default" is not a fifth browser, it is the absence of a
+ * choice — which is a different state from choosing whatever the window
+ * currently says, and the difference is what happens when the window changes.
+ * A conversation following the default moves with it; one that picked the dock
+ * browser keeps the dock browser. `SessionState.browserMode` spells the first
+ * `null`, and this is that `null` with a name a menu can carry.
+ */
+export const FOLLOW_WINDOW = 'follow';
+
+/** What a conversation's browser picker is set to. */
+export type PaneBrowserChoice = BrowserMode | typeof FOLLOW_WINDOW;
+
+/** Short enough for the trailing edge of a menu row. */
+export const BROWSER_MODE_SHORT_LABELS: Readonly<Record<BrowserMode, string>> = {
+  embedded: 'Built-in',
+  extension: 'My Chrome',
+  chrome: 'Claude in Chrome',
+  external: 'My browser',
+};
+
+/** One row of a conversation's browser picker. */
+export interface PaneBrowserOption {
+  readonly id: PaneBrowserChoice;
+  readonly label: string;
+  /** What choosing it does, or — when it is disabled — why it cannot be. */
+  readonly note: string;
+  readonly disabled?: true;
+}
+
+/** What the picker on a conversation is currently set to. */
+export function paneBrowserChoice(paneMode: BrowserMode | null): PaneBrowserChoice {
+  return paneMode ?? FOLLOW_WINDOW;
+}
+
+/** The mode a choice means, or `null` for "follow the window default". */
+export function paneModeFor(choice: PaneBrowserChoice): BrowserMode | null {
+  return choice === FOLLOW_WINDOW ? null : choice;
+}
+
+/**
+ * The five rows a conversation's browser picker draws.
+ *
+ * The same four the window offers, under the same rule — an option that cannot
+ * work is shown, disabled, carrying the reason — plus the one above them that
+ * says "whatever the window says". Shown rather than hidden for the reason
+ * every degraded control in this app is: a user who cannot find "My Chrome"
+ * concludes Artemis does not have it, where a dimmed row saying no browser is
+ * paired has taught them where to go.
+ *
+ * The follow row's note names what the window resolves to *right now*, because
+ * "follow the default" answers nothing on its own — and under
+ * `per-conversation` reach the answer is the built-in browser even when the
+ * window's own picker says My Chrome, which is exactly the state this control
+ * exists to let somebody out of.
+ */
+export function paneBrowserOptions(options: {
+  readonly windowMode: BrowserMode;
+  readonly reach: ExtensionReach;
+  readonly context: BrowserModeContext;
+}): readonly PaneBrowserOption[] {
+  const inherited = effectiveBrowserMode({ ...options, paneMode: null });
+  return [
+    {
+      id: FOLLOW_WINDOW,
+      label: 'Follow the window default',
+      note: `Currently ${BROWSER_MODE_LABELS[inherited]}.`,
+    },
+    ...BROWSER_MODES.map((mode): PaneBrowserOption => {
+      const unavailable = browserModeUnavailable(mode, options.context);
+      return {
+        id: mode,
+        label: BROWSER_MODE_LABELS[mode],
+        note: unavailable ?? BROWSER_MODE_NOTES[mode],
+        ...(unavailable === null ? {} : { disabled: true as const }),
+      };
+    }),
+  ];
+}
+
+/**
+ * What this conversation's browser is, in the words a status row uses.
+ *
+ * `inherited` is what lets the row say *(default)*. A user looking at two
+ * panes on the built-in browser needs to know which of them will move when
+ * they change the window's setting and which will not, and that is not
+ * recoverable from the browser's name.
+ */
+export function effectiveBrowserSummary(options: {
+  readonly windowMode: BrowserMode;
+  readonly reach: ExtensionReach;
+  readonly paneMode: BrowserMode | null;
+  readonly context: BrowserModeContext;
+}): { readonly mode: BrowserMode; readonly label: string; readonly inherited: boolean } {
+  const mode = effectiveBrowserMode(options);
+  return { mode, label: BROWSER_MODE_SHORT_LABELS[mode], inherited: options.paneMode === null };
+}

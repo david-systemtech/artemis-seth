@@ -397,6 +397,41 @@ describe('a resumed turn', () => {
     expect(asked.artemis?.['chromeBrowser']).toBe(true);
     expect(silent.artemis).not.toHaveProperty('chromeBrowser');
   });
+
+  it('asks the server for the caller’s own browser when the run wants it', async () => {
+    // The other browser a served run can have, and the one the client itself
+    // drives: the server publishes each verb back down this connection. Same
+    // `true`-or-absent spelling, so an older server simply drops the field.
+    const { setBrowserRelayClient } = await import('../adapter.js');
+    setBrowserRelayClient(() => ({}) as never);
+    try {
+      const { origin, seen } = await serve((_request, response) => happyStream(response));
+
+      await drive(origin, { extensionBrowser: true });
+      await drive(origin, { extensionBrowser: false });
+
+      const asked = seen[0]?.body as { artemis?: Record<string, unknown> };
+      const silent = seen[1]?.body as { artemis?: Record<string, unknown> };
+      expect(asked.artemis?.['extensionBrowser']).toBe(true);
+      expect(silent.artemis).not.toHaveProperty('extensionBrowser');
+    } finally {
+      setBrowserRelayClient(null);
+    }
+  });
+
+  it('does not ask for a browser it cannot drive on this client’s behalf', async () => {
+    // A server that honoured the request and then got no answer would hand the
+    // agent a tool set whose every verb waits out its deadline and refuses.
+    // Not asking leaves the run with whatever the serving machine gives it,
+    // which is a lesser feature rather than a broken one.
+    const { origin, seen } = await serve((_request, response) => happyStream(response));
+
+    await drive(origin, { extensionBrowser: true });
+
+    expect((seen[0]?.body as { artemis?: Record<string, unknown> }).artemis).not.toHaveProperty(
+      'extensionBrowser',
+    );
+  });
 });
 
 describe('refusals and losses', () => {
@@ -592,6 +627,35 @@ describe('what the server set aside', () => {
     expect((notices[0] as { text: string }).text).toMatch(/cannot take standing instructions/);
     // The reply itself is untouched.
     expect(events.some((event) => event.type === 'text.delta' && (event as { text: string }).text === 'Hello.')).toBe(true);
+  });
+
+  it('says once that the server would not let the run use this machine’s browser', async () => {
+    /*
+     * The picker on this side is showing "My Chrome" and the agent is about to
+     * browse something else, or nothing. The operator's switch is named
+     * because it is the only cure and it is not on this machine — a message
+     * that said only "the server declined" would leave the user with nothing
+     * to ask its operator for.
+     */
+    const { origin } = await serve((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      const ignored = { artemis: { ignored: ['artemis.extensionBrowser'] } };
+      response.write(sse(chunk({ role: 'assistant' }, ignored)));
+      response.write(sse(chunk({ content: 'Hello.' }, ignored)));
+      response.write(sse(chunk({}, { finish_reason: 'stop', artemis: { endReason: 'completed' } })));
+      response.write(sse('[DONE]'));
+      response.end();
+    });
+
+    const events = await drive(origin, { extensionBrowser: true });
+
+    const notices = events.filter(
+      (event) => event.type === 'text.complete' && (event as { synthetic?: boolean }).synthetic === true,
+    );
+    expect(notices).toHaveLength(1);
+    const text = (notices[0] as { text: string }).text;
+    expect(text).toMatch(/does not let its runs use the browser on your machine/);
+    expect(text).toContain('ARTEMIS_ALLOW_CLIENT_BROWSER');
   });
 
   it('names the always-on skills when they are what the run went without, and both when both', async () => {

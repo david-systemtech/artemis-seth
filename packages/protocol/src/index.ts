@@ -73,6 +73,7 @@ export * from './agentPrompts.js';
 export * from './skills.js';
 export * from './slashCommands.js';
 export * from './browserDriver.js';
+export * from './extensionBridge.js';
 export * from './describeBank.js';
 export * from './suggestedTasks.js';
 export * from './secretRefs.js';

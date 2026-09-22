@@ -57,6 +57,7 @@ import {
   CalendarClockIcon,
   CastIcon,
   GaugeIcon,
+  GlobeIcon,
   InfoIcon,
   KeyRoundIcon,
   LaptopIcon,
@@ -76,6 +77,7 @@ import { KeyManagersSection } from './KeyManagersSection';
 import { MemoryBanksSection } from './MemoryBanksSection';
 import { SkillsSection } from './SkillsSection';
 import { ModelsSection } from './ModelsSection';
+import { BrowserSection } from './BrowserSection';
 import { PermissionsSection } from './PermissionsSection';
 import { RemoteSection } from './RemoteSection';
 import { RunsSection } from './RunsSection';
@@ -194,16 +196,29 @@ export const SETTINGS_NAV: readonly NavBand[] = [
         hint: 'Shared facts agents keep',
         icon: <BrainIcon aria-hidden="true" />,
       },
-      // After what the agent is told, what it is allowed: the browser
-      // switches live in here now — "whose browser" was always a permission
-      // question, and the old nav's answer (a separate pane, parked adjacent,
-      // "in the same breath") was the weaker form of putting them in the same
-      // sentence. The `browser` id still resolves to this pane.
+      // After what the agent is told, what it is allowed: the browser picker
+      // lives in here — "whose browser" was always a permission question, and
+      // the old nav's answer (a separate pane, parked adjacent, "in the same
+      // breath") was the weaker form of putting it in the same sentence.
       {
         id: 'permissions',
         label: 'Permissions & access',
         hint: 'What runs without asking',
         icon: <ShieldIcon aria-hidden="true" />,
+      },
+      // And the machinery behind the one option in that picker that has to be
+      // set up. `browser` is an id that used to resolve *to* the pane above,
+      // when it named a pane holding two switches that belonged with the
+      // permission modes; it names its own room again now, and a different
+      // room — not the choice, but pairing a Chrome, the code, the paired
+      // browsers and what an agent may read on each site. It sits directly
+      // under Permissions & access because that is where somebody who just
+      // met a disabled "My Chrome" option will look next.
+      {
+        id: 'browser',
+        label: 'Browser',
+        hint: 'Pair a Chrome, and its rules',
+        icon: <GlobeIcon aria-hidden="true" />,
       },
       // Last in the band because nothing depends on it and it changes nothing
       // about a run: pure taste, safely explored after the questions with
@@ -450,8 +465,9 @@ function SectionBody({ section }: { readonly section: SettingsSection }): ReactE
     // straight in still lands in the right room instead of failing to compile
     // away the case.
     case 'permissions':
-    case 'browser':
       return <PermissionsSection />;
+    case 'browser':
+      return <BrowserSection />;
     case 'agents':
       return <InstructionsSection />;
     case 'skills':

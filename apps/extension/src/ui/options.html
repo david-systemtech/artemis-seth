@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Artemis</title>
+    <link rel="stylesheet" href="ui.css" />
+  </head>
+  <body>
+    <h1>Artemis</h1>
+    <p id="browser-name">This browser</p>
+
+    <section>
+      <div class="status"><span class="dot" id="dot"></span><span id="status">Loading…</span></div>
+      <p class="detail" id="detail"></p>
+    </section>
+
+    <h2>Pairing</h2>
+    <section id="pair-section">
+      <p>
+        Artemis shows a pairing code in Settings. Type it here once; after that this browser proves itself
+        without sending the code or the secret again.
+      </p>
+      <div class="row">
+        <input id="code" type="text" autocomplete="off" spellcheck="false" placeholder="Pairing code" />
+        <button id="pair" class="primary" type="button">Pair</button>
+      </div>
+    </section>
+
+    <section id="paired-section" hidden>
+      <p>This browser is paired with Artemis on this machine.</p>
+      <div class="row">
+        <button id="unpair" class="danger" type="button">Unpair</button>
+      </div>
+    </section>
+
+    <h2>Connection</h2>
+    <section>
+      <label for="port">Port Artemis listens on</label>
+      <div class="row">
+        <input id="port" type="number" min="1" max="65535" />
+        <button id="save-port" type="button">Save</button>
+      </div>
+      <p>The extension only ever connects to <code>127.0.0.1</code> on this machine. There is no host to set.</p>
+    </section>
+
+    <h2>What the agent may do here</h2>
+    <section id="policy-section">
+      <p id="policy-summary" class="empty">No policy yet — Artemis sends one when this browser connects.</p>
+    </section>
+
+    <h2>Log</h2>
+    <section>
+      <p>Everything Artemis did in this browser, newest first. Kept on this machine and sent nowhere.</p>
+      <div class="row"><button id="refresh-audit" type="button">Refresh</button></div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Conversation</th>
+            <th>Verb</th>
+            <th>Site</th>
+            <th>Outcome</th>
+          </tr>
+        </thead>
+        <tbody id="audit"></tbody>
+      </table>
+    </section>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

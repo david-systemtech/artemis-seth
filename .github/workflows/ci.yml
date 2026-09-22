@@ -27,6 +27,15 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
+      # The browser extension is built here as well as at release time, for the
+      # reason `pnpm build` is: a package whose build only runs when a tag is
+      # pushed ships its regressions blind, and this one ends up in someone's
+      # browser. The script exits 0 with a notice on a checkout that has no
+      # `apps/extension` — that is a branch predating the extension, not a
+      # broken build — and non-zero when the package is there and will not
+      # build. See scripts/package-extension.ts.
+      - name: Build the browser extension
+        run: pnpm exec tsx scripts/package-extension.ts
       # Production bundling is its own way to fail — electron-vite resolves,
       # tree-shakes and externalizes differently from the dev server, and an
       # Electron app whose bundling only runs at release time ships bundling

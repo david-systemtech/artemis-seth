@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "//": "Everything that runs inside Chrome. `types: []` is the same boundary `@rx-artemis/protocol` draws and it is here for the same reason: nothing in an extension may reach for `fs`, `process` or `electron`, and the compiler is a cheaper enforcer than a reviewer. The `chrome` namespace arrives from `src/chrome.d.ts`, which declares only the calls this extension actually makes.",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "./.tsbuild/src",
+    "tsBuildInfoFile": "./.tsbuild/src/.tsbuildinfo",
+    "emitDeclarationOnly": true,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": [],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "verbatimModuleSyntax": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", ".tsbuild", "**/*.test.ts"],
+  "references": [{ "path": "../../packages/protocol" }]
+}
