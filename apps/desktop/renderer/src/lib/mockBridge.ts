@@ -1728,6 +1728,13 @@ export function createMockBridge(): ArtemisBridge {
           suggestionListeners.delete(listener);
         };
       },
+      /*
+       * Nothing fires this in dev, and a subscription that quietly does
+       * nothing is the honest mock of it. A browser choice is made inside a
+       * tool call against a real paired Chrome; there is no fake of that here,
+       * and inventing one would put a browser on a pane that has none.
+       */
+      onBrowserChoice: (): Unsubscribe => () => undefined,
     },
 
     sessions: {
@@ -2702,6 +2709,18 @@ export function createMockBridge(): ArtemisBridge {
             state: settle({
               ...state,
               browsers: state.browsers.filter((one) => one.browserId !== browserId),
+            }),
+          }),
+        // Renaming actually renames, because the question this mock exists to
+        // answer is what the pane looks like — and a row whose name never
+        // changes cannot answer it.
+        rename: async ({ browserId, browserName }) =>
+          ok({
+            state: settle({
+              ...state,
+              browsers: state.browsers.map((one) =>
+                one.browserId === browserId ? { ...one, browserName } : one,
+              ),
             }),
           }),
         policy: async ({ policy }) => ok({ state: settle({ ...state, policy }) }),

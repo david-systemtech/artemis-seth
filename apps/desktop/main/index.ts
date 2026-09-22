@@ -471,7 +471,9 @@ async function bootstrap(): Promise<void> {
    * does not ask a server for a browser at all, which is the honest lesser
    * feature rather than a run waiting out deadlines nobody will answer.
    */
-  setBrowserRelayClient((runKey) => extensionPageDriver(runKey as RunId, requireExtensionBridge()));
+  setBrowserRelayClient((runKey, browserId) =>
+    extensionPageDriver(runKey as RunId, requireExtensionBridge(), { browser: browserId }),
+  );
 
   const sdkExecutablePath = bundledSdkExecutablePath();
   await engineHost.start({
@@ -532,7 +534,28 @@ async function bootstrap(): Promise<void> {
            * instead would have it report on the wrong cookie jar and never
            * mention the substitution.
            */
-          extension: () => extensionBrowserToolServer(runId, requireExtensionBridge()),
+          extension: (browserId) =>
+            extensionBrowserToolServer(runId, requireExtensionBridge(), {
+              browser: browserId,
+              /*
+               * And when the agent settles the "which browser?" question
+               * mid-turn, the conversation moves onto that browser.
+               *
+               * A push rather than a return value, because the decision
+               * happens inside a tool call and the pane that has to learn it
+               * is in another process. The renderer routes it by run id to the
+               * pane holding the run — see `IPC_PUSH.runBrowserChoice` — so
+               * the browser row shows the answer and the next turn starts on
+               * it without the user being asked twice.
+               */
+              onChosen: (chosen) => {
+                broadcast(IPC_PUSH.runBrowserChoice, {
+                  kind: 'run-browser-choice',
+                  runId,
+                  browserId: chosen,
+                });
+              },
+            }),
         }),
         /*
          * Suggested tasks, on every run and under no preference.

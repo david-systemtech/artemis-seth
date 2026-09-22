@@ -36,11 +36,19 @@
  * ## Targeting is by closure, never by argument
  *
  * The factory is called **per run** and closes over that run's id, which is
- * what the driver is built around. A tool therefore acts on the browser
- * belonging to *its own* conversation, and the model has no way to name a
- * different one: there is no `browserId` parameter on any tool. An agent in the
- * left-hand column cannot drive the page in the right-hand one, and it cannot
- * do so precisely because it cannot say which page it means.
+ * what the driver is built around. A tool therefore acts on the page belonging
+ * to *its own* conversation, and the model has no way to name a different one:
+ * no tool takes a tab id. An agent in the left-hand column cannot drive the
+ * page in the right-hand one, and it cannot do so precisely because it cannot
+ * say which page it means.
+ *
+ * `browser_open`'s `browser` argument is not an exception to that and is worth
+ * saying why. It names one of the *user's paired browsers* — their work Chrome
+ * or their personal one — and it exists because with two of them open Artemis
+ * has to ask which is meant rather than guess. It selects a browser, not a
+ * page: whichever browser a run ends up in, the tab it acts on is still the one
+ * filed under its own run key, and no other conversation's tab is reachable
+ * from it.
  *
  * ## What the dock browser will not do
  *
@@ -57,7 +65,11 @@ import { pageToolInstructions, pageTools, pageToolServer } from '@rx-artemis/cor
 import { browserUrlFor, type RunId } from '@rx-artemis/protocol';
 
 import { embeddedPageDriver, type BrowserToolContext } from './embeddedPageDriver.js';
-import { extensionPageDriver, type ExtensionDriverHost } from './extensionPageDriver.js';
+import {
+  extensionPageDriver,
+  type ExtensionDriverHost,
+  type ExtensionDriverOptions,
+} from './extensionPageDriver.js';
 import { createLogger } from './log.js';
 
 const log = createLogger('browser-tools');
@@ -222,6 +234,11 @@ const EXTERNAL_INSTRUCTIONS =
  * | false           | false              | true              | the open-only external server |
  * | false           | false              | false             | the embedded dock browser |
  *
+ * `extensionBrowserId` is not a fifth row. It says *which* paired browser the
+ * second row means, and only that row reads it — a run may have a work Chrome
+ * and a personal one paired at once, and a conversation set to the first must
+ * not be handed the second. It rides through to the driver untouched.
+ *
  * Read top to bottom, and the order is the argument. Chrome wins over
  * everything because it is not a variation on Artemis's tools, it is the
  * *absence* of them: the CLI brings its own set, and handing it a sibling
@@ -254,16 +271,29 @@ export function agentBrowserServers(
   input: {
     readonly chromeBrowser?: boolean;
     readonly extensionBrowser?: boolean;
+    readonly extensionBrowserId?: string;
     readonly externalBrowser?: boolean;
   },
   build: {
     readonly embedded: () => McpServerConfig;
     readonly external: () => McpServerConfig;
-    readonly extension: () => McpServerConfig;
+    /**
+     * The extension server, over the paired browser the run named — or over
+     * whichever is open, when it named none.
+     *
+     * The id is passed through rather than resolved here, because this table
+     * decides *which tools* a run gets and not which browser answers them. A
+     * browser that has been unpaired, or whose Chrome is shut, is still this
+     * row: the driver refuses in a sentence naming it, which is the rule the
+     * paragraph above states for the extension as a whole.
+     */
+    readonly extension: (browserId: string | undefined) => McpServerConfig;
   },
 ): Record<string, McpServerConfig> | undefined {
   if (input.chromeBrowser === true) return undefined;
-  if (input.extensionBrowser === true) return { artemisBrowser: build.extension() };
+  if (input.extensionBrowser === true) {
+    return { artemisBrowser: build.extension(input.extensionBrowserId) };
+  }
   return { artemisBrowser: input.externalBrowser === true ? build.external() : build.embedded() };
 }
 
@@ -278,13 +308,18 @@ export function agentBrowserServers(
 export function extensionBrowserToolServer(
   runId: RunId,
   bridge: ExtensionDriverHost,
+  options: ExtensionDriverOptions = {},
 ): McpServerConfig {
-  return pageToolServer(extensionPageDriver(runId, bridge));
+  return pageToolServer(extensionPageDriver(runId, bridge, options));
 }
 
 /** The extension variant's tool definitions. Addressable for the same reason {@link browserTools} is. */
-export function extensionBrowserTools(runId: RunId, bridge: ExtensionDriverHost) {
-  return pageTools(extensionPageDriver(runId, bridge));
+export function extensionBrowserTools(
+  runId: RunId,
+  bridge: ExtensionDriverHost,
+  options: ExtensionDriverOptions = {},
+) {
+  return pageTools(extensionPageDriver(runId, bridge, options));
 }
 
 function messageOf(error: unknown): string {

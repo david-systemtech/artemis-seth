@@ -338,6 +338,19 @@ interface Wording {
   /** Anything `browser_screenshot` has to add on this browser. */
   readonly screenshot: string;
   /**
+   * What `browser_open`'s `browser` argument means here, or `null` where the
+   * argument is not offered at all.
+   *
+   * Per kind because *having several browsers to choose between* is a property
+   * of one of the three. The user's own Chrome may have a work profile and a
+   * personal one paired with the same Artemis, each with its own logins; the
+   * dock tab and the headless Chromium beside a server are one browser each,
+   * by construction. Offering the argument there would be a parameter with one
+   * legal value, which a model spends context reasoning about and eventually
+   * fills in with something.
+   */
+  readonly chooseBrowser: string | null;
+  /**
    * Where `browser_evaluate` may run, on this browser.
    *
    * Per kind because the answer is a property of the browser and not of the
@@ -382,6 +395,8 @@ const WORDING: Readonly<Record<BrowserDriverKind, Wording>> = {
       'it is not their own browser.',
     page: 'this conversation’s embedded dock browser tab',
     screenshot: '',
+    /* One tab in one dock. There is nothing to choose between. */
+    chooseBrowser: null,
     /*
      * Never read: this driver's `abilities` say it offers none of the three,
      * so the tools carrying these sentences are not registered. Written out
@@ -429,6 +444,8 @@ const WORDING: Readonly<Record<BrowserDriverKind, Wording>> = {
     screenshot:
       ' Nobody can see this browser, so a screenshot is the only way to show ' +
       'the user what a page looks like.',
+    /* One Chromium per server, signed in to nothing. Nothing to choose between. */
+    chooseBrowser: null,
     /*
      * No per-site rule to state, because there is no per-site anything: this
      * browser is signed in to nothing and its context is thrown away with the
@@ -470,6 +487,23 @@ const WORDING: Readonly<Record<BrowserDriverKind, Wording>> = {
       'keeps to itself, which they can see and close.',
     page: 'this conversation’s tab in the user’s own Chrome',
     screenshot: '',
+    /*
+     * Only ever used to *answer* a question Artemis asked. The user may have
+     * paired a work Chrome and a personal one; with both open and the
+     * conversation set to neither, the first verb is refused with a sentence
+     * naming them and telling the model to ask which. This is where the answer
+     * goes, and the description says so rather than inviting the model to pick
+     * one unprompted — it has no way to know which profile a task belongs to,
+     * and acting as the wrong signed-in person is the failure the refusal
+     * exists to prevent.
+     */
+    chooseBrowser:
+      'Which of the user’s paired browsers to use, by the name they gave it ' +
+      '("Work", "Personal"). Leave it out unless Artemis has refused a call ' +
+      'asking which browser to use: it then lists the names, you ask the user ' +
+      'which one they mean, and you put their answer here. The choice holds for ' +
+      'the rest of the conversation. Never guess a name — the wrong one acts as ' +
+      'the wrong signed-in person.',
     /*
      * The per-site policy, stated where it is true. This is the user's own
      * browser, so a stored token is *their* token and a session cookie is
@@ -556,6 +590,29 @@ export function pageToolServer(driver: PageDriver): McpServerConfig {
  * addressable means the decisions in them can be asserted directly, rather than
  * by standing up an MCP client to ask a fake browser a question.
  */
+/**
+ * `browser_open`'s parameters, with `browser` only where naming one is a real
+ * question.
+ *
+ * The shape is *declared* with `browser` optional rather than built by a
+ * conditional whose type the compiler would have to union, which is what keeps
+ * the handler's destructuring honest: the argument is always in the type and
+ * sometimes in the schema, and a driver with one browser simply never sees it
+ * arrive. See {@link Wording.chooseBrowser} on why absence beats a parameter
+ * with one legal value.
+ */
+function openArguments(wording: Wording): {
+  readonly url: z.ZodOptional<z.ZodString>;
+  readonly browser?: z.ZodOptional<z.ZodString>;
+} {
+  return {
+    url: z.string().optional().describe('Address to open, e.g. http://localhost:5173'),
+    ...(wording.chooseBrowser === null
+      ? {}
+      : { browser: z.string().optional().describe(wording.chooseBrowser) }),
+  };
+}
+
 export function pageTools(driver: PageDriver) {
   const wording = WORDING[driver.kind];
   const abilities = driver.abilities;
@@ -564,10 +621,10 @@ export function pageTools(driver: PageDriver) {
     tool(
       'browser_open',
       wording.open,
-      { url: z.string().optional().describe('Address to open, e.g. http://localhost:5173') },
-      async ({ url }) =>
+      openArguments(wording),
+      async ({ url, browser }) =>
         settled(
-          () => driver.open(url),
+          () => driver.open(url, browser),
           (at) => say(`Browser open at ${whereIs(at)}.`),
         ),
     ),

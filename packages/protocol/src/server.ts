@@ -1675,6 +1675,21 @@ export interface ArtemisChatExtensions {
    */
   readonly extensionBrowser?: boolean;
   /**
+   * *Which* of the caller's paired browsers {@link extensionBrowser} means -
+   * {@link RunInput.extensionBrowserId}, asked of another machine.
+   *
+   * An id the *client* issued when it paired that browser, so only the client
+   * can resolve it; the server carries it to the relay and no further. Absent
+   * means whichever of the caller's browsers is open, which is what every
+   * served run meant before this field existed.
+   *
+   * Dropped with {@link extensionBrowser} whenever that is dropped, and named
+   * under `artemis.ignored` as `artemis.extensionBrowser` rather than
+   * separately: a browser choice without a browser is not a second thing the
+   * host declined, it is part of the one it did.
+   */
+  readonly extensionBrowserId?: string;
+  /**
    * Continue an earlier conversation. Absent starts a new one.
    *
    * The only piece of turn state a caller supplies, and it exists because
@@ -1945,6 +1960,14 @@ export function readChatExtensions(body: unknown): ArtemisChatExtensions {
     // one spelling of it downstream.
     ...(extensions['chromeBrowser'] === true ? { chromeBrowser: true } : {}),
     ...(extensions['extensionBrowser'] === true ? { extensionBrowser: true } : {}),
+    // Only beside the flag it qualifies. A browser id with no request to use a
+    // browser names nothing the run will do, and carrying it would leave the
+    // host holding a choice it must then remember to ignore.
+    ...(extensions['extensionBrowser'] === true &&
+    typeof extensions['extensionBrowserId'] === 'string' &&
+    extensions['extensionBrowserId'].length > 0
+      ? { extensionBrowserId: extensions['extensionBrowserId'] as string }
+      : {}),
     ...(typeof extensions['sessionId'] === 'string'
       ? { sessionId: extensions['sessionId'] as string }
       : {}),

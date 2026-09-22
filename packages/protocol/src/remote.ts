@@ -342,6 +342,23 @@ export type ServerBrowserCall = BridgeVerb & {
   readonly runId: string;
   /** The key the extension files this conversation's tab under. */
   readonly runKey: string;
+  /**
+   * Which of the client's paired browsers to drive. Absent means whichever of
+   * them is connected, which is the only answer when there is one.
+   *
+   * Deliberately on this event and not on {@link BridgeCall}: choosing between
+   * paired browsers is the client's job, done by picking one of the sockets it
+   * holds, and the extension at the far end of that socket never learns that
+   * any other browser exists.
+   *
+   * It carries whatever the caller used to name the browser — the id from
+   * `artemis.extensionBrowserId`, or the *name* the agent chose after Artemis
+   * asked which browser to use. The client resolves either, because the client
+   * is the only side that holds the list the two could be compared against; a
+   * server that tried to translate a name into an id would be translating
+   * against a list it has never seen.
+   */
+  readonly browserId?: string;
 };
 
 /** Body of `POST /api/v0/browser/answer`. */

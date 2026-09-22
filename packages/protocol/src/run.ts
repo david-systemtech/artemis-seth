@@ -246,6 +246,33 @@ export interface RunInput {
   readonly extensionBrowser?: boolean;
 
   /**
+   * *Which* paired browser {@link extensionBrowser} means, by the id Artemis
+   * issued when it was paired.
+   *
+   * A person may have several Chrome profiles paired with one Artemis — a work
+   * one and a personal one — and each carries its own logins. Absent means
+   * "whichever of them is open", which is what every run meant before this
+   * field existed and is still the right answer for somebody with one browser.
+   * Present names exactly one, and a run that names a browser gets that
+   * browser or a refusal saying why not: a conversation set to the work
+   * profile must never quietly act in the personal one.
+   *
+   * Meaningless without {@link extensionBrowser}, and ignored there — the
+   * decision table in `browserTools.ts` resolves which browser a run gets
+   * before this is read at all.
+   *
+   * A request rather than a guarantee, on {@link extensionBrowser}'s own
+   * reasoning: a browser that has been unpaired, or whose Chrome is closed, is
+   * a refusal per verb in words the agent can repeat, not a run refused at the
+   * door.
+   *
+   * On a served conversation it rides as `artemis.extensionBrowserId` and
+   * names a browser paired with the *client*, which is the only machine that
+   * can resolve it.
+   */
+  readonly extensionBrowserId?: string;
+
+  /**
    * Open pages in the user's default browser instead of the host's embedded
    * one.
    *

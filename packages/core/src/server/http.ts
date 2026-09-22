@@ -3952,8 +3952,22 @@ async function handleChatCompletions(
   const mayRelay = context.browserRelay !== undefined && context.allowClientBrowser !== false;
   const kept = canAppend ? extensions : withoutAppends;
   const { chromeBrowser: _noChrome, ...withoutChrome } = kept;
-  const { extensionBrowser: _noRelay, ...withoutRelay } = kept;
-  const { chromeBrowser: _alsoNoChrome, extensionBrowser: _alsoNoRelay, ...withoutEither } = kept;
+  /*
+   * `extensionBrowserId` leaves with the flag it qualifies. It names one of the
+   * *caller's* paired browsers, so a host that is not relaying to that caller
+   * has nowhere to send it and nothing to check it against, and a run started
+   * with a browser id and no browser would carry a choice nothing ever reads.
+   * It is not named separately under `artemis.ignored` — a browser choice
+   * without a browser is part of the one thing the host declined, not a second
+   * thing.
+   */
+  const { extensionBrowser: _noRelay, extensionBrowserId: _noRelayId, ...withoutRelay } = kept;
+  const {
+    chromeBrowser: _alsoNoChrome,
+    extensionBrowser: _alsoNoRelay,
+    extensionBrowserId: _alsoNoRelayId,
+    ...withoutEither
+  } = kept;
   const droppedChrome = extensions.chromeBrowser === true && !mayBrowse;
   const droppedRelay = extensions.extensionBrowser === true && !mayRelay;
   const applied: ArtemisChatExtensions = droppedChrome
@@ -4478,6 +4492,10 @@ const STEER_IGNORED: readonly (readonly [keyof ArtemisChatExtensions, string])[]
   // Chrome is: the servers were built and handed to the provider, and a steer
   // arrives after that.
   ['extensionBrowser', 'artemis.extensionBrowser'],
+  // And so is *which* browser it drives, for the same reason and one more: the
+  // driver was built around it, and a run that changed browsers mid-turn would
+  // leave a tab open in one of them with nobody to close it.
+  ['extensionBrowserId', 'artemis.extensionBrowserId'],
 ];
 
 /**

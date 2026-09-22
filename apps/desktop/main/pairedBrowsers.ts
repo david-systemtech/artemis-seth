@@ -87,6 +87,15 @@ export interface PairedBrowsers {
   /** Forget one. Answers whether there was one to forget. */
   remove(browserId: string): Promise<boolean>;
   /**
+   * Call one something else. Answers whether there was one to rename.
+   *
+   * The name is what a person uses to tell two Chrome profiles apart — both
+   * report themselves as "Chrome on Windows" — so it is the one field of a
+   * pairing the user may edit. The caller cleans it; this stores what it is
+   * given, exactly as {@link add} does.
+   */
+  rename(browserId: string, browserName: string): Promise<boolean>;
+  /**
    * Note that a browser connected, with the extension version it reported.
    *
    * Separate from {@link add} because it happens on every connection and
@@ -160,6 +169,19 @@ export async function openPairedBrowsers(userDataDir: string): Promise<PairedBro
       const kept = document.browsers.filter((one) => one.browserId !== browserId);
       if (kept.length === document.browsers.length) return false;
       await save({ ...document, browsers: kept });
+      return true;
+    },
+
+    rename: async (browserId, browserName) => {
+      const found = document.browsers.find((one) => one.browserId === browserId);
+      if (found === undefined) return false;
+      if (found.browserName === browserName) return true;
+      await save({
+        ...document,
+        browsers: document.browsers.map((one) =>
+          one.browserId === browserId ? { ...one, browserName } : one,
+        ),
+      });
       return true;
     },
 

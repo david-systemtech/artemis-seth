@@ -756,6 +756,13 @@ export function createRemoteBridge(
       // do not ride the stream yet; a composer with no suggestion is the
       // documented cold state, not a failure.
       onSuggestion: () => () => undefined,
+      /*
+       * And no browser choices either, for a sharper reason than the one
+       * above. A run served from another machine drives a browser paired with
+       * *that* machine's Artemis, chosen there; this window's panes hold no
+       * such browser and there is nothing here for a choice to land on.
+       */
+      onBrowserChoice: () => () => undefined,
     },
 
     /*
@@ -1108,6 +1115,7 @@ export function createRemoteBridge(
       state: async () => ok({ state: EXTENSION_BRIDGE_ELSEWHERE }),
       pair: async () => absent(EXTENSION_BRIDGE_REASON),
       unpair: async () => absent(EXTENSION_BRIDGE_REASON),
+      rename: async () => absent(EXTENSION_BRIDGE_REASON),
       policy: async () => absent(EXTENSION_BRIDGE_REASON),
       saveBundle: async () => absent(DIALOG_REASON),
       onState: () => () => undefined,
