@@ -189,6 +189,20 @@ describe('turning a compose file’s address into an endpoint', () => {
     expect(endpoint).toBe('ws://127.0.0.1:9222/devtools/browser/abc');
   });
 
+  it('brackets an IPv6 address in a full devtools endpoint too', async () => {
+    /*
+     * The failure this pins is silent. `ws:` is a special scheme, so the WHATWG
+     * host parser refuses a bare IPv6 literal — and `URL.hostname =` does not
+     * throw when it refuses, it leaves the old host alone. Without the
+     * brackets the endpoint comes back still naming `browser`, which is the
+     * one thing resolving it was for.
+     */
+    const endpoint = await resolveCdpEndpoint('ws://browser:9222/devtools/browser/abc', {
+      lookup: async () => 'fd00::5',
+    });
+    expect(endpoint).toBe('ws://[fd00::5]:9222/devtools/browser/abc');
+  });
+
   it('brackets an IPv6 address when it asks', async () => {
     const asked: string[] = [];
     await resolveCdpEndpoint('http://browser:9222', {
@@ -216,6 +230,38 @@ describe('turning a compose file’s address into an endpoint', () => {
     await expect(
       resolveCdpEndpoint('http://browser:9222', { lookup, fetchJson: async () => ({ ok: true }) }),
     ).rejects.toThrow('did not name a webSocketDebuggerUrl');
+  });
+
+  it('gives up on an endpoint that accepts the connection and then says nothing', async () => {
+    /*
+     * The one place on the connect path with nothing above it: this runs before
+     * any `CdpConnection` exists, so none of that class's deadlines apply. A
+     * half-started container, or a proxy holding the request open, used to hang
+     * the run's first `browser_open` for the life of the run.
+     *
+     * The stub honours the signal and does nothing else, which is exactly the
+     * endpoint being described — so what settles this promise is the deadline
+     * or nothing at all.
+     */
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal('fetch', async (_url: string, init?: { signal?: AbortSignal }) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(new DOMException('This operation was aborted', 'AbortError'));
+          });
+        });
+      });
+      const resolving = resolveCdpEndpoint('http://browser:9222', { lookup });
+      const said = expect(resolving).rejects.toThrow(
+        'The browser at http://172.20.0.3:9222/json/version did not answer within 10 seconds.',
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      await said;
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
   });
 });
 
