@@ -88,6 +88,8 @@ class FakeChromium {
   redirects = new Map<string, string>();
   /** A navigation that fails outright, as `Page.navigate`'s `errorText`. */
   navigationFailures = new Map<string, string>();
+  /** A `Page.navigate` the browser rejects rather than answers. See the case below. */
+  navigationErrors = new Map<string, string>();
   evaluated: (expression: string) => Record<string, unknown> = () => ({
     result: { type: 'string', value: 'ok' },
   });
@@ -204,7 +206,7 @@ class FakeChromium {
 
     if (method === 'Page.navigate') {
       const url = String(params['url']);
-      if (this.navigationFailures.has(url)) return;
+      if (this.navigationFailures.has(url) || this.navigationErrors.has(url)) return;
       queueMicrotask(() => {
         this.arriveAt(this.redirects.get(url) ?? url, sessionId);
       });
@@ -258,6 +260,39 @@ class FakeChromium {
     }
     this.emit('Page.frameNavigated', { frame: { id: TOP_FRAME, url } }, sessionId);
     this.emit('Page.loadEventFired', { timestamp: 1 }, sessionId);
+    // After the load event, as Chromium sends it: measured on 141, the top
+    // frame's `frameStoppedLoading` follows `loadEventFired` by a millisecond,
+    // which is what makes it safe as a second way to clear the wait.
+    this.emit('Page.frameStoppedLoading', { frameId: TOP_FRAME }, sessionId);
+  }
+
+  /**
+   * A frame *inside* the page arriving somewhere, in the same order.
+   *
+   * The response first, because it carries the address that frame's document
+   * was served from and the policy reads it when `frameNavigated` asks. The
+   * frame keeps its own `frameStartedLoading` and `frameStoppedLoading`, which
+   * is the pair the page's own load must not be confused by.
+   */
+  frameArrivesAt(
+    url: string,
+    sessionId: string,
+    options?: { readonly frameId?: string; readonly servedFrom?: string },
+  ): void {
+    const frameId = options?.frameId ?? 'frame-inside';
+    this.emit('Page.frameStartedLoading', { frameId }, sessionId);
+    this.emit(
+      'Network.responseReceived',
+      {
+        requestId: `sub-${String(this.#nextId++)}`,
+        type: 'Document',
+        frameId,
+        response: { status: 200, remoteIPAddress: options?.servedFrom ?? this.servedFrom(url) },
+      },
+      sessionId,
+    );
+    this.emit('Page.frameNavigated', { frame: { id: frameId, parentId: TOP_FRAME, url } }, sessionId);
+    this.emit('Page.frameStoppedLoading', { frameId }, sessionId);
   }
 
   /**
@@ -327,6 +362,7 @@ class FakeChromium {
       case 'Runtime.enable':
       case 'Log.enable':
       case 'Network.enable':
+      case 'Target.setAutoAttach':
       case 'Emulation.setDeviceMetricsOverride':
       case 'DOM.focus':
       case 'Input.dispatchMouseEvent':
@@ -337,6 +373,10 @@ class FakeChromium {
 
       case 'Page.navigate': {
         const asked = String(params['url']);
+        const refused = this.navigationErrors.get(asked);
+        // A CDP-level rejection rather than an `errorText`: the socket died, or
+        // the target went away. Different from a page that would not load.
+        if (refused !== undefined) throw new Error(refused);
         const failure = this.navigationFailures.get(asked);
         if (failure !== undefined) return { errorText: failure };
         const targetId = sessionId === undefined ? undefined : this.sessions.get(sessionId);
@@ -466,12 +506,15 @@ class FakeTimers implements BrowserTimers {
 
 let chromium: FakeChromium;
 let timers: FakeTimers;
+/** What the server would have written to its stderr. */
+let logged: string[];
 
 function build(limits?: Parameters<typeof createServerBrowser>[0]['limits']): ServerBrowser {
   return createServerBrowser({
     endpoint: 'ws://browser:9222/devtools/browser/fake',
     dial: async () => chromium.dial(),
     endpointDeps: { lookup: async () => '172.20.0.3' },
+    log: (line) => logged.push(line),
     resolveHost: async (host) => {
       const answer = dns.get(host);
       if (answer === null) throw new Error(`getaddrinfo ENOTFOUND ${host}`);
@@ -502,6 +545,7 @@ function reasonOf(result: { ok: boolean; reason?: string }): string {
 beforeEach(() => {
   chromium = new FakeChromium();
   timers = new FakeTimers();
+  logged = [];
   dns = new Map();
   chromium.elements.set('button[type="submit"]', { box: [10, 20, 110, 20, 110, 60, 10, 60] });
   chromium.elements.set('#email', { box: [0, 0, 200, 0, 200, 30, 0, 30], kind: 'field' });
@@ -1248,10 +1292,10 @@ describe('the address behind a name', () => {
     expect(reasonOf(refused)).toContain('The tab is now blank.');
   });
 
-  it('ignores the address a subframe was served from', async () => {
-    // An advert in an iframe reaching a private address is the network's
-    // business. Treating it as the page's would refuse pages for what their
-    // third parties did.
+  it('does not take a frame’s address for the page’s own', async () => {
+    // A response for a frame says where *that frame* came from. Letting it
+    // overwrite the page's would check the page's name against a machine that
+    // never served it, which refuses pages at random and misses real ones.
     const { driver } = await openAt();
     const session = chromium.sessionIds()[0] as string;
     chromium.emit(
@@ -1366,6 +1410,136 @@ describe('a page that moves itself', () => {
       // Blanked, so the next round starts from a page that is allowed.
       await driver.navigate('https://example.com/orders');
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* A frame inside the page is judged exactly as the page is                    */
+/* -------------------------------------------------------------------------- */
+
+describe('a frame inside the page', () => {
+  it('refuses the whole page when it loads a cloud metadata address', async () => {
+    /*
+     * The one the agent can write itself. `browser_evaluate` appending an
+     * `<iframe src="http://169.254.169.254/…">` used to be invisible to every
+     * gate, while `browser_screenshot` rendered it and `browser_click` — which
+     * aims at viewport coordinates — could drive it.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.frameArrivesAt('http://169.254.169.254/latest/meta-data/', session);
+    await Promise.resolve();
+
+    const refused = await driver.read();
+    expect(reasonOf(refused)).toContain(
+      'A frame inside the page loaded http://169.254.169.254/latest/meta-data/',
+    );
+    expect(reasonOf(refused)).toContain('cloud metadata address');
+    expect(reasonOf(refused)).toContain('The tab is now blank.');
+    expect(chromium.called('Page.navigate').at(-1)).toEqual({ url: 'about:blank' });
+    // And the operator hears about it, because nothing else in the transcript
+    // reaches them and this is what a prompt injection going for the metadata
+    // service looks like from outside.
+    expect(logged.some((line) => line.includes('169.254.169.254'))).toBe(true);
+  });
+
+  it('is judged on the machine that served it, not only on its name', async () => {
+    /*
+     * A frame is checked against its *own* remote address, which is the only
+     * thing that can see a public name in an `<iframe src>` that Chromium
+     * actually fetched from inside the operator's network.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.frameArrivesAt('https://widget.example/embed', session, { servedFrom: '10.0.0.5' });
+    await Promise.resolve();
+
+    const refused = await driver.read();
+    expect(reasonOf(refused)).toContain('resolves to 10.0.0.5');
+    expect(reasonOf(refused)).toContain('A frame inside the page loaded https://widget.example/embed');
+  });
+
+  it('is judged through the target it becomes when it is out of process', async () => {
+    /*
+     * Measured on Chromium 141: under site isolation — which the full browser
+     * in `docker/browser.Dockerfile` has on — a cross-site iframe is its own
+     * target and reports nothing on the page's `Page` domain. It arrives as an
+     * attach carrying no url, and the url follows on a `targetInfoChanged`.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    const targetInfo = { targetId: 'target-frame', type: 'iframe', url: '' };
+    chromium.emit(
+      'Target.attachedToTarget',
+      { sessionId: 'session-frame', targetInfo },
+      session,
+    );
+    chromium.emit(
+      'Target.targetInfoChanged',
+      { targetInfo: { ...targetInfo, url: 'http://metadata.google.internal/computeMetadata/v1/' } },
+      session,
+    );
+    await Promise.resolve();
+
+    const refused = await driver.read();
+    expect(reasonOf(refused)).toContain('http://metadata.google.internal/computeMetadata/v1/');
+    expect(reasonOf(refused)).toContain('cloud metadata address');
+  });
+
+  it('is left alone when it is somewhere this browser may go', async () => {
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.frameArrivesAt('https://widget.example/embed', session);
+    await Promise.resolve();
+    expect((await driver.read()).ok).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Waiting for a load, and stopping waiting                                    */
+/* -------------------------------------------------------------------------- */
+
+describe('waiting for a page to settle', () => {
+  it('is not held up by a frame that starts loading after the page has loaded', async () => {
+    /*
+     * The twenty-second stall. A lazy embed, an advert, a frame some analytics
+     * script injects — anything that starts loading after `loadEventFired` —
+     * used to set the page's own loading flag, and nothing cleared it: the load
+     * event had already been and gone, and `Page.frameStoppedLoading` was never
+     * subscribed. Every verb after that waited out the full settle timeout.
+     *
+     * This test fails by timing out rather than by asserting, which is the
+     * honest shape for it: the bug is that the verb never comes back.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.emit('Page.frameStartedLoading', { frameId: 'frame-advert' }, session);
+
+    expect((await driver.read()).ok).toBe(true);
+  });
+
+  it('stops waiting when the top frame stops loading without a load event', async () => {
+    // A document that commits and then ends without firing `load` — one the
+    // page replaced, or one that failed part-way — produces
+    // `frameStoppedLoading` and no `loadEventFired`.
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.emit('Page.frameStartedLoading', { frameId: TOP_FRAME }, session);
+    chromium.emit('Page.frameStoppedLoading', { frameId: TOP_FRAME }, session);
+
+    expect((await driver.read()).ok).toBe(true);
+  });
+
+  it('does not leave the next verb waiting when the browser refuses the navigation', async () => {
+    // The wait is armed before `Page.navigate` is sent, deliberately — so a
+    // call that is rejected rather than answered has to release it. The socket
+    // dying mid-navigation is the case: the next verb must not pay for it.
+    const { driver } = await openAt();
+    chromium.navigationErrors.set('https://example.com/gone', 'Target closed.');
+
+    const refused = await driver.navigate('https://example.com/gone');
+    expect(reasonOf(refused)).toContain('Target closed.');
+    expect((await driver.read()).ok).toBe(true);
   });
 });
 

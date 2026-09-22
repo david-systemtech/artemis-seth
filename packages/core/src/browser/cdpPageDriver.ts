@@ -42,18 +42,25 @@
  *  - **Before navigating**, on the address the agent named *and on what it
  *    resolves to*. A name check alone was a spelling check:
  *    `169.254.169.254.nip.io` is a public name for the metadata service.
- *  - **On every navigation the browser makes**, from `Page.frameNavigated` and
- *    `Page.navigatedWithinDocument`. A page can move itself with a meta refresh
- *    or a timer, with no tool call anywhere near it, and a policy that only ran
- *    inside `navigate` and `click` never saw that. The listener blanks the tab
- *    and leaves its sentence for the next verb.
+ *  - **On every navigation the browser makes, in every frame**, from
+ *    `Page.frameNavigated`, `Page.navigatedWithinDocument`, and — for a frame
+ *    that is its own target — `Target.attachedToTarget` and
+ *    `Target.targetInfoChanged`. A page can move itself with a meta refresh or
+ *    a timer, with no tool call anywhere near it, and a policy that only ran
+ *    inside `navigate` and `click` never saw that. Frames count because
+ *    `browser_evaluate` can write one: see {@link CdpPageDriver.#watch}. The
+ *    listener blanks the tab and leaves its sentence for the next verb.
  *  - **Before every verb acts**, over the address the tab has now and the
  *    machine the main document was actually served from. The second is what
  *    defeats rebinding between the lookup and the fetch.
  *
- * What none of it covers: a loaded page's own sub-requests, which happen below
- * anything CDP lets a client veto cheaply. Only a network-level rule on the
- * container can, and `docs/SERVER-BROWSER.md` says so and says how.
+ * What none of it covers: a loaded page's own sub-requests — a `fetch`, an
+ * `XMLHttpRequest`, an `<img src>`, a stylesheet, a beacon — which happen below
+ * anything CDP lets a client veto cheaply. Those reach an address without ever
+ * navigating anything, so no event above fires for them; what they cannot do is
+ * put the answer in front of the agent, because nothing renders and nothing is
+ * read back. Only a network-level rule on the container closes it, and
+ * `docs/SERVER-BROWSER.md` says so and says how.
  *
  * ## One tab, and it may go away between calls
  *
@@ -82,7 +89,7 @@ import type {
   StorageSnapshot,
 } from '@rx-artemis/protocol';
 
-import type { CdpPage } from './cdpPage.js';
+import type { CdpPage, FrameArrival } from './cdpPage.js';
 import {
   addressStanding,
   navigationStanding,
@@ -146,6 +153,16 @@ export interface PageLease {
    * is the one the gate consults.
    */
   readonly resolveHost: HostResolver;
+  /**
+   * Where operational news goes: the server's stderr, in practice.
+   *
+   * On the lease because the one thing this file has to say to an operator —
+   * a frame of a page reaching a refused address — happens with no tool call
+   * in flight, so the agent's transcript is not the only place it belongs. An
+   * agent appending an `<iframe src="http://169.254.169.254/…">` is worth a
+   * line in the log whatever the agent is then told.
+   */
+  log(line: string): void;
 }
 
 function ok<T>(value: T): DriverResult<T> {
@@ -385,40 +402,71 @@ class CdpPageDriver implements PageDriver {
    * Watch where this tab goes, for the navigations no verb asked for.
    *
    * Set once per tab. The listener cannot answer anybody — nothing is waiting
-   * on it — so it does the two things it can: blank the tab, and leave the
-   * sentence for whichever verb comes next.
+   * on it — so it does the three things it can: blank the tab, leave the
+   * sentence for whichever verb comes next, and tell the operator's log.
+   *
+   * ## A frame counts, and a refused frame refuses the page
+   *
+   * This used to run on the top frame alone, reasoning that an advert in an
+   * iframe reaching a private address was the network's business. That reading
+   * covers a *page's* third parties and nothing else, and it left the agent's
+   * own tools outside every gate: `browser_evaluate` appends
+   * `<iframe src="http://169.254.169.254/latest/meta-data/">`, the frame's
+   * navigation was invisible, and the frame was then perfectly readable —
+   * `Page.captureScreenshot` renders the whole viewport including cross-origin
+   * frames, and `Input.dispatchMouseEvent` aims at viewport coordinates, so
+   * `browser_click` and `browser_type` drive it. Cloud metadata answers in
+   * plain text; a screenshot of it is the host's own credentials in the
+   * transcript.
+   *
+   * So a frame is judged exactly as the page is, and a page one of whose
+   * frames is refused is refused **whole**: the top frame goes to
+   * `about:blank` and the agent is told on its next verb. Frames are written
+   * by pages as well as by agents, so this does refuse a page for what a third
+   * party embedded — and for a browser sitting inside the operator's network
+   * that is the honest reading. There is nothing here to tell the two apart:
+   * the event is the same event whether the agent wrote the `<iframe>` or the
+   * document did. An operator who needs such a page names the host in
+   * `ARTEMIS_BROWSER_ALLOW_HOSTS`, which is the same remedy as for every other
+   * internal address, and the metadata list is the one part of it that has no
+   * switch.
    */
   #watch(page: CdpPage): void {
     if (this.#watching === page) return;
     this.#watching = page;
-    page.onNavigated((url) => {
-      const refusal = this.#verdictOn(page, url);
+    page.onNavigated((arrival) => {
+      const refusal = this.#verdictOn(arrival.url, arrival.address);
       if (refusal === null) return;
-      /*
-       * Neutral about *how* it got there, because the listener cannot tell: a
-       * server redirect, a `<meta http-equiv="refresh">` and a timer calling
-       * `location.assign` all arrive as the same event. Saying "the page moved
-       * itself" would be a guess, and on a plain 302 a wrong one.
-       */
-      this.#blocked = `The page went to ${url}, which this browser may not open. ${refusal} The tab is now blank.`;
+      this.#blocked = refusedSentence(arrival, refusal);
+      this.#lease.log(
+        `browser policy refused ${arrival.top ? 'a page' : 'a frame inside a page'} at ${arrival.url}: ${refusal}`,
+      );
       void page.navigate('about:blank').catch(() => undefined);
     });
   }
 
   /**
-   * Why this tab may not be where it is, or `null`.
+   * Why a document may not be where it is, or `null`.
    *
-   * Two checks over one address: the name, and the machine the main document
-   * was actually served from. The second is the one that catches a name which
+   * Two checks over one address: the name, and the machine that document was
+   * actually served from. The second is the one that catches a name which
    * resolved publicly when the driver looked and privately when Chromium
    * fetched — and it is free, because the page recorded it from
    * `Network.responseReceived` on the way in.
+   *
+   * The address is passed in rather than read off the page, because "which
+   * machine served this" has a different answer for the page and for each
+   * frame inside it, and only `CdpPage` knows which response belonged to
+   * which. `null` is "nothing to check" and not "fine": a `data:` page, a
+   * document with no remote address, or a frame that is its own target and
+   * whose response this session never saw. See `serverBrowserPolicy.ts` on how
+   * narrow that gap is.
    *
    * No resolver here, deliberately. This runs on every verb and inside an event
    * handler; a DNS lookup in both would be a lookup per tool call for a weaker
    * answer than the remote address already gives.
    */
-  #verdictOn(page: CdpPage, url: string): string | null {
+  #verdictOn(url: string, address: string | null): string | null {
     // A tab that has not been anywhere sits on about:blank, which is not an
     // http address and would fail the gate for the wrong reason.
     if (url.length === 0 || url === 'about:blank') return null;
@@ -426,10 +474,6 @@ class CdpPageDriver implements PageDriver {
     const named = navigationStanding(url, this.#lease.allowList);
     if (!named.allowed) return named.reason;
 
-    const address = page.mainDocumentAddress();
-    // `null` is "nothing to check" and not "fine": a data: page, or one whose
-    // document had no remote address. See `serverBrowserPolicy.ts` on how
-    // narrow that gap is for this browser.
     if (address === null) return null;
 
     const byAddress = addressStanding(named.host, [address], this.#lease.allowList);
@@ -449,7 +493,7 @@ class CdpPageDriver implements PageDriver {
     if (recorded !== null) return recorded;
 
     const at = await page.location();
-    const refusal = this.#verdictOn(page, at.url);
+    const refusal = this.#verdictOn(at.url, page.mainDocumentAddress());
     if (refusal === null) return null;
     await page.navigate('about:blank').catch(() => undefined);
     return `This tab is on ${at.url}, which this browser may not open. ${refusal} The tab is now blank.`;
@@ -475,10 +519,36 @@ class CdpPageDriver implements PageDriver {
     if (recorded !== null) return no(recorded);
 
     const at = await page.location();
-    const refusal = this.#verdictOn(page, at.url);
+    const refusal = this.#verdictOn(at.url, page.mainDocumentAddress());
     if (refusal === null) return ok(at);
 
     await page.navigate('about:blank').catch(() => undefined);
     return no(`${lead} ${at.url}, which this browser may not open. ${refusal} The tab is now blank.`);
   }
+}
+
+/**
+ * What the agent is told when a navigation nobody asked for is refused.
+ *
+ * Neutral about *how* the page got there, because the listener cannot tell: a
+ * server redirect, a `<meta http-equiv="refresh">` and a timer calling
+ * `location.assign` all arrive as the same event, and saying "the page moved
+ * itself" would be a guess — on a plain 302, a wrong one.
+ *
+ * A frame reads differently because the next move is different. "The page went
+ * to X" would be false, and an agent told that about an address it had never
+ * navigated to would go looking for a redirect that does not exist. What
+ * happened is that something inside the page reached that address, and the
+ * whole page went with it.
+ */
+function refusedSentence(arrival: FrameArrival, refusal: string): string {
+  if (arrival.top) {
+    return `The page went to ${arrival.url}, which this browser may not open. ${refusal} The tab is now blank.`;
+  }
+  return (
+    `A frame inside the page loaded ${arrival.url}, which this browser may not open. ${refusal} ` +
+    'A page is refused whole when one of its frames is refused, because a frame is as readable ' +
+    'through browser_screenshot and as clickable through browser_click as the page around it. ' +
+    'The tab is now blank.'
+  );
 }

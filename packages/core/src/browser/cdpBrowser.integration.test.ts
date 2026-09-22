@@ -252,6 +252,44 @@ beforeAll(async () => {
       );
       return;
     }
+    if (url === '/frame') {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><html><body><p>inside the frame</p></body></html>');
+      return;
+    }
+    if (url === '/late-frame') {
+      /*
+       * A frame that starts loading *after* the page's load event.
+       *
+       * The shape of a lazy embed, an advert, or a frame an analytics script
+       * injects — and the shape that used to leave the page's loading flag set
+       * with nothing on the way to clear it, so every later verb waited out the
+       * twenty-second settle. Appended on `load` and then on a timer, so there
+       * is no ordering to be lucky about.
+       */
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end(
+        '<!doctype html><html><head><title>Late</title></head><body><p>the frame comes later</p>' +
+          '<script>window.addEventListener("load", function () {' +
+          '  setTimeout(function () {' +
+          '    var f = document.createElement("iframe");' +
+          '    f.id = "late"; f.src = "/frame";' +
+          '    document.body.appendChild(f);' +
+          '  }, 50);' +
+          '});</script></body></html>',
+      );
+      return;
+    }
+    if (url === '/secret') {
+      // Something a screenshot of would be worth taking: what a metadata
+      // endpoint answers with is plain text, and this stands in for it.
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end(
+        '<!doctype html><html><body style="margin:0;background:#000;color:#0f0;font-size:40px">' +
+          `<p>${'AKIA-NOT-A-REAL-CREDENTIAL '.repeat(40)}</p></body></html>`,
+      );
+      return;
+    }
     if (url === '/api/missing') {
       response.writeHead(404, { 'content-type': 'text/plain' });
       response.end('no');
@@ -283,7 +321,14 @@ beforeAll(async () => {
        * `remoteIPAddress` check exists to catch, and the only way to produce it
        * without an attacker's nameserver.
        */
-      '--host-resolver-rules=MAP rebind.example 127.0.0.1',
+      /*
+       * `metadata.google.internal` is mapped too, and that is the whole of what
+       * makes the frame test real: the name is on the list that has no switch,
+       * and pointing it at the test site means the frame genuinely loads and
+       * genuinely renders before the policy sees it — which is the situation
+       * being pinned, rather than a navigation that failed for want of a route.
+       */
+      '--host-resolver-rules=MAP rebind.example 127.0.0.1, MAP metadata.google.internal 127.0.0.1',
       `--remote-debugging-port=${String(cdpPort)}`,
       `--user-data-dir=${profileDir}`,
       'about:blank',
@@ -434,6 +479,28 @@ when('every verb against a real Chromium', () => {
     expect(at.url).toBe(`${origin}/?arrived=1`);
     await value(driver.navigate(`${origin}/`));
   });
+
+  it('is not held up by a frame that loads after the page did', async () => {
+    /*
+     * The twenty-second stall, against a real Chromium. `/late-frame` appends
+     * an iframe once the page's load event has been and gone, so the frame's
+     * `Page.frameStartedLoading` arrives with no `loadEventFired` left to clear
+     * it. Every verb from there used to wait out the full settle.
+     *
+     * Timed rather than merely awaited: a test that only asserted the answer
+     * would pass in twenty seconds, which is the bug.
+     */
+    const fresh = browser.driver();
+    await value(fresh.open(`${origin}/late-frame`));
+    // Long enough for the frame to have started, which is what breaks it.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    const began = Date.now();
+    const page = await value(fresh.read());
+    expect(page.text).toContain('the frame comes later');
+    expect(Date.now() - began).toBeLessThan(5_000);
+    await fresh.close();
+  }, 30_000);
 
   it('refuses a selector that matches nothing, in a sentence', async () => {
     expect(await refusal(driver.click('.absent'))).toBe('Nothing matches .absent on this page.');
@@ -659,6 +726,65 @@ when('the navigation policy against a real redirect', () => {
     } finally {
       await named.dispose();
     }
+  }, 30_000);
+
+  it('refuses the page when the agent puts a metadata address in a frame', async () => {
+    /*
+     * The bypass the top-frame-only policy had, end to end. Nothing hostile is
+     * on the page: `browser_evaluate` writes the `<iframe>` itself, the frame
+     * really loads, and before this it was invisible to every gate while
+     * staying perfectly readable — `Page.captureScreenshot` renders cross-origin
+     * frames, and `Input.dispatchMouseEvent` aims at viewport coordinates.
+     */
+    const driver = browser.driver();
+    await value(driver.open(`${origin}/`));
+    await value(
+      driver.evaluate(
+        `document.body.insertAdjacentHTML('beforeend', '<iframe id="sneaky" width="1280" height="800" src="http://metadata.google.internal:${String(sitePort)}/secret"></iframe>')`,
+      ),
+    );
+    // The frame loads and arrives; nothing Artemis did is waiting on it.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    const said = await refusal(driver.read());
+    expect(said).toContain('A frame inside the page loaded');
+    expect(said).toContain('metadata.google.internal');
+    expect(said).toContain('cloud metadata address');
+
+    // Really blanked, rather than loaded with the agent merely told not to look.
+    const at = await value(driver.open());
+    expect(at.url).toBe('about:blank');
+    expect(await value(driver.evaluate('document.querySelectorAll("iframe").length'))).toBe(0);
+
+    /*
+     * And what a screenshot holds now is an empty tab rather than that
+     * document. Measured here on Chromium 141: the `/secret` page fills the
+     * viewport and comes back as about 246 kB of JPEG, and a blank tab as
+     * 6.8 kB, so twenty kilobytes separates the two by a wide margin without
+     * pinning an exact encoder output.
+     */
+    const image = await value(driver.screenshot());
+    expect(Buffer.from(image.data, 'base64').length).toBeLessThan(20_000);
+    await driver.close();
+  }, 30_000);
+
+  it('refuses the page when a frame reaches an internal host nobody named', async () => {
+    // The same rule for the ordinary case: `localhost` reaches the same test
+    // site as `127.0.0.1` and is deliberately not on this browser's allow-list,
+    // so it is an address that is genuinely reachable and genuinely refused.
+    const driver = browser.driver();
+    await value(driver.open(`${origin}/`));
+    await value(
+      driver.evaluate(
+        `document.body.insertAdjacentHTML('beforeend', '<iframe src="http://localhost:${String(sitePort)}/frame"></iframe>')`,
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    const said = await refusal(driver.read());
+    expect(said).toContain('A frame inside the page loaded');
+    expect(said).toContain('inside the operator’s own network');
+    await driver.close();
   }, 30_000);
 
   it('refuses a cloud metadata address whatever the allow-list says', async () => {

@@ -201,6 +201,10 @@ class Lease implements PageLease {
     return this.browser.resolveHost;
   }
 
+  log(line: string): void {
+    this.browser.note(line);
+  }
+
   current(): CdpPage | null {
     return this.page;
   }
@@ -272,6 +276,18 @@ class ServerBrowserImpl implements ServerBrowser {
     const lease = new Lease(this, this.timers.now());
     this.#leases.add(lease);
     return cdpPageDriver(lease);
+  }
+
+  /**
+   * Operational news from a lease.
+   *
+   * The navigation policy is the only caller: a page whose frame reached a
+   * refused address is something an operator wants in the log whatever the
+   * agent is told, because it is the shape a prompt injection that went looking
+   * for the metadata service leaves behind.
+   */
+  note(line: string): void {
+    this.#log(line);
   }
 
   /* ---------------------------------------------------------------- */

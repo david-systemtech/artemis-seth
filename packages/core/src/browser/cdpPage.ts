@@ -65,6 +65,17 @@ const MAX_NETWORK = 400;
 const MAX_IN_FLIGHT = 500;
 
 /**
+ * How many subframes' served addresses are remembered at once.
+ *
+ * A real page has a handful of frames; a page written to make this file hold
+ * memory has as many as it likes. Two hundred is far past any document anybody
+ * meant to write, and dropping the oldest costs at worst one frame judged on
+ * its name alone — which is the same answer an out-of-process frame gets
+ * anyway.
+ */
+const MAX_FRAME_ADDRESSES = 200;
+
+/**
  * The window every page is rendered into.
  *
  * A fixed size rather than whatever a headless shell defaults to (800×600),
@@ -169,6 +180,30 @@ function push<T>(buffer: T[], entry: T, max: number): void {
  */
 export class SelectorProblem extends Error {}
 
+/**
+ * Somewhere a frame of this tab has arrived, for the navigation policy to judge.
+ *
+ * Every frame, not only the top one — see {@link CdpPage.onNavigated}. The
+ * address is carried with the url because only this class knows which
+ * `Network.responseReceived` belongs to which frame, and the gate above needs
+ * both halves to say anything about rebinding.
+ */
+export interface FrameArrival {
+  /** Where the frame now is. */
+  readonly url: string;
+  /**
+   * The machine that frame's document was really served from, or `null` when
+   * there is nothing to check.
+   *
+   * `null` is not a pass. It is a `data:` or `about:` document, a frame whose
+   * response this page never saw because the frame is its own target, or a
+   * frame whose address has been forgotten to the bound above.
+   */
+  readonly address: string | null;
+  /** Whether this is the page's own frame rather than something inside it. */
+  readonly top: boolean;
+}
+
 /** What CDP calls a console message, in the vocabulary the contract uses. */
 const CONSOLE_LEVELS: Readonly<Record<string, ConsoleEntry['level']>> = {
   log: 'log',
@@ -210,12 +245,26 @@ export class CdpPage {
   readonly #sleep: (ms: number) => Promise<void>;
   /**
    * The frame with no parent. Captured at {@link start} and kept in step with
-   * `Page.frameNavigated`, because every check below is about the *top* frame:
-   * an advert in an iframe reaching a private address is the network's problem,
-   * and treating it as the page's would refuse pages for what their third
-   * parties did.
+   * `Page.frameNavigated`.
+   *
+   * What it separates is the *page's* load and address from a frame inside it.
+   * It is no longer what decides whether the navigation policy runs — every
+   * frame is judged now — but a subframe's load is not the page's load and a
+   * subframe's remote address is not the page's, and both of those are read off
+   * this.
    */
   #topFrameId: string | null = null;
+  /**
+   * Subframe id → the address that frame's document was served from.
+   *
+   * The per-frame half of what {@link #mainDocumentAddress} is for the page. A
+   * frame is judged on the machine its own document came from, not on the
+   * page's: checking a frame's host against the *page's* remote address would
+   * be comparing two unrelated things and would refuse pages at random.
+   *
+   * Bounded by {@link MAX_FRAME_ADDRESSES}, oldest out.
+   */
+  readonly #frameAddresses = new Map<string, string>();
   /**
    * The address the main document was actually served from, per
    * `Network.responseReceived`.
@@ -227,8 +276,8 @@ export class CdpPage {
    * see `serverBrowserPolicy.ts` on why that gap is narrow here.
    */
   #mainDocumentAddress: string | null = null;
-  /** Told whenever the top frame arrives somewhere new. */
-  #onNavigated: ((url: string) => void) | null = null;
+  /** Told whenever any frame of this tab arrives somewhere new. */
+  #onNavigated: ((arrival: FrameArrival) => void) | null = null;
 
   constructor(options: {
     readonly cdp: CdpConnection;
@@ -267,6 +316,47 @@ export class CdpPage {
     await this.#call('Runtime.enable');
     await this.#call('Log.enable');
     await this.#call('Network.enable');
+    /*
+     * Out-of-process frames, so the navigation policy can see them.
+     * ------------------------------------------------------------------
+     *
+     * Measured on Chromium 141 (2026-09-22), because the answer decides
+     * whether the gate below is a gate at all:
+     *
+     *  - With site isolation **off** — which is what the headless shell does
+     *    by default — a cross-origin iframe stays in the page's own frame
+     *    tree and reports `Page.frameNavigated` on this session, carrying a
+     *    `parentId`. Nothing else is needed.
+     *  - With site isolation **on** — `--site-per-process`, and what the full
+     *    Chromium in `docker/browser.Dockerfile` does by default — a
+     *    cross-*site* iframe becomes its own target. It reports **no**
+     *    `Page.frameNavigated` here and does not appear in
+     *    `Page.getFrameTree`. Without this call the policy simply never sees
+     *    it, which is a gate that opens itself on the very deployment this
+     *    feature ships as.
+     *
+     * With auto-attach on, that frame arrives as `Target.attachedToTarget`
+     * with `type: "iframe"` — measured to carry an empty url at creation and
+     * then a `Target.targetInfoChanged` with the real one — and every later
+     * navigation of it arrives as a further `targetInfoChanged`. Both are
+     * listened for below.
+     *
+     * `waitForDebuggerOnStart: false`: nothing here debugs a frame, and a
+     * frame paused waiting for a client that will never speak to it is a page
+     * that never finishes loading. `flatten: true` to stay on one socket, as
+     * everywhere else — see `cdp.ts`.
+     *
+     * Not wrapped in a `try`. A build that cannot do this is a build where a
+     * cross-site frame is invisible to the policy, and failing `browser_open`
+     * with the browser's own words is the honest outcome — a gate that
+     * silently stopped applying is the failure mode this whole file is written
+     * against.
+     */
+    await this.#call('Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+    });
     await this.#call('Emulation.setDeviceMetricsOverride', {
       width: VIEWPORT.width,
       height: VIEWPORT.height,
@@ -289,15 +379,25 @@ export class CdpPage {
   }
 
   /**
-   * Be told whenever the top frame arrives somewhere new.
+   * Be told whenever any frame of this tab arrives somewhere new.
    *
    * The seam the navigation policy hangs off. A page can reach an address
    * without any verb being called — a `<meta http-equiv="refresh">`, a
    * `location =` on a timer, a form that posts itself — and a policy that only
    * ran inside `navigate` and `click` would never see it. Registered once by
    * the driver, before the page is sent anywhere.
+   *
+   * **Every frame, and that is a correction.** This used to return early on a
+   * `parentId`, on the reasoning that an advert in an iframe reaching a private
+   * address was the network's business. It is not, because the agent can write
+   * the iframe: `browser_evaluate` appending
+   * `<iframe src="http://169.254.169.254/…">` put a refused address inside the
+   * tab where no gate could see it, and `browser_screenshot` renders it and
+   * `browser_click` — which aims at viewport coordinates — drives it. See
+   * `cdpPageDriver.ts` on what happens to a page one of its frames is refused
+   * for, and why refusing it whole is the honest answer here.
    */
-  onNavigated(listener: (url: string) => void): void {
+  onNavigated(listener: (arrival: FrameArrival) => void): void {
     this.#onNavigated = listener;
   }
 
@@ -325,7 +425,21 @@ export class CdpPage {
    */
   async navigate(url: string): Promise<void> {
     const settled = this.#awaitLoad();
-    const result = await this.#call('Page.navigate', { url });
+    let result: Record<string, unknown>;
+    try {
+      result = await this.#call('Page.navigate', { url });
+    } catch (error) {
+      /*
+       * The call itself failed — the socket died, or the target went away
+       * under it. The wait armed a line above is now waiting for a load that
+       * cannot happen, and leaving it to its twenty-second timer would make
+       * the *next* verb pay for this one's failure. Released before the throw,
+       * so `#loading` is false by the time the driver turns this into a
+       * sentence.
+       */
+      this.#releaseLoad();
+      throw error;
+    }
     const failure = result['errorText'];
     if (typeof failure === 'string' && failure.length > 0) {
       this.#releaseLoad();
@@ -608,7 +722,7 @@ export class CdpPage {
   }
 
   /**
-   * Is this the frame the policy cares about?
+   * Is this the page's own frame, rather than something inside it?
    *
    * A frame id this page has never heard of counts as the top one. Not
    * carelessness: `Page.getFrameTree` can fail at startup, and a check that
@@ -797,7 +911,36 @@ export class CdpPage {
     on('Page.loadEventFired', () => {
       this.#releaseLoad();
     });
+
+    /*
+     * Loading is a property of the *top* frame, and reading it off any frame
+     * was a bug with a twenty-second price.
+     *
+     * `Page.frameStartedLoading` arrives for every frame on the page; the two
+     * things that clear the flag do not. `Page.loadEventFired` is the page's
+     * own load and carries no frame id, and the timer inside {@link #awaitLoad}
+     * is twenty seconds long. So an iframe that started loading *after* the
+     * main document had finished — a lazy embed, an advert, a frame some
+     * analytics script injects — left `#loading` true with nothing on the way
+     * to clear it, and every later verb's {@link settle} waited out the full
+     * twenty seconds before reporting. The grace path made it worse rather
+     * than better: `#startWaiters` fired for that frame too, so a click on
+     * such a page resolved its grace and then stalled anyway.
+     *
+     * `Page.frameStoppedLoading` is subscribed as a second way out, for the
+     * top frame only and for the same reason. It is not redundant with
+     * `loadEventFired`: a navigation that commits and then stops without ever
+     * firing `load` — one the page replaces, or a document that ends in an
+     * error — produces the second and not the first.
+     */
     on('Page.frameStartedLoading', (params) => {
+      const frameId = params['frameId'];
+      if (!this.#isTopFrame(frameId)) {
+        // The same reasoning as the top frame's, one frame down: where a frame
+        // was served from last time is not an answer about where it is going.
+        if (typeof frameId === 'string') this.#frameAddresses.delete(frameId);
+        return;
+      }
       // A click that navigates: `settle` has something to wait for without the
       // verb having to know a navigation happened.
       this.#loading = true;
@@ -809,11 +952,18 @@ export class CdpPage {
        * leave the previous page's address to be checked against the new page's
        * name, and refuse a page for where a different one was served from.
        */
-      if (this.#isTopFrame(params['frameId'])) this.#mainDocumentAddress = null;
+      this.#mainDocumentAddress = null;
+      // A new document in the top frame means every frame that was inside the
+      // old one is gone, and so is anything known about where they came from.
+      this.#frameAddresses.clear();
+    });
+    on('Page.frameStoppedLoading', (params) => {
+      if (!this.#isTopFrame(params['frameId'])) return;
+      this.#releaseLoad();
     });
 
     /*
-     * Where the top frame has arrived, whoever sent it there.
+     * Where a frame of this tab has arrived, whoever sent it there.
      *
      * Both events, because they are two different ways to change the address
      * and only one of them loads a document: `frameNavigated` is a real
@@ -822,21 +972,61 @@ export class CdpPage {
      * `/admin` fires only the second, and a policy that watched only the first
      * would never see it.
      *
-     * A subframe is ignored: an advert reaching a private address is the
-     * network's business, and treating it as the page's would refuse pages for
-     * what their third parties did.
+     * Subframes included. They carry a `parentId`, which is how the top frame
+     * is still told apart — what it is told apart *for* is which load and which
+     * remote address belong to the page, not for deciding whether the policy
+     * runs. See {@link onNavigated} on why the earlier early-return was wrong.
      */
     on('Page.frameNavigated', (params) => {
       const frame = (params['frame'] ?? {}) as { id?: unknown; parentId?: unknown; url?: unknown };
-      if (typeof frame.parentId === 'string' && frame.parentId.length > 0) return;
-      if (typeof frame.id === 'string') this.#topFrameId = frame.id;
-      if (typeof frame.url === 'string') this.#onNavigated?.(frame.url);
+      const inside = typeof frame.parentId === 'string' && frame.parentId.length > 0;
+      if (!inside && typeof frame.id === 'string') this.#topFrameId = frame.id;
+      if (typeof frame.url !== 'string' || frame.url.length === 0) return;
+      this.#onNavigated?.({
+        url: frame.url,
+        address: inside
+          ? (typeof frame.id === 'string' ? this.#frameAddresses.get(frame.id) ?? null : null)
+          : this.#mainDocumentAddress,
+        top: !inside,
+      });
     });
 
     on('Page.navigatedWithinDocument', (params) => {
-      if (!this.#isTopFrame(params['frameId'])) return;
-      if (typeof params['url'] === 'string') this.#onNavigated?.(params['url']);
+      const top = this.#isTopFrame(params['frameId']);
+      if (typeof params['url'] !== 'string' || params['url'].length === 0) return;
+      const frameId = params['frameId'];
+      this.#onNavigated?.({
+        url: params['url'],
+        address: top
+          ? this.#mainDocumentAddress
+          : (typeof frameId === 'string' ? this.#frameAddresses.get(frameId) ?? null : null),
+        top,
+      });
     });
+
+    /*
+     * The frames that are their own target.
+     *
+     * Under site isolation a cross-site iframe is an out-of-process frame and
+     * says nothing on this session's `Page` domain — see {@link start} for the
+     * measurement. What it does produce, once auto-attach is on, is these two:
+     * an attach carrying the target's url (empty at creation) and a change
+     * carrying it afterwards and on every later navigation of that frame.
+     *
+     * No address to go with it. Chromium reports `remoteIPAddress` on the
+     * session the document loaded in, which for one of these is the frame's
+     * own, and `Network.enable` is not on there. So an out-of-process frame is
+     * judged on its name and on the metadata list — which is the half that has
+     * no switch, and the half the agent-written `<iframe>` runs into.
+     */
+    const outOfProcessFrame = (params: Record<string, unknown>): void => {
+      const info = params['targetInfo'] as { type?: unknown; url?: unknown } | undefined;
+      if (info?.type !== 'iframe') return;
+      if (typeof info.url !== 'string' || info.url.length === 0) return;
+      this.#onNavigated?.({ url: info.url, address: null, top: false });
+    };
+    on('Target.attachedToTarget', outOfProcessFrame);
+    on('Target.targetInfoChanged', outOfProcessFrame);
 
     on('Runtime.consoleAPICalled', (params) => {
       const args = Array.isArray(params['args']) ? (params['args'] as Record<string, unknown>[]) : [];
@@ -937,10 +1127,28 @@ export class CdpPage {
        * `Network.enable` has already disabled for this tab — records `null`,
        * which the driver reads as "nothing to check" rather than as a pass.
        */
-      if (params['type'] === 'Document' && this.#isTopFrame(params['frameId'])) {
-        const remote = response['remoteIPAddress'];
-        this.#mainDocumentAddress =
-          typeof remote === 'string' && remote.length > 0 ? remote.replace(/^\[|\]$/gu, '') : null;
+      if (params['type'] === 'Document') {
+        const raw = response['remoteIPAddress'];
+        const remote =
+          typeof raw === 'string' && raw.length > 0 ? raw.replace(/^\[|\]$/gu, '') : null;
+        const frameId = params['frameId'];
+        if (this.#isTopFrame(frameId)) {
+          this.#mainDocumentAddress = remote;
+        } else if (typeof frameId === 'string') {
+          /*
+           * A frame's own address, kept so that a frame is judged on the
+           * machine *it* talked to. This is what closes rebinding one frame
+           * down: a public name in an `<iframe src>` that resolves into private
+           * space by the time Chromium fetches it is refused here for the same
+           * reason the page would be.
+           */
+          if (remote === null) this.#frameAddresses.delete(frameId);
+          else this.#frameAddresses.set(frameId, remote);
+          if (this.#frameAddresses.size > MAX_FRAME_ADDRESSES) {
+            const oldest = this.#frameAddresses.keys().next();
+            if (oldest.done !== true) this.#frameAddresses.delete(oldest.value);
+          }
+        }
       }
 
       const held = this.#inFlight.get(String(params['requestId']));

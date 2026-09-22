@@ -58,16 +58,24 @@
  *
  * ## What this still cannot do
  *
- * It gates **navigation**: the address an agent names, the address the page
- * ends up at after redirects or its own scripting, and the address the main
- * document was actually served from. It does **not** gate the requests a page
- * makes once it is loaded: an `<img src>` or a `fetch()` to a private address
- * happens inside Chromium's own network stack, below anything the DevTools
- * protocol lets a client veto without `Fetch.enable` on every request — which
- * would put an Artemis round trip in front of every subresource of every page.
- * The fence for that is the container's network, and it is the reason the
- * compose service in `docker/docker-compose.yml` puts the browser on its own
- * network with only the server reachable from it. See `docs/SERVER-BROWSER.md`.
+ * It gates **navigation**, in every frame: the address an agent names, the
+ * address the page ends up at after redirects or its own scripting, the address
+ * the main document was actually served from, and the address any frame inside
+ * the page reaches — including one the agent wrote itself with
+ * `browser_evaluate`. A page one of whose frames is refused is refused whole;
+ * `cdpPageDriver.ts` says why that is the honest answer here.
+ *
+ * It does **not** gate the requests a page makes once it is loaded: a `fetch`,
+ * an `XMLHttpRequest`, an `<img src>`, a stylesheet or a beacon to a private
+ * address happens inside Chromium's own network stack, below anything the
+ * DevTools protocol lets a client veto without `Fetch.enable` on every request
+ * — which would put an Artemis round trip in front of every subresource of
+ * every page. None of those renders anything or is read back through a verb, so
+ * what they can do is *reach* an address rather than report it; that is a
+ * smaller hole than a frame, and it is the one that is left. The fence for it
+ * is the container's network, and it is the reason the compose service in
+ * `docker/docker-compose.yml` puts the browser on its own network with only the
+ * server reachable from it. See `docs/SERVER-BROWSER.md`.
  *
  * And a document with **no** remote address — one served from the cache, or a
  * `data:`/`about:` page — leaves step 3 with nothing to check, so those pages
