@@ -109,6 +109,7 @@ import {
   denyPendingPermission,
   focusedPane,
   installEventBridge,
+  installBrowserChoiceFeed,
   installSuggestionFeed,
   installPlanUsageFeed,
   installRunWatchdog,
@@ -227,6 +228,10 @@ export function App(): ReactElement {
     // Predictions arrive seconds after a run ends — well after `bootstrap` —
     // so ordering is relaxed here; it rides with the feeds because it is one.
     const stopSuggestionFeed = installSuggestionFeed();
+    // And the browser a run settled on when it had to ask which of several
+    // paired Chromes the user meant. It rides with the feeds for the same
+    // reason: it arrives mid-turn, addressed by run id, and lands on a pane.
+    const stopBrowserChoiceFeed = installBrowserChoiceFeed();
     if (!started.current) {
       started.current = true;
       void bootstrap();
@@ -235,6 +240,7 @@ export function App(): ReactElement {
       unsubscribe();
       stopWatchdog();
       stopSuggestionFeed();
+      stopBrowserChoiceFeed();
       stopFeed();
       stopUsageFeed();
       stopTerminalFeed();

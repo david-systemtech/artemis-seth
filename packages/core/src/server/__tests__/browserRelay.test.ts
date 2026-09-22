@@ -242,3 +242,161 @@ describe('what this driver claims it can do', () => {
     });
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* Which of the caller's browsers                                             */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * A caller may have a work Chrome and a personal one paired with their client,
+ * and nothing on the serving machine can tell them apart: the list of pairings
+ * is on the client. So what is pinned here is that the choice is *carried* —
+ * on every call, not only the first — and never interpreted.
+ */
+describe('the browser a served run drives', () => {
+  it('rides on every call, because the client keeps nothing between them', async () => {
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1', 'b-work');
+
+    void driver.open();
+    void driver.read();
+    void driver.close();
+
+    expect(published.map((one) => one.call.browserId)).toEqual(['b-work', 'b-work', 'b-work']);
+  });
+
+  it('is absent when the run named none, which means whichever is open', async () => {
+    const { relay, published } = relayWatching();
+
+    void relay.driverFor('conn-a', 'run-1').read();
+
+    expect(published[0]?.call).not.toHaveProperty('browserId');
+  });
+
+  it('takes the name the agent answered with and sends that instead', async () => {
+    /*
+     * The ask-then-choose flow over the relay. The refusal that asked came
+     * from the client's own driver and named the browsers; the model's answer
+     * is a name, and a name is what crosses — the client is the only side that
+     * can turn one into a pairing.
+     */
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1');
+
+    void driver.open('https://example.com', 'Personal');
+    void driver.read();
+
+    expect(published.map((one) => one.call.browserId)).toEqual(['Personal', 'Personal']);
+  });
+
+  it('lets go of that answer when the open it came with failed, since a refusal cannot be told from a wrong name', async () => {
+    // The price of not being able to check a name here: a page that would not
+    // load costs the agent one more answer, which is cheaper than a name that
+    // was wrong sticking for the rest of the run.
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1');
+
+    const opening = driver.open('https://example.com/missing', 'Personal');
+    relay.answer('conn-a', lastCallId(published), { ok: false, reason: 'that page 404ed' });
+    expect((await opening).ok).toBe(false);
+    void driver.read();
+
+    expect(published.at(-1)?.call.browserId).toBeUndefined();
+  });
+
+  it('refuses to move a run the caller pinned, and drives nothing while refusing', async () => {
+    /*
+     * The argument answers a question, and a run that arrived with
+     * `artemis.extensionBrowserId` was never asked one. A model that could
+     * move such a conversation could act as a different signed-in person
+     * because a page it was reading suggested it — so the open does not happen
+     * at all, in the browser it named or in the one it has.
+     */
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1', 'b-work');
+
+    const result = await driver.open(undefined, 'Personal');
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe(RELAY_REFUSALS.ALREADY_CHOSEN);
+    expect(published).toHaveLength(0);
+  });
+
+  it('keeps driving the pinned browser after refusing the move', async () => {
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1', 'b-work');
+
+    await driver.open(undefined, 'Personal');
+    void driver.read();
+
+    expect(published.at(-1)?.call.browserId).toBe('b-work');
+  });
+
+  it('lets the agent name the same browser again, which is not a move', async () => {
+    // A model repeating its own answer has asked for nothing, and refusing it
+    // would teach it that its answer did not take.
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1', 'Personal');
+
+    void driver.open(undefined, '  personal ');
+
+    expect(published.at(-1)?.call.browserId).toBe('Personal');
+  });
+
+  it('refuses a second, different answer from a run that already answered once', async () => {
+    // The question is asked once and answered once. Nothing asked again, so a
+    // second name is not an answer to anything.
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1');
+
+    void driver.open(undefined, 'Work');
+    const again = await driver.open(undefined, 'Personal');
+
+    expect(again.ok).toBe(false);
+    expect(published.at(-1)?.call.browserId).toBe('Work');
+  });
+
+  it('lets go of a first answer the client refused, so a mistyped name is not a dead end', async () => {
+    // The server cannot check a name; the client can, and says no. Kept, the
+    // wrong name would make every later verb an unknown-browser refusal and
+    // every correction a refused move.
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1');
+
+    const first = driver.open(undefined, 'Wrok');
+    expect(published.at(-1)?.call.browserId).toBe('Wrok');
+    relay.answer('conn-a', lastCallId(published), { ok: false, reason: 'No browser is called "Wrok".' });
+    expect((await first).ok).toBe(false);
+
+    const again = driver.open(undefined, 'Work');
+    expect(published.at(-1)?.call.browserId).toBe('Work');
+    relay.answer('conn-a', lastCallId(published), { ok: true, value: { url: '', title: '' } });
+    expect((await again).ok).toBe(true);
+
+    // And now it is kept: a later verb goes to the corrected browser.
+    void driver.read();
+    expect(published.at(-1)?.call.browserId).toBe('Work');
+  });
+
+  it('keeps a first answer the client accepted, even when the page then failed to load', async () => {
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1');
+
+    const first = driver.open('https://example.com', 'Work');
+    relay.answer('conn-a', lastCallId(published), { ok: true, value: { url: 'https://example.com', title: '' } });
+    expect((await first).ok).toBe(true);
+
+    void driver.read();
+    expect(published.at(-1)?.call.browserId).toBe('Work');
+  });
+
+  it('ignores an empty name, which is not a choice', async () => {
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1', 'b-work');
+
+    void driver.open(undefined, '   ');
+
+    expect(published.at(-1)?.call.browserId).toBe('b-work');
+  });
+});

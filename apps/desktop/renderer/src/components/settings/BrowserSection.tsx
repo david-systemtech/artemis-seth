@@ -18,10 +18,13 @@
  *     countdown is computed here from `pairing.expiresAt` rather than pushed
  *     per second — a timestamp stays right across a push that arrives late,
  *     and "270 seconds left" does not.
- *  3. **The browsers that are paired**, with whether each is connected and a
- *     way to unpair. Unpairing cuts a live connection, so a run's next tool
- *     call refuses; that is issue #436's last acceptance criterion and the
- *     copy says it out loud.
+ *  3. **The browsers that are paired**, with whether each is connected, what
+ *     each is called, and a way to unpair. The name is editable here because
+ *     it is the whole of how a person tells two Chrome profiles apart —
+ *     both report themselves as "Chrome on Windows" — and every browser picker
+ *     in the app shows it. Unpairing cuts a live connection, so a run's next
+ *     tool call refuses; that is issue #436's last acceptance criterion and
+ *     the copy says it out loud.
  *  4. **What the agent may read.** The policy: dev sites, the block list, and
  *     the two switches that widen the first rule to every site.
  *
@@ -60,6 +63,7 @@ import { useApp } from '../../state/store';
 import { SettingsGroup, SettingsPane } from './pane';
 import { Button } from '@/components/ui/button';
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
 import {
   Item,
   ItemActions,
@@ -287,6 +291,12 @@ function PairedBrowsers({ state }: { readonly state: ExtensionBridgeState | null
     void call(() => surface.unpair({ browserId }));
   };
 
+  const rename = (browserId: string, browserName: string): void => {
+    const surface = channels();
+    if (surface === null) return;
+    void call(() => surface.rename({ browserId, browserName }));
+  };
+
   return (
     <SettingsGroup label="Paired browsers">
       {browsers.length === 0 ? (
@@ -301,6 +311,9 @@ function PairedBrowsers({ state }: { readonly state: ExtensionBridgeState | null
               key={browser.browserId}
               browser={browser}
               bundled={bundled}
+              onRename={(name) => {
+                rename(browser.browserId, name);
+              }}
               onUnpair={() => {
                 unpair(browser.browserId);
               }}
@@ -308,24 +321,78 @@ function PairedBrowsers({ state }: { readonly state: ExtensionBridgeState | null
           ))}
         </ItemGroup>
       )}
+      {browsers.length > 1 ? (
+        <p className="px-3 py-2.5 text-2xs leading-relaxed text-ink-faint">
+          A conversation can be set to one of these by name, in its own browser row. One that is
+          set to none of them is asked which to use the first time it opens a page.
+        </p>
+      ) : null}
     </SettingsGroup>
   );
 }
 
+/**
+ * One paired browser: its name, editable, and what it is doing.
+ *
+ * The name is a text field rather than a label with a pencil, because with two
+ * Chrome profiles paired it is the one thing on the row a person actually
+ * needs to change — both of them describe themselves as "Chrome on Windows",
+ * and until they are told apart every browser picker in the app offers two
+ * identical options.
+ *
+ * Committed on blur and on Enter, like the host lists below, and never per
+ * keystroke: each save is an IPC call main writes to disk, and doing that per
+ * character would store "W", "Wo", "Wor" on the way to "Work". A field the
+ * user has emptied is not saved at all — an unnamed browser is not a thing the
+ * pickers can show — and it snaps back to the stored name when they leave it.
+ */
 function PairedBrowserRow({
   browser,
   bundled,
+  onRename,
   onUnpair,
 }: {
   readonly browser: PairedBrowserInfo;
   readonly bundled: string | null;
+  readonly onRename: (browserName: string) => void;
   readonly onUnpair: () => void;
 }): ReactElement {
   const outdated = extensionIsOutdated(browser.extensionVersion, bundled);
+  const [draft, setDraft] = useState(browser.browserName);
+
+  // Follow the stored name when it changes underneath — main shortening what
+  // was typed, a second window renaming the same browser, or the extension
+  // pairing afresh.
+  useEffect(() => {
+    setDraft(browser.browserName);
+  }, [browser.browserName]);
+
+  const commit = (): void => {
+    const name = draft.trim();
+    if (name.length === 0 || name === browser.browserName) {
+      setDraft(browser.browserName);
+      return;
+    }
+    onRename(name);
+  };
+
   return (
     <Item size="sm" className="items-start">
       <ItemContent>
-        <ItemTitle className="text-xs text-ink">{browser.browserName}</ItemTitle>
+        <Input
+          aria-label={`Name for ${browser.browserName}`}
+          value={draft}
+          className="h-7 text-xs"
+          spellCheck={false}
+          onChange={(event) => {
+            setDraft(event.target.value);
+          }}
+          onBlur={commit}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') event.currentTarget.blur();
+            if (event.key === 'Escape') setDraft(browser.browserName);
+          }}
+        />
         <ItemDescription className="line-clamp-none text-2xs leading-relaxed text-ink-faint">
           {browser.connected ? 'Connected. ' : 'Not connected — open Chrome to reach it. '}
           Paired {new Date(browser.pairedAt).toLocaleDateString()}.

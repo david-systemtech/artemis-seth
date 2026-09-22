@@ -151,6 +151,14 @@ export interface RunSource {
      */
     readonly extensionBrowser?: boolean;
     /**
+     * Which of the caller's paired browsers, when they named one.
+     *
+     * Carried to the relay and no further. The id was issued by the client
+     * when it paired that browser, so the serving machine has nothing to check
+     * it against and nothing to do with it but pass it back down.
+     */
+    readonly extensionBrowserId?: string;
+    /**
      * Which connection asked for this run.
      *
      * Carried only for {@link extensionBrowser}: the browser relay publishes
@@ -1220,7 +1228,16 @@ export async function* runTurn(
         // says which caller, and a host handed one without the other would
         // have a run asking for a browser nobody can be asked about.
         ...(turn.extensions.extensionBrowser === true
-          ? { extensionBrowser: true, connectionId: turn.connectionId }
+          ? {
+              extensionBrowser: true,
+              connectionId: turn.connectionId,
+              // Beside them and never instead: the id says which of the
+              // caller's browsers, and it means nothing without the flag that
+              // says to use one at all.
+              ...(turn.extensions.extensionBrowserId === undefined
+                ? {}
+                : { extensionBrowserId: turn.extensions.extensionBrowserId }),
+            }
           : {}),
         ...(turn.extensions.sessionId === undefined
           ? {}

@@ -361,8 +361,27 @@ export interface PageDriver {
   readonly kind: BrowserDriverKind;
   readonly abilities: PageDriverAbilities;
 
-  /** Open this run's page, optionally at an address. Reuses one that exists. */
-  open(url?: string): Promise<DriverResult<PageLocation>>;
+  /**
+   * Open this run's page, optionally at an address. Reuses one that exists.
+   *
+   * `browser` is the one place a verb may name something outside its own run,
+   * and it is narrow on purpose: it names a *paired browser*, by the name the
+   * user gave it, and only where the driver has more than one to choose
+   * between — the user's own Chrome, with a work profile and a personal one
+   * paired at once. It is not a tab id and cannot reach another conversation's
+   * page; the run key still decides that.
+   *
+   * It exists because of the question the agent has to ask. With two browsers
+   * connected and nothing chosen, the extension driver refuses the first verb
+   * with a sentence naming them and tells the model to ask the user which one;
+   * this is how the answer comes back. Drivers with one browser — the dock
+   * tab, the headless Chromium beside a server — ignore it, and the tool
+   * surface does not offer the argument for them at all.
+   *
+   * A driver that takes one remembers it for the rest of the run, so the
+   * question is asked once.
+   */
+  open(url?: string, browser?: string): Promise<DriverResult<PageLocation>>;
   /** Go somewhere, and wait for the load to settle. */
   navigate(url: string): Promise<DriverResult<PageLocation>>;
   /** The page's readable text. */
@@ -430,6 +449,12 @@ export interface PageDriver {
  * One verb per message, matched by `id`. `runKey` names the conversation's page
  * — opaque to the extension, which keeps one tab per key inside its own tab
  * group and cannot be asked about any other tab.
+ *
+ * Nothing here names a *browser*. Several Chrome profiles may be paired with
+ * one Artemis, each on its own connection, and which one a verb goes to is
+ * decided before a message exists — `extensionBridge.ts` picks the socket. An
+ * extension therefore cannot be asked about, or told about, any browser but
+ * itself.
  */
 export const BRIDGE_PROTOCOL_VERSION = 1;
 
@@ -456,12 +481,59 @@ export const BRIDGE_DEFAULT_PORT = 47_615;
  */
 export const ARTEMIS_EXTENSION_ID = 'pbdboognedfpknmikiajchompjfjhdal';
 
+/**
+ * Longest a browser selector may be, in characters.
+ *
+ * A selector is either an id Artemis issued — thirty-two hex characters — or a
+ * browser name, which is bounded at eighty where it is stored. Two hundred is
+ * generous for both and small enough that the string cannot be a payload: it
+ * crosses a network on a served conversation, is compared against every
+ * pairing on the client, and ends up in a refusal sentence a model reads. None
+ * of those is a place for a kilobyte somebody chose.
+ */
+export const BROWSER_SELECTOR_MAX = 200;
+
+/**
+ * One browser selector off the wire, or `null` for anything that is not plainly
+ * one.
+ *
+ * Shared by the two places a selector arrives from somewhere else — the
+ * `artemis.extensionBrowserId` field of a chat request, and the `browserId` of
+ * a relayed call — so the two cannot come to disagree about what they accept.
+ * They face opposite directions and that is the point: a client that bounded
+ * one way and a server that bounded the other would leave a selector one of
+ * them stores and the other refuses to act on.
+ *
+ * Trimmed, because a name is a thing a person typed and a trailing space is not
+ * part of what they call their browser. Control characters are refused rather
+ * than stripped: the stripping rule for a *stored* name lives in
+ * `extensionBridge.ts`, and a second copy of it out here would be a second
+ * answer to "what is this browser called".
+ */
+export function readBrowserSelector(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > BROWSER_SELECTOR_MAX) return null;
+  // C0, DEL and C1: everything that is not text, in any encoding this crosses.
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(trimmed)) return null;
+  return trimmed;
+}
+
 /** Extension → Artemis, first message of a first connection. */
 export interface BridgePairRequest {
   readonly type: 'pair';
   readonly version: number;
   readonly code: string;
-  /** e.g. "Chrome on Windows" — shown in Artemis settings. */
+  /**
+   * What the user called this browser at pairing — "Work", "Personal" — shown
+   * in Artemis settings and in every browser picker.
+   *
+   * A label the person types, not a fact about the machine. Two Chrome
+   * profiles on one computer both describe themselves as "Chrome on Windows",
+   * so the description Chrome can supply is offered as the field's default
+   * text and nothing more. Artemis bounds it and strips control characters
+   * before storing it; see `extensionBridge.ts`'s `nameOf`.
+   */
   readonly browserName: string;
   readonly extensionVersion: string;
 }
@@ -480,6 +552,15 @@ export interface BridgeHello {
   readonly type: 'hello';
   readonly version: number;
   readonly browserId: string;
+  /**
+   * The label this browser stored at pairing, sent again so an Artemis that
+   * lost its store has something to show.
+   *
+   * Artemis does **not** overwrite the name it holds with this. Renaming a
+   * browser is done in the Browser pane, which is the more recent statement of
+   * what the user calls it, and a reconnect that took the extension's copy
+   * would undo every rename the next time Chrome restarted.
+   */
   readonly browserName: string;
   readonly extensionVersion: string;
 }

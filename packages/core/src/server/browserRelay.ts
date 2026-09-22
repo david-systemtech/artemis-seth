@@ -39,6 +39,24 @@
  * it reports it by performing the verb against its own driver and posting that
  * driver's refusal — so the sentence a served run gets is word for word the
  * one a local run would have got, written once in `extensionPageDriver.ts`.
+ *
+ * ## Which of the caller's browsers, and who decides
+ *
+ * A caller may have a work Chrome and a personal one paired with their client.
+ * Nothing on this machine can tell them apart — the pairings are on the client,
+ * which is the only side holding the list — so the choice is carried and never
+ * interpreted here. `artemis.extensionBrowserId` arrives as an id and rides on
+ * every call; when the caller chose nothing and the client finds two browsers
+ * open, the *client's* driver refuses with the sentence that asks which, that
+ * sentence reaches the model unchanged, and the model's answer comes back as a
+ * name on `browser_open`. A name and an id look alike from here, and that is
+ * fine: this file passes whichever it was given, and the client resolves it.
+ *
+ * The answer is taken once, and only for a run that arrived without a browser.
+ * A caller who sent `artemis.extensionBrowserId` pinned that conversation to
+ * one of their own browsers, and a model that could move it afterwards could
+ * act as a different signed-in person because a page it was reading suggested
+ * it. See {@link RelayedPageDriver.open}.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -95,6 +113,21 @@ const NO_CLIENT =
   'and connected. Ask them to open Artemis, and say when it is back. Until ' +
   'then you have no browser at all — do not describe pages you have not seen.';
 
+/**
+ * What the model is told when it names a browser for a conversation that
+ * already has one.
+ *
+ * Unnamed on purpose, unlike the desktop driver's version of this sentence.
+ * The selector in force here may be an id the caller's client issued, and this
+ * machine has never seen the list that would turn it into a name — printing
+ * the id instead would be a sentence the user cannot read either.
+ */
+const ALREADY_CHOSEN =
+  'This conversation is already set to one of the browsers on the user’s machine, ' +
+  'so it cannot be moved to another one from here. Carry on in the browser it has, ' +
+  'or tell the user what you wanted the other one for — changing it is done in the ' +
+  'conversation’s own Browser row, by them. Do not work around this.';
+
 function timedOut(seconds: number): string {
   return (
     `The client that owns the browser did not answer within ${String(seconds)} seconds. ` +
@@ -116,10 +149,14 @@ export interface BrowserRelay {
    *
    * Built per run by the host, closing over the connection that started it —
    * targeting is a closure here for the same reason it is everywhere else in
-   * the browser tools: no verb takes a browser or a client id, so an agent
-   * cannot name a machine that is not the one its conversation came from.
+   * the browser tools: no verb takes a client id, so an agent cannot name a
+   * machine that is not the one its conversation came from.
+   *
+   * `browser` says which of *that machine's* paired browsers to drive, from
+   * `artemis.extensionBrowserId`. It is carried and never interpreted: the
+   * list it names is on the client, and the client resolves it.
    */
-  driverFor(connectionId: string, runKey: string): PageDriver;
+  driverFor(connectionId: string, runKey: string, browser?: string): PageDriver;
   /**
    * Settle a call with what the client's browser said.
    *
@@ -164,6 +201,7 @@ export function createBrowserRelay(options: BrowserRelayOptions): BrowserRelay {
     runKey: string,
     verb: BridgeVerb,
     timeoutMs: number,
+    browser?: string,
   ): Promise<DriverResult<unknown>> {
     if (options.isConnected?.(connectionId) === false) {
       return Promise.resolve({ ok: false, reason: NO_CLIENT });
@@ -197,6 +235,11 @@ export function createBrowserRelay(options: BrowserRelayOptions): BrowserRelay {
           callId,
           runId: runKey,
           runKey,
+          // On every call and not only the first. The client builds a driver
+          // per call and keeps nothing between them, so a choice stated once
+          // would be a choice forgotten by the next verb — and the next verb
+          // would be the ambiguous one again.
+          ...(browser === undefined ? {} : { browserId: browser }),
           ...verb,
         });
       } catch {
@@ -208,7 +251,8 @@ export function createBrowserRelay(options: BrowserRelayOptions): BrowserRelay {
   }
 
   return {
-    driverFor: (connectionId, runKey) => new RelayedPageDriver(connectionId, runKey, send),
+    driverFor: (connectionId, runKey, browser) =>
+      new RelayedPageDriver(connectionId, runKey, send, browser),
 
     answer: (connectionId, callId, result) => {
       const waiting = pending.get(callId);
@@ -247,6 +291,7 @@ type Send = (
   runKey: string,
   verb: BridgeVerb,
   timeoutMs: number,
+  browser?: string,
 ) => Promise<DriverResult<unknown>>;
 
 /**
@@ -268,17 +313,64 @@ class RelayedPageDriver implements PageDriver {
   readonly #runKey: string;
   readonly #send: Send;
 
-  constructor(connectionId: string, runKey: string, send: Send) {
+  /**
+   * Which of the caller's browsers, as the caller named it, or `null` for
+   * whichever of them is open.
+   *
+   * Mutable for the one case that changes it: the client refused a verb
+   * because two of the user's browsers were connected and neither had been
+   * chosen, the agent asked the user, and the answer came back as a name on
+   * `browser_open`. Nothing on this machine can check that name — the list is
+   * on the client — so it is stored as given and sent as given.
+   */
+  #browser: string | null;
+
+  constructor(connectionId: string, runKey: string, send: Send, browser?: string) {
     this.#connectionId = connectionId;
     this.#runKey = runKey;
     this.#send = send;
+    this.#browser = browser ?? null;
   }
 
-  async open(url?: string): Promise<DriverResult<PageLocation>> {
-    return this.#ask<PageLocation>(
+  /**
+   * Open this run's page, and take the agent's answer to "which browser?" —
+   * once, and only for a run that had no browser.
+   *
+   * Remembered here, on the server, rather than on the client: the client
+   * builds a driver per relayed call and holds nothing between them, so the
+   * only place a choice can outlive one verb is the driver the run owns. It is
+   * kept only once the client has driven something with it. Nothing here can
+   * tell a mistyped name from a page that would not load — the list is on the
+   * client, and what comes back is a sentence — so a first answer the client
+   * refuses is let go of again, and the agent can answer once more. Kept, a
+   * wrong name would be a dead end: every later verb refused as unknown, every
+   * correction refused as a move.
+   *
+   * A run that arrived with `artemis.extensionBrowserId` was never asked the
+   * question, so the argument is refused for it: the caller pinned that
+   * conversation to one of their browsers, and a model that could move it
+   * could act as a different signed-in person because a page suggested it.
+   * Repeating the selector already in force is not a move and carries on
+   * quietly; comparison is textual, because the two spellings a selector can
+   * have — an id and a name — are only comparable on the client.
+   */
+  async open(url?: string, browser?: string): Promise<DriverResult<PageLocation>> {
+    const named = browser?.trim() ?? '';
+    let firstAnswer = false;
+    if (named.length > 0) {
+      if (this.#browser === null) {
+        this.#browser = named;
+        firstAnswer = true;
+      } else if (this.#browser.trim().toLowerCase() !== named.toLowerCase()) {
+        return { ok: false, reason: ALREADY_CHOSEN };
+      }
+    }
+    const result = await this.#ask<PageLocation>(
       url === undefined ? { verb: 'open' } : { verb: 'open', url },
       LOAD_TIMEOUT_MS,
     );
+    if (firstAnswer && !result.ok) this.#browser = null;
+    return result;
   }
 
   async navigate(url: string): Promise<DriverResult<PageLocation>> {
@@ -332,9 +424,15 @@ class RelayedPageDriver implements PageDriver {
 
   /** See `extensionPageDriver.ts` on why the value is not re-derived here. */
   async #ask<T>(verb: BridgeVerb, timeoutMs: number): Promise<DriverResult<T>> {
-    return (await this.#send(this.#connectionId, this.#runKey, verb, timeoutMs)) as DriverResult<T>;
+    return (await this.#send(
+      this.#connectionId,
+      this.#runKey,
+      verb,
+      timeoutMs,
+      this.#browser ?? undefined,
+    )) as DriverResult<T>;
   }
 }
 
 /** The refusal sentences, exported for the tests that pin them. */
-export const RELAY_REFUSALS = { NO_CLIENT, timedOut } as const;
+export const RELAY_REFUSALS = { NO_CLIENT, timedOut, ALREADY_CHOSEN } as const;

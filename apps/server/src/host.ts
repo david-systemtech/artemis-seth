@@ -914,7 +914,10 @@ export function createHeadlessHost(
     return servedBrowserServers(input, {
       ...(owner === undefined
         ? {}
-        : { extension: () => pageToolServer(relay.driverFor(owner, String(runId))) }),
+        : {
+            extension: (browserId) =>
+              pageToolServer(relay.driverFor(owner, String(runId), browserId)),
+          }),
       ...(browser === undefined
         ? {}
         : {
@@ -1109,6 +1112,12 @@ export function createHeadlessHost(
         ...(input.ultracode === undefined ? {} : { ultracode: input.ultracode }),
         ...(input.chromeBrowser === true ? { chromeBrowser: true } : {}),
         ...(input.extensionBrowser === true ? { extensionBrowser: true } : {}),
+        // Which of the caller's browsers, when they named one. Carried and not
+        // read: the id belongs to the client's own list of pairings, which this
+        // machine has never seen.
+        ...(input.extensionBrowserId === undefined
+          ? {}
+          : { extensionBrowserId: input.extensionBrowserId }),
         ...(input.resumeSessionId === undefined
           ? {}
           : { resumeSessionId: input.resumeSessionId as never }),

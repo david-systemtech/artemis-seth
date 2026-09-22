@@ -270,6 +270,18 @@ export interface SessionState extends MirroredState {
    * this is the one browser question that *is* per conversation.
    */
   readonly browserMode: BrowserMode | null;
+  /**
+   * Which paired browser this conversation drives, or `null` for whichever of
+   * them is open.
+   *
+   * Only meaningful beside `browserMode: 'extension'`. Two Chrome profiles may
+   * be paired with one Artemis and each carries its own logins, so a
+   * conversation about work and one about a personal project are different
+   * questions — and this is where the answer lives, whether the user picked it
+   * in the browser row or the agent asked them for it mid-run. See
+   * `IPC_PUSH.runBrowserChoice` for the second route in.
+   */
+  readonly browserExtensionId: string | null;
 
   readonly forkOnResume: boolean;
   readonly resumeSessionId: SessionId | null;

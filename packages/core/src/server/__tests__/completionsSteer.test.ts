@@ -261,16 +261,20 @@ describe('a message to a conversation the server is still working on', () => {
           thinking: 'high',
           chromeBrowser: true,
           extensionBrowser: true,
+          extensionBrowserId: 'b-work',
         },
       });
       const chunks = await parseStream(response);
-      // Both browsers among them: a turn already running was started with its
-      // tools, and a browser cannot be handed to it part-way.
+      // Both browsers among them, and *which* browser too: a turn already
+      // running was started with its tools, and a browser cannot be handed to
+      // it part-way — nor swapped for another one, which would leave a tab
+      // open in the first with nobody to close it.
       expect(chunks[0]?.artemis?.ignored).toEqual([
         'artemis.systemPrompt',
         'artemis.thinking',
         'artemis.chromeBrowser',
         'artemis.extensionBrowser',
+        'artemis.extensionBrowserId',
       ]);
     } finally {
       await close();

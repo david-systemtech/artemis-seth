@@ -113,6 +113,69 @@ describe('readChatExtensions', () => {
     expect(readChatExtensions({})).toEqual({});
   });
 
+  it('carries which of the caller’s browsers a run should drive', () => {
+    expect(
+      readChatExtensions({ artemis: { extensionBrowser: true, extensionBrowserId: 'b-work' } }),
+    ).toEqual({ extensionBrowser: true, extensionBrowserId: 'b-work' });
+  });
+
+  it('drops a browser id with no request to use a browser at all', () => {
+    // It names nothing the run will do, and carrying it would leave the host
+    // holding a choice it must then remember to ignore.
+    expect(readChatExtensions({ artemis: { extensionBrowserId: 'b-work' } })).toEqual({});
+  });
+
+  it('drops a browser id that is not a string, or is empty', () => {
+    expect(
+      readChatExtensions({ artemis: { extensionBrowser: true, extensionBrowserId: 7 } }),
+    ).toEqual({ extensionBrowser: true });
+    expect(
+      readChatExtensions({ artemis: { extensionBrowser: true, extensionBrowserId: '' } }),
+    ).toEqual({ extensionBrowser: true });
+  });
+
+  it('bounds the browser id, because it is a selector and not a payload', () => {
+    // It crosses a network, is compared against every pairing on the client,
+    // and ends up quoted in a refusal a model reads. None of those is a place
+    // for a kilobyte somebody chose. A run that sent one drives whichever of
+    // their browsers is open, which is what a served run meant before the
+    // field existed.
+    expect(
+      readChatExtensions({
+        artemis: { extensionBrowser: true, extensionBrowserId: 'x'.repeat(201) },
+      }),
+    ).toEqual({ extensionBrowser: true });
+    expect(
+      readChatExtensions({
+        artemis: { extensionBrowser: true, extensionBrowserId: 'x'.repeat(200) },
+      }),
+    ).toMatchObject({ extensionBrowserId: 'x'.repeat(200) });
+  });
+
+  it('drops a browser id carrying control characters', () => {
+    // A selector is one line of text. Stripping instead of refusing would be a
+    // second answer to "what is this browser called", and the first one lives
+    // where the name is stored.
+    expect(
+      readChatExtensions({
+        artemis: { extensionBrowser: true, extensionBrowserId: 'Wo\u0000rk' },
+      }),
+    ).toEqual({ extensionBrowser: true });
+    expect(
+      readChatExtensions({
+        artemis: { extensionBrowser: true, extensionBrowserId: 'Work\u009f' },
+      }),
+    ).toEqual({ extensionBrowser: true });
+  });
+
+  it('trims a browser id, because a trailing space is not part of a name', () => {
+    expect(
+      readChatExtensions({
+        artemis: { extensionBrowser: true, extensionBrowserId: '  Work  ' },
+      }),
+    ).toMatchObject({ extensionBrowserId: 'Work' });
+  });
+
   it('carries a requested permission mode, and drops a non-string one', () => {
     expect(readChatExtensions({ artemis: { permissionMode: 'acceptEdits' } })).toEqual({
       permissionMode: 'acceptEdits',

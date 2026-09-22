@@ -419,6 +419,27 @@ describe('a resumed turn', () => {
     }
   });
 
+  it('says which of this client’s browsers, when the conversation named one', async () => {
+    // Only beside the flag, and only when there is one: a browser id with no
+    // request to browse names nothing the run will do, and an older server
+    // drops the field and drives whichever browser is open.
+    const { setBrowserRelayClient } = await import('../adapter.js');
+    setBrowserRelayClient(() => ({}) as never);
+    try {
+      const { origin, seen } = await serve((_request, response) => happyStream(response));
+
+      await drive(origin, { extensionBrowser: true, extensionBrowserId: 'b-work' });
+      await drive(origin, { extensionBrowser: true });
+
+      const named = seen[0]?.body as { artemis?: Record<string, unknown> };
+      const unnamed = seen[1]?.body as { artemis?: Record<string, unknown> };
+      expect(named.artemis?.['extensionBrowserId']).toBe('b-work');
+      expect(unnamed.artemis).not.toHaveProperty('extensionBrowserId');
+    } finally {
+      setBrowserRelayClient(null);
+    }
+  });
+
   it('does not ask for a browser it cannot drive on this client’s behalf', async () => {
     // A server that honoured the request and then got no answer would hand the
     // agent a tool set whose every verb waits out its deadline and refuses.

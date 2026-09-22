@@ -272,11 +272,19 @@ describe('which browser a run gets', () => {
   /** Builders that record being asked and return tell-apart markers. */
   function builders(): {
     asked: string[];
-    build: { embedded: () => never; external: () => never; extension: () => never };
+    /** Which browser the extension builder was asked for, if it was asked. */
+    forBrowser: (string | undefined)[];
+    build: {
+      embedded: () => never;
+      external: () => never;
+      extension: (browserId: string | undefined) => never;
+    };
   } {
     const asked: string[] = [];
+    const forBrowser: (string | undefined)[] = [];
     return {
       asked,
+      forBrowser,
       build: {
         embedded: () => {
           asked.push('embedded');
@@ -286,8 +294,9 @@ describe('which browser a run gets', () => {
           asked.push('external');
           return 'the external server' as never;
         },
-        extension: () => {
+        extension: (browserId) => {
           asked.push('extension');
+          forBrowser.push(browserId);
           return 'the extension server' as never;
         },
       },
@@ -357,6 +366,37 @@ describe('which browser a run gets', () => {
     agentBrowserServers({ extensionBrowser: true }, build);
 
     expect(asked).toEqual(['extension']);
+  });
+
+  it('hands the extension builder the browser the run named', () => {
+    // A person may have a work Chrome and a personal one paired at once, and a
+    // conversation set to the first must not be given the second. This table
+    // carries the id and resolves nothing: which browser answers is the
+    // driver's question, and it refuses in words when the answer is none.
+    const { forBrowser, build } = builders();
+
+    agentBrowserServers({ extensionBrowser: true, extensionBrowserId: 'b-work' }, build);
+
+    expect(forBrowser).toEqual(['b-work']);
+  });
+
+  it('hands it nothing when the run named no browser, which means whichever is open', () => {
+    const { forBrowser, build } = builders();
+
+    agentBrowserServers({ extensionBrowser: true }, build);
+
+    expect(forBrowser).toEqual([undefined]);
+  });
+
+  it('ignores a browser id on a run that did not ask for the extension at all', () => {
+    // A stale id on a run that has since moved to the dock browser names
+    // nothing the run will do, and the table reads only the row it is on.
+    const { asked, build } = builders();
+
+    const servers = agentBrowserServers({ extensionBrowserId: 'b-work' }, build);
+
+    expect(servers).toEqual({ artemisBrowser: 'the embedded server' });
+    expect(asked).toEqual(['embedded']);
   });
 
   it('lets Chrome win over the extension, because Chrome means no Artemis tools at all', () => {

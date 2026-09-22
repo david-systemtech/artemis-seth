@@ -45,6 +45,7 @@
 
 import {
   createSseDecoder,
+  readBrowserSelector,
   REMOTE_BROWSER_ANSWER_PATH,
   REMOTE_EVENTS_PATH,
   type DriverResult,
@@ -76,21 +77,31 @@ const MAX_HELD = 32;
 /* -------------------------------------------------------------------------- */
 
 /**
- * Run one relayed verb against a driver.
+ * Run one relayed verb against this machine's browser.
  *
  * The inverse of the mapping in `extensionPageDriver.ts`, and deliberately a
  * plain exhaustive switch: the compiler is what keeps it in step with
  * `BridgeVerb`, so a verb added to the contract fails the build here rather
  * than becoming a silent refusal in somebody's browser.
  *
+ * It takes a *factory* rather than a driver because the call says which of
+ * this machine's paired browsers it is for, and that is a property of the
+ * driver rather than of the verb. The server holds the choice and restates it
+ * on every call — it has no way to resolve a name into an id, having never
+ * seen the list — so this side builds a driver for the browser named and lets
+ * it answer. A call that names nothing gets a driver that drives whichever
+ * browser is open, or refuses with the sentence that asks which; either way
+ * the words are the local driver's and reach the model unchanged.
+ *
  * `close` answers `ok` with nothing. The contract's `close` returns `void`
  * because a local caller has nobody to report to; across a wire the server is
  * waiting on *something*, and "it is done" is the honest thing to send.
  */
 export async function performBrowserCall(
-  driver: PageDriver,
+  driverFor: (runKey: string, browserId: string | undefined) => PageDriver,
   call: ServerBrowserCall,
 ): Promise<DriverResult<unknown>> {
+  const driver = driverFor(call.runKey, call.browserId);
   switch (call.verb) {
     case 'open':
       return driver.open(call.url);
@@ -136,8 +147,13 @@ export interface BrowserCallClientOptions {
    * one would mean deciding when to let it go. `runKey` is the server's, and
    * is what the extension files the tab under — so one served run is one tab,
    * exactly as one local run is.
+   *
+   * `browserId` is which of this machine's paired browsers the server asked
+   * for, as an id or as the name the agent answered with. Passed on each call
+   * precisely because nothing is held between them: the server is the one that
+   * remembers, and this side resolves what it is handed.
    */
-  readonly driverFor: (runKey: string) => PageDriver;
+  readonly driverFor: (runKey: string, browserId: string | undefined) => PageDriver;
   /** Injected by tests. Defaults to the global. */
   readonly fetch?: typeof globalThis.fetch;
   /** Hears anything that went wrong. Defaults to silence. */
@@ -237,7 +253,7 @@ export function createBrowserCallClient(options: BrowserCallClientOptions): Brow
   async function handle(call: ServerBrowserCall): Promise<void> {
     let result: DriverResult<unknown>;
     try {
-      result = await performBrowserCall(options.driverFor(call.runKey), call);
+      result = await performBrowserCall(options.driverFor, call);
     } catch (error) {
       /*
        * A driver is contracted to answer rather than throw, and this is the
@@ -389,6 +405,23 @@ function readCall(data: string | undefined): ServerBrowserCall | null {
   if (typeof raw['callId'] !== 'string' || raw['callId'].length === 0) return null;
   if (typeof raw['runKey'] !== 'string' || raw['runKey'].length === 0) return null;
   if (typeof raw['verb'] !== 'string') return null;
+  /*
+   * `browserId` is proved to be a selector when it is there, and no further:
+   * whether any browser answers to it is the driver's to say, in a sentence,
+   * and it says it better than a parser could. What is checked is that it is a
+   * bounded line of text — {@link readBrowserSelector}, the same reader the
+   * server applied to `artemis.extensionBrowserId` on the way in, so the two
+   * ends of this cannot come to disagree.
+   *
+   * A field that fails it drops the whole call rather than the field. Dropping
+   * only the field would silently turn a call for the user's work profile into
+   * a call for whichever browser is open, which is the one substitution this
+   * whole feature exists to prevent; dropping the call leaves the server's own
+   * deadline to answer the agent in words.
+   */
+  if (raw['browserId'] !== undefined && readBrowserSelector(raw['browserId']) === null) {
+    return null;
+  }
   return parsed as ServerBrowserCall;
 }
 

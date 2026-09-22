@@ -904,7 +904,17 @@ class ArtemisRun implements Run {
          * whatever it was given.
          */
         ...(this.#input.extensionBrowser === true && canRelayBrowser()
-          ? { extensionBrowser: true }
+          ? {
+              extensionBrowser: true,
+              // And *which* of this machine's paired browsers, when the
+              // conversation named one. Only beside the flag: an id with no
+              // request to browse names nothing the run will do. An older
+              // server drops it and drives whichever browser is open, which is
+              // what a client with one browser wanted anyway.
+              ...(this.#input.extensionBrowserId === undefined
+                ? {}
+                : { extensionBrowserId: this.#input.extensionBrowserId }),
+            }
           : {}),
         // Opt into the two behaviours a remote client needs and a script does
         // not: a disconnect detaches the run rather than killing it, and a
@@ -1942,7 +1952,7 @@ async function fetchServerSessions(
  * server cannot honour a request nobody will answer and leave the agent
  * waiting out deadlines. See {@link canRelayBrowser}.
  */
-let relayedBrowsers: ((runKey: string) => PageDriver) | null = null;
+let relayedBrowsers: ((runKey: string, browserId: string | undefined) => PageDriver) | null = null;
 
 /** One {@link BrowserCallClient} per server root, made on first use. */
 const relayClients = new Map<string, BrowserCallClient>();
@@ -1955,7 +1965,9 @@ const relayClients = new Map<string, BrowserCallClient>();
  * process back to not asking for a browser at all, which is what a test does
  * between cases.
  */
-export function setBrowserRelayClient(driverFor: ((runKey: string) => PageDriver) | null): void {
+export function setBrowserRelayClient(
+  driverFor: ((runKey: string, browserId: string | undefined) => PageDriver) | null,
+): void {
   relayedBrowsers = driverFor;
   if (driverFor === null) {
     for (const client of relayClients.values()) client.stop();

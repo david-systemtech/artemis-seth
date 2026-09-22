@@ -28,14 +28,36 @@
  *
  * ## The refusals are the product
  *
- * Three things go wrong that are not the page's fault: no browser has ever been
- * paired, a paired browser's Chrome is not running, and a browser that is
- * connected does not answer in time. All three arrive at the model as a
- * sentence naming the actual situation and the actual remedy, because the agent
- * is the only party in the room who can tell the user — nobody is watching a
- * tool call fail. A thrown error, or a generic "the browser tool failed", would
- * have the agent guess: usually that the *page* is broken, which sends it
- * looking for a bug that is not there.
+ * Six things go wrong that are not the page's fault: no browser has ever been
+ * paired, a paired browser's Chrome is not running, a browser that is connected
+ * does not answer in time, the browser this conversation names has been
+ * unpaired, the browser it names is closed while others are open, and — with
+ * several browsers open and none chosen — nobody has said which one is meant.
+ * All six arrive at the model as a sentence naming the actual situation and the
+ * actual remedy, because the agent is the only party in the room who can tell
+ * the user — nobody is watching a tool call fail. A thrown error, or a generic
+ * "the browser tool failed", would have the agent guess: usually that the
+ * *page* is broken, which sends it looking for a bug that is not there.
+ *
+ * The last of the six is the only refusal here that asks for something. See
+ * {@link chooseBrowser}. There is a seventh that is not about the browser
+ * being unreachable at all — see {@link alreadyChosen}, which is about who is
+ * allowed to decide.
+ *
+ * ## Which browser, and how it is named
+ *
+ * A person may pair a work Chrome and a personal one with the same Artemis,
+ * and both call themselves "Chrome on Windows" — so Artemis stores the label
+ * they typed and everything from the picker to this file addresses a browser by
+ * it. A driver holds a *selector* rather than an id: the picker supplies an id,
+ * a model answering "which browser?" supplies a name, and this file resolves
+ * either against the bridge's list. The bridge itself only ever sees an id.
+ *
+ * A model may name a browser **once**, and only for a run that had none. The
+ * argument is an answer to a question, not a control: a conversation the user
+ * pinned to their work profile must not be moved to their personal one by a
+ * tool call, because the thing asking for the move may be a page the agent is
+ * reading. See {@link ExtensionPageDriver.open}.
  *
  * ## Timeouts are per verb, not per driver
  *
@@ -70,11 +92,16 @@ import type {
 /**
  * How one call came out, before it is turned into words.
  *
- * Four cases and not a `DriverResult`, so that the sentences the model reads
+ * Seven cases and not a `DriverResult`, so that the sentences the model reads
  * live in this file with the rest of the driver's voice rather than in the
  * socket plumbing. `answered` carries the extension's own `DriverResult`
  * through untouched — a refusal it wrote is a refusal Artemis has nothing to
  * add to.
+ *
+ * The last three arrived with several paired browsers, and each is a
+ * *different question to the user*: repair a conversation's stale choice, open
+ * the browser it names, or say which of the open ones you meant. One refusal
+ * covering all three would have the agent guess at the remedy.
  */
 export type BridgeCallOutcome =
   | { readonly status: 'answered'; readonly result: DriverResult<unknown> }
@@ -83,7 +110,20 @@ export type BridgeCallOutcome =
   /** A browser is paired, but nothing is connected right now. */
   | { readonly status: 'disconnected' }
   /** Sent, and nothing came back before the deadline. */
-  | { readonly status: 'timeout' };
+  | { readonly status: 'timeout' }
+  /** A browser was named, and no pairing answers to that id any more. */
+  | { readonly status: 'no-such-browser' }
+  /** The named browser is paired, and its Chrome is not running. */
+  | { readonly status: 'browser-asleep'; readonly browserName: string }
+  /** Nothing named a browser, and more than one is connected to choose from. */
+  | { readonly status: 'ambiguous'; readonly browserNames: readonly string[] };
+
+/** One paired browser, as the driver needs to see it: named, and reachable or not. */
+export interface PairedBrowserRef {
+  readonly browserId: string;
+  readonly browserName: string;
+  readonly connected: boolean;
+}
 
 /**
  * The part of the bridge a driver uses.
@@ -97,6 +137,10 @@ export interface ExtensionDriverHost {
   /**
    * Put one verb on the wire and wait for its answer.
    *
+   * `browserId` names which paired browser to send it to. Absent means
+   * "whichever is connected", which is an answer only while exactly one is —
+   * see {@link BridgeCallOutcome}'s `ambiguous`.
+   *
    * Contracted never to reject: everything that can go wrong is one of the
    * {@link BridgeCallOutcome} cases, because a driver's job is to answer.
    */
@@ -105,7 +149,25 @@ export interface ExtensionDriverHost {
     id: string,
     verb: BridgeVerb,
     timeoutMs: number,
+    browserId?: string,
   ): Promise<BridgeCallOutcome>;
+  /**
+   * Every paired browser, named.
+   *
+   * Read by the driver for two things it cannot do without the list: turning a
+   * name the *model* used into the id the bridge addresses, and saying which
+   * browser a run settled on. Carries no secret — it is the same three fields
+   * a settings pane is shown.
+   */
+  browsers(): readonly PairedBrowserRef[];
+  /**
+   * Tell every connected browser a run is over.
+   *
+   * The fallback for a close that could not be addressed: see
+   * {@link ExtensionPageDriver.close}. An unknown run key is a no-op in the
+   * extension, so telling everyone costs nothing and leaves no tab behind.
+   */
+  endRun(runKey: string): void;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -184,6 +246,104 @@ function timedOut(seconds: number): string {
   );
 }
 
+/**
+ * What the model is told when the browser this conversation names is gone.
+ *
+ * Distinct from {@link UNPAIRED} because the remedy is different and the
+ * difference matters: other browsers may be paired and working, and an agent
+ * told "no browser has been paired" would send the user to pair one they
+ * already have. What is actually wrong is that *this conversation* points at a
+ * pairing that no longer exists — someone unpaired it — and the fix is to
+ * choose again.
+ */
+function noSuchBrowser(asked: string): string {
+  return (
+    `This conversation is set to a browser Artemis is no longer paired with (${quoted(asked)}). ` +
+    'Ask the user to choose a browser for this conversation again — the browser ' +
+    'row in the conversation’s menu, or Artemis settings → Browser to pair it ' +
+    'afresh. Until then you have no browser at all — do not describe pages you ' +
+    'have not seen.'
+  );
+}
+
+/**
+ * What the model is told when the browser it was given is paired and closed.
+ *
+ * It names the browser, and it says not to use another one. With several
+ * profiles paired, "the browser is not connected" invites exactly the wrong
+ * recovery: the agent reaches for whatever else is open, acts as the wrong
+ * signed-in person, and reports success. The logins this conversation was
+ * pointed at are in that browser and nowhere else.
+ */
+function browserAsleep(name: string): string {
+  return (
+    `This conversation drives the browser called ${quoted(name)}, and it is not ` +
+    `connected. Ask the user to open ${quoted(name)} with the Artemis extension ` +
+    'enabled, and say when it is running. Do not use a different browser instead ' +
+    '— the logins this conversation needs are in that one. Until then you have ' +
+    'no browser at all — do not describe pages you have not seen.'
+  );
+}
+
+/**
+ * What the model is told when several browsers are connected and none was
+ * chosen.
+ *
+ * The one refusal in this file that asks for something rather than reporting
+ * something, and the design David chose in issue #443: no new card, no new
+ * window, no Artemis-side prompt. The agent already has a way to ask the user
+ * a question, it is already mid-turn, and the answer is one word. So the
+ * refusal names the browsers, says to ask, and says exactly which call to make
+ * with the answer — because a model told only "be more specific" will guess,
+ * and guessing here means acting in somebody's work profile from a
+ * conversation about their personal one.
+ *
+ * It is a refusal and not a notice, so the verb does not happen. That is the
+ * point: there is no browser it could have happened in that would not have
+ * been a guess.
+ */
+function chooseBrowser(names: readonly string[]): string {
+  const example = names[0] ?? 'Work';
+  return (
+    `More than one browser is connected to Artemis: ${names.map(quoted).join(', ')}. ` +
+    'This conversation has not been set to one of them, so there is no way to ' +
+    'know which the user means. Ask the user which browser to use — with your own ' +
+    'question tool, AskUserQuestion on Claude, offering each of those names as an ' +
+    'option — then call browser_open again with the browser argument set to their ' +
+    // Straight quotes here and curly ones above, deliberately: the list is
+    // prose the model reads out, and this is a call it copies. A model handed
+    // a curly quote inside an example has been known to send one.
+    `answer, for example browser_open(browser: "${example}"). Artemis remembers ` +
+    'it for the rest of the conversation, so you are asked once. Do not guess, ' +
+    'and do not describe pages you have not seen.'
+  );
+}
+
+/**
+ * What the model is told when it names a browser for a conversation that
+ * already has one.
+ *
+ * The argument answers a question, and this conversation was not asked one:
+ * somebody chose its browser in the picker, or answered the question already.
+ * Either way that is a statement about whose logins this conversation acts
+ * with, made by the only party entitled to make it — so the remedy named here
+ * is the control the *user* has, and the model is told plainly that the choice
+ * is not its own to change.
+ */
+function alreadyChosen(current: string, asked: string): string {
+  return (
+    `This conversation is set to the browser called ${quoted(current)}, so it cannot ` +
+    `be moved to ${quoted(asked)} from here. Carry on in ${quoted(current)}, or tell the ` +
+    'user what you wanted the other browser for — changing it is done in the ' +
+    'conversation’s own Browser row, by them. Do not work around this.'
+  );
+}
+
+/** A name inside the curly quotes the rest of Artemis's copy uses. */
+function quoted(text: string): string {
+  return `“${text}”`;
+}
+
 /* -------------------------------------------------------------------------- */
 /* The driver                                                                 */
 /* -------------------------------------------------------------------------- */
@@ -197,6 +357,36 @@ const EXTENSION_ABILITIES: PageDriverAbilities = {
   evaluate: true,
 };
 
+/** What a driver is told about the browser it is for, beyond the run. */
+export interface ExtensionDriverOptions {
+  /**
+   * Which paired browser this run drives, by the id Artemis issued or by the
+   * name the user gave it.
+   *
+   * Either, because the two arrive from opposite directions and only this
+   * process can compare them. `RunInput.extensionBrowserId` carries an id,
+   * chosen in a picker that listed real pairings. A served run whose agent was
+   * asked which browser to use carries back a *name*, because a name is what a
+   * person answers with and what the model was shown — and the machine that
+   * holds the pairings is this one. Resolution is the same either way: exact
+   * id first, then name.
+   *
+   * Absent means whichever browser is connected, which is an answer while
+   * exactly one is and a question when more are.
+   */
+  readonly browser?: string | undefined;
+  /**
+   * Told when this run settled on a browser mid-turn, so the conversation can
+   * be moved onto it.
+   *
+   * Only fires for a choice *made here* — the agent answering the question in
+   * {@link chooseBrowser} — and never for a browser the run was started with,
+   * which the conversation already knows about. The desktop pushes it at the
+   * pane holding the run; see `IPC_PUSH.runBrowserChoice`.
+   */
+  readonly onChosen?: (browserId: string) => void;
+}
+
 /**
  * One run's hands on the user's own Chrome.
  *
@@ -205,9 +395,18 @@ const EXTENSION_ABILITIES: PageDriverAbilities = {
  * a closure exactly as it is for the dock browser: no verb takes a tab id, so
  * the model cannot name a page belonging to another conversation, and the
  * extension would not honour it if it did — it only knows the key it was told.
+ *
+ * {@link ExtensionDriverOptions.browser} is the one thing a model may name,
+ * and it names a *browser* rather than a page: which of the user's paired
+ * Chrome profiles this conversation acts in. See `browser_open`'s `browser`
+ * argument in `pageTools.ts`, and the refusal that asks for it.
  */
-export function extensionPageDriver(runId: RunId, bridge: ExtensionDriverHost): PageDriver {
-  return new ExtensionPageDriver(runId, bridge);
+export function extensionPageDriver(
+  runId: RunId,
+  bridge: ExtensionDriverHost,
+  options: ExtensionDriverOptions = {},
+): PageDriver {
+  return new ExtensionPageDriver(runId, bridge, options);
 }
 
 class ExtensionPageDriver implements PageDriver {
@@ -216,13 +415,68 @@ class ExtensionPageDriver implements PageDriver {
 
   readonly #runKey: string;
   readonly #bridge: ExtensionDriverHost;
+  readonly #onChosen: ((browserId: string) => void) | null;
 
-  constructor(runId: RunId, bridge: ExtensionDriverHost) {
+  /**
+   * The browser this run drives, as an id or a name, or `null` for "whichever".
+   *
+   * Mutable for one reason: the agent may answer the "which browser?" question
+   * mid-run, and the answer holds for the rest of the run. It is never
+   * un-chosen — a conversation that has settled on a browser does not drift
+   * back to "whichever is open" because a second Chrome started.
+   */
+  #browser: string | null;
+
+  constructor(runId: RunId, bridge: ExtensionDriverHost, options: ExtensionDriverOptions) {
     this.#runKey = runId;
     this.#bridge = bridge;
+    this.#browser = emptyToNull(options.browser);
+    this.#onChosen = options.onChosen ?? null;
   }
 
-  async open(url?: string): Promise<DriverResult<PageLocation>> {
+  /**
+   * Open this run's page, and — the first time the agent names one, and only
+   * then — decide which browser the rest of the conversation happens in.
+   *
+   * **Once.** The `browser` argument exists to answer a question Artemis
+   * asked, and a run that already has a browser was not asked one. Honouring
+   * it a second time would let a model move a conversation the user pinned to
+   * their work profile onto their personal one — and on the desktop that
+   * choice is written back into the pane, so every later turn would run there
+   * too. A page the agent is reading is untrusted input, and "move to the
+   * other browser" is a thing a page could ask for.
+   *
+   * The choice is taken before the verb rather than after it, and it sticks
+   * even when the open then fails. A name that resolved is the user's answer
+   * to a question they were asked; a page that would not load is a fact about
+   * a page. Forgetting the first because of the second would ask the question
+   * again on the next tool call.
+   */
+  async open(url?: string, browser?: string): Promise<DriverResult<PageLocation>> {
+    const named = emptyToNull(browser);
+    if (named !== null) {
+      const found = this.#find(named);
+      if (found === null) return { ok: false, reason: this.#unknownBrowser(named) };
+      if (this.#browser === null) {
+        this.#browser = found.browserId;
+        this.#onChosen?.(found.browserId);
+      } else {
+        /*
+         * Already set. Naming the *same* browser is not a move and carries on
+         * in silence — a model that repeats its own answer has not asked for
+         * anything. Naming another one is refused.
+         *
+         * A pinned browser that no longer resolves falls through instead of
+         * refusing here, so the model gets `#send`'s sentence about the
+         * browser this conversation lost rather than one about the browser it
+         * just named. That is the more useful of the two.
+         */
+        const current = this.#find(this.#browser);
+        if (current !== null && current.browserId !== found.browserId) {
+          return { ok: false, reason: alreadyChosen(current.browserName, found.browserName) };
+        }
+      }
+    }
     return this.#send<PageLocation>(
       url === undefined ? { verb: 'open' } : { verb: 'open', url },
       LOAD_TIMEOUT_MS,
@@ -283,9 +537,74 @@ class ExtensionPageDriver implements PageDriver {
    * browser. The answer is discarded — the run is over and there is nobody to
    * report it to — but the call is still awaited so a browser that is mid-reply
    * is not cut off in the same tick.
+   *
+   * A close that cannot be addressed — the run never chose between two
+   * connected browsers, or the one it chose has been unpaired since — is not
+   * dropped: every connected browser is told the run is over instead. The
+   * extension ignores a run key it has no tab for, so the one holding the tab
+   * closes it and the rest do nothing. This is what makes the served path
+   * safe as well: the server's end-of-run close arrives with no browser named,
+   * and there is no other hook on that path to broadcast from.
    */
   async close(): Promise<void> {
-    await this.#bridge.call(this.#runKey, freshId(), { verb: 'close' }, CLOSE_TIMEOUT_MS);
+    const selector = this.#browser;
+    let browserId: string | undefined;
+    if (selector !== null) {
+      const found = this.#find(selector);
+      if (found === null) {
+        this.#bridge.endRun(this.#runKey);
+        return;
+      }
+      browserId = found.browserId;
+    }
+    const outcome = await this.#bridge.call(
+      this.#runKey,
+      freshId(),
+      { verb: 'close' },
+      CLOSE_TIMEOUT_MS,
+      browserId,
+    );
+    if (outcome.status === 'ambiguous' || outcome.status === 'no-such-browser') {
+      this.#bridge.endRun(this.#runKey);
+    }
+  }
+
+  /**
+   * One paired browser, by the id Artemis issued or by the name the user gave
+   * it.
+   *
+   * Id first, and exactly. A name is matched case-insensitively and after
+   * trimming, because it is a thing a person typed into a settings field and
+   * then a model typed back — "work" and "Work " are the same browser, and
+   * refusing over a capital would be a refusal nobody can act on. Two browsers
+   * sharing a name resolve to the first, which is the same browser every time
+   * rather than a coin toss; nothing stops a user naming both "Chrome", and a
+   * stable wrong answer is at least visible in the run navigator.
+   */
+  #find(selector: string): PairedBrowserRef | null {
+    const browsers = this.#bridge.browsers();
+    const byId = browsers.find((one) => one.browserId === selector);
+    if (byId !== undefined) return byId;
+    const wanted = selector.trim().toLowerCase();
+    return browsers.find((one) => one.browserName.trim().toLowerCase() === wanted) ?? null;
+  }
+
+  /**
+   * What to say about a name that matches no paired browser.
+   *
+   * A model that mistyped one of the names it was just given, and a
+   * conversation pointing at a browser somebody unpaired, arrive here
+   * together. The sentence is {@link noSuchBrowser}'s, with the names that
+   * *would* work appended when there are any — which turns a mistyped answer
+   * into a second attempt rather than into a dead end.
+   */
+  #unknownBrowser(selector: string): string {
+    const connected = this.#bridge.browsers().filter((one) => one.connected);
+    if (connected.length === 0) return noSuchBrowser(selector);
+    return (
+      `${noSuchBrowser(selector)} Connected right now: ` +
+      `${connected.map((one) => quoted(one.browserName)).join(', ')}.`
+    );
   }
 
   /**
@@ -302,7 +621,23 @@ class ExtensionPageDriver implements PageDriver {
    * handshake, not this line.
    */
   async #send<T>(verb: BridgeVerb, timeoutMs: number): Promise<DriverResult<T>> {
-    const outcome = await this.#bridge.call(this.#runKey, freshId(), verb, timeoutMs);
+    /*
+     * A name is turned into an id here rather than being sent as it stands,
+     * because the bridge addresses browsers by id and a name is the user's
+     * word for one. Resolving on every verb rather than once at construction
+     * is deliberate: a browser can be unpaired or renamed mid-run, and the
+     * honest answer to a verb after that is a sentence about *this* browser,
+     * not a call sent to an id nothing answers to.
+     */
+    const selector = this.#browser;
+    let browserId: string | undefined;
+    if (selector !== null) {
+      const found = this.#find(selector);
+      if (found === null) return { ok: false, reason: this.#unknownBrowser(selector) };
+      browserId = found.browserId;
+    }
+
+    const outcome = await this.#bridge.call(this.#runKey, freshId(), verb, timeoutMs, browserId);
     switch (outcome.status) {
       case 'answered':
         return outcome.result as DriverResult<T>;
@@ -312,8 +647,21 @@ class ExtensionPageDriver implements PageDriver {
         return { ok: false, reason: DISCONNECTED };
       case 'timeout':
         return { ok: false, reason: timedOut(Math.round(timeoutMs / 1000)) };
+      case 'no-such-browser':
+        return { ok: false, reason: this.#unknownBrowser(selector ?? '') };
+      case 'browser-asleep':
+        return { ok: false, reason: browserAsleep(outcome.browserName) };
+      case 'ambiguous':
+        return { ok: false, reason: chooseBrowser(outcome.browserNames) };
     }
   }
+}
+
+/** A browser nobody named, spelled one way. An empty string is not a choice. */
+function emptyToNull(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : trimmed;
 }
 
 /**
@@ -329,4 +677,12 @@ function freshId(): string {
 }
 
 /** The refusal sentences, exported for the tests that pin them. */
-export const EXTENSION_REFUSALS = { UNPAIRED, DISCONNECTED, timedOut } as const;
+export const EXTENSION_REFUSALS = {
+  UNPAIRED,
+  DISCONNECTED,
+  timedOut,
+  noSuchBrowser,
+  browserAsleep,
+  chooseBrowser,
+  alreadyChosen,
+} as const;

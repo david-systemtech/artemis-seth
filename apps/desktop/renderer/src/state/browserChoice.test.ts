@@ -11,22 +11,54 @@
 
 import { describe, expect, it } from 'vitest';
 
+import type { PairedBrowserInfo, ProviderId } from '@rx-artemis/protocol';
+
 import {
+  browserChoiceOf,
+  browserChoiceValue,
   browserFlagsFor,
   browserModeFromPrefs,
   browserModeUnavailable,
   effectiveBrowserMode,
+  effectiveBrowserSelection,
   effectiveBrowserSummary,
   FOLLOW_WINDOW,
+  pairedBrowserUnavailable,
   paneBrowserChoice,
   paneBrowserOptions,
-  paneModeFor,
   type BrowserModeContext,
 } from './browserChoice';
 
-/** A machine with a paired browser that is awake, unless a test says otherwise. */
-function context(over: Partial<BrowserModeContext> = {}): BrowserModeContext {
-  return { providerId: 'claude', anyPaired: true, anyConnected: true, ...over };
+/** One paired browser, named and awake unless a test says otherwise. */
+function browser(
+  browserId: string,
+  browserName: string,
+  connected = true,
+): PairedBrowserInfo {
+  return { browserId, browserName, pairedAt: 0, connected };
+}
+
+/**
+ * A machine with a paired browser that is awake, unless a test says otherwise.
+ *
+ * `anyPaired` and `anyConnected` are still how most of these tests describe a
+ * machine, because most of them are about the four modes and not about which
+ * browser — so the helper turns them into the one-browser list they always
+ * meant. A test that cares about several passes `browsers` instead.
+ */
+function context(
+  over: {
+    readonly providerId?: ProviderId | null;
+    readonly anyPaired?: boolean;
+    readonly anyConnected?: boolean;
+    readonly browsers?: readonly PairedBrowserInfo[];
+  } = {},
+): BrowserModeContext {
+  const providerId = over.providerId ?? 'claude';
+  if (over.browsers !== undefined) return { providerId, browsers: over.browsers };
+  const paired = over.anyPaired ?? true;
+  const connected = over.anyConnected ?? true;
+  return { providerId, browsers: paired ? [browser('b-work', 'Work', connected)] : [] };
 }
 
 describe('the old switches become the new choice', () => {
@@ -268,6 +300,9 @@ describe('a conversation’s own browser picker', () => {
       FOLLOW_WINDOW,
       'embedded',
       'extension',
+      // The one paired browser, by id, directly under the row that means
+      // "whichever of them is open".
+      'extension:b-work',
       'chrome',
       'external',
     ]);
@@ -284,7 +319,7 @@ describe('a conversation’s own browser picker', () => {
     });
 
     expect(rows[0]?.note).toContain('built-in browser');
-    expect(rows[0]?.disabled).toBeUndefined();
+    expect(rows[0]?.unavailable).toBeUndefined();
   });
 
   it('follows always-on to the paired Chrome instead', () => {
@@ -304,15 +339,19 @@ describe('a conversation’s own browser picker', () => {
     const rows = paneBrowserOptions({ ...window, context: context({ anyPaired: false }) });
     const extension = rows.find((row) => row.id === 'extension');
 
-    expect(extension?.disabled).toBe(true);
-    expect(extension?.note).toContain('No browser is paired yet');
+    expect(extension?.unavailable).toContain('No browser is paired yet');
+    // And the note still says what the option *does*, because Settings draws
+    // both and only a menu has to choose between them.
+    expect(extension?.note).toContain('Your real Chrome');
   });
 
   it('disables Claude in Chrome on a provider that has never heard of it', () => {
     const rows = paneBrowserOptions({ ...window, context: context({ providerId: 'codex' }) });
 
-    expect(rows.find((row) => row.id === 'chrome')?.disabled).toBe(true);
-    expect(rows.find((row) => row.id === 'external')?.disabled).toBeUndefined();
+    expect(rows.find((row) => row.id === 'chrome')?.unavailable).toContain(
+      'Only Claude conversations',
+    );
+    expect(rows.find((row) => row.id === 'external')?.unavailable).toBeUndefined();
   });
 
   it('never disables following the window, which is always a thing to do', () => {
@@ -322,7 +361,7 @@ describe('a conversation’s own browser picker', () => {
       context: context({ providerId: 'codex', anyPaired: false }),
     });
 
-    expect(rows[0]?.disabled).toBeUndefined();
+    expect(rows[0]?.unavailable).toBeUndefined();
   });
 });
 
@@ -336,8 +375,8 @@ describe('what a conversation’s picker is set to', () => {
     // The difference that makes the follow row a row rather than a fifth
     // browser: a conversation following the default moves when the window
     // changes, and one that picked the same browser does not.
-    expect(paneModeFor(FOLLOW_WINDOW)).toBeNull();
-    expect(paneModeFor('embedded')).toBe('embedded');
+    expect(browserChoiceOf(FOLLOW_WINDOW)).toEqual({ mode: null, browserId: null });
+    expect(browserChoiceOf('embedded')).toEqual({ mode: 'embedded', browserId: null });
   });
 });
 
@@ -387,5 +426,192 @@ describe('what a status row says this conversation is on', () => {
     });
 
     expect(summary.label).toBe('My Chrome');
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Several paired browsers                                                    */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Issue #443 from this side. A person may pair a work Chrome and a personal
+ * one with the same Artemis; both describe themselves as "Chrome on Windows",
+ * and until the picker can say which, every conversation drives whichever
+ * connected first. What is pinned here is that a choice carries *which*, all
+ * the way onto the run input.
+ */
+describe('a choice that names one of several browsers', () => {
+  const TWO = [browser('b-work', 'Work'), browser('b-personal', 'Personal', false)];
+
+  it('reads and writes a named browser as one picker value', () => {
+    // One string, because a radio group carries one value per row. The prefix
+    // is what keeps ids and mode names from being mistaken for one another.
+    expect(browserChoiceValue('extension', 'b-work')).toBe('extension:b-work');
+    expect(browserChoiceOf('extension:b-work')).toEqual({
+      mode: 'extension',
+      browserId: 'b-work',
+    });
+  });
+
+  it('reads the plain row as the extension with no browser named', () => {
+    expect(browserChoiceValue('extension')).toBe('extension');
+    expect(browserChoiceOf('extension')).toEqual({ mode: 'extension', browserId: null });
+  });
+
+  it('reads a value that names nothing as following the window', () => {
+    // A stale menu, or a hand-edited preferences file.
+    expect(browserChoiceOf('firefox')).toEqual({ mode: null, browserId: null });
+  });
+
+  it('draws a row per paired browser, under the one that means whichever is open', () => {
+    const rows = paneBrowserOptions({
+      windowMode: 'embedded',
+      reach: 'per-conversation',
+      context: context({ browsers: TWO }),
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      FOLLOW_WINDOW,
+      'embedded',
+      'extension',
+      'extension:b-work',
+      'extension:b-personal',
+      'chrome',
+      'external',
+    ]);
+    expect(rows.find((row) => row.id === 'extension:b-work')?.label).toBe('My Chrome: Work');
+  });
+
+  it('says the plain row means whichever is open, but only when there are several', () => {
+    // With one browser paired there is nothing for "whichever" to choose
+    // between, and the sentence would warn about a situation nobody is in.
+    const many = paneBrowserOptions({
+      windowMode: 'embedded',
+      reach: 'per-conversation',
+      context: context({ browsers: TWO }),
+    });
+    const one = paneBrowserOptions({
+      windowMode: 'embedded',
+      reach: 'per-conversation',
+      context: context(),
+    });
+
+    expect(many.find((row) => row.id === 'extension')?.note).toContain('Whichever of them is open');
+    expect(one.find((row) => row.id === 'extension')?.note).not.toContain('Whichever');
+  });
+
+  it('disables the row for a browser whose Chrome is shut, and names it', () => {
+    // The plain row is still live — something *is* connected — so a rule about
+    // the set would say nothing about this browser.
+    const rows = paneBrowserOptions({
+      windowMode: 'embedded',
+      reach: 'per-conversation',
+      context: context({ browsers: TWO }),
+    });
+
+    expect(rows.find((row) => row.id === 'extension:b-work')?.unavailable).toBeUndefined();
+    const shut = rows.find((row) => row.id === 'extension:b-personal');
+    expect(shut?.unavailable).toContain('Personal is not connected');
+  });
+
+  it('says a browser is gone when nothing answers to its id', () => {
+    expect(pairedBrowserUnavailable('b-gone', context({ browsers: TWO }))).toContain(
+      'no longer paired',
+    );
+    expect(pairedBrowserUnavailable('b-work', context({ browsers: TWO }))).toBeNull();
+  });
+
+  it('carries the browser onto the run input beside the flag', () => {
+    expect(browserFlagsFor('extension', 'b-work')).toEqual({
+      extensionBrowser: true,
+      extensionBrowserId: 'b-work',
+    });
+    // And never without it: the plain row means whichever is open, which is
+    // what every run meant before a person could have two.
+    expect(browserFlagsFor('extension', null)).toEqual({ extensionBrowser: true });
+  });
+
+  it('sets no browser id on a mode that has only one browser', () => {
+    // Guarding against a stale id surviving a change of mode: a run on the
+    // dock browser that carried one would be carrying a choice nothing reads.
+    expect(browserFlagsFor('embedded', 'b-work')).toEqual({});
+    expect(browserFlagsFor('external', 'b-work')).toEqual({ externalBrowser: true });
+  });
+
+  it('resolves a conversation’s own named browser, and keeps it when its Chrome is shut', () => {
+    // The rule the whole module turns on, applied to one browser rather than
+    // to the set: the run refuses in a sentence naming that browser, and a
+    // quiet swap to the dock browser would contradict it.
+    expect(
+      effectiveBrowserSelection({
+        windowMode: 'embedded',
+        reach: 'per-conversation',
+        paneMode: 'extension',
+        paneBrowserId: 'b-personal',
+        context: context({ browsers: TWO }),
+      }),
+    ).toEqual({ mode: 'extension', browserId: 'b-personal' });
+  });
+
+  it('drops a window default pointed at a browser that is shut, as it always has', () => {
+    // Nobody is waiting on an answer: the picker is already drawing that row
+    // disabled with the reason, and the dock browser is a browser that works.
+    expect(
+      effectiveBrowserSelection({
+        windowMode: 'extension',
+        windowBrowserId: 'b-personal',
+        reach: 'always-on',
+        paneMode: null,
+        context: context({ browsers: TWO }),
+      }),
+    ).toEqual({ mode: 'embedded', browserId: null });
+  });
+
+  it('keeps a window default pointed at a browser that is running', () => {
+    expect(
+      effectiveBrowserSelection({
+        windowMode: 'extension',
+        windowBrowserId: 'b-work',
+        reach: 'always-on',
+        paneMode: null,
+        context: context({ browsers: TWO }),
+      }),
+    ).toEqual({ mode: 'extension', browserId: 'b-work' });
+  });
+
+  it('names the browser on the status row, not just the mode', () => {
+    // "My Chrome" on two panes driving two signed-in profiles is the exact
+    // ambiguity this feature removes.
+    const summary = effectiveBrowserSummary({
+      windowMode: 'embedded',
+      reach: 'per-conversation',
+      paneMode: 'extension',
+      paneBrowserId: 'b-work',
+      context: context({ browsers: TWO }),
+    });
+
+    expect(summary.label).toBe('My Chrome: Work');
+  });
+
+  it('falls back to the plain name when the browser it names has been unpaired', () => {
+    // Not a cover-up: the run refuses with a sentence naming the missing
+    // browser, and a row reading "My Chrome: undefined" would help nobody.
+    const summary = effectiveBrowserSummary({
+      windowMode: 'embedded',
+      reach: 'per-conversation',
+      paneMode: 'extension',
+      paneBrowserId: 'b-gone',
+      context: context({ browsers: TWO }),
+    });
+
+    expect(summary.label).toBe('My Chrome');
+  });
+
+  it('migrates an old stored choice to the plain row, naming no browser', () => {
+    // The migration is unchanged by any of this: a preferences file written
+    // before browsers had names cannot name one, and "whichever is open" is
+    // exactly what that user was already getting.
+    expect(browserModeFromPrefs({ browserMode: 'extension' })).toBe('extension');
+    expect(paneBrowserChoice('extension', null)).toBe('extension');
   });
 });

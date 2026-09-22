@@ -72,6 +72,7 @@ async function renderRow(options: {
   readonly windowMode?: string;
   readonly reach?: string;
   readonly paneMode?: string | null;
+  readonly paneBrowserId?: string | null;
   readonly providerId?: string;
   readonly bridge?: ExtensionBridgeState | null;
 } = {}): Promise<void> {
@@ -83,6 +84,7 @@ async function renderRow(options: {
   setPaneState(focusedPane(), {
     activeProviderId: options.providerId ?? 'claude',
     browserMode: options.paneMode ?? null,
+    browserExtensionId: options.paneBrowserId ?? null,
   } as never);
 
   render(
@@ -190,7 +192,7 @@ describe('an option that cannot work', () => {
     await renderRow({ bridge: { ...PAIRED_AND_AWAKE, browsers: [] } });
     await openSubmenu();
 
-    const row = option(/My Chrome/u);
+    const row = option(/^My Chrome \(Artemis extension\)/u);
     expect(row.getAttribute('data-disabled')).not.toBeNull();
     expect(row.textContent).toContain('No browser is paired yet');
     expect(row.textContent).toContain('Settings → Browser');
@@ -205,7 +207,12 @@ describe('an option that cannot work', () => {
     });
     await openSubmenu();
 
-    expect(option(/My Chrome/u).textContent).toContain('not connected');
+    expect(option(/^My Chrome \(Artemis extension\)/u).textContent).toContain('not connected');
+    // And the row for that browser by name says which browser to open, which
+    // is the sentence somebody with two of them can act on.
+    expect(option(/^My Chrome: Chrome on Linux/u).textContent).toContain(
+      'Chrome on Linux is not connected',
+    );
   });
 
   it('disables Claude in Chrome on a provider that has never heard of it', async () => {
@@ -221,7 +228,12 @@ describe('an option that cannot work', () => {
     await renderRow();
     await openSubmenu();
 
-    for (const name of [/Follow the window default/u, /My Chrome/u, /Claude in Chrome/u]) {
+    for (const name of [
+      /Follow the window default/u,
+      /^My Chrome \(Artemis extension\)/u,
+      /^My Chrome: Chrome on Linux/u,
+      /Claude in Chrome/u,
+    ]) {
       expect(option(name).getAttribute('data-disabled')).toBeNull();
     }
   });
@@ -233,10 +245,26 @@ describe('choosing one', () => {
     await openSubmenu();
 
     await act(async () => {
-      option(/My Chrome/u).click();
+      option(/^My Chrome \(Artemis extension\)/u).click();
     });
 
     expect(focusedPane().store.getState().browserMode).toBe('extension');
+    // The plain row means whichever browser is open, so it names none.
+    expect(focusedPane().store.getState().browserExtensionId).toBeNull();
+  });
+
+  it('writes the browser a named row picks, not just the mode', async () => {
+    // The whole of issue #443 from this end: with two Chrome profiles paired,
+    // "My Chrome" is not an answer and this row is.
+    await renderRow();
+    await openSubmenu();
+
+    await act(async () => {
+      option(/^My Chrome: Chrome on Linux/u).click();
+    });
+
+    expect(focusedPane().store.getState().browserMode).toBe('extension');
+    expect(focusedPane().store.getState().browserExtensionId).toBe('b1');
   });
 
   it('is one click away from the paired Chrome, which is the point of it', async () => {
@@ -247,7 +275,7 @@ describe('choosing one', () => {
     await openSubmenu();
 
     await act(async () => {
-      option(/My Chrome/u).click();
+      option(/^My Chrome \(Artemis extension\)/u).click();
     });
 
     expect(focusedPane().store.getState().browserMode).toBe('extension');
@@ -264,5 +292,35 @@ describe('choosing one', () => {
     });
 
     expect(focusedPane().store.getState().browserMode).toBeNull();
+    expect(focusedPane().store.getState().browserExtensionId).toBeNull();
+  });
+});
+
+describe('two browsers paired', () => {
+  const TWO: ExtensionBridgeState = {
+    ...PAIRED_AND_AWAKE,
+    browsers: [
+      { browserId: 'b1', browserName: 'Work', pairedAt: 1, connected: true },
+      { browserId: 'b2', browserName: 'Personal', pairedAt: 2, connected: true },
+    ],
+  };
+
+  it('offers a row per browser, under the one that means whichever is open', async () => {
+    await renderRow({ bridge: TWO });
+    await openSubmenu();
+
+    expect(option(/^My Chrome: Work/u)).toBeTruthy();
+    expect(option(/^My Chrome: Personal/u)).toBeTruthy();
+    expect(option(/^My Chrome \(Artemis extension\)/u).textContent).toContain(
+      'Whichever of them is open',
+    );
+  });
+
+  it('names the chosen browser on the trigger, which is where it is checked', async () => {
+    // "My Chrome" on two panes driving two different signed-in profiles is the
+    // exact ambiguity this feature removes, so the trigger has to say which.
+    await renderRow({ bridge: TWO, paneMode: 'extension', paneBrowserId: 'b2' });
+
+    expect(screen.getByText('My Chrome: Personal')).toBeTruthy();
   });
 });

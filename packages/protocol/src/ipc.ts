@@ -289,9 +289,10 @@ export const IPC = {
    *
    * A separate namespace from `browser:` above, which is about the dock's
    * `WebContentsView`s. Nothing here opens or reads a page — the agent does
-   * that through its tools, in main, behind the permission prompt. These five
+   * that through its tools, in main, behind the permission prompt. These six
    * are the settings surface: what is listening, which browsers are paired,
-   * the code being shown, and what a paired browser is allowed to do.
+   * what each is called, the code being shown, and what a paired browser is
+   * allowed to do.
    *
    * What is *not* here is the browsers' secrets. The renderer never sees one,
    * cannot pair on a browser's behalf, and cannot make a call on the wire. See
@@ -302,6 +303,14 @@ export const IPC = {
   extensionBridgePair: 'artemis:extension-bridge:pair',
   /** Forget a browser, and cut its connection if it has one. */
   extensionBridgeUnpair: 'artemis:extension-bridge:unpair',
+  /**
+   * Change what a paired browser is called.
+   *
+   * The name is the whole of how a person tells two Chrome profiles apart —
+   * both describe themselves as "Chrome on Windows" — so the one they typed at
+   * pairing has to be editable afterwards without unpairing and starting over.
+   */
+  extensionBridgeRename: 'artemis:extension-bridge:rename',
   /** Save the page policy, and push it to every connected browser. */
   extensionBridgePolicy: 'artemis:extension-bridge:policy',
   /** Write the bundled extension zip somewhere the user chooses. */
@@ -814,6 +823,32 @@ export interface RunSuggestion {
 }
 
 /**
+ * Payload for {@link IPC_PUSH.runBrowserChoice}: the paired browser a run
+ * settled on after asking the user which one.
+ *
+ * A decision taken in main that the renderer has to hear about, which is the
+ * unusual direction for a browser choice — every other one starts in a picker.
+ * With two Chrome profiles connected and a conversation that named neither,
+ * the run's first browser verb refuses and tells the agent to ask; the agent
+ * asks, the user answers, and the agent calls `browser_open` again naming a
+ * browser. That answer is a statement about the *conversation*, not about one
+ * turn, so it is written into the pane's own browser choice exactly as if the
+ * user had picked the row themselves — which is what makes the run navigator
+ * show it and the next turn start on the same browser without being asked
+ * again.
+ *
+ * Addressed by `runId`, like {@link RunSuggestion}, and for the same reason:
+ * it is the one id that names exactly one turn in exactly one pane. A window
+ * that does not hold that run drops it.
+ */
+export interface RunBrowserChoice {
+  readonly kind: 'run-browser-choice';
+  readonly runId: RunId;
+  /** The paired browser's id, as `PairedBrowserInfo.browserId` spells it. */
+  readonly browserId: string;
+}
+
+/**
  * Main → renderer push channels, used with `webContents.send` /
  * `ipcRenderer.on`.
  */
@@ -954,6 +989,16 @@ export const IPC_PUSH = {
    * from `pairing.expiresAt` rather than pushed per second.
    */
   extensionBridgeState: 'artemis:push:extension-bridge-state',
+  /**
+   * Carries a {@link RunBrowserChoice}: the paired browser a run settled on
+   * after asking the user which of several to drive.
+   *
+   * A push because the decision is main's. Every other browser choice is made
+   * in a picker and travels the other way; this one is made by an agent
+   * mid-turn, in the process that holds the bridge, and the pane has to learn
+   * it or the next turn would ask the same question again.
+   */
+  runBrowserChoice: 'artemis:push:run-browser-choice',
 } as const;
 
 /** Union of every request/response channel name. */
@@ -1992,6 +2037,28 @@ export interface ExtensionBridgeUnpairRequest {
 }
 
 export interface ExtensionBridgeUnpairResponse {
+  readonly state: ExtensionBridgeState;
+}
+
+/**
+ * Give a paired browser a different name.
+ *
+ * The whole name, not an edit. Main bounds it and strips control characters
+ * the same way it does a name the extension sent at pairing, so the two routes
+ * into the store cannot disagree about what a name may contain — and a rename
+ * that main shortened comes back in the state, which is what the field
+ * redraws from.
+ *
+ * An id that names no paired browser is not an error: the pane may be a moment
+ * behind a browser the user unpaired in another window, and the answer to that
+ * is the current state, which no longer lists it.
+ */
+export interface ExtensionBridgeRenameRequest {
+  readonly browserId: string;
+  readonly browserName: string;
+}
+
+export interface ExtensionBridgeRenameResponse {
   readonly state: ExtensionBridgeState;
 }
 
@@ -3513,6 +3580,7 @@ export type IpcRequestMap = {
   [IPC.extensionBridgeState]: ExtensionBridgeStateRequest;
   [IPC.extensionBridgePair]: ExtensionBridgePairRequest;
   [IPC.extensionBridgeUnpair]: ExtensionBridgeUnpairRequest;
+  [IPC.extensionBridgeRename]: ExtensionBridgeRenameRequest;
   [IPC.extensionBridgePolicy]: ExtensionBridgePolicyRequest;
   [IPC.extensionBridgeSaveBundle]: ExtensionBridgeSaveBundleRequest;
   [IPC.terminalStart]: TerminalStartRequest;
@@ -3641,6 +3709,7 @@ export type IpcResponseMap = {
   [IPC.extensionBridgeState]: ExtensionBridgeStateResponse;
   [IPC.extensionBridgePair]: ExtensionBridgePairResponse;
   [IPC.extensionBridgeUnpair]: ExtensionBridgeUnpairResponse;
+  [IPC.extensionBridgeRename]: ExtensionBridgeRenameResponse;
   [IPC.extensionBridgePolicy]: ExtensionBridgePolicyResponse;
   [IPC.extensionBridgeSaveBundle]: ExtensionBridgeSaveBundleResponse;
   [IPC.terminalStart]: TerminalStartResponse;
@@ -3766,6 +3835,7 @@ export type IpcPushMap = {
   [IPC_PUSH.routinesState]: RoutinesState;
   [IPC_PUSH.runSuggestion]: RunSuggestion;
   [IPC_PUSH.extensionBridgeState]: ExtensionBridgeState;
+  [IPC_PUSH.runBrowserChoice]: RunBrowserChoice;
 };
 
 /** Payload type for a push channel. */
@@ -3896,6 +3966,15 @@ export interface ArtemisBridge {
      * already stopped. See {@link IPC_PUSH.runSuggestion}.
      */
     onSuggestion(listener: (suggestion: RunSuggestion) => void): Unsubscribe;
+    /**
+     * Subscribe to browsers a run chose for itself, at most one per run.
+     *
+     * Off {@link onEvent} for {@link onSuggestion}'s reason turned around: this
+     * is not part of what a run *did*, it is a setting the run discovered on
+     * the conversation's behalf and the pane has to adopt. See
+     * {@link IPC_PUSH.runBrowserChoice}.
+     */
+    onBrowserChoice(listener: (choice: RunBrowserChoice) => void): Unsubscribe;
   };
 
   readonly sessions: {
@@ -4269,6 +4348,14 @@ export interface ArtemisBridge {
     pair(request: ExtensionBridgePairRequest): Promise<IpcResult<ExtensionBridgePairResponse>>;
     /** Forget a browser. Its live connection, if any, is cut. */
     unpair(request: ExtensionBridgeUnpairRequest): Promise<IpcResult<ExtensionBridgeUnpairResponse>>;
+    /**
+     * Call a paired browser something else.
+     *
+     * The name is how a person tells two Chrome profiles apart, and both of
+     * them describe themselves as "Chrome on Windows" — so the one typed at
+     * pairing has to be editable without unpairing and starting again.
+     */
+    rename(request: ExtensionBridgeRenameRequest): Promise<IpcResult<ExtensionBridgeRenameResponse>>;
     /** Save the page policy and push it to every connected browser. */
     policy(request: ExtensionBridgePolicyRequest): Promise<IpcResult<ExtensionBridgePolicyResponse>>;
     /** Write the bundled extension zip to a folder the user picks. */

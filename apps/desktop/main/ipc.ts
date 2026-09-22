@@ -172,6 +172,7 @@ import {
   validateBrowserClose,
   validateBrowserList,
   validateExtensionBridgePair,
+  validateExtensionBridgeRename,
   validateExtensionBridgePolicy,
   validateExtensionBridgeSaveBundle,
   validateExtensionBridgeState,
@@ -1213,7 +1214,7 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
      * Five channels, and every one of them answers with the whole state.
      *
      * Not because the state is large — it is a handful of names and dates —
-     * but because these five change each other. Unpairing the last browser
+     * but because these six change each other. Unpairing the last browser
      * changes whether anything is connected, which changes what the Browser
      * picker may offer; a wrong pairing code spends one of five attempts and
      * may withdraw the offer. A pane that had to infer the second fact from
@@ -1239,6 +1240,23 @@ export function registerIpcHandlers(options: IpcLayerOptions): IpcLayer {
     [IPC.extensionBridgeUnpair]: {
       validate: validateExtensionBridgeUnpair,
       handle: async (request) => ({ state: await extensionBridge.unpair(request.browserId) }),
+    },
+
+    /*
+     * Rename a paired browser.
+     *
+     * The one field of a pairing a user may edit, and the reason is what a
+     * name is for: two Chrome profiles on one machine both describe themselves
+     * as "Chrome on Windows", so the label typed at pairing is the whole of
+     * how a person tells the work one from the personal one in a picker. Main
+     * cleans it — see `nameOf` — and the cleaned name comes back in the state,
+     * which is what the field redraws from.
+     */
+    [IPC.extensionBridgeRename]: {
+      validate: validateExtensionBridgeRename,
+      handle: async (request) => ({
+        state: await extensionBridge.rename(request.browserId, request.browserName),
+      }),
     },
 
     [IPC.extensionBridgePolicy]: {

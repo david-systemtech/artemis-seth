@@ -14,6 +14,7 @@ import {
   validateExtensionBridgePolicy,
   validateExtensionBridgeSaveBundle,
   validateExtensionBridgeState,
+  validateExtensionBridgeRename,
   validateExtensionBridgeUnpair,
   validatePreviewOpen,
   validateProfilesCreate,
@@ -142,6 +143,25 @@ describe('validateRunsStart', () => {
     ).toThrow(ValidationError);
   });
 
+  it('carries which paired browser a conversation was set to', () => {
+    // Absent from this whitelist it would vanish on its way through IPC, and a
+    // conversation set to the work profile would silently drive the personal
+    // one. That is the shape of the rewind bug, in a browser full of logins.
+    const result = validateRunsStart({
+      input: { ...VALID_RUN, extensionBrowser: true, extensionBrowserId: 'a1b2c3d4' },
+    });
+    expect(result.input).toMatchObject({ extensionBrowserId: 'a1b2c3d4' });
+  });
+
+  it('refuses a browser id that is a payload rather than an id', () => {
+    expect(() =>
+      validateRunsStart({ input: { ...VALID_RUN, extensionBrowserId: '../../etc/passwd' } }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateRunsStart({ input: { ...VALID_RUN, extensionBrowserId: 7 } }),
+    ).toThrow(ValidationError);
+  });
+
   it('refuses a switch that is not a boolean, rather than reading it as on', () => {
     expect(() => validateRunsStart({ input: { ...VALID_RUN, chromeBrowser: 'yes' } })).toThrow(ValidationError);
   });
@@ -212,6 +232,21 @@ describe('the extension-bridge validators', () => {
     expect(validateExtensionBridgeUnpair({ browserId: 'abc' })).toEqual({ browserId: 'abc' });
     expect(() => validateExtensionBridgeUnpair({})).toThrow(ValidationError);
     expect(() => validateExtensionBridgeUnpair({ browserId: '' })).toThrow(ValidationError);
+  });
+
+  it('carries a rename, and refuses one missing either half', () => {
+    // The name is bounded here and cleaned in main, which is the one place
+    // that decides what a browser name may contain — see `nameOf`. A second
+    // rule here could only drift from it.
+    expect(validateExtensionBridgeRename({ browserId: 'abc', browserName: 'Work' })).toEqual({
+      browserId: 'abc',
+      browserName: 'Work',
+    });
+    expect(() => validateExtensionBridgeRename({ browserId: 'abc' })).toThrow(ValidationError);
+    expect(() => validateExtensionBridgeRename({ browserName: 'Work' })).toThrow(ValidationError);
+    expect(() =>
+      validateExtensionBridgeRename({ browserId: 'abc', browserName: '' }),
+    ).toThrow(ValidationError);
   });
 
   it('carries a whole policy through, lists and switches alike', () => {

@@ -75,6 +75,7 @@ import {
   type ServerState,
   type ServerStatusRequest,
   type RoutinesState,
+  type RunBrowserChoice,
   type RunSuggestion,
   type RoutinesListRequest,
   type RoutinesCreateRequest,
@@ -151,6 +152,7 @@ import {
   type BrowserLayoutRequest,
   type BrowserListRequest,
   type ExtensionBridgePairRequest,
+  type ExtensionBridgeRenameRequest,
   type ExtensionBridgePolicyRequest,
   type ExtensionBridgeSaveBundleRequest,
   type ExtensionBridgeState,
@@ -389,6 +391,24 @@ function isRunSuggestion(value: unknown): value is RunSuggestion {
   );
 }
 
+/**
+ * A pushed {@link RunBrowserChoice}, checked the way every other push is: the
+ * discriminator and the two ids it is addressed by, and nothing about what
+ * either names — the renderer looks both up in its own state, and an id that
+ * matches nothing is dropped there.
+ */
+function isRunBrowserChoice(value: unknown): value is RunBrowserChoice {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as { kind?: unknown; runId?: unknown; browserId?: unknown };
+  return (
+    candidate.kind === 'run-browser-choice' &&
+    typeof candidate.runId === 'string' &&
+    candidate.runId !== '' &&
+    typeof candidate.browserId === 'string' &&
+    candidate.browserId !== ''
+  );
+}
+
 function isRoutinesState(value: unknown): value is RoutinesState {
   if (typeof value !== 'object' || value === null) return false;
   const routines = (value as { routines?: unknown }).routines;
@@ -611,6 +631,12 @@ const extensionBridgeStates = createPushChannel<ExtensionBridgeState>({
   isValid: isExtensionBridgeState,
 });
 
+const runBrowserChoices = createPushChannel<RunBrowserChoice>({
+  channel: IPC_PUSH.runBrowserChoice,
+  label: 'artemis.runs.onBrowserChoice',
+  isValid: isRunBrowserChoice,
+});
+
 // A renderer reload destroys the JavaScript context without unwinding this
 // script's state. Drop the subscribers so a reloaded page starts from zero
 // rather than fanning events out to callbacks in a dead world.
@@ -643,6 +669,7 @@ window.addEventListener('pagehide', () => {
   serverStates.reset();
   routineStates.reset();
   runSuggestions.reset();
+  runBrowserChoices.reset();
 });
 
 /* -------------------------------------------------------------------------- */
@@ -737,6 +764,7 @@ const bridge: ArtemisBridge = Object.freeze({
     events: (request: RunsEventsRequest) => invoke(IPC.runsEvents, request),
     onEvent: agentEvents.subscribe,
     onSuggestion: runSuggestions.subscribe,
+    onBrowserChoice: runBrowserChoices.subscribe,
   }),
 
   sessions: Object.freeze({
@@ -898,6 +926,7 @@ const bridge: ArtemisBridge = Object.freeze({
     state: (request: ExtensionBridgeStateRequest) => invoke(IPC.extensionBridgeState, request),
     pair: (request: ExtensionBridgePairRequest) => invoke(IPC.extensionBridgePair, request),
     unpair: (request: ExtensionBridgeUnpairRequest) => invoke(IPC.extensionBridgeUnpair, request),
+    rename: (request: ExtensionBridgeRenameRequest) => invoke(IPC.extensionBridgeRename, request),
     policy: (request: ExtensionBridgePolicyRequest) => invoke(IPC.extensionBridgePolicy, request),
     saveBundle: (request: ExtensionBridgeSaveBundleRequest) =>
       invoke(IPC.extensionBridgeSaveBundle, request),

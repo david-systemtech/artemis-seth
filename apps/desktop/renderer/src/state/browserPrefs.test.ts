@@ -68,8 +68,12 @@ const ONE_BROWSER_CONNECTED = {
 };
 
 /** Every `runs.start` input main was handed, keyed by what this suite pins. */
-let started: { chromeBrowser?: boolean; extensionBrowser?: boolean; externalBrowser?: boolean }[] =
-  [];
+let started: {
+  chromeBrowser?: boolean;
+  extensionBrowser?: boolean;
+  extensionBrowserId?: string;
+  externalBrowser?: boolean;
+}[] = [];
 
 (globalThis.window as unknown as { artemis: unknown }).artemis = {
   runs: {
@@ -81,6 +85,7 @@ let started: { chromeBrowser?: boolean; extensionBrowser?: boolean; externalBrow
         runId: string;
         chromeBrowser?: boolean;
         extensionBrowser?: boolean;
+        extensionBrowserId?: string;
         externalBrowser?: boolean;
       };
     }) => {
@@ -90,6 +95,9 @@ let started: { chromeBrowser?: boolean; extensionBrowser?: boolean; externalBrow
       started.push({
         ...('chromeBrowser' in input ? { chromeBrowser: input.chromeBrowser } : {}),
         ...('extensionBrowser' in input ? { extensionBrowser: input.extensionBrowser } : {}),
+        ...('extensionBrowserId' in input
+          ? { extensionBrowserId: input.extensionBrowserId }
+          : {}),
         ...('externalBrowser' in input ? { externalBrowser: input.externalBrowser } : {}),
       });
       return {
@@ -189,6 +197,29 @@ describe('what rides the run input', () => {
     setBrowserMode('extension');
     setExtensionReach('always-on');
     setPaneState(focusedPane(), { activeProviderId: 'codex', activeProfileId: 'p2' } as never);
+
+    await submitPrompt('hello');
+
+    expect(started).toEqual([{ extensionBrowser: true }]);
+  });
+
+  it('names which paired browser the conversation was set to', async () => {
+    // With a work Chrome and a personal one paired, `extensionBrowser: true`
+    // alone means "whichever is open" — which is the ambiguity this field
+    // exists to remove, and which the run would otherwise have to ask about.
+    setBrowserMode('extension');
+    setExtensionReach('always-on');
+    setPaneBrowserMode('extension', 'b-work');
+
+    await submitPrompt('hello');
+
+    expect(started).toEqual([{ extensionBrowser: true, extensionBrowserId: 'b-work' }]);
+  });
+
+  it('sends no browser id for the row that means whichever is open', async () => {
+    setBrowserMode('extension');
+    setExtensionReach('always-on');
+    setPaneBrowserMode('extension', null);
 
     await submitPrompt('hello');
 

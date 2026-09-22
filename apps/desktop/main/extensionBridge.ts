@@ -57,6 +57,16 @@
  * nobody is reading; displacing it means the freshest connection wins, which
  * is the one that can actually answer.
  *
+ * ## Several browsers, and which one a verb goes to
+ *
+ * A person may pair a work Chrome and a personal one with the same Artemis.
+ * Each runs its own copy of the extension with its own storage, so each pairs
+ * separately and holds a connection of its own here, and this file is where a
+ * verb is pointed at one of them. {@link createExtensionBridge}'s `choose`
+ * carries that reasoning; what matters at this level is that Artemis never
+ * picks between two open browsers on the user's behalf. It drives the one it
+ * was told to, or it asks.
+ *
  * ## Nothing here decides policy
  *
  * The {@link PagePolicy} is pushed to every connected browser and applied
@@ -213,6 +223,15 @@ export interface ExtensionBridge extends ExtensionDriverHost {
   offerPairing(offer: boolean): ExtensionBridgeState;
   /** Forget a browser, cutting its connection. */
   unpair(browserId: string): Promise<ExtensionBridgeState>;
+  /**
+   * Call a paired browser something else.
+   *
+   * The name is the whole of how a person tells two Chrome profiles apart, and
+   * the one they typed at pairing is the one every picker and every refusal
+   * shows. Renaming does not disturb the connection: the id is what everything
+   * addresses, and the name is what everything displays.
+   */
+  rename(browserId: string, browserName: string): Promise<ExtensionBridgeState>;
   /** Save the policy and push it to every connected browser. */
   setPolicy(policy: PagePolicy): Promise<ExtensionBridgeState>;
   /** Tell every connected browser this run is over, and forget its calls. */
@@ -311,6 +330,50 @@ export function createExtensionBridge(options: ExtensionBridgeOptions): Extensio
     for (const settle of connection.pending.values()) settle({ status: 'disconnected' });
     connection.pending.clear();
     announce();
+  }
+
+  /**
+   * Which connection a verb goes down, or why none.
+   *
+   * This is what the comment that used to sit in `call` retired. It said "the
+   * first connected browser, and there is normally exactly one", and it was
+   * true right up until a person paired their work Chrome and their personal
+   * one with the same Artemis — at which point every conversation drove
+   * whichever had started first, silently, and no part of the app said so.
+   * Issue #443 is that.
+   *
+   * Three answers, and the middle one is the feature:
+   *
+   *  - **A browser was named.** It gets that browser or a refusal about *that*
+   *    browser. Never a substitute: a conversation pointed at the work profile
+   *    acting in the personal one is the failure this whole field exists to
+   *    prevent, and it is invisible from inside the run.
+   *  - **Nothing was named and one is connected.** That one, silently. The
+   *    person with a single browser never meets any of this.
+   *  - **Nothing was named and several are connected.** `ambiguous`, carrying
+   *    their names, which the driver turns into a question for the user. There
+   *    is no defensible pick here — first-connected is an artefact of what
+   *    order somebody opened two windows in — so Artemis asks rather than
+   *    guesses.
+   */
+  function choose(browserId?: string): Connection | BridgeCallOutcome {
+    if (browserId !== undefined) {
+      const live = connections.get(browserId);
+      if (live !== undefined) return live;
+      const paired = store.find(browserId);
+      return paired === null
+        ? { status: 'no-such-browser' }
+        : { status: 'browser-asleep', browserName: paired.browserName };
+    }
+    const open = [...connections.values()];
+    if (open.length === 0) return { status: 'disconnected' };
+    if (open.length === 1) return open[0] as Connection;
+    return {
+      status: 'ambiguous',
+      browserNames: open.map(
+        (one) => store.find(one.browserId)?.browserName ?? 'A browser',
+      ),
+    };
   }
 
   /* ------------------------------------------------------------------ */
@@ -637,6 +700,22 @@ export function createExtensionBridge(options: ExtensionBridgeOptions): Extensio
       return announce();
     },
 
+    async rename(browserId: string, browserName: string): Promise<ExtensionBridgeState> {
+      // Through the same `nameOf` a pairing goes through, so the two ways a
+      // name enters the store cannot disagree about what a name may be. An id
+      // that names nothing is not an error — see `ExtensionBridgeRenameRequest`
+      // — and the state that comes back is the answer either way.
+      await store.rename(browserId, nameOf(browserName));
+      return announce();
+    },
+
+    browsers: () =>
+      store.all().map((browser) => ({
+        browserId: browser.browserId,
+        browserName: browser.browserName,
+        connected: connections.has(browser.browserId),
+      })),
+
     async setPolicy(policy: PagePolicy): Promise<ExtensionBridgeState> {
       await store.setPolicy(policy);
       // Pushed rather than waited for: a browser that is asleep gets the
@@ -648,6 +727,20 @@ export function createExtensionBridge(options: ExtensionBridgeOptions): Extensio
       return announce();
     },
 
+    /*
+     * Still broadcast to every connection, now that a run drives exactly one
+     * of them.
+     *
+     * Deliberate, and cheaper than the alternative. The bridge does not record
+     * which browser a run used — that lives in the driver, which is gone by the
+     * time a run ends — so addressing this would mean keeping a run-to-browser
+     * map alive for the sake of a message that costs nothing to send. A `close`
+     * for a run a browser never heard of is a no-op there: the extension looks
+     * the key up in its tab book, finds nothing, and answers. What it *must*
+     * not do is miss the browser that does hold the tab, which is exactly what
+     * a wrong guess at "which one" would do — and the symptom would be a tab
+     * left behind in somebody's Chrome for every conversation.
+     */
     endRun(runKey: string): void {
       for (const connection of connections.values()) {
         send(connection.socket, {
@@ -664,19 +757,12 @@ export function createExtensionBridge(options: ExtensionBridgeOptions): Extensio
       id: string,
       verb: BridgeVerb,
       timeoutMs: number,
+      browserId?: string,
     ): Promise<BridgeCallOutcome> {
       if (store.all().length === 0) return { status: 'unpaired' };
-      /*
-       * The first connected browser, and there is normally exactly one. A
-       * verb takes no browser id — targeting is by run, as it is everywhere
-       * else in the browser tools — so with two paired browsers both awake
-       * this picks the one that connected first and keeps picking it, which is
-       * stable and explainable. Choosing per call would have a conversation
-       * silently change browsers mid-turn.
-       */
-      const connection = connections.values().next();
-      if (connection.done === true) return { status: 'disconnected' };
-      const live = connection.value;
+
+      const live = choose(browserId);
+      if ('status' in live) return live;
 
       return new Promise<BridgeCallOutcome>((resolve) => {
         let settled = false;
@@ -766,10 +852,40 @@ function constantTimeEquals(left: string, right: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-/** The peer's name for itself, bounded and stripped of anything that is not text. */
+/**
+ * Characters a browser's name may not contain, whoever supplied it.
+ *
+ * Wider than "control characters" because of where this name ends up. It is
+ * drawn in two pickers and a settings row, quoted into refusal sentences a
+ * model reads back to the user, and written to a JSON file somebody may open
+ * — and each of those is a place where an invisible character makes two
+ * different names look like one. That is the whole failure this feature
+ * removes, so a name that renders as `Work` and is not `Work` would reintroduce
+ * it by hand.
+ *
+ * In order: C0 and DEL and C1; the soft hyphen, the combining grapheme
+ * joiner, the Arabic letter mark and the Mongolian vowel separator, each of
+ * which draws as nothing; the zero-width characters, the word joiner and the
+ * invisible operators; the bidi embedding, override and isolate controls,
+ * which can make a name render right-to-left and read as another one
+ * entirely; and the byte-order mark, which arrives at the front of anything
+ * pasted out of a file.
+ */
+const NOT_A_NAME =
+  /[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/gu;
+
+/**
+ * The name a browser goes by, bounded and stripped of anything that is not
+ * text.
+ *
+ * The one place that decides, and it is on both roads in: the label typed into
+ * the extension at pairing, and a rename made in the Browser pane. Two rules
+ * would mean a name a rename accepted and a pairing refused, differing in a
+ * character neither of them can show you.
+ */
 function nameOf(raw: unknown): string {
   if (typeof raw !== 'string') return 'A browser';
-  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/gu, '').trim();
+  const cleaned = raw.replace(NOT_A_NAME, '').trim();
   return cleaned.length === 0 ? 'A browser' : cleaned.slice(0, 80);
 }
 

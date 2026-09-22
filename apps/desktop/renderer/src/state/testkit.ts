@@ -51,6 +51,7 @@ const SESSION_KEYS: Readonly<Record<keyof SessionState, true>> = {
   fastMode: true,
   ultracode: true,
   browserMode: true,
+  browserExtensionId: true,
   forkOnResume: true,
   resumeSessionId: true,
   historyLoading: true,

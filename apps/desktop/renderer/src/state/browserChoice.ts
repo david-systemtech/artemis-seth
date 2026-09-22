@@ -15,11 +15,21 @@
  * is make the *question* single-valued at the place a person answers it, so
  * the table never has to.
  *
+ * ## Four modes, and any number of browsers under one of them
+ *
+ * `extension` is the one mode that is not a single browser. A person may pair
+ * a work Chrome and a personal one with the same Artemis, so the picker grows
+ * a row per pairing under "My Chrome" — "My Chrome: Work" — and a choice is a
+ * {@link BrowserSelection}: a mode, plus which browser when the mode is that
+ * one. The plain "My Chrome" row stays and means *whichever of them is open*,
+ * which is what a person with one browser gets without ever meeting any of
+ * this.
+ *
  * ## Two settings, and they answer different questions
  *
  * {@link BrowserMode} is "which browser", a window preference, as its two
- * predecessors were: the extension bridges one browser at a time, and a
- * per-pane version of this would invite two columns to fight over it.
+ * predecessors were: a per-pane *default* would invite two columns to fight
+ * over it.
  *
  * {@link ExtensionReach} is "how do conversations *get* the paired browser",
  * and it exists because driving somebody's signed-in Chrome is a bigger grant
@@ -36,7 +46,7 @@
  * hide: the migration runs once, in the field, on data nobody can re-read.
  */
 
-import type { ProviderId } from '@rx-artemis/protocol';
+import type { PairedBrowserInfo, ProviderId } from '@rx-artemis/protocol';
 
 /** Which browser an agent drives. Exactly one per run. */
 export type BrowserMode =
@@ -122,14 +132,30 @@ export function isExtensionReach(value: unknown): value is ExtensionReach {
 /* What a mode can do right now                                               */
 /* -------------------------------------------------------------------------- */
 
-/** What the picker knows about the machine when it decides what to offer. */
+/**
+ * What the picker knows about the machine when it decides what to offer.
+ *
+ * The browsers as a list rather than two booleans about them, because a person
+ * may have paired a work Chrome and a personal one and the picker now draws a
+ * row for each. `anyPaired` and `anyConnected` are still the questions the four
+ * mode rows ask, and they are folded from the list here rather than carried
+ * beside it — two copies of the same fact are two things to keep in step.
+ */
 export interface BrowserModeContext {
   /** The provider the conversation is running as. */
   readonly providerId: ProviderId | null;
-  /** Whether any browser has been paired with Artemis. */
-  readonly anyPaired: boolean;
-  /** Whether a paired browser is connected right now. */
-  readonly anyConnected: boolean;
+  /** Every paired browser, in the order Artemis lists them. */
+  readonly browsers: readonly PairedBrowserInfo[];
+}
+
+/** Whether any browser has been paired with Artemis. */
+function anyPaired(context: BrowserModeContext): boolean {
+  return context.browsers.length > 0;
+}
+
+/** Whether a paired browser is connected right now. */
+function anyConnected(context: BrowserModeContext): boolean {
+  return context.browsers.some((one) => one.connected);
 }
 
 /**
@@ -147,12 +173,57 @@ export function browserModeUnavailable(
     return 'Only Claude conversations can use the Claude in Chrome extension.';
   }
   if (mode === 'extension') {
-    if (!context.anyPaired) return 'No browser is paired yet. Pair one in Settings → Browser.';
-    if (!context.anyConnected) {
+    if (!anyPaired(context)) return 'No browser is paired yet. Pair one in Settings → Browser.';
+    if (!anyConnected(context)) {
       return 'The paired browser is not connected. Open Chrome with the Artemis extension enabled.';
     }
   }
   return null;
+}
+
+/**
+ * Why *one named browser* cannot be chosen, or `null` when it can.
+ *
+ * The same rule as the plain extension row applied to one browser rather than
+ * to the set, which is what it has to be once there are several: with a work
+ * Chrome open and a personal one shut, "a paired browser is connected" is true
+ * and says nothing about the one this row names. A row for a browser that is
+ * not running is still drawn — see {@link browserPickerOptions} — because a
+ * user who cannot find "My Chrome: Personal" concludes Artemis has forgotten
+ * it, where a dimmed row saying to open it has told them what to do.
+ */
+export function pairedBrowserUnavailable(
+  browserId: string,
+  context: BrowserModeContext,
+): string | null {
+  const browser = context.browsers.find((one) => one.browserId === browserId);
+  if (browser === undefined) {
+    return 'That browser is no longer paired with Artemis. Pair it again in Settings → Browser.';
+  }
+  if (!browser.connected) {
+    return `${browser.browserName} is not connected. Open it with the Artemis extension enabled.`;
+  }
+  return null;
+}
+
+/**
+ * Why a whole choice — a mode, and which browser when it is the extension —
+ * cannot be used, or `null` when it can.
+ *
+ * One function so that every caller asks the question the same way. The
+ * difference it resolves is narrow and easy to get wrong in two places: a
+ * choice that names a browser is judged against *that* browser, and one that
+ * names none is judged against the set.
+ */
+export function browserChoiceUnavailable(
+  mode: BrowserMode,
+  browserId: string | null,
+  context: BrowserModeContext,
+): string | null {
+  if (mode === 'extension' && browserId !== null) {
+    return pairedBrowserUnavailable(browserId, context);
+  }
+  return browserModeUnavailable(mode, context);
 }
 
 /**
@@ -193,22 +264,52 @@ export function browserModeUnavailable(
  *    in words, so the run would have no browser at all and nothing would say
  *    so — which is the failure this fallback was written for.
  */
-export function effectiveBrowserMode(options: {
+export function effectiveBrowserSelection(options: {
   readonly windowMode: BrowserMode;
+  readonly windowBrowserId?: string | null;
   readonly reach: ExtensionReach;
   readonly paneMode: BrowserMode | null;
+  readonly paneBrowserId?: string | null;
   readonly context: BrowserModeContext;
-}): BrowserMode {
-  const chosen =
-    options.paneMode ??
-    (options.windowMode === 'extension' && options.reach === 'per-conversation'
-      ? 'embedded'
-      : options.windowMode);
-  if (browserModeUnavailable(chosen, options.context) === null) return chosen;
+}): BrowserSelection {
+  const chosen: BrowserSelection =
+    options.paneMode !== null
+      ? { mode: options.paneMode, browserId: options.paneBrowserId ?? null }
+      : options.windowMode === 'extension' && options.reach === 'per-conversation'
+        ? WHICHEVER_EMBEDDED
+        : { mode: options.windowMode, browserId: options.windowBrowserId ?? null };
+  if (browserChoiceUnavailable(chosen.mode, chosen.browserId, options.context) === null) {
+    return chosen;
+  }
   // Unavailable. Kept only when this conversation asked for it *and* the run
   // will explain itself; see the note above on why those are two conditions
   // and not one.
-  return options.paneMode === chosen && explainsItsOwnAbsence(chosen) ? chosen : 'embedded';
+  return options.paneMode !== null && explainsItsOwnAbsence(chosen.mode)
+    ? chosen
+    : WHICHEVER_EMBEDDED;
+}
+
+/** The answer that grants nothing, which every fallback here lands on. */
+const WHICHEVER_EMBEDDED: BrowserSelection = { mode: 'embedded', browserId: null };
+
+/**
+ * The mode alone, for the callers that have no use for which browser it is.
+ *
+ * Kept beside {@link effectiveBrowserSelection} rather than folded into it
+ * because most of the app genuinely only asks "which kind of browser" — the
+ * decision table, the fallback rules, the disabled states — and a caller
+ * forced to take an object it then drops half of reads as though the half
+ * mattered.
+ */
+export function effectiveBrowserMode(options: {
+  readonly windowMode: BrowserMode;
+  readonly windowBrowserId?: string | null;
+  readonly reach: ExtensionReach;
+  readonly paneMode: BrowserMode | null;
+  readonly paneBrowserId?: string | null;
+  readonly context: BrowserModeContext;
+}): BrowserMode {
+  return effectiveBrowserSelection(options).mode;
 }
 
 /**
@@ -240,16 +341,26 @@ function explainsItsOwnAbsence(mode: BrowserMode): boolean {
  * `embedded` sets nothing at all, which is what the decision table reads as
  * the dock browser.
  */
-export function browserFlagsFor(mode: BrowserMode): {
+export function browserFlagsFor(
+  mode: BrowserMode,
+  browserId: string | null = null,
+): {
   readonly chromeBrowser?: true;
   readonly extensionBrowser?: true;
+  readonly extensionBrowserId?: string;
   readonly externalBrowser?: true;
 } {
   switch (mode) {
     case 'chrome':
       return { chromeBrowser: true };
     case 'extension':
-      return { extensionBrowser: true };
+      // The id only beside the flag, and only when there is one. Absent means
+      // whichever paired browser is open, which is what every run meant before
+      // a person could have two — and is still what the plain "My Chrome" row
+      // means.
+      return browserId === null
+        ? { extensionBrowser: true }
+        : { extensionBrowser: true, extensionBrowserId: browserId };
     case 'external':
       return { externalBrowser: true };
     case 'embedded':
@@ -273,8 +384,64 @@ export function browserFlagsFor(mode: BrowserMode): {
  */
 export const FOLLOW_WINDOW = 'follow';
 
-/** What a conversation's browser picker is set to. */
-export type PaneBrowserChoice = BrowserMode | typeof FOLLOW_WINDOW;
+/**
+ * How a picker row names a *particular* paired browser: `extension:<id>`.
+ *
+ * One string, because a radio group carries one value per row and a picker is
+ * the wrong place to invent a second channel for the half of a choice that is
+ * an id. The prefix is what keeps the four mode names and any number of
+ * browser ids in one space without either being able to be mistaken for the
+ * other — a browser whose id happened to be `external` would otherwise select
+ * the wrong row, and browser ids are thirty-two hex characters that nobody
+ * chose.
+ */
+const NAMED_BROWSER_PREFIX = 'extension:';
+
+/** What a browser picker is set to: a mode, one named browser, or the default. */
+export type BrowserChoiceValue = string;
+
+/** One whole answer to "which browser": a mode, and which one when it is Chrome. */
+export interface BrowserSelection {
+  readonly mode: BrowserMode;
+  /**
+   * Which paired browser, or `null` for whichever of them is open.
+   *
+   * Only ever set alongside `extension`. The other three modes each have one
+   * browser by construction.
+   */
+  readonly browserId: string | null;
+}
+
+/** The value a picker row carries, for a mode and optionally one browser. */
+export function browserChoiceValue(
+  mode: BrowserMode | null,
+  browserId: string | null = null,
+): BrowserChoiceValue {
+  if (mode === null) return FOLLOW_WINDOW;
+  if (mode === 'extension' && browserId !== null) return `${NAMED_BROWSER_PREFIX}${browserId}`;
+  return mode;
+}
+
+/**
+ * What a picker row's value means.
+ *
+ * `mode: null` is "follow the window default", which is a state and not a
+ * browser — see {@link FOLLOW_WINDOW}. A value that is neither a known mode nor
+ * a named browser reads as the default, which is what a stale menu and a
+ * hand-edited preferences file both produce.
+ */
+export function browserChoiceOf(value: BrowserChoiceValue): {
+  readonly mode: BrowserMode | null;
+  readonly browserId: string | null;
+} {
+  if (value.startsWith(NAMED_BROWSER_PREFIX)) {
+    const browserId = value.slice(NAMED_BROWSER_PREFIX.length);
+    return browserId.length === 0
+      ? { mode: 'extension', browserId: null }
+      : { mode: 'extension', browserId };
+  }
+  return isBrowserMode(value) ? { mode: value, browserId: null } : { mode: null, browserId: null };
+}
 
 /** Short enough for the trailing edge of a menu row. */
 export const BROWSER_MODE_SHORT_LABELS: Readonly<Record<BrowserMode, string>> = {
@@ -284,63 +451,134 @@ export const BROWSER_MODE_SHORT_LABELS: Readonly<Record<BrowserMode, string>> = 
   external: 'My browser',
 };
 
-/** One row of a conversation's browser picker. */
-export interface PaneBrowserOption {
-  readonly id: PaneBrowserChoice;
+/**
+ * One row of a browser picker, in either the window's copy or a pane's.
+ *
+ * Two sentences rather than one, because the two pickers have different room
+ * for them. Settings draws the note under the label and hangs the reason off a
+ * tooltip; a menu row has nowhere to put a tooltip anybody would find, so it
+ * shows the reason *instead of* the note. Folding them here would have given
+ * the settings row the same sentence twice.
+ */
+export interface BrowserPickerOption {
+  readonly id: BrowserChoiceValue;
   readonly label: string;
-  /** What choosing it does, or — when it is disabled — why it cannot be. */
+  /** What choosing it does. */
   readonly note: string;
-  readonly disabled?: true;
-}
-
-/** What the picker on a conversation is currently set to. */
-export function paneBrowserChoice(paneMode: BrowserMode | null): PaneBrowserChoice {
-  return paneMode ?? FOLLOW_WINDOW;
-}
-
-/** The mode a choice means, or `null` for "follow the window default". */
-export function paneModeFor(choice: PaneBrowserChoice): BrowserMode | null {
-  return choice === FOLLOW_WINDOW ? null : choice;
+  /** Why it cannot be chosen right now, and absent when it can. */
+  readonly unavailable?: string;
 }
 
 /**
- * The five rows a conversation's browser picker draws.
+ * What the picker on a conversation is currently set to.
  *
- * The same four the window offers, under the same rule — an option that cannot
- * work is shown, disabled, carrying the reason — plus the one above them that
- * says "whatever the window says". Shown rather than hidden for the reason
- * every degraded control in this app is: a user who cannot find "My Chrome"
- * concludes Artemis does not have it, where a dimmed row saying no browser is
- * paired has taught them where to go.
+ * Takes both halves of the pane's choice, because "My Chrome" and "My Chrome:
+ * Work" are different rows and a control that showed the first when the second
+ * was set would be a control lying about a conversation's logins.
+ */
+export function paneBrowserChoice(
+  paneMode: BrowserMode | null,
+  paneBrowserId: string | null = null,
+): BrowserChoiceValue {
+  return browserChoiceValue(paneMode, paneBrowserId);
+}
+
+/**
+ * The rows a browser picker draws: the four modes, plus one per paired
+ * browser.
  *
- * The follow row's note names what the window resolves to *right now*, because
- * "follow the default" answers nothing on its own — and under
+ * The per-browser rows sit directly under the plain "My Chrome" row, which
+ * stays and means *whichever of them is open* — the answer somebody with one
+ * browser wants and never has to think about, and the answer that lets a
+ * conversation say "my Chrome" without pinning it to a profile. Each named row
+ * is drawn whether that browser is running or not, disabled with the reason
+ * when it is not, under exactly the rule the plain row has always followed:
+ * hiding it would have a user conclude Artemis had forgotten the browser they
+ * paired.
+ *
+ * The rows are not built for a machine with no pairings at all, beyond the
+ * plain row that is already there saying so.
+ */
+export function browserPickerOptions(context: BrowserModeContext): readonly BrowserPickerOption[] {
+  return BROWSER_MODES.flatMap((mode): BrowserPickerOption[] => {
+    const unavailable = browserModeUnavailable(mode, context);
+    const row: BrowserPickerOption = {
+      id: browserChoiceValue(mode),
+      label: BROWSER_MODE_LABELS[mode],
+      // Said only where it answers a question the user actually has. With one
+      // browser paired there is nothing for "whichever" to choose between, and
+      // the sentence would be a warning about a situation they are not in.
+      note:
+        mode === 'extension' && context.browsers.length > 1
+          ? `${BROWSER_MODE_NOTES[mode]} Whichever of them is open.`
+          : BROWSER_MODE_NOTES[mode],
+      ...(unavailable === null ? {} : { unavailable }),
+    };
+    if (mode !== 'extension') return [row];
+    return [
+      row,
+      ...context.browsers.map((browser): BrowserPickerOption => {
+        const why = pairedBrowserUnavailable(browser.browserId, context);
+        return {
+          id: browserChoiceValue('extension', browser.browserId),
+          label: namedBrowserLabel(browser.browserName),
+          note: 'Always this browser, whatever else is open.',
+          ...(why === null ? {} : { unavailable: why }),
+        };
+      }),
+    ];
+  });
+}
+
+/** "My Chrome: Work" — the mode, then the name the user gave that browser. */
+export function namedBrowserLabel(browserName: string): string {
+  return `${BROWSER_MODE_SHORT_LABELS.extension}: ${browserName}`;
+}
+
+/**
+ * The rows a conversation's browser picker draws.
+ *
+ * Everything the window offers, plus the one above them that says "whatever
+ * the window says". Its note names what the window resolves to *right now*,
+ * because "follow the default" answers nothing on its own — and under
  * `per-conversation` reach the answer is the built-in browser even when the
  * window's own picker says My Chrome, which is exactly the state this control
  * exists to let somebody out of.
  */
 export function paneBrowserOptions(options: {
   readonly windowMode: BrowserMode;
+  readonly windowBrowserId?: string | null;
   readonly reach: ExtensionReach;
   readonly context: BrowserModeContext;
-}): readonly PaneBrowserOption[] {
-  const inherited = effectiveBrowserMode({ ...options, paneMode: null });
+}): readonly BrowserPickerOption[] {
+  const inherited = effectiveBrowserSelection({ ...options, paneMode: null });
   return [
     {
       id: FOLLOW_WINDOW,
       label: 'Follow the window default',
-      note: `Currently ${BROWSER_MODE_LABELS[inherited]}.`,
+      note: `Currently ${selectionLabel(inherited, options.context)}.`,
     },
-    ...BROWSER_MODES.map((mode): PaneBrowserOption => {
-      const unavailable = browserModeUnavailable(mode, options.context);
-      return {
-        id: mode,
-        label: BROWSER_MODE_LABELS[mode],
-        note: unavailable ?? BROWSER_MODE_NOTES[mode],
-        ...(unavailable === null ? {} : { disabled: true as const }),
-      };
-    }),
+    ...browserPickerOptions(options.context),
   ];
+}
+
+/**
+ * A whole selection in the picker's own words.
+ *
+ * Falls back to the plain mode label when the browser it names is not in the
+ * list, which is what a conversation set to a browser somebody has since
+ * unpaired looks like. Saying "My Chrome" there is not a cover-up: the run
+ * itself refuses with a sentence naming the missing browser, and a menu row
+ * reading "My Chrome: undefined" would help nobody read it.
+ */
+function selectionLabel(selection: BrowserSelection, context: BrowserModeContext): string {
+  const named =
+    selection.browserId === null
+      ? undefined
+      : context.browsers.find((one) => one.browserId === selection.browserId);
+  return named === undefined
+    ? BROWSER_MODE_LABELS[selection.mode]
+    : namedBrowserLabel(named.browserName);
 }
 
 /**
@@ -353,10 +591,30 @@ export function paneBrowserOptions(options: {
  */
 export function effectiveBrowserSummary(options: {
   readonly windowMode: BrowserMode;
+  readonly windowBrowserId?: string | null;
   readonly reach: ExtensionReach;
   readonly paneMode: BrowserMode | null;
+  readonly paneBrowserId?: string | null;
   readonly context: BrowserModeContext;
 }): { readonly mode: BrowserMode; readonly label: string; readonly inherited: boolean } {
-  const mode = effectiveBrowserMode(options);
-  return { mode, label: BROWSER_MODE_SHORT_LABELS[mode], inherited: options.paneMode === null };
+  const selection = effectiveBrowserSelection(options);
+  const named =
+    selection.browserId === null
+      ? undefined
+      : options.context.browsers.find((one) => one.browserId === selection.browserId);
+  return {
+    mode: selection.mode,
+    /*
+     * The browser's own name when this conversation has one, because that is
+     * the fact the row exists to carry. With a work Chrome and a personal one
+     * paired, "My Chrome" on both panes is the exact ambiguity the whole
+     * feature removes; the trigger is where a user checks which they are about
+     * to act in.
+     */
+    label:
+      named === undefined
+        ? BROWSER_MODE_SHORT_LABELS[selection.mode]
+        : namedBrowserLabel(named.browserName),
+    inherited: options.paneMode === null,
+  };
 }

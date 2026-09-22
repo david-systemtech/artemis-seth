@@ -77,6 +77,17 @@ let handshake: BridgeHandshake | null = null;
 let status: ExtensionState['status'] = 'unpaired';
 let detail: string | undefined;
 let credential: BridgeCredential | null = null;
+/**
+ * The label the user gave this browser, or `null` before they gave one.
+ *
+ * Kept beside the credential because it is written at the same moment and read
+ * on every connection: it is sent at pairing, and sent again in each `hello`
+ * so that an Artemis which lost its store has something to show. Artemis does
+ * not take it back over a rename made in its own Browser pane — see
+ * `BridgeHello.browserName` — so this is the name of record only until
+ * somebody edits it there.
+ */
+let browserName: string | null = null;
 let policy: PagePolicy | null = null;
 let port = BRIDGE_DEFAULT_PORT;
 /** The code the user typed, alive only for the connection that spends it. */
@@ -102,6 +113,7 @@ function start(): Promise<void> {
   starting ??= (async () => {
     port = await readLocal(LOCAL_KEYS.port, asPort, BRIDGE_DEFAULT_PORT);
     credential = await readLocal(LOCAL_KEYS.credential, asCredential, null);
+    browserName = await readLocal(LOCAL_KEYS.browserName, asName, null);
     policy = await readLocal(LOCAL_KEYS.policy, asPolicy, null);
     runner.policy = policy;
     runner.restore({
@@ -170,7 +182,7 @@ function connect(): void {
     return;
   }
 
-  const identity = { browserName: thisBrowserName(), extensionVersion: chrome.runtime.getManifest().version };
+  const identity = { browserName: nameInForce(), extensionVersion: chrome.runtime.getManifest().version };
   const pending = new BridgeHandshake({ identity, credential, pairingCode: pairingCode });
   const opening = pending.opening();
   if (opening === null) {
@@ -398,7 +410,7 @@ function currentState(): ExtensionState {
     status,
     ...(detail === undefined ? {} : { detail }),
     port,
-    browserName: thisBrowserName(),
+    browserName: nameInForce(),
     extensionVersion: chrome.runtime.getManifest().version,
     paired: credential !== null,
     runs: runner.book.entries().map((entry) => ({ runKey: entry.runKey, tabId: entry.tabId })),
@@ -475,6 +487,15 @@ async function handleUi(request: UiRequest): Promise<UiResponse> {
       // already past its handshake would be answered with a refusal.
       pairingCode = request.code.trim();
       credential = null;
+      /*
+       * The name is stored before the connection is made, not after Artemis
+       * answers. It is what the opening message carries, and a worker that
+       * Chrome stopped between the two would otherwise dial again and
+       * introduce this browser under the machine-derived name — which is the
+       * one the user typed over.
+       */
+      browserName = request.browserName;
+      await writeLocal(LOCAL_KEYS.browserName, browserName);
       await dropLocal(LOCAL_KEYS.credential);
       await dropLocal(LOCAL_KEYS.stopped);
       closeAndRedial();
@@ -483,10 +504,18 @@ async function handleUi(request: UiRequest): Promise<UiResponse> {
 
     case 'unpair': {
       credential = null;
+      /*
+       * And the name with it. An unpaired browser has no name in Artemis to
+       * correspond to, so keeping one would mean the pairing field starting
+       * pre-filled with a label from a pairing that no longer exists — which
+       * reads as though the browser were still known.
+       */
+      browserName = null;
       policy = null;
       runner.policy = null;
       pairingCode = null;
       await dropLocal(LOCAL_KEYS.credential);
+      await dropLocal(LOCAL_KEYS.browserName);
       await dropLocal(LOCAL_KEYS.policy);
       await runner.stopEverything();
       await persist();
@@ -537,6 +566,25 @@ function closeAndRedial(): void {
 /* -------------------------------------------------------------------------- */
 /* Shapers                                                                    */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * What this browser calls itself right now.
+ *
+ * The stored label wins; `naming.ts` is the fallback and the field's starting
+ * text. A browser that has never been paired has no label and there is nothing
+ * dishonest about "Chrome on Windows" then — it is what the browser can say
+ * about itself, and the user is about to say better.
+ */
+function nameInForce(): string {
+  return browserName ?? thisBrowserName();
+}
+
+/** A stored label: a non-empty string, bounded as the options page bounds it. */
+function asName(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : trimmed.slice(0, 80);
+}
 
 function asCredential(value: unknown): BridgeCredential | null {
   const record = asRecord(value);

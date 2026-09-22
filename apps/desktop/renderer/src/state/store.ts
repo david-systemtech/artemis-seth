@@ -104,7 +104,7 @@ import type {
 import {
   browserFlagsFor,
   browserModeFromPrefs,
-  effectiveBrowserMode,
+  effectiveBrowserSelection,
   isExtensionReach,
   type BrowserMode,
   type BrowserModeContext,
@@ -991,6 +991,16 @@ export interface AppState {
    */
   readonly browserMode: BrowserMode;
   /**
+   * Which paired browser the window's default means, or `null` for whichever
+   * of them is open.
+   *
+   * Only read when {@link browserMode} is `extension`. A person with a work
+   * Chrome and a personal one may want every new conversation on one of them
+   * by default, and a window setting that could only say "my Chrome" would
+   * leave that to chance.
+   */
+  readonly browserExtensionId: string | null;
+  /**
    * How conversations get the paired Chrome: each one asks, or all of them.
    *
    * Per conversation is the default and stays it. Driving a browser full of
@@ -1724,6 +1734,8 @@ interface Prefs {
    * still read for — see `browserModeFromPrefs`. They are no longer written.
    */
   browserMode?: string;
+  /** Which paired browser the default means. See `AppState.browserExtensionId`. */
+  browserExtensionId?: string;
   extensionReach?: string;
   agentChrome?: boolean;
   openWebExternally?: boolean;
@@ -2162,6 +2174,8 @@ function loadPrefs(): Prefs {
     escapeStopsRun: boolOrUndefined(raw['escapeStopsRun']),
     autoHandoff: boolOrUndefined(raw['autoHandoff']),
     browserMode: typeof raw['browserMode'] === 'string' ? raw['browserMode'] : undefined,
+    browserExtensionId:
+      typeof raw['browserExtensionId'] === 'string' ? raw['browserExtensionId'] : undefined,
     extensionReach: typeof raw['extensionReach'] === 'string' ? raw['extensionReach'] : undefined,
     // Still read, never written: these two are where the browser preference
     // lived before the picker, and a user upgrading must keep the browser they
@@ -2343,6 +2357,9 @@ function savePrefs(): void {
     escapeStopsRun: s.escapeStopsRun,
     autoHandoff: s.autoHandoff,
     browserMode: s.browserMode,
+    // Absent rather than null when there is none, which is how every optional
+    // key in this document is written and what keeps a file readable.
+    ...(s.browserExtensionId === null ? {} : { browserExtensionId: s.browserExtensionId }),
     extensionReach: s.extensionReach,
     handoffThresholds: s.handoffThresholds,
     updateChannel: s.updateChannel,
@@ -2448,6 +2465,7 @@ function seedSession(overrides: Partial<SessionState> = {}): SessionState {
     // Not restored from preferences: a conversation's browser choice belongs to
     // that conversation, and a fresh column has not had one.
     browserMode: null,
+    browserExtensionId: null,
     forkOnResume: false,
     resumeSessionId: null,
     historyLoading: false,
@@ -2586,6 +2604,10 @@ export const useApp = create<AppState>(() => ({
   // the agent a browser the user is signed into, which is a grant nobody
   // should discover was made for them.
   browserMode: browserModeFromPrefs(prefs),
+  // Read as it stands. A browser that has since been unpaired makes the
+  // default unavailable, which the picker draws and `effectiveBrowserSelection`
+  // falls back from — the same treatment an unpaired browser has always had.
+  browserExtensionId: prefs.browserExtensionId ?? null,
   // Per conversation, always, on a file that has not said. See the field.
   extensionReach: isExtensionReach(prefs.extensionReach) ? prefs.extensionReach : 'per-conversation',
   // Filled by the first push, or by the pane's own read. `null` is "not asked
@@ -4769,6 +4791,7 @@ function seedBeside(source: Pane, state: AppState = useApp.getState()): SessionS
     fastMode: from.fastMode,
     ultracode: from.ultracode,
     browserMode: from.browserMode,
+    browserExtensionId: from.browserExtensionId,
     // The catalogue is a property of the account, and the account came across
     // with it — so it comes too, rather than making the new pane flash the
     // built-in list until its own fetch lands.
@@ -6111,6 +6134,33 @@ export function installSuggestionFeed(): () => void {
     setPaneState(pane, {
       suggestion: { runId: suggestion.runId, text: suggestion.suggestion },
     });
+  });
+}
+
+/**
+ * Adopt a browser a run chose for itself. Call alongside
+ * {@link installEventBridge}.
+ *
+ * The one place a browser choice arrives from main rather than from a picker.
+ * With two Chrome profiles connected and a conversation set to neither, the
+ * run's first browser verb refuses and tells the agent to ask the user which;
+ * the agent asks, and its answer is pushed here. Writing it into the pane is
+ * what makes the answer a property of the *conversation* — the browser row
+ * shows it, and the next turn starts on the same browser instead of asking
+ * again.
+ *
+ * Routed by {@link paneForRun}, like the suggestion feed, and dropped just as
+ * quietly for a run this window does not hold. There is no status check: a
+ * choice made during a turn is still this conversation's browser after the
+ * turn ends, which is exactly the point of recording it.
+ */
+export function installBrowserChoiceFeed(): () => void {
+  const { bridge } = resolveBridge();
+  if (!bridge) return () => undefined;
+  return bridge.runs.onBrowserChoice((choice) => {
+    const pane = paneForRun(choice.runId);
+    if (pane === undefined) return;
+    setPaneBrowserMode('extension', choice.browserId, pane);
   });
 }
 
@@ -10178,8 +10228,8 @@ export function setEscapeStopsRun(on: boolean): void {
  * a run already in flight keeps the tools it started with, which is the same
  * rule every setting in the dialog follows.
  */
-export function setBrowserMode(mode: BrowserMode): void {
-  useApp.setState({ browserMode: mode });
+export function setBrowserMode(mode: BrowserMode, browserExtensionId: string | null = null): void {
+  useApp.setState({ browserMode: mode, browserExtensionId });
   savePrefs();
 }
 
@@ -10196,8 +10246,12 @@ export function setExtensionReach(reach: ExtensionReach): void {
  * same as choosing the default: the window's may change afterwards, and a
  * conversation that never expressed a preference should follow it.
  */
-export function setPaneBrowserMode(mode: BrowserMode | null, pane: Pane = focusedPane()): void {
-  setPaneState(pane, { browserMode: mode });
+export function setPaneBrowserMode(
+  mode: BrowserMode | null,
+  browserExtensionId: string | null = null,
+  pane: Pane = focusedPane(),
+): void {
+  setPaneState(pane, { browserMode: mode, browserExtensionId });
   savePrefs();
 }
 
@@ -10217,11 +10271,41 @@ export function browserModeContext(
   browsers: readonly PairedBrowserInfo[] | undefined,
   providerId: ProviderId | null,
 ): BrowserModeContext {
-  return {
-    providerId,
-    anyPaired: (browsers?.length ?? 0) > 0,
-    anyConnected: browsers?.some((one) => one.connected) ?? false,
-  };
+  return { providerId, browsers: browsers ?? NO_BROWSERS };
+}
+
+/**
+ * The empty list, once.
+ *
+ * A fresh `[]` per call would make every context a new object *containing* a
+ * new object, and the components that fold one on each render compare by
+ * identity somewhere below. One frozen empty array costs nothing and cannot
+ * be the thing that reintroduces a render loop.
+ */
+const NO_BROWSERS: readonly PairedBrowserInfo[] = Object.freeze([]);
+
+/**
+ * The browser fields of a run input, from a window and one of its panes.
+ *
+ * Here rather than inline at the call site because the two halves have to be
+ * folded together before either is useful: which mode wins is a question about
+ * the pane, the window and the reach setting at once, and which *browser* only
+ * exists once that answer is `extension`. Splitting them would let a caller
+ * send a browser id for a run that is on the dock browser.
+ */
+function browserSelectionFlags(
+  windowState: AppState,
+  state: SessionState,
+): ReturnType<typeof browserFlagsFor> {
+  const selection = effectiveBrowserSelection({
+    windowMode: windowState.browserMode,
+    windowBrowserId: windowState.browserExtensionId,
+    reach: windowState.extensionReach,
+    paneMode: state.browserMode,
+    paneBrowserId: state.browserExtensionId,
+    context: browserModeContext(windowState.extensionBridge?.browsers, state.activeProviderId),
+  });
+  return browserFlagsFor(selection.mode, selection.browserId);
 }
 
 export function setAutoHandoff(on: boolean): void {
@@ -12267,22 +12351,16 @@ export async function submitPrompt(
     ...(supportsFast ? { fastMode: state.fastMode } : {}),
     ...(supportsUltra ? { ultracode: state.ultracode } : {}),
     /*
-     * The browser, as at most one of three booleans.
+     * The browser, as at most one of three booleans and — for the one mode
+     * where the question exists — which of the paired browsers it means.
      *
-     * One place decides it, and it is not here: `effectiveBrowserMode` folds
-     * the conversation's own choice, the window's default, the always-on
-     * setting and whether each mode can work at all into a single mode, and
-     * `browserFlagsFor` spells that mode out. A run input cannot ask for two
+     * One place decides it, and it is not here: `effectiveBrowserSelection`
+     * folds the conversation's own choice, the window's default, the always-on
+     * setting and whether each mode can work at all into a single answer, and
+     * `browserFlagsFor` spells that answer out. A run input cannot ask for two
      * browsers, because the thing that builds it cannot say two.
      */
-    ...browserFlagsFor(
-      effectiveBrowserMode({
-        windowMode: windowState.browserMode,
-        reach: windowState.extensionReach,
-        paneMode: state.browserMode,
-        context: browserModeContext(windowState.extensionBridge?.browsers, state.activeProviderId),
-      }),
-    ),
+    ...browserSelectionFlags(windowState, state),
     ...(capabilities.permissionModes.includes(state.permissionMode)
       ? { permissionMode: state.permissionMode }
       : {}),

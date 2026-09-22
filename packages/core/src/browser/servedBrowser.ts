@@ -67,6 +67,14 @@ export interface ServedBrowserInput {
   readonly chromeBrowser?: boolean;
   /** The run asked for the caller's own Chrome, through their client. */
   readonly extensionBrowser?: boolean;
+  /**
+   * *Which* of the caller's paired browsers, when they have more than one.
+   *
+   * An id the client issued, meaningful only there. It is carried across this
+   * table rather than resolved by it - the serving machine has never seen the
+   * list it names, and nothing here could check it.
+   */
+  readonly extensionBrowserId?: string;
 }
 
 /** The browsers this host could build, each lazily. */
@@ -79,8 +87,10 @@ export interface ServedBrowserBuilders {
   /**
    * The caller's own Chrome, through the relay to their client. Absent on a
    * host with no relay, or for a request with no connection to relay to.
+   *
+   * Takes the browser the run named, which only the client can resolve.
    */
-  readonly extension?: () => McpServerConfig;
+  readonly extension?: (browserId: string | undefined) => McpServerConfig;
 }
 
 /**
@@ -96,7 +106,7 @@ export function servedBrowserServers(
 ): Record<string, McpServerConfig> | undefined {
   if (input.chromeBrowser === true) return undefined;
   if (input.extensionBrowser === true && build.extension !== undefined) {
-    return { [BROWSER_TOOL_SERVER]: build.extension() };
+    return { [BROWSER_TOOL_SERVER]: build.extension(input.extensionBrowserId) };
   }
   if (build.server === undefined) return undefined;
   return { [BROWSER_TOOL_SERVER]: build.server() };

@@ -408,6 +408,12 @@ export function createServerHost(options: ServerHostOptions): ServerHost {
          * one kind of run, which is why the relay fits there and not here.
          */
         ...(input.extensionBrowser === true ? { extensionBrowser: true } : {}),
+        // And which of the caller's browsers they named, on the same terms:
+        // carried beside the flag, never reaching a run on this host because
+        // the flag never does either.
+        ...(input.extensionBrowserId === undefined
+          ? {}
+          : { extensionBrowserId: input.extensionBrowserId }),
         ...(input.resumeSessionId === undefined
           ? {}
           : { resumeSessionId: input.resumeSessionId as never }),

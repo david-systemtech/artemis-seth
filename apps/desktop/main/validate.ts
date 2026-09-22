@@ -183,6 +183,7 @@ import {
   type BrowserLayoutRequest,
   type BrowserListRequest,
   type ExtensionBridgePairRequest,
+  type ExtensionBridgeRenameRequest,
   type ExtensionBridgePolicyRequest,
   type ExtensionBridgeSaveBundleRequest,
   type ExtensionBridgeStateRequest,
@@ -1195,6 +1196,14 @@ function validateRunInput(value: unknown, field: string): RunInput {
     ultracode: optionalBoolean(input['ultracode'], `${field}.ultracode`),
     chromeBrowser: optionalBoolean(input['chromeBrowser'], `${field}.chromeBrowser`),
     extensionBrowser: optionalBoolean(input['extensionBrowser'], `${field}.extensionBrowser`),
+    /*
+     * Which paired browser the run drives, when the conversation named one.
+     * An id and not a name: the picker chose it from a list main issued, and
+     * the only thing this boundary proves is that it is an id rather than a
+     * payload. Whether a browser still answers to it is the driver's question,
+     * and it answers in a sentence naming the browser.
+     */
+    extensionBrowserId: optionalId(input['extensionBrowserId'], `${field}.extensionBrowserId`),
     externalBrowser: optionalBoolean(input['externalBrowser'], `${field}.externalBrowser`),
     allowedTools: optionalStringArray(
       input['allowedTools'],
@@ -1744,6 +1753,24 @@ export function validateExtensionBridgePair(raw: unknown): ExtensionBridgePairRe
 export function validateExtensionBridgeUnpair(raw: unknown): ExtensionBridgeUnpairRequest {
   const request = requireRequest(raw);
   return { browserId: requireString(request['browserId'], 'browserId', LIMITS.id) };
+}
+
+/**
+ * A new name for a paired browser.
+ *
+ * The name is a label a person typed, so it is held to {@link LIMITS.label}
+ * and to nothing else here: main strips control characters and shortens it
+ * through the same `nameOf` a pairing goes through, which is the one place
+ * that decides what a browser name may contain. A second rule here could only
+ * drift from that one, and the field that would suffer is the one the user is
+ * looking at.
+ */
+export function validateExtensionBridgeRename(raw: unknown): ExtensionBridgeRenameRequest {
+  const request = requireRequest(raw);
+  return {
+    browserId: requireString(request['browserId'], 'browserId', LIMITS.id),
+    browserName: requireString(request['browserName'], 'browserName', LIMITS.label),
+  };
 }
 
 /**

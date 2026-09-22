@@ -20,10 +20,20 @@
         Artemis shows a pairing code in Settings. Type it here once; after that this browser proves itself
         without sending the code or the secret again.
       </p>
+      <label for="browser-label">What to call this browser in Artemis</label>
+      <div class="row">
+        <input id="browser-label" type="text" autocomplete="off" spellcheck="false" maxlength="80" placeholder="Work" />
+      </div>
+      <p>
+        Two Chrome profiles on one computer both describe themselves the same way, so Artemis shows
+        whatever you type here — “Work”, “Personal” — wherever a conversation picks a browser. You
+        can change it later in Artemis settings.
+      </p>
       <div class="row">
         <input id="code" type="text" autocomplete="off" spellcheck="false" placeholder="Pairing code" />
         <button id="pair" class="primary" type="button">Pair</button>
       </div>
+      <p class="detail" id="pair-problem"></p>
     </section>
 
     <section id="paired-section" hidden>

@@ -581,3 +581,74 @@ describe('the wording says which browser these tools are driving', () => {
     }
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* Naming one of several browsers                                             */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * `browser_open`'s one argument that names something outside the run. It
+ * exists so an agent can answer "which of your Chrome profiles?" — and it is
+ * offered only where that question can be asked, because a parameter with one
+ * legal value is a parameter a model will eventually fill in wrongly.
+ */
+describe('choosing which of the user’s browsers to drive', () => {
+  function parametersOf(kind: BrowserDriverKind): Record<string, unknown> {
+    const found = pageTools(fakeDriver({ kind, abilities: EVERYTHING })).find(
+      (one) => one.name === 'browser_open',
+    );
+    if (found === undefined) throw new Error('No tool named browser_open');
+    return (found as unknown as { inputSchema: Record<string, unknown> }).inputSchema;
+  }
+
+  it('offers the argument on the user’s own Chrome, where several may be paired', () => {
+    expect(Object.keys(parametersOf('extension'))).toContain('browser');
+  });
+
+  it('does not offer it on a browser there is only one of', () => {
+    // The dock tab and the headless Chromium beside a server are one browser
+    // each by construction, so the argument would be a question with no answer.
+    expect(Object.keys(parametersOf('embedded'))).not.toContain('browser');
+    expect(Object.keys(parametersOf('server'))).not.toContain('browser');
+  });
+
+  it('tells the model to use it only as an answer, and never to guess a name', () => {
+    const description = (
+      parametersOf('extension')['browser'] as { description?: string }
+    ).description;
+    expect(description).toContain('Leave it out unless Artemis has refused');
+    expect(description).toContain('Never guess a name');
+  });
+
+  it('hands the name to the driver, which is the only thing that can resolve it', async () => {
+    const asked: (string | undefined)[] = [];
+    const driver = fakeDriver({
+      kind: 'extension',
+      abilities: EVERYTHING,
+      open: async (_url, browser) => {
+        asked.push(browser);
+        return yes(AT);
+      },
+    });
+
+    await call(driver, 'browser_open', { url: 'https://example.com', browser: 'Work' });
+
+    expect(asked).toEqual(['Work']);
+  });
+
+  it('hands it nothing when the model named no browser', async () => {
+    const asked: (string | undefined)[] = [];
+    const driver = fakeDriver({
+      kind: 'extension',
+      abilities: EVERYTHING,
+      open: async (_url, browser) => {
+        asked.push(browser);
+        return yes(AT);
+      },
+    });
+
+    await call(driver, 'browser_open', { url: 'https://example.com' });
+
+    expect(asked).toEqual([undefined]);
+  });
+});
