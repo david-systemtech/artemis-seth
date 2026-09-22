@@ -45,6 +45,24 @@ describe('the manifest', () => {
     expect(csp).not.toContain('unsafe-inline');
   });
 
+  it('permits exactly the one address the extension dials, and no other name for it', () => {
+    /*
+     * `ws://localhost:*` was here, argued for by a scenario no code path
+     * reaches: `bridgeUrl` builds the literal `127.0.0.1` and `isBridgeUrl`
+     * rejects everything else, so the socket that entry would have permitted
+     * is one this extension refuses to open. A CSP that is wider than the code
+     * is a CSP that stops being a second opinion — it says the browser would
+     * allow something, and the only reason it does not happen is that the
+     * code currently declines to ask.
+     *
+     * The rule this pins is the general one, not the removal: `connect-src`
+     * names what is dialled.
+     */
+    const csp = manifest.content_security_policy.extension_pages;
+    const connect = /connect-src ([^;]+);/u.exec(csp)?.[1]?.trim().split(/\s+/u) ?? [];
+    expect(connect).toEqual(["'self'", 'ws://127.0.0.1:*']);
+  });
+
   it('follows the desktop app’s version, trimmed to what Chrome will accept', () => {
     expect(extensionManifest('2.19.1').version).toBe('2.19.1');
   });

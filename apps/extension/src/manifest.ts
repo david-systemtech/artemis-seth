@@ -127,12 +127,19 @@ export interface ExtensionManifest {
  * copy of the rule `bridgeUrl` enforces in code — and `object-src 'none'`,
  * which removes plugin embedding outright rather than restricting it.
  *
- * `connect-src` naming both `ws://127.0.0.1:*` and `ws://localhost:*` is not a
- * loosening: the extension only ever dials the literal `127.0.0.1`, and the
- * `localhost` entry is there because a user who has their Artemis port
- * forwarded to a `localhost`-only listener would otherwise see a CSP violation
- * with no explanation. `http:` and `https:` are absent, so no page of this
- * extension can fetch anything from the web.
+ * `connect-src` names exactly one address, `ws://127.0.0.1:*`, because that is
+ * exactly what `bridgeUrl` builds and `isBridgeUrl` will accept. It once also
+ * named `ws://localhost:*`, on the argument that somebody forwarding their
+ * Artemis port to a `localhost`-only listener would otherwise meet a CSP
+ * violation with no explanation — but no code path here dials that name, so
+ * the entry permitted a socket this extension refuses to open. A policy wider
+ * than the code stops being a second opinion about it: it says the browser
+ * would allow something, and the only thing preventing it is that the code
+ * currently declines to ask. If dialling `localhost` is ever wanted, the
+ * address builder is where it starts and this line follows it.
+ *
+ * `http:` and `https:` are absent, so no page of this extension can fetch
+ * anything from the web.
  */
 export function extensionManifest(version: string): ExtensionManifest {
   return {
@@ -155,7 +162,7 @@ export function extensionManifest(version: string): ExtensionManifest {
     icons: { '16': 'icons/icon-16.png', '32': 'icons/icon-32.png', '48': 'icons/icon-48.png', '128': 'icons/icon-128.png' },
     permissions: [...MANIFEST_PERMISSIONS],
     content_security_policy: {
-      extension_pages: "script-src 'self'; object-src 'none'; connect-src 'self' ws://127.0.0.1:* ws://localhost:*;",
+      extension_pages: "script-src 'self'; object-src 'none'; connect-src 'self' ws://127.0.0.1:*;",
     },
   };
 }
