@@ -1026,6 +1026,57 @@ describe('choosing between paired browsers', () => {
   });
 });
 
+/*
+ * A browser's name is the whole of how a person tells two Chrome profiles
+ * apart, and it arrives from the extension — which is to say, from whatever
+ * was typed into a page. What is pinned here is that the name Artemis stores
+ * and shows is text: an invisible character would make two different names
+ * render identically in the picker, which is the exact failure this feature
+ * exists to remove.
+ */
+describe('the name a pairing supplies', () => {
+  it('keeps the label the user typed', async () => {
+    const { bridge, port } = await bridgeOn();
+
+    await pair(bridge, port, { browserName: 'Work' });
+
+    expect(bridge.state().browsers[0]?.browserName).toBe('Work');
+  });
+
+  it('strips every character that would make two names look alike', async () => {
+    // Control characters and DEL; C1; the zero-width characters and the word
+    // joiner; the bidi embedding, override and isolate controls; and a
+    // byte-order mark, which arrives at the front of anything pasted out of a
+    // file.
+    const { bridge, port } = await bridgeOn();
+
+    await pair(bridge, port, {
+      browserName:
+        '\ufeff W\u0000o\u001br\u007fk\u009f\u200b\u200e\u202e\u2060\u2066\u2069 ',
+    });
+
+    expect(bridge.state().browsers[0]?.browserName).toBe('Work');
+  });
+
+  it('falls back to a name rather than storing an empty one', async () => {
+    // A pairing whose label was nothing but invisible characters. An unnamed
+    // row is not a thing the pickers can draw.
+    const { bridge, port } = await bridgeOn();
+
+    await pair(bridge, port, { browserName: '\u200b\u202e\ufeff' });
+
+    expect(bridge.state().browsers[0]?.browserName).toBe('A browser');
+  });
+
+  it('bounds a name at the length the store keeps', async () => {
+    const { bridge, port } = await bridgeOn();
+
+    await pair(bridge, port, { browserName: 'x'.repeat(500) });
+
+    expect(bridge.state().browsers[0]?.browserName).toBe('x'.repeat(80));
+  });
+});
+
 describe('renaming a paired browser', () => {
   it('changes what it is called without disturbing its connection', async () => {
     // The id is what everything addresses and the name is what everything
@@ -1045,11 +1096,15 @@ describe('renaming a paired browser', () => {
     const { bridge, port } = await bridgeOn();
     const { browserId } = await pair(bridge, port);
 
-    const state = await bridge.rename(browserId, `  Wo\u0000rk\u001b  ${'x'.repeat(200)}`);
+    const state = await bridge.rename(
+      browserId,
+      `  Wo\u0000rk\u001b\u009f\u200b\u202e\ufeff  ${'x'.repeat(200)}`,
+    );
 
     const name = state.browsers[0]?.browserName ?? '';
     expect(name.startsWith('Work')).toBe(true);
     expect(name.length).toBe(80);
+    expect(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/u.test(name)).toBe(false);
   });
 
   it('keeps the name a rename gave it when that browser reconnects', async () => {

@@ -852,10 +852,37 @@ function constantTimeEquals(left: string, right: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-/** The peer's name for itself, bounded and stripped of anything that is not text. */
+/**
+ * Characters a browser's name may not contain, whoever supplied it.
+ *
+ * Wider than "control characters" because of where this name ends up. It is
+ * drawn in two pickers and a settings row, quoted into refusal sentences a
+ * model reads back to the user, and written to a JSON file somebody may open
+ * — and each of those is a place where an invisible character makes two
+ * different names look like one. That is the whole failure this feature
+ * removes, so a name that renders as `Work` and is not `Work` would reintroduce
+ * it by hand.
+ *
+ * In order: C0 and DEL and C1; the zero-width characters and the word joiner;
+ * the bidi embedding, override and isolate controls, which can make a name
+ * render right-to-left and read as another one entirely; and the byte-order
+ * mark, which arrives at the front of anything pasted out of a file.
+ */
+const NOT_A_NAME =
+  /[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠⁦-⁩﻿]/gu;
+
+/**
+ * The name a browser goes by, bounded and stripped of anything that is not
+ * text.
+ *
+ * The one place that decides, and it is on both roads in: the label typed into
+ * the extension at pairing, and a rename made in the Browser pane. Two rules
+ * would mean a name a rename accepted and a pairing refused, differing in a
+ * character neither of them can show you.
+ */
 function nameOf(raw: unknown): string {
   if (typeof raw !== 'string') return 'A browser';
-  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/gu, '').trim();
+  const cleaned = raw.replace(NOT_A_NAME, '').trim();
   return cleaned.length === 0 ? 'A browser' : cleaned.slice(0, 80);
 }
 

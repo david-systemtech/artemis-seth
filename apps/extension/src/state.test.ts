@@ -8,9 +8,9 @@
  * in, so the shapes are proved rather than assumed.
  *
  * The name is the case worth the most care. A pairing carries the label the
- * user typed, and a pairing that arrived without one would produce a browser
- * called "Chrome on Windows" in Artemis — which is exactly the row a second
- * Chrome profile would be indistinguishable from.
+ * user typed, and a pairing that arrived without one would be stored under
+ * `nameOf`'s fallback, "A browser" — a row that says nothing about which Chrome
+ * profile it is, in the one list whose whole job is telling two of them apart.
  */
 
 import { describe, expect, it } from 'vitest';
