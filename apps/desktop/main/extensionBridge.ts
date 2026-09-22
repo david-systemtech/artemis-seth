@@ -336,6 +336,10 @@ export function createExtensionBridge(options: ExtensionBridgeOptions): Extensio
     let stage: 'greeting' | 'challenged' | 'live' = 'greeting';
     let nonce: string | null = null;
     let claimed: PairedBrowser | null = null;
+    // What the extension said it was when it introduced itself, kept for the
+    // proof: the stored record's version is what it was at pairing, and an
+    // extension the user has since updated reconnects rather than re-pairs.
+    let claimedVersion: string | undefined;
     let connection: Connection | null = null;
     let ping: NodeJS.Timeout | null = null;
 
@@ -450,6 +454,7 @@ export function createExtensionBridge(options: ExtensionBridgeOptions): Extensio
            * this port into an oracle for which browser ids are paired.
            */
           claimed = found;
+          claimedVersion = message.extensionVersion;
           nonce = randomBytes(32).toString('hex');
           stage = 'challenged';
           send(socket, { type: 'challenge', nonce });
@@ -472,7 +477,7 @@ export function createExtensionBridge(options: ExtensionBridgeOptions): Extensio
             refuse(socket, 'This browser is not paired with Artemis. Pair it again in Artemis settings.');
             return;
           }
-          goLive(claimed, claimed.extensionVersion ?? 'unknown');
+          goLive(claimed, claimedVersion ?? claimed.extensionVersion ?? 'unknown');
           send(socket, { type: 'ready', policy: store.policy() });
           return;
         }

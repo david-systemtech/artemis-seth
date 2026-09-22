@@ -6416,18 +6416,6 @@ export async function describeMemoryBank(
  * first window's shells and has nowhere to put them.
  */
 /**
- * Route browser events into the records that draw the chrome.
- *
- * The mirror of {@link installTerminalFeed}, and it drops unknown ids for the
- * same reason: push channels broadcast to every window, so a second Artemis
- * window hears about the first's pages and has nowhere to put them.
- *
- * A `gone` event removes the record outright. Main has already destroyed the
- * view by the time it sends one, so there is nothing left to draw and no
- * `browser.close` to send back — reloading it would put the reader back on the
- * page that had just crashed, which is a loop rather than a recovery.
- */
-/**
  * Follow the extension bridge: what is paired, what is connected, the policy.
  *
  * In the window store rather than in a hook beside `useServerState`, and the
@@ -6460,6 +6448,18 @@ export function installExtensionBridgeFeed(): () => void {
   return unsubscribe;
 }
 
+/**
+ * Route browser events into the records that draw the chrome.
+ *
+ * The mirror of {@link installTerminalFeed}, and it drops unknown ids for the
+ * same reason: push channels broadcast to every window, so a second Artemis
+ * window hears about the first's pages and has nowhere to put them.
+ *
+ * A `gone` event removes the record outright. Main has already destroyed the
+ * view by the time it sends one, so there is nothing left to draw and no
+ * `browser.close` to send back — reloading it would put the reader back on the
+ * page that had just crashed, which is a loop rather than a recovery.
+ */
 export function installBrowserFeed(): () => void {
   const { bridge } = resolveBridge();
   if (!bridge) return () => undefined;

@@ -622,15 +622,6 @@ async function bootstrap(): Promise<void> {
   stopEventForwarding = forwardAgentEvents(engineHost);
   stopSuggestionForwarding = forwardRunSuggestions(engineHost);
   /*
-   * A question the agent stops to ask waits for the person it was asked of —
-   * the server no longer answers on their behalf after a quarter of an hour
-   * (see `server/runs.ts`) — so the person has to find out it is waiting. The
-   * pane pins the card and the sidebar marks the session, but both are only
-   * visible to someone looking at Artemis. When no window is focused, an OS
-   * notification says so once per question; when one is, the card in the
-   * pane is the notification, and a system toast over it would be noise.
-   */
-  /*
    * A run that has ended lets go of its tab in the user's Chrome.
    *
    * The dock browser deliberately does *not* do this — its tab belongs to the
@@ -647,6 +638,15 @@ async function bootstrap(): Promise<void> {
         extensionBridge?.endRun(event.runId);
       })
     : null;
+  /*
+   * A question the agent stops to ask waits for the person it was asked of —
+   * the server no longer answers on their behalf after a quarter of an hour
+   * (see `server/runs.ts`) — so the person has to find out it is waiting. The
+   * pane pins the card and the sidebar marks the session, but both are only
+   * visible to someone looking at Artemis. When no window is focused, an OS
+   * notification says so once per question; when one is, the card in the
+   * pane is the notification, and a system toast over it would be noise.
+   */
   stopAskNotifying = engineHost.ready
     ? engineHost.require().subscribe((event) => {
         if (event.type !== 'permission.request') return;

@@ -187,6 +187,7 @@ async function reconnect(
   port: number,
   browserId: string,
   secret: string,
+  extensionVersion = '2.19.1',
 ): Promise<FakeExtension> {
   const extension = new FakeExtension(port);
   await extension.open();
@@ -195,7 +196,7 @@ async function reconnect(
     version: BRIDGE_PROTOCOL_VERSION,
     browserId,
     browserName: 'Chrome on Linux',
-    extensionVersion: '2.19.1',
+    extensionVersion,
   });
   const challenge = await extension.next();
   extension.send({ type: 'proof', mac: macOf(secret, challenge['nonce'] as string) });
@@ -419,6 +420,20 @@ describe('proving a pairing on a later connection', () => {
 
     expect(back.closed).toBe(false);
     expect(bridge.state().browsers[0]?.connected).toBe(true);
+  });
+
+  it('takes the version the extension reports on reconnect, which is how an update is noticed', async () => {
+    // An updated extension reconnects; it does not pair again. The stored
+    // version is what it was at pairing, so a bridge that kept that one would
+    // tell the user to update an extension they had just updated, for ever.
+    const { bridge, port } = await bridgeOn();
+    const { extension, browserId, secret } = await pair(bridge, port, { extensionVersion: '2.18.0' });
+    extension.socket.close();
+    await extension.untilClosed();
+
+    await reconnect(port, browserId, secret, '2.19.1');
+
+    expect(bridge.state().browsers[0]?.extensionVersion).toBe('2.19.1');
   });
 
   it('hands the policy over with the ready, so a browser never acts on a stale one', async () => {
