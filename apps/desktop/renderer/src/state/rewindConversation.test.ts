@@ -227,6 +227,48 @@ describe('rewindConversationTo', () => {
     expect(texts(working)).toEqual(['first ask', 'first answer', 'second ask', 'second answer']);
   });
 
+  it('starts a new conversation when wound back to the first message', async () => {
+    // Nothing comes before the opening prompt for a truncating resume to
+    // re-enter at, so the provider refuses one aimed there. Wound back to
+    // nothing is a new session: no history bound, message in the composer.
+    twoTurns();
+    const first = pane()
+      .transcript.getListSnapshot()
+      .find((id) => (pane().transcript.getItem(id) as { text?: string } | undefined)?.text === 'first ask') as string;
+    storedEvents = [
+      { type: 'text.complete', runId: 'r', seq: 0, ts: 1, messageId: 'uuid-1', role: 'user', text: 'first ask', replay: true },
+      { type: 'text.complete', runId: 'r', seq: 1, ts: 2, messageId: 'uuid-2', role: 'user', text: 'second ask', replay: true },
+    ];
+
+    await rewindConversationTo(first, { fork: false }, pane());
+    pane().transcript.flush();
+
+    expect(texts(pane())).toEqual([]);
+    expect(paneState(pane()).resumeSessionId).toBeNull();
+    expect(paneState(pane()).rewindToMessageId).toBeNull();
+    expect(paneState(pane()).draft).toBe('first ask');
+
+    expect(await submitPrompt('ask it differently', undefined, pane())).toBe(true);
+    expect(started[0]).not.toHaveProperty('resumeSessionId');
+    expect(started[0]).not.toHaveProperty('rewindToMessageId');
+  });
+
+  it('treats a first message typed this window the same way', async () => {
+    // No provider id on the row, so the stored read answers both questions:
+    // which uuid it is, and whether anything came before it.
+    const typedId = pane().transcript.pushUserMessage('hello');
+    pane().transcript.confirmUserMessage(typedId);
+    pane().transcript.flush();
+    storedEvents = [
+      { type: 'text.complete', runId: 'r', seq: 0, ts: 1, messageId: 'uuid-1', role: 'user', text: 'hello', replay: true },
+    ];
+
+    await rewindConversationTo(typedId, { fork: false }, pane());
+
+    expect(paneState(pane()).resumeSessionId).toBeNull();
+    expect(paneState(pane()).draft).toBe('hello');
+  });
+
   it('refuses a message still pending, before any lookup', async () => {
     twoTurns();
     const pendingId = pane().transcript.pushUserMessage('not yet delivered');

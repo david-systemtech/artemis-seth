@@ -122,7 +122,11 @@ function asString(value: unknown): string | undefined {
  * would have to start with the tag character-for-character.
  */
 function isHarnessNote(text: string): boolean {
-  if (text.startsWith('<task-notification>')) return true;
+  return text.startsWith('<task-notification>') || isInterruptMarker(text);
+}
+
+/** What the CLI records in a user slot when a turn is stopped. */
+function isInterruptMarker(text: string): boolean {
   return text === '[Request interrupted by user]' || text === '[Request interrupted by user for tool use]';
 }
 
@@ -434,17 +438,30 @@ export interface RewindPoint {
 }
 
 /**
- * Whether a stored entry is something the user actually asked — the start of a
- * turn — as opposed to the other things that arrive in a user-typed envelope:
- * tool results, and the harness notes {@link isHarnessNote} names.
+ * Whether a stored entry after a prompt belongs to that prompt's turn, as the
+ * provider's `--resume-drops-turn` validator judges it: the turn's own
+ * answers, its tool results, and the marker a stop leaves behind.
+ *
+ * Anything else in a user envelope is not the turn's. A task notification is
+ * the case that bit: a background task finishes after the answer, the CLI
+ * writes the notification and the model answers *it*, and the range past the
+ * prompt now holds a second exchange nobody typed. {@link isHarnessNote}
+ * rightly keeps that from being drawn as a prompt, but it is not part of the
+ * turn either, and declaring the turn over it is what the
+ * provider refuses with `Resume rejected by --resume-drops-turn:`.
  */
-function isPromptEntry(stored: StoredMessage): boolean {
-  if (stored.type !== 'user') return false;
+function belongsToTurn(stored: StoredMessage): boolean {
+  if (stored.type !== 'user') return true;
   const blocks = contentBlocks(stored.message);
-  if (blocks.some((block) => block.type === 'tool_result')) return false;
-  return blocks.some(
-    (block) =>
-      block.type === 'text' && typeof block.text === 'string' && !isHarnessNote(block.text),
+  if (blocks.some((block) => block.type === 'tool_result')) return true;
+  return (
+    blocks.length > 0 &&
+    blocks.every(
+      (block) =>
+        block.type === 'text' &&
+        typeof block.text === 'string' &&
+        isInterruptMarker(block.text),
+    )
   );
 }
 
@@ -456,6 +473,12 @@ function isPromptEntry(stored: StoredMessage): boolean {
  * *before* it, and only the stored file knows what that was. `null` when the
  * uuid is not in the chain or has nothing before it; the caller turns that
  * into an error worth reading, because both mean the rewind cannot happen.
+ *
+ * The drops-turn acknowledgement is declared only when everything past the
+ * prompt is that one turn's (see {@link belongsToTurn}). When it is not, the
+ * resume truncates unvalidated — the user asked to wind back past all of it,
+ * and a declaration the provider is certain to refuse would only turn that
+ * into an error the retry cannot get past.
  */
 export function resolveRewindPoint(
   messages: readonly StoredMessage[],
@@ -467,14 +490,10 @@ export function resolveRewindPoint(
   const before = messages[at - 1];
   if (before === undefined) return null;
 
-  // One turn, or more? The provider's drops-turn acknowledgement names a
-  // single prompt, so a range holding a second prompt cannot be declared.
-  const laterPrompts = messages
-    .slice(at + 1)
-    .some((stored) => isPromptEntry(stored));
+  const oneTurn = messages.slice(at + 1).every((stored) => belongsToTurn(stored));
 
   return {
     resumeSessionAt: before.uuid,
-    ...(laterPrompts ? {} : { dropsTurn: promptUuid }),
+    ...(oneTurn ? { dropsTurn: promptUuid } : {}),
   };
 }
