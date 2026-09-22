@@ -312,7 +312,6 @@ describe('a turn the CLI opens on its own', () => {
     fake.messages.push(toolResultEcho('result-1'));
     fake.messages.push({ ...userEcho('(synthetic)', 'synthetic-1'), isSynthetic: true } as SDKMessage);
     fake.messages.push({ ...userEcho('(replay)', 'replay-1'), isReplay: true } as SDKMessage);
-    fake.messages.push(assistantText('thinking', 'msg-2'));
     // A wrongly taken opener reads the store within a tick; three retry
     // periods is ample to be sure none of them did.
     await new Promise<void>((resolve) => setTimeout(resolve, 150));
@@ -324,6 +323,32 @@ describe('a turn the CLI opens on its own', () => {
     expect(turn.historyOffset).toBe(9);
 
     fake.messages.push(assistantText('ok', 'msg-3'));
+    fake.messages.push(RESULT);
+    await drain(turn.events);
+  });
+
+  it('is not pinned by a steer that arrives once the model has spoken', async () => {
+    const { fake, adopted } = await processHoldingWork();
+    sdkMock.stored = [
+      ...new Array<unknown>(5).fill({ type: 'user', uuid: 'older' }),
+      { type: 'assistant', uuid: 'msg-2' },
+      { type: 'user', uuid: 'steer-1' },
+    ];
+
+    // A turn whose opener never showed, already producing output when a
+    // prompt-shaped message arrives: that is a steer into the turn, and the
+    // seam must not move to it.
+    fake.messages.push(INIT);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    const turn = adopted[0] as Run;
+    await vi.waitFor(() => expect(turn.historyOffset).toBe(7));
+
+    fake.messages.push(assistantText('working on it', 'msg-2'));
+    fake.messages.push(userEcho('also do this', 'steer-1'));
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    expect(sdkMock.reads).toHaveLength(1);
+    expect(turn.historyOffset).toBe(7);
+
     fake.messages.push(RESULT);
     await drain(turn.events);
   });

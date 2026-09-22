@@ -4831,10 +4831,17 @@ class ClaudeProcess {
 
     // The first prompt echoed after that `init` is the message that opened the
     // turn; its place in the store is where the seam belongs — see the method.
-    if (this.#seamToPin !== undefined && opensTurn(message)) {
-      const turn = this.#seamToPin;
-      this.#seamToPin = undefined;
-      void this.#pinSeam(turn, message.uuid);
+    if (this.#seamToPin !== undefined) {
+      if (opensTurn(message)) {
+        const turn = this.#seamToPin;
+        this.#seamToPin = undefined;
+        void this.#pinSeam(turn, message.uuid);
+      } else if (message.type === 'assistant' || message.type === 'stream_event') {
+        // The opener comes before the turn's own output. Once the model has
+        // spoken, a later prompt on this turn is a steer, not the opener, and
+        // pinning to it would put the seam in the middle of the turn.
+        this.#seamToPin = undefined;
+      }
     }
 
     /*
@@ -5931,7 +5938,7 @@ async function readStoredMessages(
     return await withClaudeConfigDir(
       configDir,
       () => sdkGetSessionMessages(sessionId, { ...(cwd === undefined ? {} : { dir: cwd }) }),
-      'countSessionMessages',
+      'readSessionMessages',
     );
   } catch (error) {
     throw adapterError('unknown', `Could not read that session: ${describe(error)}`, {
