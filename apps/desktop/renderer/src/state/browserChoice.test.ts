@@ -149,8 +149,22 @@ describe('which browser a conversation actually gets', () => {
       }),
     ).toBe('embedded');
   });
+});
 
-  it('falls back when the extension was chosen and nothing is paired', () => {
+/*
+ * The two halves of one rule, and the thing that decides between them is not
+ * how loudly the user asked: it is whether the run itself can say what went
+ * wrong. See `effectiveBrowserMode`, and `agentBrowserServers` in
+ * `apps/desktop/main/browserTools.ts`, which states the same rule from the
+ * other side.
+ */
+describe('an unavailable browser: who says so, and when', () => {
+  const base = { reach: 'per-conversation' as const, paneMode: null, context: context() };
+
+  it('drops a window default that cannot work, because the picker already says why', () => {
+    // Nobody is waiting on an answer here. The option is drawn disabled with
+    // its reason next to it, so a run started under it is not the place to
+    // find out — and the dock browser is a working browser.
     expect(
       effectiveBrowserMode({
         ...base,
@@ -161,13 +175,52 @@ describe('which browser a conversation actually gets', () => {
     ).toBe('embedded');
   });
 
-  it('falls back when the paired browser has gone away mid-session', () => {
+  it('keeps a conversation’s own choice of the paired Chrome when nothing is paired', () => {
+    /*
+     * The agent is the only party who will tell the user. Handing this run the
+     * dock browser instead would have it browse a session signed in to nothing
+     * and report on it as though it were their Chrome — the exact failure the
+     * wording in `pageTools.ts` exists to prevent. The extension tool server
+     * is built anyway and every verb of it refuses in a sentence.
+     */
+    expect(
+      effectiveBrowserMode({
+        ...base,
+        paneMode: 'extension',
+        windowMode: 'embedded',
+        context: context({ anyPaired: false }),
+      }),
+    ).toBe('extension');
+  });
+
+  it('keeps it when the paired browser has gone away mid-session', () => {
+    // The commonest case by far: the user closed Chrome. "Open Chrome and say
+    // when it is running" is a sentence they can act on; a quiet swap to the
+    // dock browser is not.
     expect(
       effectiveBrowserMode({
         ...base,
         paneMode: 'extension',
         windowMode: 'embedded',
         context: context({ anyConnected: false }),
+      }),
+    ).toBe('extension');
+  });
+
+  it('drops a conversation’s own choice of Claude in Chrome, which cannot explain itself', () => {
+    /*
+     * The other half, and why the rule is not simply "an explicit choice
+     * wins". `chromeBrowser` is the *absence* of Artemis's tools — the CLI
+     * brings its own — so on a provider with no bridge the run gets no browser
+     * at all and nothing anywhere says so. There is no driver to refuse in
+     * words, so the honest degradation is a browser that works.
+     */
+    expect(
+      effectiveBrowserMode({
+        ...base,
+        paneMode: 'chrome',
+        windowMode: 'embedded',
+        context: context({ providerId: 'codex' }),
       }),
     ).toBe('embedded');
   });

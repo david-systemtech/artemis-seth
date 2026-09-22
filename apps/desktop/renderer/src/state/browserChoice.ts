@@ -170,11 +170,28 @@ export function browserModeUnavailable(
  *  3. Falling back to the embedded browser, which is the one that grants
  *     nothing.
  *
- * Then, whatever came out, a mode that cannot work here falls back to embedded
- * rather than silently doing nothing. A stored `chrome` preference on a Codex
- * conversation used to mean the run had no browser tools at all and nobody
- * said so; it now means the dock browser, which is the honest degradation and
- * the one the picker is already showing as disabled.
+ * Then, a mode that cannot work here may be dropped for the embedded browser —
+ * and whether it is turns on one question, which is **not** how loudly the
+ * user asked for it. It is whether the run itself can say what went wrong.
+ *
+ *  - **A window default is dropped.** Nobody is waiting on an answer: the
+ *    picker draws that option disabled with its reason beside it, so a run
+ *    started under it is not where anyone should discover the problem, and the
+ *    dock browser is a browser that works.
+ *  - **A conversation's own choice of the extension is kept.** Artemis builds
+ *    the extension tool server for it regardless — see `agentBrowserServers`
+ *    in `apps/desktop/main/browserTools.ts`, which states this rule from the
+ *    other side — and every verb of that server refuses in a sentence the
+ *    agent can repeat: pair a browser, or open Chrome. Handing the run the
+ *    dock browser instead would have it browse a session signed in to nothing
+ *    and report on it as though it were the user's Chrome, which is the exact
+ *    failure the wording in `pageTools.ts` exists to prevent.
+ *  - **A conversation's own choice of Chrome is still dropped**, and that is
+ *    what makes this a rule about self-explanation rather than about
+ *    insistence. `chromeBrowser` is the *absence* of Artemis's tools: the CLI
+ *    brings its own. On a provider with no bridge there is no driver to refuse
+ *    in words, so the run would have no browser at all and nothing would say
+ *    so — which is the failure this fallback was written for.
  */
 export function effectiveBrowserMode(options: {
   readonly windowMode: BrowserMode;
@@ -187,7 +204,25 @@ export function effectiveBrowserMode(options: {
     (options.windowMode === 'extension' && options.reach === 'per-conversation'
       ? 'embedded'
       : options.windowMode);
-  return browserModeUnavailable(chosen, options.context) === null ? chosen : 'embedded';
+  if (browserModeUnavailable(chosen, options.context) === null) return chosen;
+  // Unavailable. Kept only when this conversation asked for it *and* the run
+  // will explain itself; see the note above on why those are two conditions
+  // and not one.
+  return options.paneMode === chosen && explainsItsOwnAbsence(chosen) ? chosen : 'embedded';
+}
+
+/**
+ * Whether a run given this mode, on a machine where it cannot work, will say
+ * so in words the agent can pass on.
+ *
+ * True of the extension alone. Artemis owns that driver, so an unpaired or
+ * closed browser becomes a refusal per verb rather than a silence. The other
+ * three either always work (`embedded`, `external`) or are the absence of
+ * Artemis's tools (`chrome`), and nothing can be refused by a driver that was
+ * never built.
+ */
+function explainsItsOwnAbsence(mode: BrowserMode): boolean {
+  return mode === 'extension';
 }
 
 /* -------------------------------------------------------------------------- */

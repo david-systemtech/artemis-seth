@@ -227,6 +227,14 @@ const EXTERNAL_INSTRUCTIONS =
  * agent can repeat to the user beats a tool set that silently became the dock
  * browser, which is how an agent ends up reporting on the wrong cookie jar.
  *
+ * The renderer holds the other half of that rule and states it the same way:
+ * `effectiveBrowserMode` in `renderer/src/state/browserChoice.ts` drops a
+ * *window default* that cannot work — the picker is already showing it
+ * disabled with the reason — and keeps a *conversation's own choice* of the
+ * extension, precisely so that this file's refusal is what the user hears.
+ * The two halves have to agree, because between them they decide whether an
+ * agent is told the truth or handed a different browser without comment.
+ *
  * A function of the input rather than inline in the composition root so the
  * table is testable without Electron — the builders are injected precisely so
  * a test can hand in markers and assert which one was asked for, and they are

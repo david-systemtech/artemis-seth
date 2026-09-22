@@ -240,10 +240,10 @@ describe('how a conversation comes by the paired Chrome', () => {
     expect(started).toEqual([{}]);
   });
 
-  it('refuses the extension when nothing is paired, whatever the setting says', async () => {
-    // A stored preference must not outlive the browser it named. The driver
-    // would answer every verb with a refusal, which is honest but wasteful;
-    // the dock browser is what the picker is already offering instead.
+  it('drops the window default when nothing is paired, because the picker says why', async () => {
+    // A stored default must not outlive the browser it named, and nobody is
+    // waiting on an answer: the picker draws the option disabled with its
+    // reason beside it. The dock browser is what it offers instead.
     setBrowserMode('extension');
     setExtensionReach('always-on');
     useApp.setState({ extensionBridge: { ...ONE_BROWSER_CONNECTED, browsers: [] } } as never);
@@ -253,7 +253,39 @@ describe('how a conversation comes by the paired Chrome', () => {
     expect(started).toEqual([{}]);
   });
 
-  it('refuses the extension when the paired browser is not connected', async () => {
+  it('keeps a conversation’s own choice when nothing is paired, and lets the run say so', async () => {
+    /*
+     * The other half of the rule in `browserChoice.ts`. This conversation
+     * asked for the user's Chrome; handing it the dock browser would have the
+     * agent browse a session signed in to nothing and report on it as though
+     * it were theirs. The extension tool server is built regardless and every
+     * verb of it refuses in a sentence the agent can repeat.
+     */
+    setBrowserMode('embedded');
+    setPaneBrowserMode('extension');
+    useApp.setState({ extensionBridge: { ...ONE_BROWSER_CONNECTED, browsers: [] } } as never);
+
+    await submitPrompt('hello');
+
+    expect(started).toEqual([{ extensionBrowser: true }]);
+  });
+
+  it('keeps it when the user has simply closed Chrome', async () => {
+    setBrowserMode('embedded');
+    setPaneBrowserMode('extension');
+    useApp.setState({
+      extensionBridge: {
+        ...ONE_BROWSER_CONNECTED,
+        browsers: [{ ...ONE_BROWSER_CONNECTED.browsers[0], connected: false }],
+      },
+    } as never);
+
+    await submitPrompt('hello');
+
+    expect(started).toEqual([{ extensionBrowser: true }]);
+  });
+
+  it('drops the window default when the paired browser is not connected', async () => {
     setBrowserMode('extension');
     setExtensionReach('always-on');
     useApp.setState({
