@@ -35,9 +35,11 @@ import {
   ARTEMIS_EXTENSION_ID,
   BRIDGE_PROTOCOL_VERSION,
   DEFAULT_PAGE_POLICY,
+  type RunId,
 } from '@rx-artemis/protocol';
 
 import { createExtensionBridge, type ExtensionBridge } from './extensionBridge';
+import { extensionPageDriver } from './extensionPageDriver';
 import { openPairedBrowsers } from './pairedBrowsers';
 
 /** The Artemis extension's own origin — the only one the bridge accepts. */
@@ -1005,6 +1007,35 @@ describe('choosing between paired browsers', () => {
       { browserId: work.browserId, browserName: 'Work', connected: true },
       { browserId: personal.browserId, browserName: 'Personal', connected: false },
     ]);
+  });
+
+  it('shuts the tab through endRun when the driver’s own close could not choose', async () => {
+    /*
+     * The coupling between two decisions that are only correct together.
+     *
+     * `close` is a verb like any other, so it goes through the same picking:
+     * a run that never chose a browser, with two connected, gets the "which
+     * one?" refusal for its close as well — refused to nobody, because the run
+     * is over and the driver discards the answer. On its own that is a tab left
+     * behind in somebody's Chrome for every such conversation. `endRun`
+     * broadcasting is what actually shuts it, and an unknown run key is a no-op
+     * in the browsers that never held the tab.
+     */
+    const { bridge, port } = await bridgeOn();
+    const work = await pair(bridge, port, { browserName: 'Work' });
+    const personal = await pair(bridge, port, { browserName: 'Personal' });
+
+    await extensionPageDriver('run-ambiguous' as RunId, bridge).close();
+
+    // Nothing went out: the close could not be addressed to one of them.
+    expect(work.extension.pending()).toBe(0);
+    expect(personal.extension.pending()).toBe(0);
+
+    bridge.endRun('run-ambiguous');
+
+    for (const seen of [await work.extension.next(), await personal.extension.next()]) {
+      expect(seen).toMatchObject({ type: 'call', runKey: 'run-ambiguous', verb: 'close' });
+    }
   });
 
   it('still tells every connected browser a run has ended', async () => {
