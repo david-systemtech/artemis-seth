@@ -339,9 +339,12 @@ class RelayedPageDriver implements PageDriver {
    * Remembered here, on the server, rather than on the client: the client
    * builds a driver per relayed call and holds nothing between them, so the
    * only place a choice can outlive one verb is the driver the run owns. It is
-   * kept even when the open then fails, for the reason the desktop's driver
-   * keeps it — a name that was answered is an answer, and a page that would not
-   * load is a page.
+   * kept only once the client has driven something with it. Nothing here can
+   * tell a mistyped name from a page that would not load — the list is on the
+   * client, and what comes back is a sentence — so a first answer the client
+   * refuses is let go of again, and the agent can answer once more. Kept, a
+   * wrong name would be a dead end: every later verb refused as unknown, every
+   * correction refused as a move.
    *
    * A run that arrived with `artemis.extensionBrowserId` was never asked the
    * question, so the argument is refused for it: the caller pinned that
@@ -353,16 +356,21 @@ class RelayedPageDriver implements PageDriver {
    */
   async open(url?: string, browser?: string): Promise<DriverResult<PageLocation>> {
     const named = browser?.trim() ?? '';
+    let firstAnswer = false;
     if (named.length > 0) {
-      if (this.#browser === null) this.#browser = named;
-      else if (this.#browser.trim().toLowerCase() !== named.toLowerCase()) {
+      if (this.#browser === null) {
+        this.#browser = named;
+        firstAnswer = true;
+      } else if (this.#browser.trim().toLowerCase() !== named.toLowerCase()) {
         return { ok: false, reason: ALREADY_CHOSEN };
       }
     }
-    return this.#ask<PageLocation>(
+    const result = await this.#ask<PageLocation>(
       url === undefined ? { verb: 'open' } : { verb: 'open', url },
       LOAD_TIMEOUT_MS,
     );
+    if (firstAnswer && !result.ok) this.#browser = null;
+    return result;
   }
 
   async navigate(url: string): Promise<DriverResult<PageLocation>> {

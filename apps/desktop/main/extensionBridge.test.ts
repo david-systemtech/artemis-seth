@@ -1100,7 +1100,7 @@ describe('the name a pairing supplies', () => {
 
     await pair(bridge, port, {
       browserName:
-        '\ufeff W\u0000o\u001br\u007fk\u009f\u200b\u200e\u202e\u2060\u2066\u2069 ',
+        '\ufeff W\u0000o\u00ad\u001br\u007fk\u009f\u200b\u200e\u202e\u2060\u2062\u2066\u2069\u034f\u061c\u180e ',
     });
 
     expect(bridge.state().browsers[0]?.browserName).toBe('Work');
@@ -1152,7 +1152,7 @@ describe('renaming a paired browser', () => {
     const name = state.browsers[0]?.browserName ?? '';
     expect(name.startsWith('Work')).toBe(true);
     expect(name.length).toBe(80);
-    expect(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/u.test(name)).toBe(false);
+    expect(/[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/u.test(name)).toBe(false);
   });
 
   it('keeps the name a rename gave it when that browser reconnects', async () => {

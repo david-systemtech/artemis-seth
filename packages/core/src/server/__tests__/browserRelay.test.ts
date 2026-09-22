@@ -354,6 +354,40 @@ describe('the browser a served run drives', () => {
     expect(published.at(-1)?.call.browserId).toBe('Work');
   });
 
+  it('lets go of a first answer the client refused, so a mistyped name is not a dead end', async () => {
+    // The server cannot check a name; the client can, and says no. Kept, the
+    // wrong name would make every later verb an unknown-browser refusal and
+    // every correction a refused move.
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1');
+
+    const first = driver.open(undefined, 'Wrok');
+    expect(published.at(-1)?.call.browserId).toBe('Wrok');
+    relay.answer('conn-a', lastCallId(published), { ok: false, reason: 'No browser is called "Wrok".' });
+    expect((await first).ok).toBe(false);
+
+    const again = driver.open(undefined, 'Work');
+    expect(published.at(-1)?.call.browserId).toBe('Work');
+    relay.answer('conn-a', lastCallId(published), { ok: true, value: { url: '', title: '' } });
+    expect((await again).ok).toBe(true);
+
+    // And now it is kept: a later verb goes to the corrected browser.
+    void driver.read();
+    expect(published.at(-1)?.call.browserId).toBe('Work');
+  });
+
+  it('keeps a first answer the client accepted, even when the page then failed to load', async () => {
+    const { relay, published } = relayWatching();
+    const driver = relay.driverFor('conn-a', 'run-1');
+
+    const first = driver.open('https://example.com', 'Work');
+    relay.answer('conn-a', lastCallId(published), { ok: true, value: { url: 'https://example.com', title: '' } });
+    expect((await first).ok).toBe(true);
+
+    void driver.read();
+    expect(published.at(-1)?.call.browserId).toBe('Work');
+  });
+
   it('ignores an empty name, which is not a choice', async () => {
     const { relay, published } = relayWatching();
     const driver = relay.driverFor('conn-a', 'run-1', 'b-work');

@@ -863,13 +863,16 @@ function constantTimeEquals(left: string, right: string): boolean {
  * removes, so a name that renders as `Work` and is not `Work` would reintroduce
  * it by hand.
  *
- * In order: C0 and DEL and C1; the zero-width characters and the word joiner;
- * the bidi embedding, override and isolate controls, which can make a name
- * render right-to-left and read as another one entirely; and the byte-order
- * mark, which arrives at the front of anything pasted out of a file.
+ * In order: C0 and DEL and C1; the soft hyphen, the combining grapheme
+ * joiner, the Arabic letter mark and the Mongolian vowel separator, each of
+ * which draws as nothing; the zero-width characters, the word joiner and the
+ * invisible operators; the bidi embedding, override and isolate controls,
+ * which can make a name render right-to-left and read as another one
+ * entirely; and the byte-order mark, which arrives at the front of anything
+ * pasted out of a file.
  */
 const NOT_A_NAME =
-  /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu;
+  /[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/gu;
 
 /**
  * The name a browser goes by, bounded and stripped of anything that is not
