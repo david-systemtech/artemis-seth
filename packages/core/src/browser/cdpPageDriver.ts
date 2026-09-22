@@ -48,8 +48,9 @@
  *    `Target.targetInfoChanged`. A page can move itself with a meta refresh or
  *    a timer, with no tool call anywhere near it, and a policy that only ran
  *    inside `navigate` and `click` never saw that. Frames count because
- *    `browser_evaluate` can write one: see {@link CdpPageDriver.#watch}. The
- *    listener blanks the tab and leaves its sentence for the next verb.
+ *    `browser_evaluate` can write one — see "a frame counts" on the watcher
+ *    below. The listener blanks the tab and leaves its sentence for the next
+ *    verb.
  *  - **Before every verb acts**, over the address the tab has now and the
  *    machine the main document was actually served from. The second is what
  *    defeats rebinding between the lookup and the fetch.

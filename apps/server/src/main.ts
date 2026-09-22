@@ -111,7 +111,9 @@
  *                          browser sits inside the operator's network, so the
  *                          public internet is open to it and everything
  *                          private is shut unless named here. Cloud metadata
- *                          addresses are refused whatever this says.
+ *                          addresses are refused whatever this says. Both
+ *                          rules hold for every frame of a page, so a page
+ *                          embedding an internal host is refused whole.
  *   ARTEMIS_BROWSER_IDLE_EXIT   `0` stops this process asking Chromium to exit
  *                          after five minutes with nothing open. On by
  *                          default, because a process that has exited holds no
