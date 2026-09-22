@@ -113,6 +113,7 @@ beforeAll(async () => {
 
   chrome = await launchChrome(binary as string, extensionDist);
   profileDir = chrome.profileDir;
+  await chrome.awaitExtension();
 
   // Pairing driven through the real options page, the way a person does it:
   // the port Artemis is listening on, then the code Artemis is showing. The
@@ -434,6 +435,333 @@ describe.skipIf(binary === null)('a run on a server, driving the browser here', 
   }, 120_000);
 });
 
+/* -------------------------------------------------------------------------- */
+/* Two Chrome profiles, one Artemis                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The feature of issue #443, with two real browsers.
+ *
+ * Everything above runs against one Chrome, which is the arrangement the old
+ * bridge comment described: "the first connected browser, and there is
+ * normally exactly one". The whole of this feature is what happens when that
+ * stops being true, and it is not a thing a fake can prove — the failure it
+ * removes is that *every verb succeeds* while acting in the wrong signed-in
+ * profile, so the only evidence is which browser a page turned up in.
+ *
+ * So this launches two Chromiums with their own `--user-data-dir`s, which is
+ * what makes them two profiles as far as the extension is concerned: each gets
+ * its own `chrome.storage`, pairs separately, and holds its own connection.
+ * Each is named through the real options page, because the name is what the
+ * user types and what every refusal quotes back.
+ *
+ * ## How "it drove A and not B" is proved
+ *
+ * By the tab book. The extension files one tab per `runKey` and knows nothing
+ * about any other browser, so a page opened for a run in one browser is
+ * readable through that browser and refused through the other — "this
+ * conversation's tab has no page open". That is a fact about where the page
+ * actually is, rather than about what Artemis believes.
+ *
+ * ## The shared browser is closed first
+ *
+ * This box has been OOM-killed by parallel suites, and three headless
+ * Chromiums at once is the arrangement most likely to do it again. The one the
+ * suites above share has finished its work by the time this runs, so it goes
+ * before these two start. The file's own `afterAll` is null-safe.
+ */
+describe.skipIf(binary === null)('two Chrome profiles paired with one Artemis', () => {
+  const RUN_A = 'run-e2e-two-a' as RunId;
+  const RUN_B = 'run-e2e-two-b' as RunId;
+  const RUN_C = 'run-e2e-two-c' as RunId;
+  const RUN_SERVED = 'run-e2e-two-served';
+
+  let twoDataDir = '';
+  let twoBridge: ExtensionBridge | null = null;
+  let work: ChromeUnderTest | null = null;
+  let personal: ChromeUnderTest | null = null;
+  let workId = '';
+  let personalId = '';
+  /**
+   * Every browser this suite started, for teardown to close.
+   *
+   * Kept separately from `work` and `personal` because those are assigned
+   * *after* a pairing succeeds, and a pairing that throws — a code that did not
+   * land, an options page that never came up — would otherwise leave a
+   * headless Chromium running with nobody holding a reference to it. One was
+   * found that way while this suite was being written.
+   */
+  const started: ChromeUnderTest[] = [];
+
+  /**
+   * Launch one Chromium, and pair it under a name through the options page.
+   *
+   * The `input` events are not decoration, here for the reason the suite above
+   * gives and one more: the page stops overwriting the name field once it has
+   * been typed into, and a test that only assigned `value` would be pairing
+   * under whatever the browser called itself — which is the same string for
+   * both of these and would prove nothing.
+   */
+  async function pairOne(name: string): Promise<{ chrome: ChromeUnderTest; browserId: string }> {
+    const bridge = twoBridge as ExtensionBridge;
+    const listening = bridge.state().listening;
+    if (listening.kind !== 'listening') throw new Error('the bridge is not listening');
+
+    const launched = await launchChrome(binary as string, extensionDist);
+    started.push(launched);
+    await launched.awaitExtension();
+
+    const code = bridge.offerPairing(true).pairing?.code ?? '';
+    const options = await launched.openPage(
+      `chrome-extension://${ARTEMIS_EXTENSION_ID}/options.html`,
+    );
+    await options.evaluate(`(async () => {
+      const type = (id, value) => {
+        const field = document.getElementById(id);
+        field.value = value;
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+      };
+      type('port', ${JSON.stringify(String(listening.port))});
+      document.getElementById('save-port').click();
+      await new Promise((r) => setTimeout(r, 200));
+      type('browser-label', ${JSON.stringify(name)});
+      type('code', ${JSON.stringify(code)});
+      document.getElementById('pair').click();
+    })()`);
+
+    await until(
+      () => bridge.state().browsers.some((one) => one.browserName === name && one.connected),
+      90_000,
+    );
+    const paired = bridge.state().browsers.find((one) => one.browserName === name);
+    if (paired === undefined) throw new Error(`${name} did not pair`);
+    return { chrome: launched, browserId: paired.browserId };
+  }
+
+  beforeAll(async () => {
+    await chrome?.close();
+    chrome = null;
+
+    twoDataDir = await mkdtemp(join(tmpdir(), 'artemis-e2e-two-'));
+    twoBridge = createExtensionBridge({ store: await openPairedBrowsers(twoDataDir), port: 0 });
+    await twoBridge.start();
+
+    const first = await pairOne('Work');
+    work = first.chrome;
+    workId = first.browserId;
+    const second = await pairOne('Personal');
+    personal = second.chrome;
+    personalId = second.browserId;
+  }, 420_000);
+
+  afterAll(async () => {
+    /*
+     * Every browser that was started, whatever happened to it, and before the
+     * bridge: one left running holds a socket this process is about to stop
+     * reading. Closing one twice is harmless — the last test closes the first
+     * browser on purpose — and closing one the suite never got to pair is the
+     * case this list exists for.
+     */
+    for (const browser of started) await browser.close();
+    await twoBridge?.dispose();
+    for (const directory of [twoDataDir, ...started.map((one) => one.profileDir)]) {
+      if (directory === '') continue;
+      await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    }
+  });
+
+  it('pairs two browsers under the names typed into their own options pages', () => {
+    const browsers = twoBridge?.state().browsers ?? [];
+
+    expect(browsers.map((one) => one.browserName)).toEqual(['Work', 'Personal']);
+    expect(browsers.every((one) => one.connected)).toBe(true);
+    // Two ids, because two profiles pair separately: each runs its own copy of
+    // the extension with its own storage and its own secret.
+    expect(workId).not.toBe(personalId);
+  });
+
+  it('drives the browser a conversation names, and leaves the other one alone', async () => {
+    const driver = extensionPageDriver(RUN_A, twoBridge as ExtensionBridge, { browser: workId });
+
+    const opened = await driver.open(siteUrl);
+    expect(opened.ok).toBe(true);
+
+    const read = await driver.read();
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect((read.value as PageText).text).toContain('The page under test');
+
+    /*
+     * And the page is in Work and nowhere else. The extension files one tab
+     * per run key and knows about no other browser, so asking Personal about
+     * this run finds nothing — which is the assertion that would have failed
+     * under "the first connected browser" and succeeded silently.
+     */
+    const elsewhere = await extensionPageDriver(RUN_A, twoBridge as ExtensionBridge, {
+      browser: personalId,
+    }).read();
+    expect(elsewhere.ok).toBe(false);
+    if (elsewhere.ok) return;
+    expect(elsewhere.reason).toContain('no page open');
+
+    await driver.close();
+  }, 180_000);
+
+  it('asks which browser when a conversation named none, then drives the one answered', async () => {
+    const driver = extensionPageDriver(RUN_B, twoBridge as ExtensionBridge);
+
+    // The first verb refuses rather than guessing, and the sentence carries
+    // both names because the agent is about to read them out to the user.
+    const refused = await driver.open(siteUrl);
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.reason).toContain('“Work”');
+    expect(refused.reason).toContain('“Personal”');
+    expect(refused.reason).toContain('browser_open');
+
+    // The answer, as `browser_open`'s new argument carries it.
+    const opened = await driver.open(siteUrl, 'Personal');
+    expect(opened.ok).toBe(true);
+
+    // In Personal, and nowhere else.
+    const here = await extensionPageDriver(RUN_B, twoBridge as ExtensionBridge, {
+      browser: personalId,
+    }).read();
+    expect(here.ok).toBe(true);
+    if (!here.ok) return;
+    expect((here.value as PageText).text).toContain('The page under test');
+
+    const elsewhere = await extensionPageDriver(RUN_B, twoBridge as ExtensionBridge, {
+      browser: workId,
+    }).read();
+    expect(elsewhere.ok).toBe(false);
+
+    // And the run stays on the browser it was told, without being told again.
+    const again = await driver.read();
+    expect(again.ok).toBe(true);
+
+    await driver.close();
+  }, 240_000);
+
+  /*
+   * The served path, with the same two browsers.
+   *
+   * Everything between the run and the page is the shipping code, as in the
+   * suite above: a real `createArtemisServer`, the relay publishing verbs
+   * scoped to one connection, the client listening on it and performing them.
+   * What is added here is the browser id — `artemis.extensionBrowserId`'s
+   * journey, from the relay's `driverFor` to the call on the feed to the
+   * driver the client builds — and the thing being proved is the same one:
+   * the page turns up in the browser that was named.
+   */
+  it('drives the named browser from a run on a server', async () => {
+    const TOKEN = 'served-two-token-abcdefghijklmnop';
+    const CONNECTION = {
+      id: 'conn-e2e-two',
+      label: 'The client with two browsers',
+      workspace: { kind: 'directory' as const, path: '/w' },
+      token: TOKEN,
+      createdAt: 0,
+    };
+
+    const feed = createPushFeed();
+    const relay = createBrowserRelay({
+      publish: (connectionId, call) => {
+        feed.publish('artemis:push:browser-call', call, { connectionId });
+      },
+    });
+    const server = createArtemisServer({
+      port: 0,
+      connections: () => [CONNECTION],
+      version: '1.1.1',
+      catalogue: { read: async () => [], invalidate: () => undefined },
+      runs: {
+        startRun: async () => {
+          throw new Error('not under test');
+        },
+        subscribe: () => () => undefined,
+        interrupt: async () => undefined,
+        respondToPermission: async () => undefined,
+        disposeRun: async () => undefined,
+      } as never,
+      workspaces: createWorkspaceResolver(),
+      feed,
+      browserRelay: relay,
+    });
+    const port = await server.listen();
+
+    const client = createBrowserCallClient({
+      root: `http://127.0.0.1:${String(port)}`,
+      headers: () => ({ authorization: `Bearer ${TOKEN}` }),
+      // The same driver a local run gets, built for whichever browser the
+      // server named — which is the client's half of the whole feature.
+      driverFor: (runKey, browserId) =>
+        extensionPageDriver(runKey as RunId, twoBridge as ExtensionBridge, { browser: browserId }),
+    });
+
+    try {
+      client.own(RUN_SERVED);
+      await client.ready();
+
+      const driver = relay.driverFor(CONNECTION.id, RUN_SERVED, workId);
+      const opened = await driver.open(siteUrl);
+      expect(opened.ok).toBe(true);
+
+      const read = await driver.read();
+      expect(read.ok).toBe(true);
+      if (!read.ok) return;
+      expect((read.value as PageText).text).toContain('The page under test');
+
+      // In Work, because that is the id the run carried all the way across.
+      const elsewhere = await extensionPageDriver(RUN_SERVED as RunId, twoBridge as ExtensionBridge, {
+        browser: personalId,
+      }).read();
+      expect(elsewhere.ok).toBe(false);
+
+      await driver.close();
+    } finally {
+      client.stop();
+      await server.close();
+    }
+  }, 240_000);
+
+  /*
+   * Last, because it kills one of the browsers the tests above need.
+   */
+  it('drives the one that is left, silently, once the other is closed', async () => {
+    await work?.close();
+    work = null;
+    await until(
+      () => (twoBridge?.state().browsers.filter((one) => one.connected).length ?? 0) === 1,
+      60_000,
+    );
+
+    // No id, one browser: the person with one Chrome never meets any of this,
+    // and neither does the person who has just shut their other one.
+    const driver = extensionPageDriver(RUN_C, twoBridge as ExtensionBridge);
+
+    const opened = await driver.open(siteUrl);
+    expect(opened.ok).toBe(true);
+
+    const read = await driver.read();
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect((read.value as PageText).text).toContain('The page under test');
+
+    // And a conversation still pointed at the closed one is told which browser
+    // to open rather than being handed the one that happens to be running.
+    const pinned = await extensionPageDriver(RUN_C, twoBridge as ExtensionBridge, {
+      browser: workId,
+    }).read();
+    expect(pinned.ok).toBe(false);
+    if (pinned.ok) return;
+    expect(pinned.reason).toContain('“Work”');
+    expect(pinned.reason).toContain('Do not use a different browser instead');
+
+    await driver.close();
+  }, 240_000);
+});
+
 /*
  * Always runs, so the skip above is visible in the report. A suite that is
  * silently absent is a suite that stops being maintained.
@@ -492,6 +820,18 @@ interface Page {
 
 interface ChromeUnderTest {
   readonly profileDir: string;
+  /**
+   * Wait until the extension's service worker exists in this browser.
+   *
+   * Before it does, `chrome-extension://…/options.html` is a URL Chrome has
+   * nothing to serve: the target is created, the document loads as an error
+   * page, `readyState` reaches `complete`, and every `getElementById` on it
+   * answers `null`. That is a pairing script failing on a line that looks
+   * correct, and it was found by launching a second browser — the first one in
+   * the file had a bridge and a web server built between launching and opening
+   * a page, which was enough time by accident.
+   */
+  awaitExtension(): Promise<void>;
   openPage(url: string): Promise<Page>;
   close(): Promise<void>;
 }
@@ -540,6 +880,16 @@ async function launchChrome(binaryPath: string, extensionDir: string): Promise<C
 
   return {
     profileDir: profile,
+
+    awaitExtension: async () => {
+      await untilValue(
+        async () =>
+          (await targets()).find(
+            (one) => one.type === 'service_worker' && one.url.includes(ARTEMIS_EXTENSION_ID),
+          ),
+        30_000,
+      );
+    },
 
     openPage: async (url) => {
       await fetch(`http://127.0.0.1:${String(port)}/json/new?${encodeURIComponent(url)}`, {
