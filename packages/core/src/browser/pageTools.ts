@@ -650,7 +650,10 @@ export function pageTools(driver: PageDriver) {
       async ({ selector, text }) =>
         settled(
           () => driver.type(selector, text),
-          () => say(`Typed into ${selector}.`),
+          // With the address, as a click reports it: a framework listening for
+          // `change` may submit on the value it just received, and a model
+          // told only "typed" would go on reading a page that is already gone.
+          (at) => say(`Typed into ${selector}. Now at ${whereIs(at)}.`),
         ),
     ),
 

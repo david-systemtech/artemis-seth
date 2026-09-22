@@ -151,9 +151,11 @@ describe('the six verbs report what happened', () => {
     );
   });
 
-  it('confirms a type by the selector, since the page has not moved', async () => {
+  it('names the selector it typed into and where that left the page', async () => {
+    // A framework may submit on the value it just received, so the address is
+    // reported as it is for a click, and a page that moved is not read on.
     expect(textOf(await call(fakeDriver(), 'browser_type', { selector: '#q', text: 'hi' }))).toBe(
-      'Typed into #q.',
+      'Typed into #q. Now at Orders (https://example.com/orders).',
     );
   });
 });
