@@ -160,6 +160,14 @@ export interface ExtensionDriverHost {
    * a settings pane is shown.
    */
   browsers(): readonly PairedBrowserRef[];
+  /**
+   * Tell every connected browser a run is over.
+   *
+   * The fallback for a close that could not be addressed: see
+   * {@link ExtensionPageDriver.close}. An unknown run key is a no-op in the
+   * extension, so telling everyone costs nothing and leaves no tab behind.
+   */
+  endRun(runKey: string): void;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -529,9 +537,36 @@ class ExtensionPageDriver implements PageDriver {
    * browser. The answer is discarded — the run is over and there is nobody to
    * report it to — but the call is still awaited so a browser that is mid-reply
    * is not cut off in the same tick.
+   *
+   * A close that cannot be addressed — the run never chose between two
+   * connected browsers, or the one it chose has been unpaired since — is not
+   * dropped: every connected browser is told the run is over instead. The
+   * extension ignores a run key it has no tab for, so the one holding the tab
+   * closes it and the rest do nothing. This is what makes the served path
+   * safe as well: the server's end-of-run close arrives with no browser named,
+   * and there is no other hook on that path to broadcast from.
    */
   async close(): Promise<void> {
-    await this.#send<unknown>({ verb: 'close' }, CLOSE_TIMEOUT_MS);
+    const selector = this.#browser;
+    let browserId: string | undefined;
+    if (selector !== null) {
+      const found = this.#find(selector);
+      if (found === null) {
+        this.#bridge.endRun(this.#runKey);
+        return;
+      }
+      browserId = found.browserId;
+    }
+    const outcome = await this.#bridge.call(
+      this.#runKey,
+      freshId(),
+      { verb: 'close' },
+      CLOSE_TIMEOUT_MS,
+      browserId,
+    );
+    if (outcome.status === 'ambiguous' || outcome.status === 'no-such-browser') {
+      this.#bridge.endRun(this.#runKey);
+    }
   }
 
   /**

@@ -53,8 +53,9 @@ const PERSONAL: PairedBrowserRef = {
 function fakeHost(
   answer: BridgeCallOutcome,
   browsers: readonly PairedBrowserRef[] = [WORK],
-): { host: ExtensionDriverHost; seen: Seen[] } {
+): { host: ExtensionDriverHost; seen: Seen[]; ended: string[] } {
   const seen: Seen[] = [];
+  const ended: string[] = [];
   return {
     seen,
     host: {
@@ -63,7 +64,11 @@ function fakeHost(
         return answer;
       },
       browsers: () => browsers,
+      endRun: (runKey) => {
+        ended.push(runKey);
+      },
     },
+    ended,
   };
 }
 
@@ -71,6 +76,43 @@ function fakeHost(
 function answering(): { host: ExtensionDriverHost; seen: Seen[] } {
   return fakeHost({ status: 'answered', result: { ok: true, value: { url: '', title: '' } } });
 }
+
+describe('a close that cannot be addressed still closes the tab', () => {
+  const PERSONAL: PairedBrowserRef = { browserId: 'b-personal', browserName: 'Personal', connected: true };
+
+  it('tells every browser the run is over when the run never chose between two', async () => {
+    const { host, seen, ended } = fakeHost(
+      { status: 'ambiguous', browserNames: ['Work', 'Personal'] },
+      [WORK, PERSONAL],
+    );
+
+    await extensionPageDriver(RUN, host).close();
+
+    expect(seen.at(-1)).toMatchObject({ verb: { verb: 'close' }, browserId: undefined });
+    expect(ended).toEqual([RUN]);
+  });
+
+  it('tells every browser the run is over when the chosen one has been unpaired since', async () => {
+    const { host, seen, ended } = fakeHost({ status: 'answered', result: { ok: true, value: null } }, []);
+
+    await extensionPageDriver(RUN, host, { browser: 'b-work' }).close();
+
+    expect(seen).toHaveLength(0);
+    expect(ended).toEqual([RUN]);
+  });
+
+  it('closes the chosen browser alone, and tells nobody else', async () => {
+    const { host, seen, ended } = fakeHost(
+      { status: 'answered', result: { ok: true, value: null } },
+      [WORK, PERSONAL],
+    );
+
+    await extensionPageDriver(RUN, host, { browser: 'b-work' }).close();
+
+    expect(seen.at(-1)).toMatchObject({ verb: { verb: 'close' }, browserId: 'b-work' });
+    expect(ended).toEqual([]);
+  });
+});
 
 describe('every verb crosses as the shape the extension switches on', () => {
   it('sends open with no address when none was given', async () => {
@@ -401,6 +443,7 @@ describe('a run that was pointed at one browser', () => {
     const host: ExtensionDriverHost = {
       call: async () => ({ status: 'answered', result: { ok: true, value: null } }),
       browsers: () => browsers,
+      endRun: () => {},
     };
     const driver = extensionPageDriver(RUN, host, { browser: 'b-work' });
 

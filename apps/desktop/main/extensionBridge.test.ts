@@ -1044,12 +1044,8 @@ describe('choosing between paired browsers', () => {
 
     await extensionPageDriver('run-ambiguous' as RunId, bridge).close();
 
-    // Nothing went out: the close could not be addressed to one of them.
-    expect(work.extension.pending()).toBe(0);
-    expect(personal.extension.pending()).toBe(0);
-
-    bridge.endRun('run-ambiguous');
-
+    // The close could not be addressed to one of them, so the driver told
+    // both through endRun, and the one holding the tab is the one that acts.
     for (const seen of [await work.extension.next(), await personal.extension.next()]) {
       expect(seen).toMatchObject({ type: 'call', runKey: 'run-ambiguous', verb: 'close' });
     }
