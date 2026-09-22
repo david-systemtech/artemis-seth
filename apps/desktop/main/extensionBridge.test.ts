@@ -168,6 +168,20 @@ class FakeExtension {
   }
 }
 
+/**
+ * Wait until the bridge itself has seen a browser go: on Windows the server
+ * side learns of a closed socket a beat after the client does, so a test that
+ * closes a fake extension and reads the bridge straight away reads it too soon.
+ */
+async function untilBridgeSees(bridge: ExtensionBridge, browserId: string, connected: boolean): Promise<void> {
+  const until = Date.now() + 2_000;
+  while (Date.now() < until) {
+    if (bridge.browsers().some((b) => b.browserId === browserId && b.connected === connected)) return;
+    await new Promise<void>((tick) => setTimeout(tick, 10));
+  }
+  throw new Error(`The bridge never saw ${browserId} become ${connected ? 'connected' : 'disconnected'}.`);
+}
+
 /** Pair a fake extension and return what the bridge gave it. */
 async function pair(
   bridge: ExtensionBridge,
@@ -938,6 +952,7 @@ describe('choosing between paired browsers', () => {
     await pair(bridge, port, { browserName: 'Personal' });
     work.extension.socket.close();
     await work.extension.untilClosed();
+    await untilBridgeSees(bridge, work.browserId, false);
 
     expect(await bridge.call('run-1', 'c-2', { verb: 'read' }, 500, work.browserId)).toEqual({
       status: 'browser-asleep',
@@ -986,6 +1001,7 @@ describe('choosing between paired browsers', () => {
     const personal = await pair(bridge, port, { browserName: 'Personal' });
     work.extension.socket.close();
     await work.extension.untilClosed();
+    await untilBridgeSees(bridge, work.browserId, false);
 
     const answering = bridge.call('run-1', 'c-6', { verb: 'read' }, 2_000);
     await personal.extension.next();
@@ -1002,6 +1018,7 @@ describe('choosing between paired browsers', () => {
     const personal = await pair(bridge, port, { browserName: 'Personal' });
     personal.extension.socket.close();
     await personal.extension.untilClosed();
+    await untilBridgeSees(bridge, personal.browserId, false);
 
     expect(bridge.browsers()).toEqual([
       { browserId: work.browserId, browserName: 'Work', connected: true },
