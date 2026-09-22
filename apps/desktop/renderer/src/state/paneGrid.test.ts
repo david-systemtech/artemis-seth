@@ -8,7 +8,7 @@
  * and none of them look wrong in a screenshot — which is exactly the class of
  * regression the rest of this suite exists for.
  *
- * The four rules:
+ * The five rules:
  *
  *  1. **Right grows a row, down adds a full-width one.** This is the whole
  *     layout model, and the reason a third conversation under a left/right pair
@@ -17,7 +17,10 @@
  *     row length — see `MAX_PANES`.
  *  3. **A row dies with its last pane**, and the focus lands on a neighbour
  *     rather than jumping to the corner.
- *  4. **Events reach the pane that owns the run**, by `runId` and nothing else.
+ *  4. **A dragged pane moves, and nothing else does.** Its caption drops it
+ *     beside another pane, into a row of its own, or into the other's place,
+ *     and the conversations in it are the same objects afterwards.
+ *  5. **Events reach the pane that owns the run**, by `runId` and nothing else.
  *     Two panes streaming at once is the case the whole split exists for, and
  *     it is the one place a mix-up would put one agent's output under another
  *     agent's prompt.
@@ -33,11 +36,13 @@ import { NO_CAPABILITIES } from '@rx-artemis/protocol';
 import {
   MAX_PANES,
   allPanes,
+  canMovePane,
   canSplit,
   closePane,
   focusPane,
   focusedPane,
   handleAgentEvent,
+  movePane,
   paneCount,
   splitPane,
   useApp,
@@ -213,6 +218,136 @@ describe('closing', () => {
     closePane(second!.id);
 
     expect(focusedPane().id).toBe(first!.id);
+  });
+});
+
+describe('moving', () => {
+  /** A left/right pair over a full-width third: `[[a, b], [c]]`. */
+  function pairOverOne(): { a: string; b: string; c: string } {
+    const a = focusedPane().id;
+    const b = splitPane('right')!.id;
+    const c = splitPane('down')!.id;
+    return { a, b, c };
+  }
+
+  it('swaps two panes when dropped on the centre', () => {
+    const { a, b, c } = pairOverOne();
+
+    expect(movePane(a, c, 'centre')).toBe(true);
+
+    expect(shape()).toEqual([[c, b], [a]]);
+  });
+
+  it('joins the target’s row when dropped on a side edge', () => {
+    const { a, b, c } = pairOverOne();
+
+    movePane(c, a, 'left');
+
+    // The bottom row had only `c`, so it goes rather than staying as a band of
+    // nothing — the rule `closePane` keeps.
+    expect(shape()).toEqual([[c, a, b]]);
+  });
+
+  it('puts the pane on the right of the target, not at the end of the row', () => {
+    const { a, b, c } = pairOverOne();
+
+    movePane(c, a, 'right');
+
+    expect(shape()).toEqual([[a, c, b]]);
+  });
+
+  it('opens a full-width row when dropped on the top or bottom edge', () => {
+    const { a, b, c } = pairOverOne();
+
+    movePane(b, a, 'up');
+    expect(shape()).toEqual([[b], [a], [c]]);
+
+    movePane(b, c, 'down');
+    expect(shape()).toEqual([[a], [c], [b]]);
+  });
+
+  it('moves within a row', () => {
+    const a = focusedPane().id;
+    const b = splitPane('right')!.id;
+    const c = splitPane('right')!.id;
+
+    movePane(a, c, 'right');
+
+    expect(shape()).toEqual([[b, c, a]]);
+  });
+
+  it('keeps the same panes, so a working conversation keeps working', () => {
+    const { a, c } = pairOverOne();
+    const moving = allPanes().find((p) => p.id === a)!;
+    setPaneState(moving, { draft: 'half a thought' });
+
+    movePane(a, c, 'down');
+
+    // The same object in a new place — not a copy seeded from it, which is what
+    // a split makes and what would leave a run streaming into a pane nobody
+    // can see.
+    expect(allPanes().find((p) => p.id === a)).toBe(moving);
+    expect(paneState(moving).draft).toBe('half a thought');
+    expect(paneCount()).toBe(3);
+  });
+
+  it('keeps the ids of rows that survive', () => {
+    // The panel library keys a row's dividers by its id; a move that re-minted
+    // every row would reset dividers the user never touched.
+    const { a, b } = pairOverOne();
+    const top = useApp.getState().grid[0]!.id;
+
+    movePane(a, b, 'right');
+
+    expect(useApp.getState().grid[0]!.id).toBe(top);
+  });
+
+  it('focuses the pane it moved', () => {
+    const { a, c } = pairOverOne();
+
+    movePane(a, c, 'right');
+
+    expect(focusedPane().id).toBe(a);
+  });
+
+  it('is not held back by the pane limit', () => {
+    // A move adds nothing, so a full window can still be rearranged.
+    for (let i = 1; i < MAX_PANES; i += 1) splitPane('right');
+    const [first, , third] = useApp.getState().grid[0]!.panes;
+    expect(canSplit()).toBe(false);
+
+    expect(movePane(first!.id, third!.id, 'down')).toBe(true);
+    expect(paneCount()).toBe(MAX_PANES);
+  });
+
+  it('writes nothing for a drop that changes nothing', () => {
+    const { a, b, c } = pairOverOne();
+    const before = useApp.getState().grid;
+
+    // Onto itself; onto a pane that is not there; beside the pane it is
+    // already beside; the lone pane of a row onto the row it already sits
+    // under. Each is a real drop a hand can make, and none is a move.
+    expect(movePane(a, a, 'centre')).toBe(false);
+    expect(movePane(a, 'pane-gone', 'left')).toBe(false);
+    expect(movePane(a, b, 'left')).toBe(false);
+    expect(movePane(c, a, 'down')).toBe(false);
+    expect(movePane(c, b, 'down')).toBe(false);
+
+    // Not merely an equal grid — the same one, so nothing re-rendered.
+    expect(useApp.getState().grid).toBe(before);
+  });
+
+  it('answers which drops would move something, for the targets to offer', () => {
+    const { a, b, c } = pairOverOne();
+
+    expect(canMovePane(a, b, 'left')).toBe(false);
+    expect(canMovePane(a, b, 'right')).toBe(true);
+    expect(canMovePane(c, a, 'down')).toBe(false);
+    expect(canMovePane(c, a, 'up')).toBe(true);
+    expect(canMovePane(a, a, 'centre')).toBe(false);
+
+    // Asking is not moving.
+    expect(shape()).toEqual([[a, b], [c]]);
   });
 });
 
