@@ -380,6 +380,29 @@ describe('a turn the CLI opens on its own', () => {
     await drain(second.events);
   });
 
+  it('rides out a read that fails while the CLI is still writing', async () => {
+    const { fake, adopted } = await processHoldingWork();
+    sdkMock.stored = new Array<unknown>(5).fill({ type: 'user', uuid: 'older' });
+
+    fake.messages.push(INIT);
+    await vi.waitFor(() => expect(adopted).toHaveLength(1));
+    const turn = adopted[0] as Run;
+    await vi.waitFor(() => expect(turn.historyOffset).toBe(5));
+
+    // The first read after the echo throws; the next one sees the message.
+    sdkMock.failReads = true;
+    fake.messages.push(userEcho('go on', 'opening-1'));
+    await vi.waitFor(() => expect(sdkMock.reads).toHaveLength(2));
+    sdkMock.failReads = false;
+    sdkMock.stored = [...sdkMock.stored, { type: 'user', uuid: 'opening-1' }];
+
+    await vi.waitFor(() => expect(turn.historyOffset).toBe(6));
+
+    fake.messages.push(assistantText('ok', 'msg-3'));
+    fake.messages.push(RESULT);
+    await drain(turn.events);
+  });
+
   it('keeps the counted seam when the echoed message never appears in the store', async () => {
     const { fake, adopted } = await processHoldingWork();
     sdkMock.stored = new Array<unknown>(5).fill({ type: 'user', uuid: 'older' });

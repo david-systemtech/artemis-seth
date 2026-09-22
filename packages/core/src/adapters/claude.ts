@@ -3280,16 +3280,15 @@ class ClaudeProcess {
   async #pinSeam(turn: ClaudeTurn, uuid: string): Promise<void> {
     const sessionId = this.#sessionId ?? this.#input.resumeSessionId;
     if (sessionId === undefined) return;
+    let lastError: unknown;
     for (let attempt = 0; attempt < SEAM_PIN_ATTEMPTS; attempt += 1) {
-      let stored: readonly { readonly uuid?: unknown }[];
+      let stored: readonly { readonly uuid?: unknown }[] = [];
       try {
         stored = await readStoredMessages(this.#input.env, sessionId, this.#input.cwd);
       } catch (error) {
-        this.#deps.diagnostic?.(
-          `Run ${turn.runId}: could not read the conversation to pin its seam.`,
-          describe(error),
-        );
-        return;
+        // A read that throws is a read that did not find the message. Mid-append
+        // is one face of the same lag the retries exist for, so try again.
+        lastError = error;
       }
       const at = stored.findIndex((message) => message.uuid === uuid);
       if (at >= 0) {
@@ -3306,6 +3305,7 @@ class ClaudeProcess {
     }
     this.#deps.diagnostic?.(
       `Run ${turn.runId}: the message that opened this turn never appeared in the store; keeping the counted seam.`,
+      ...(lastError === undefined ? [] : [describe(lastError)]),
     );
   }
 
