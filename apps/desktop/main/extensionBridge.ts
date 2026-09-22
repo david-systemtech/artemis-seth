@@ -769,7 +769,7 @@ function constantTimeEquals(left: string, right: string): boolean {
 /** The peer's name for itself, bounded and stripped of anything that is not text. */
 function nameOf(raw: unknown): string {
   if (typeof raw !== 'string') return 'A browser';
-  const cleaned = raw.replace(/[ -]/gu, '').trim();
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/gu, '').trim();
   return cleaned.length === 0 ? 'A browser' : cleaned.slice(0, 80);
 }
 

@@ -22,8 +22,9 @@
  * for a reason that is not the code's.
  */
 
+import { fileURLToPath } from 'node:url';
 import { createHmac } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -853,6 +854,19 @@ describe('the pairing secret', () => {
     const written = await readFile(join(directory, 'paired-browsers.json'), 'utf8');
 
     expect(written).toContain(secret);
+    // The claim in this test's name. Windows has no mode bits to assert.
+    if (process.platform !== 'win32') {
+      const mode = (await stat(join(directory, 'paired-browsers.json'))).mode & 0o777;
+      expect(mode).toBe(0o600);
+    }
+  });
+
+  it('is kept out of the source as well: no control byte hides in this file', async () => {
+    // A character class written with literal control bytes makes git call the
+    // file binary and a reviewer read `[-]`; the class is spelled in escapes.
+    const source = await readFile(fileURLToPath(new URL('./extensionBridge.ts', import.meta.url)), 'latin1');
+    expect([...source].some((ch) => ch < ' ' && ch !== '\n' && ch !== '\t' && ch !== '\r')).toBe(false);
+    expect(source.includes('\u007f')).toBe(false);
   });
 });
 
