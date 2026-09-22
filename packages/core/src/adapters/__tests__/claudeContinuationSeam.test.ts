@@ -291,7 +291,7 @@ describe('a turn the CLI opens on its own', () => {
     expect(sdkMock.reads).toHaveLength(2);
   });
 
-  it('is not pinned by a tool result, a synthetic message or a replay, only by the prompt', async () => {
+  it('is not pinned by a tool result, a sidechain, a synthetic message or a replay, only by the prompt', async () => {
     const { fake, adopted } = await processHoldingWork();
     sdkMock.stored = [
       ...new Array<unknown>(5).fill({ type: 'user', uuid: 'older' }),
@@ -306,10 +306,11 @@ describe('a turn the CLI opens on its own', () => {
     const turn = adopted[0] as Run;
     await vi.waitFor(() => expect(turn.historyOffset).toBe(9));
 
-    // All three arrive while the turn is still waiting for its opener. None
+    // All four arrive while the turn is still waiting for its opener. None
     // of them is it: had any been taken for it, the seam would move to its
     // position and a read would show in the log.
     fake.messages.push(toolResultEcho('result-1'));
+    fake.messages.push({ ...userEcho('(sidechain)', 'result-1'), parent_tool_use_id: 'toolu_1' } as SDKMessage);
     fake.messages.push({ ...userEcho('(synthetic)', 'synthetic-1'), isSynthetic: true } as SDKMessage);
     fake.messages.push({ ...userEcho('(replay)', 'replay-1'), isReplay: true } as SDKMessage);
     // A wrongly taken opener reads the store within a tick; three retry

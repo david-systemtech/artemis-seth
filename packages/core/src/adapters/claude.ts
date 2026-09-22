@@ -2550,6 +2550,9 @@ function startsTurn(message: SDKMessage): boolean {
 function opensTurn(message: SDKMessage): message is SDKUserMessage & { readonly uuid: string } {
   if (message.type !== 'user') return false;
   if (typeof message.uuid !== 'string' || message.uuid.length === 0) return false;
+  // A subagent's prompt is filed under the tool call that spawned it, on a
+  // sidechain; only the main thread's prompt opens a turn.
+  if (message.parent_tool_use_id !== null && message.parent_tool_use_id !== undefined) return false;
   if ('isReplay' in message && message.isReplay === true) return false;
   if (message.isSynthetic === true) return false;
   const content = message.message.content;
