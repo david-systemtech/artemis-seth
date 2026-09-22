@@ -451,13 +451,22 @@ export const BROWSER_MODE_SHORT_LABELS: Readonly<Record<BrowserMode, string>> = 
   external: 'My browser',
 };
 
-/** One row of a browser picker, in either the window's copy or a pane's. */
+/**
+ * One row of a browser picker, in either the window's copy or a pane's.
+ *
+ * Two sentences rather than one, because the two pickers have different room
+ * for them. Settings draws the note under the label and hangs the reason off a
+ * tooltip; a menu row has nowhere to put a tooltip anybody would find, so it
+ * shows the reason *instead of* the note. Folding them here would have given
+ * the settings row the same sentence twice.
+ */
 export interface BrowserPickerOption {
   readonly id: BrowserChoiceValue;
   readonly label: string;
-  /** What choosing it does, or — when it is disabled — why it cannot be. */
+  /** What choosing it does. */
   readonly note: string;
-  readonly disabled?: true;
+  /** Why it cannot be chosen right now, and absent when it can. */
+  readonly unavailable?: string;
 }
 
 /**
@@ -496,27 +505,25 @@ export function browserPickerOptions(context: BrowserModeContext): readonly Brow
     const row: BrowserPickerOption = {
       id: browserChoiceValue(mode),
       label: BROWSER_MODE_LABELS[mode],
-      note: unavailable ?? BROWSER_MODE_NOTES[mode],
-      ...(unavailable === null ? {} : { disabled: true as const }),
+      // Said only where it answers a question the user actually has. With one
+      // browser paired there is nothing for "whichever" to choose between, and
+      // the sentence would be a warning about a situation they are not in.
+      note:
+        mode === 'extension' && context.browsers.length > 1
+          ? `${BROWSER_MODE_NOTES[mode]} Whichever of them is open.`
+          : BROWSER_MODE_NOTES[mode],
+      ...(unavailable === null ? {} : { unavailable }),
     };
     if (mode !== 'extension') return [row];
     return [
-      {
-        ...row,
-        // Said only where it answers a question the user actually has. With one
-        // browser paired there is nothing for "whichever" to choose between,
-        // and the sentence would be a warning about a situation they are not in.
-        ...(context.browsers.length > 1
-          ? { note: `${row.note} Whichever of them is open.` }
-          : {}),
-      },
+      row,
       ...context.browsers.map((browser): BrowserPickerOption => {
         const why = pairedBrowserUnavailable(browser.browserId, context);
         return {
           id: browserChoiceValue('extension', browser.browserId),
           label: namedBrowserLabel(browser.browserName),
-          note: why ?? `Always this browser, whatever else is open.`,
-          ...(why === null ? {} : { disabled: true as const }),
+          note: 'Always this browser, whatever else is open.',
+          ...(why === null ? {} : { unavailable: why }),
         };
       }),
     ];

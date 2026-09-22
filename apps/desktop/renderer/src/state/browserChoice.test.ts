@@ -319,7 +319,7 @@ describe('a conversation’s own browser picker', () => {
     });
 
     expect(rows[0]?.note).toContain('built-in browser');
-    expect(rows[0]?.disabled).toBeUndefined();
+    expect(rows[0]?.unavailable).toBeUndefined();
   });
 
   it('follows always-on to the paired Chrome instead', () => {
@@ -339,15 +339,19 @@ describe('a conversation’s own browser picker', () => {
     const rows = paneBrowserOptions({ ...window, context: context({ anyPaired: false }) });
     const extension = rows.find((row) => row.id === 'extension');
 
-    expect(extension?.disabled).toBe(true);
-    expect(extension?.note).toContain('No browser is paired yet');
+    expect(extension?.unavailable).toContain('No browser is paired yet');
+    // And the note still says what the option *does*, because Settings draws
+    // both and only a menu has to choose between them.
+    expect(extension?.note).toContain('Your real Chrome');
   });
 
   it('disables Claude in Chrome on a provider that has never heard of it', () => {
     const rows = paneBrowserOptions({ ...window, context: context({ providerId: 'codex' }) });
 
-    expect(rows.find((row) => row.id === 'chrome')?.disabled).toBe(true);
-    expect(rows.find((row) => row.id === 'external')?.disabled).toBeUndefined();
+    expect(rows.find((row) => row.id === 'chrome')?.unavailable).toContain(
+      'Only Claude conversations',
+    );
+    expect(rows.find((row) => row.id === 'external')?.unavailable).toBeUndefined();
   });
 
   it('never disables following the window, which is always a thing to do', () => {
@@ -357,7 +361,7 @@ describe('a conversation’s own browser picker', () => {
       context: context({ providerId: 'codex', anyPaired: false }),
     });
 
-    expect(rows[0]?.disabled).toBeUndefined();
+    expect(rows[0]?.unavailable).toBeUndefined();
   });
 });
 
@@ -505,10 +509,9 @@ describe('a choice that names one of several browsers', () => {
       context: context({ browsers: TWO }),
     });
 
-    expect(rows.find((row) => row.id === 'extension:b-work')?.disabled).toBeUndefined();
+    expect(rows.find((row) => row.id === 'extension:b-work')?.unavailable).toBeUndefined();
     const shut = rows.find((row) => row.id === 'extension:b-personal');
-    expect(shut?.disabled).toBe(true);
-    expect(shut?.note).toContain('Personal is not connected');
+    expect(shut?.unavailable).toContain('Personal is not connected');
   });
 
   it('says a browser is gone when nothing answers to its id', () => {

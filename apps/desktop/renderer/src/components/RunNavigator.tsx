@@ -1153,15 +1153,17 @@ export function BrowserRow(): ReactElement {
             <DropdownMenuRadioItem
               key={option.id}
               value={option.id}
-              disabled={option.disabled ?? false}
+              disabled={option.unavailable !== undefined}
               className="items-start text-2xs"
             >
               <span className="flex min-w-0 flex-col">
                 <span className="text-ink">{option.label}</span>
-                {/* The note doubles as the reason on a disabled row, which is
-                    where a menu can put one — a tooltip inside an open menu is
-                    a second hover nobody finds. */}
-                <span className="text-2xs leading-snug text-ink-faint">{option.note}</span>
+                {/* The reason takes the note's place on a disabled row, which
+                    is where a menu can put one — a tooltip inside an open menu
+                    is a second hover nobody finds. */}
+                <span className="text-2xs leading-snug text-ink-faint">
+                  {option.unavailable ?? option.note}
+                </span>
               </span>
             </DropdownMenuRadioItem>
           ))}

@@ -191,7 +191,9 @@ export function PermissionsSection(): ReactElement {
       id: option.id,
       label: option.label,
       note: option.note,
-      ...(option.disabled === true ? { disabled: true, reason: option.note } : {}),
+      ...(option.unavailable === undefined
+        ? {}
+        : { disabled: true, reason: option.unavailable }),
     }),
   );
 

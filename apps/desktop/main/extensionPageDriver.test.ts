@@ -427,7 +427,7 @@ describe('a run that was pointed at nothing, with several browsers open', () => 
     if (result.ok) return;
     expect(result.reason).toContain('“Work”, “Personal”');
     expect(result.reason).toContain('AskUserQuestion');
-    expect(result.reason).toContain('browser_open(browser: “Work”)');
+    expect(result.reason).toContain('browser_open(browser: "Work")');
     expect(result.reason).toContain('Do not guess');
   });
 

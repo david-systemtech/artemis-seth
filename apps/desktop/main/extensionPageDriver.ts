@@ -293,10 +293,13 @@ function chooseBrowser(names: readonly string[]): string {
     'This conversation has not been set to one of them, so there is no way to ' +
     'know which the user means. Ask the user which browser to use — with your own ' +
     'question tool, AskUserQuestion on Claude, offering each of those names as an ' +
-    `option — then call browser_open again with the browser argument set to their ` +
-    `answer, for example browser_open(browser: ${quoted(example)}). Artemis ` +
-    'remembers it for the rest of the conversation, so you are asked once. Do not ' +
-    'guess, and do not describe pages you have not seen.'
+    'option — then call browser_open again with the browser argument set to their ' +
+    // Straight quotes here and curly ones above, deliberately: the list is
+    // prose the model reads out, and this is a call it copies. A model handed
+    // a curly quote inside an example has been known to send one.
+    `answer, for example browser_open(browser: "${example}"). Artemis remembers ` +
+    'it for the rest of the conversation, so you are asked once. Do not guess, ' +
+    'and do not describe pages you have not seen.'
   );
 }
 
