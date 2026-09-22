@@ -779,12 +779,21 @@ class EmbeddedPageDriver implements PageDriver {
         try {
           contents.off('console-message', onConsole);
           contents.off('did-fail-load', onFailedLoad);
-          recorder.forget(contents.id);
         } catch (error) {
           // A `webContents` that has been destroyed throws on `off`. There is
           // nothing left to detach from in that case, which is the outcome
           // being asked for.
           log.debug('Could not detach from a browser tab', error);
+        } finally {
+          /*
+           * In a `finally`, because it is the half that is *not* on the tab.
+           * The recorder is a long-lived object on the session: its watcher
+           * count and its buffer for this tab outlive the `webContents`
+           * entirely, so throwing past this line leaked both — permanently, and
+           * exactly for the tabs most likely to hit it, the ones the user
+           * closed while an agent was driving them.
+           */
+          recorder.forget(contents.id);
         }
       },
     };

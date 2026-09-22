@@ -703,4 +703,38 @@ describe('the session recorder', () => {
     recorderFor(wr as never);
     expect(wr.installed['onCompleted']).toHaveLength(0);
   });
+
+  it('lets go of a tab even when detaching from it throws', async () => {
+    /*
+     * `off` on a destroyed `webContents` throws, which is the case for exactly
+     * the tabs this matters most for: the ones the user closed while an agent
+     * was driving them. The recorder is not on the `webContents` — it lives on
+     * the session and outlives every tab — so a throw on the way past used to
+     * leave its watcher count and its buffer for that tab behind for the life
+     * of the app.
+     */
+    const wr = fakeWebRequest();
+    const page = fakePage(wr);
+    page.contents['off'] = (): never => {
+      throw new Error('Object has been destroyed');
+    };
+    const driver = embeddedPageDriver('run-destroyed' as RunId, contextFor(page.contents));
+    await driver.open('https://example.com');
+
+    releaseEmbeddedDriver('run-destroyed' as RunId);
+
+    // Nothing is recorded for that tab any more: the buffer is gone, so a
+    // request arriving for it is dropped rather than accumulating for ever.
+    wr.fire('onCompleted', details());
+    expect(recorderFor(wr as never).drain(7)).toEqual([]);
+
+    // And the count went with it, so the next driver to watch this tab starts
+    // from one watcher rather than from two.
+    const second = fakePage(wr);
+    const next = embeddedPageDriver('run-after-destroyed' as RunId, contextFor(second.contents));
+    await next.open('https://example.com');
+    releaseEmbeddedDriver('run-after-destroyed' as RunId);
+    wr.fire('onCompleted', details());
+    expect(recorderFor(wr as never).drain(7)).toEqual([]);
+  });
 });
