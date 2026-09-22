@@ -289,7 +289,10 @@ describe('the browser a served run drives', () => {
     expect(published.map((one) => one.call.browserId)).toEqual(['Personal', 'Personal']);
   });
 
-  it('keeps that answer even when the open it came with then failed', async () => {
+  it('lets go of that answer when the open it came with failed, since a refusal cannot be told from a wrong name', async () => {
+    // The price of not being able to check a name here: a page that would not
+    // load costs the agent one more answer, which is cheaper than a name that
+    // was wrong sticking for the rest of the run.
     const { relay, published } = relayWatching();
     const driver = relay.driverFor('conn-a', 'run-1');
 
@@ -298,7 +301,7 @@ describe('the browser a served run drives', () => {
     expect((await opening).ok).toBe(false);
     void driver.read();
 
-    expect(published.at(-1)?.call.browserId).toBe('Personal');
+    expect(published.at(-1)?.call.browserId).toBeUndefined();
   });
 
   it('refuses to move a run the caller pinned, and drives nothing while refusing', async () => {
