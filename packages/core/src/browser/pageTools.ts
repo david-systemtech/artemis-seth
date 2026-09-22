@@ -328,6 +328,26 @@ interface Wording {
   readonly page: string;
   /** Anything `browser_screenshot` has to add on this browser. */
   readonly screenshot: string;
+  /**
+   * Where `browser_evaluate` may run, on this browser.
+   *
+   * Per kind because the answer is a property of the browser and not of the
+   * tool. It was written once, for every driver, in the tool's own description
+   * — and what it said was the *extension's* rule ("allowed only on the sites
+   * the user is developing"). On the server browser that is simply untrue, and
+   * a model told a false rule either works around a refusal it will never meet
+   * or declines a call that would have worked.
+   */
+  readonly evaluate: string;
+  /**
+   * What `browser_cookies` and `browser_storage` may read, on this browser.
+   *
+   * Per kind for the same reason and the same history. "Values are shown only
+   * where the site's policy allows them" describes a browser holding the user's
+   * logins; this server's browser holds none, and there is no policy to
+   * describe.
+   */
+  readonly deepRead: string;
   /** What the server tells the model it is for. See {@link pageToolInstructions}. */
   readonly instructions: string;
 }
@@ -353,6 +373,15 @@ const WORDING: Readonly<Record<BrowserDriverKind, Wording>> = {
       'it is not their own browser.',
     page: 'this conversation’s embedded dock browser tab',
     screenshot: '',
+    /*
+     * Never read: this driver's `abilities` say it offers none of the three,
+     * so the tools carrying these sentences are not registered. Written out
+     * rather than left empty so that a driver kind gaining an ability does not
+     * silently ship a blank description — see `embeddedPageDriver.ts` on why
+     * the dock browser declines them.
+     */
+    evaluate: ' The embedded dock browser does not offer this.',
+    deepRead: ' The embedded dock browser does not offer this.',
     /*
      * The second sentence exists because of a real failure: asked to open a
      * page "in my Chrome", an agent used these tools and assured the user it
@@ -392,6 +421,21 @@ const WORDING: Readonly<Record<BrowserDriverKind, Wording>> = {
       ' Nobody can see this browser, so a screenshot is the only way to show ' +
       'the user what a page looks like.',
     /*
+     * No per-site rule to state, because there is no per-site anything: this
+     * browser is signed in to nothing and its context is thrown away with the
+     * run. Saying "allowed only on the sites the user is developing" here —
+     * which is what the shared wording used to say — would teach the model a
+     * refusal it will never meet, and a model that expects one works around it.
+     */
+    evaluate:
+      ' This browser is signed in to nothing, so this works on any page it can ' +
+      'open — there is no per-site rule to fall foul of. Prefer browser_read, ' +
+      'browser_click and browser_type where they will do.',
+    deepRead:
+      ' This browser is signed in to nothing and its storage is thrown away when ' +
+      'the conversation finishes, so values are shown in full on any page it can ' +
+      'open. What you see here is what you or the application under test put there.',
+    /*
      * The server browser's hazard is the opposite of the embedded one's. It is
      * not that the model will think it belongs to the user — it is that nobody
      * is watching it at all, so "I checked the page" is a claim the user has no
@@ -417,6 +461,24 @@ const WORDING: Readonly<Record<BrowserDriverKind, Wording>> = {
       'keeps to itself, which they can see and close.',
     page: 'this conversation’s tab in the user’s own Chrome',
     screenshot: '',
+    /*
+     * The per-site policy, stated where it is true. This is the user's own
+     * browser, so a stored token is *their* token and a session cookie is
+     * their login — which is why the deep verbs are for the sites they are
+     * developing unless they have said otherwise. The refusal is named as a
+     * rule and the way to change it is named too, so a model that meets one
+     * tells the user what to do instead of looking for another route.
+     */
+    evaluate:
+      ' Allowed only on the sites the user is developing; anywhere else it is ' +
+      'refused, and the refusal is the rule rather than a fault to work around. ' +
+      'The user can widen it in Artemis settings. Prefer browser_read, ' +
+      'browser_click and browser_type where they will do.',
+    deepRead:
+      ' This is the user’s own browser, so values are shown only on the sites ' +
+      'they are developing; elsewhere you get names and attributes, which is ' +
+      'enough to see that a session exists and why it is not being sent. The ' +
+      'user can widen it in Artemis settings.',
     /*
      * Here the danger is not a lie about whose browser it is — it plainly is
      * theirs — but forgetting what that means. Every action is taken as the
@@ -636,7 +698,8 @@ export function pageTools(driver: PageDriver) {
             'browser_cookies',
             'The cookies the current page would send, with their attributes. ' +
               'Use it to see whether a session exists and why it is not being ' +
-              'sent. Values are shown only where the site’s policy allows them.',
+              'sent.' +
+              wording.deepRead,
             {},
             async () =>
               settled(
@@ -651,8 +714,8 @@ export function pageTools(driver: PageDriver) {
       ? [
           tool(
             'browser_storage',
-            'localStorage and sessionStorage for the current page’s origin, ' +
-              'where the site’s policy allows them to be read.',
+            'localStorage and sessionStorage for the current page’s origin.' +
+              wording.deepRead,
             {},
             async () =>
               settled(
@@ -667,11 +730,8 @@ export function pageTools(driver: PageDriver) {
       ? [
           tool(
             'browser_evaluate',
-            'Run a JavaScript expression in the page and return its value. ' +
-              'Allowed only on the sites the user is developing; anywhere else ' +
-              'it is refused, and the refusal is the rule rather than a fault ' +
-              'to work around. Prefer browser_read, browser_click and ' +
-              'browser_type where they will do.',
+            'Run a JavaScript expression in the page and return its value.' +
+              wording.evaluate,
             {
               expression: z
                 .string()

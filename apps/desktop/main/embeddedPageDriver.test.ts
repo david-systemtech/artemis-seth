@@ -17,9 +17,12 @@
  *  - **Cookies, storage and evaluate are refused in words.** They are declined
  *    deliberately, and the sentence has to say why rather than reading as a
  *    fault the model should route around.
+ *  - **Waiting for a load always ends.** A tab the user closes mid-load must
+ *    not hold a verb, and detaching from a `webContents` that has been
+ *    destroyed throws — which used to leave the promise unsettled for ever.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { BrowserId, BrowserState, RunId } from '@rx-artemis/protocol';
 
@@ -444,6 +447,95 @@ describe('letting go of a tab', () => {
 /* -------------------------------------------------------------------------- */
 /* The three verbs this browser declines                                      */
 /* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
+/* Waiting for a load                                                         */
+/* -------------------------------------------------------------------------- */
+
+describe('waiting for a page to stop loading always ends', () => {
+  /**
+   * A page that never finishes loading and that throws when detached from.
+   *
+   * Both halves are the real thing: a `webContents` the user closed is still
+   * the object this file holds, `isLoading` keeps answering whatever it last
+   * answered, and `off` on a destroyed one throws — which this file's own
+   * `Watch.release` comment has always said.
+   */
+  function fakeStuckPage(session: unknown): {
+    contents: Record<string, unknown>;
+    emit: (event: string) => void;
+    offCalls: number;
+  } {
+    const once = new Map<string, Set<Listener>>();
+    const counters = { offCalls: 0 };
+    const contents: Record<string, unknown> = {
+      id: 7,
+      session,
+      isLoading: () => true,
+      executeJavaScript: async () => 'the page text',
+      capturePage: async () => ({ isEmpty: () => true, toPNG: () => Buffer.alloc(0) }),
+      once: (event: string, listener: Listener) => {
+        const set = once.get(event) ?? new Set<Listener>();
+        set.add(listener);
+        once.set(event, set);
+      },
+      on: () => undefined,
+      off: () => {
+        counters.offCalls += 1;
+        throw new Error('Object has been destroyed');
+      },
+    };
+    return {
+      contents,
+      emit: (event) => {
+        for (const listener of once.get(event) ?? []) listener();
+      },
+      get offCalls() {
+        return counters.offCalls;
+      },
+    };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('gives up after the timeout even though detaching throws', async () => {
+    /*
+     * The bug this pins. `done` ran inside a bare timer callback and called
+     * `off` *before* resolving; `off` on a destroyed `webContents` throws, so
+     * the exception left the timer with nothing to catch it and the promise
+     * unsettled. The verb waited for ever, and the run waited with it.
+     */
+    vi.useFakeTimers();
+    const session = fakeWebRequest();
+    const page = fakeStuckPage(session);
+    const driver = embeddedPageDriver(RUN, contextFor(page.contents));
+
+    const reading = driver.read();
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    await expect(reading).resolves.toMatchObject({ ok: true });
+    expect(page.offCalls).toBeGreaterThan(0);
+  });
+
+  it('stops waiting when the tab is destroyed, rather than holding the verb', async () => {
+    // Without this the user closing a loading tab parks the verb for the full
+    // twenty seconds before it reports on a page that no longer exists.
+    vi.useFakeTimers();
+    const session = fakeWebRequest();
+    const page = fakeStuckPage(session);
+    const driver = embeddedPageDriver(RUN, contextFor(page.contents));
+
+    const reading = driver.read();
+    await Promise.resolve();
+    page.emit('destroyed');
+    // No time passes: what ends the wait is the event, not the deadline.
+    await vi.advanceTimersByTimeAsync(0);
+
+    await expect(reading).resolves.toMatchObject({ ok: true });
+  });
+});
 
 describe('the dock browser declines the three deep verbs, in words', () => {
   it('claims console and network and nothing else', () => {

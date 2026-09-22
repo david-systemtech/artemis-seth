@@ -340,6 +340,17 @@ export interface ServerContext {
    */
   readonly browserRelay?: BrowserRelay;
   /**
+   * Whether this host has a headless browser a served run can drive.
+   *
+   * Published on `GET /api/v0/connection` so a client can say "this machine can
+   * look at a page" rather than leaving a user to wonder why the agent will
+   * not open one. The tools themselves are wired through `agentToolServers` by
+   * the host, which is where the browser actually lives; this is only the line
+   * that says so. The headless server sets it from
+   * `ARTEMIS_BROWSER_CDP_URL`. See `ServerConnectionInfo.serverBrowser`.
+   */
+  readonly serverBrowser?: boolean;
+  /**
    * The push feed the event stream serves. Absent means this build has no
    * live feed to offer and `/api/v0/events` answers `501` — a catalogue-only
    * deployment, and every test that is not about the stream.
@@ -1088,7 +1099,11 @@ export async function handleServerRequest(
    * it a program knows its token works and nothing else — not which directory
    * it is bound to, and not whether it may run turns at all.
    */
-  if (path === `${apiPrefix}/connection`) return answer(describeConnection(connection));
+  if (path === `${apiPrefix}/connection`) {
+    return answer(
+      describeConnection(connection, { serverBrowser: context.serverBrowser === true }),
+    );
+  }
 
   if (path === '/v1/models') {
     const profiles = await visibleProfiles();
@@ -1708,6 +1723,8 @@ export interface ArtemisServerOptions {
   readonly allowClientBrowser?: boolean;
   /** See {@link ServerContext.browserRelay}. */
   readonly browserRelay?: BrowserRelay;
+  /** See {@link ServerContext.serverBrowser}. */
+  readonly serverBrowser?: boolean;
   /** See {@link ServerContext.feed}. */
   readonly feed?: PushFeed;
   /** See {@link ServerContext.remoteStream}. */
@@ -1857,6 +1874,7 @@ export function createArtemisServer(options: ArtemisServerOptions): ArtemisServe
           // *on* here, so only an explicit `false` reaches the context.
           ...(options.allowClientBrowser === false ? { allowClientBrowser: false } : {}),
           ...(options.browserRelay === undefined ? {} : { browserRelay: options.browserRelay }),
+          ...(options.serverBrowser === true ? { serverBrowser: true } : {}),
           ...(options.feed === undefined ? {} : { feed: options.feed }),
           ...(options.remoteStream === undefined ? {} : { remoteStream: options.remoteStream }),
           ...(options.guard === undefined ? {} : { guard: options.guard }),

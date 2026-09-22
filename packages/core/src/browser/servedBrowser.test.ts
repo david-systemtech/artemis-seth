@@ -10,7 +10,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { servedBrowserServers } from './servedBrowser.js';
+import { BROWSER_TOOL_SERVER, servedBrowserServers } from './servedBrowser.js';
 
 function builders(): {
   asked: string[];
@@ -85,5 +85,12 @@ describe('which browser a served run gets', () => {
     // opening on a machine nobody is looking at, so "none" is a real answer.
     expect(servedBrowserServers({}, {})).toBeUndefined();
     expect(servedBrowserServers({ extensionBrowser: true }, {})).toBeUndefined();
+  });
+
+  it('registers under the name every host uses, whatever browser is behind it', () => {
+    // Permission rules and skills address `mcp__artemisBrowser__browser_open`.
+    // A user whose run moved from the desktop to a server must not lose an
+    // allow-list they built.
+    expect(BROWSER_TOOL_SERVER).toBe('artemisBrowser');
   });
 });

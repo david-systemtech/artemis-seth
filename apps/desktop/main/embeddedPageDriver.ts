@@ -672,6 +672,18 @@ class EmbeddedPageDriver implements PageDriver {
    * still streaming after twenty seconds is usually a page whose useful content
    * arrived nineteen seconds ago and whose analytics beacon is still open.
    * Reporting what is there beats refusing to report anything.
+   *
+   * Three ways out, and the last two were missing. The timeout used to detach
+   * its listener *before* resolving, from inside a bare timer callback — and
+   * `off` on a destroyed `webContents` throws, which this file's own
+   * {@link Watch} comment says. A tab the user closed while a page was loading
+   * therefore threw out of a timer with nothing to catch it, and the promise
+   * never settled: the verb waited for ever and the run went with it. So the
+   * detach is guarded and the resolve happens whatever it does.
+   *
+   * `destroyed` is the third way out, and it is the one that makes the common
+   * case quick. Without it, closing a loading tab parks the verb for the full
+   * twenty seconds before it reports on a page that no longer exists.
    */
   async #settle(id: BrowserId): Promise<void> {
     const contents = this.#context.host.contentsFor(id);
@@ -680,11 +692,20 @@ class EmbeddedPageDriver implements PageDriver {
     await new Promise<void>((resolve) => {
       const done = (): void => {
         clearTimeout(timer);
-        contents.off('did-stop-loading', done);
+        try {
+          contents.off('did-stop-loading', done);
+          contents.off('destroyed', done);
+        } catch (error) {
+          // A `webContents` that has been destroyed throws on `off`. There is
+          // nothing left to detach from, which is the outcome being asked for —
+          // and resolving anyway is the whole point of catching it here.
+          log.debug('Could not detach from a settling browser tab', error);
+        }
         resolve();
       };
       const timer = setTimeout(done, LOAD_TIMEOUT_MS);
       contents.once('did-stop-loading', done);
+      contents.once('destroyed', done);
     });
   }
 

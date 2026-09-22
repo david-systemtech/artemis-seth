@@ -78,6 +78,14 @@ class FakeQuery {
     return Promise.resolve({ still_queued: [] });
   }
   async setModel(): Promise<void> {}
+  /**
+   * Which account this is. Read only by a run that asked for Chrome, for the
+   * one sentence that names the browser's owner — see `claude.ts`. Answered
+   * here so that a test about such a run does not die on a missing method.
+   */
+  accountInfo(): Promise<{ email: string }> {
+    return Promise.resolve({ email: 'served@example.com' });
+  }
   async setPermissionMode(): Promise<void> {}
   async applyFlagSettings(): Promise<void> {}
   /** The control call `fetchClaudeCommands` makes: a fixed list, since the plugins it was given are what is under test. */
@@ -622,6 +630,139 @@ describe('the memory banks this machine carries', () => {
     // bank is among them, because there is no bank.
     const directories = (query.options()['additionalDirectories'] ?? []) as readonly string[];
     expect(directories.some((directory) => directory.startsWith(join(root, 'bank-')))).toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The browser beside the server                                              */
+/* -------------------------------------------------------------------------- */
+
+describe('the browser beside the server', () => {
+  /**
+   * A browser that hands out drivers and counts what became of them.
+   *
+   * Nothing here dials anything: what is under test is the composition root's
+   * half — which runs are given the tools, and whether a finished run's tab is
+   * given back. The driver's own behaviour is core's tests' business.
+   */
+  function fakeBrowser(): {
+    browser: Parameters<typeof createHeadlessHost>[2];
+    handed: number;
+    closed: number;
+  } {
+    const counters = { handed: 0, closed: 0 };
+    const driver = {
+      kind: 'server' as const,
+      abilities: { console: true, network: true, cookies: true, storage: true, evaluate: true },
+      open: () => Promise.resolve({ ok: true as const, value: { url: '', title: '' } }),
+      navigate: () => Promise.resolve({ ok: true as const, value: { url: '', title: '' } }),
+      read: () => Promise.resolve({ ok: true as const, value: { url: '', title: '', text: '', truncated: false } }),
+      screenshot: () => Promise.resolve({ ok: true as const, value: { mimeType: 'image/jpeg' as const, data: '' } }),
+      click: () => Promise.resolve({ ok: true as const, value: { url: '', title: '' } }),
+      type: () => Promise.resolve({ ok: true as const, value: { url: '', title: '' } }),
+      console: () => Promise.resolve({ ok: true as const, value: [] }),
+      network: () => Promise.resolve({ ok: true as const, value: [] }),
+      cookies: () => Promise.resolve({ ok: true as const, value: [] }),
+      storage: () => Promise.resolve({ ok: true as const, value: { origin: '', local: {}, session: {} } }),
+      evaluate: () => Promise.resolve({ ok: true as const, value: null }),
+      close: () => {
+        counters.closed += 1;
+        return Promise.resolve();
+      },
+    };
+    const browser = {
+      driver: () => {
+        counters.handed += 1;
+        return driver;
+      },
+      maintain: () => Promise.resolve(),
+      dispose: () => Promise.resolve(),
+      limits: {
+        maxContexts: 2,
+        idleMinutes: 10,
+        tabMemoryMb: 500,
+        idleExitMinutes: 5,
+        idleExit: true,
+        allowHosts: ['127.0.0.1'],
+      },
+    };
+    return {
+      browser: browser as Parameters<typeof createHeadlessHost>[2],
+      get handed() {
+        return counters.handed;
+      },
+      get closed() {
+        return counters.closed;
+      },
+    };
+  }
+
+  /** A host with a browser behind it, disposed with the test. */
+  function withBrowser(): { host: typeof host; fake: ReturnType<typeof fakeBrowser> } {
+    const fake = fakeBrowser();
+    const served = createHeadlessHost(dataDir, () => [connection()], fake.browser);
+    onTestFinished(async () => {
+      await served.dispose();
+    });
+    return { host: served, fake };
+  }
+
+  it('gives a served run the browser tools under the name every host uses', async () => {
+    const { host: served } = withBrowser();
+    const query = installQuery();
+    await served.runSource.startRun(started());
+    const servers = (query.options()['mcpServers'] ?? {}) as Record<string, unknown>;
+    // The name is the contract: a user's `mcp__artemisBrowser__browser_open`
+    // allow-list has to survive a conversation moving from the desktop to here.
+    expect(Object.keys(servers)).toContain('artemisBrowser');
+  });
+
+  it('gives nothing to a run that is already driving a Chrome', async () => {
+    // The provider's own bridge has registered a `browser_open` over the
+    // account owner's real browser. A second tool of the same name, over a
+    // browser with no logins, is one the model would sometimes pick.
+    const { host: served } = withBrowser();
+    const query = installQuery();
+    await served.runSource.startRun(started({ chromeBrowser: true }));
+    const servers = (query.options()['mcpServers'] ?? {}) as Record<string, unknown>;
+    expect(Object.keys(servers)).not.toContain('artemisBrowser');
+  });
+
+  it('gives nothing to a provider that cannot take this host’s tool servers', async () => {
+    const claude = host.providers.get('claude');
+    const { host: served } = withBrowser();
+    served.providers.register({ ...claude!, id: 'codex' as ProviderId }, { replace: true });
+    const query = installQuery();
+    await served.runSource.startRun(started({ providerId: 'codex' }));
+    const servers = (query.options()['mcpServers'] ?? {}) as Record<string, unknown>;
+    expect(Object.keys(servers)).not.toContain('artemisBrowser');
+  });
+
+  it('offers no browser tools at all where no browser is configured', async () => {
+    // An absent tool is the honest signal. A `browser_open` that exists in
+    // order to answer "no browser here" teaches the model the feature is
+    // broken rather than that it is not switched on.
+    const query = installQuery();
+    await host.runSource.startRun(started());
+    const servers = (query.options()['mcpServers'] ?? {}) as Record<string, unknown>;
+    expect(Object.keys(servers)).not.toContain('artemisBrowser');
+  });
+
+  it('closes the tab when the run ends, so a context is not held against the cap', async () => {
+    const { host: served, fake } = withBrowser();
+    const query = installQuery();
+    await served.runSource.startRun(started());
+    expect(fake.handed).toBe(1);
+    expect(fake.closed).toBe(0);
+
+    // The turn finishes the way every turn finishes.
+    query.fake().messages.push(INIT(cwd));
+    query.fake().messages.push(assistantText('looked at the page'));
+    query.fake().messages.push(RESULT);
+    query.fake().messages.close();
+    await vi.waitFor(() => {
+      expect(fake.closed).toBe(1);
+    });
   });
 });
 
