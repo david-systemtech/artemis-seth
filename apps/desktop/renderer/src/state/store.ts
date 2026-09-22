@@ -9423,13 +9423,34 @@ export async function rewindConversationTo(
    * {@link resolveRewindAnchor} — and the checks re-run after it, because the
    * pane can move to another conversation while the read is in flight.
    */
-  const anchor = await resolveRewindAnchor(pane, sessionId, itemId, item);
-  if (anchor === null) return;
+  const resolved = await resolveRewindAnchor(pane, sessionId, itemId, item);
+  if (resolved === null) return;
+  const { anchor, first } = resolved;
 
   const after = paneState(pane);
   if (isLive(after) && !fork) return;
   if ((after.resumeSessionId ?? after.run?.sessionId ?? null) !== sessionId) return;
   if (pane.transcript.getItem(itemId)?.kind !== 'user') return;
+
+  /*
+   * Back to before the first message is back to before the conversation.
+   *
+   * There is no entry in front of the opening prompt for a truncating resume
+   * to re-enter at, so the provider refuses it — and it would be the wrong
+   * answer even if it did not: a conversation wound back to nothing has no
+   * history for the next run to be bound to, and binding it anyway pins the
+   * column to the account and session the user has just thrown away. So this
+   * is a new session with the message back in the composer, fork or not; a
+   * copy of nothing and a cut to nothing are the same blank. That is also
+   * what frees the account switcher, which a column still naming a session
+   * would route through a hand-off. A live run is set aside intact by
+   * `newSession`, which is what a fork of one asks for.
+   */
+  if (first) {
+    const target = newSession(pane, { adoptRecommendedProfile: false });
+    setPaneState(target, { draft: item.text });
+    return;
+  }
 
   /*
    * A branch off something that is still working goes in a column of its own,
@@ -9599,12 +9620,24 @@ async function resolveRewindAnchor(
   sessionId: SessionId,
   itemId: string,
   item: { readonly messageId?: string; readonly text: string },
-): Promise<string | null> {
-  // `:prompt:` marks the registry's retention ids — see `#recordPrompt` — and
-  // is unmintable by the provider, whose uuids have no colons.
-  if (item.messageId !== undefined && !item.messageId.includes(':prompt:')) {
-    return item.messageId;
+): Promise<{ readonly anchor: string; readonly first: boolean } | null> {
+  const rows = pane.transcript.getListSnapshot();
+  const userRows: { id: string; text: string }[] = [];
+  for (const rowId of rows) {
+    const row = pane.transcript.getItem(rowId);
+    if (row?.kind === 'user') userRows.push({ id: row.id, text: row.text });
   }
+  const position = userRows.findIndex((row) => row.id === itemId);
+  if (position < 0) return null;
+
+  // `:prompt:` marks the registry's retention ids — see `#recordPrompt` — and
+  // is unmintable by the provider, whose uuids have no colons. A row with a
+  // user message above it on screen is not the first, so its own id is the
+  // whole answer; only the top row has to ask the store whether anything came
+  // before it that this screen is not showing.
+  const known =
+    item.messageId !== undefined && !item.messageId.includes(':prompt:') ? item.messageId : undefined;
+  if (known !== undefined && position > 0) return { anchor: known, first: false };
 
   const { bridge } = resolveBridge();
   if (!bridge) return null;
@@ -9626,23 +9659,23 @@ async function resolveRewindAnchor(
     return null;
   }
 
-  const rows = pane.transcript.getListSnapshot();
-  const userRows: { id: string; text: string }[] = [];
-  for (const rowId of rows) {
-    const row = pane.transcript.getItem(rowId);
-    if (row?.kind === 'user') userRows.push({ id: row.id, text: row.text });
-  }
-  const position = userRows.findIndex((row) => row.id === itemId);
-  if (position < 0) return null;
-  const fromEnd = userRows.length - position;
-
   const stored: { messageId: string; text: string }[] = [];
   for (const event of res.value.events) {
     if (event.type === 'text.complete' && event.role === 'user' && event.messageId !== undefined) {
       stored.push({ messageId: event.messageId, text: event.text });
     }
   }
-  const target = stored[stored.length - fromEnd];
+  // First only when the read holds the whole conversation: `hasMore` means the
+  // store kept older turns back, and the top of the page is not the top.
+  const firstOf = (at: number): boolean => at === 0 && !res.value.hasMore;
+
+  if (known !== undefined) {
+    return { anchor: known, first: firstOf(stored.findIndex((one) => one.messageId === known)) };
+  }
+
+  const fromEnd = userRows.length - position;
+  const at = stored.length - fromEnd;
+  const target = stored[at];
   if (target === undefined) {
     pushBanner(
       'warn',
@@ -9659,7 +9692,7 @@ async function resolveRewindAnchor(
     );
     return null;
   }
-  return target.messageId;
+  return { anchor: target.messageId, first: firstOf(at) };
 }
 
 export function setScreen(screen: Screen): void {
