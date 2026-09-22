@@ -1052,17 +1052,41 @@ describe('going back to an earlier prompt', () => {
   });
 
   it('asks for a branch when the target is not the most recent turn', async () => {
+    const { driver, c } = rewinding();
+    const old = 'old-run' as RunId;
+    const third = [
+      ...storedTurns(),
+      { type: 'text.complete', runId: old, seq: 4, ts: 14, messageId: 'u-3', role: 'user', text: 'and bigger', replay: true },
+      { type: 'text.complete', runId: old, seq: 5, ts: 15, messageId: 'm-3', role: 'assistant', text: 'Bigger.', replay: true },
+    ] as AgentEvent[];
+    expect(c.loadHistory('s-old' as never, third)).toEqual({ ok: true });
+
+    expect(c.armRewind('u-2')).toEqual({ ok: true });
+    expect(said(c)).toEqual(['add a status line', 'Done.']);
+    expect(c.getState().rewindArmed).toEqual({ messageId: 'u-2', fork: true });
+
+    await c.send('make it green instead');
+    expect(driver.start.mock.calls[0]?.[0]).toMatchObject({
+      resumeSessionId: 's-old',
+      rewindToMessageId: 'u-2',
+      forkSession: true,
+    });
+  });
+
+  it('starts a new session when wound back to the first prompt', async () => {
+    // Nothing comes before the opening prompt, so there is no point for a
+    // truncating resume to re-enter at, and the Claude adapter refuses one
+    // aimed there. Back to before the conversation is a new conversation.
     const { driver, c } = resumed();
     expect(c.armRewind('u-1')).toEqual({ ok: true });
     expect(said(c)).toEqual([]);
-    expect(c.getState().rewindArmed).toEqual({ messageId: 'u-1', fork: true });
 
     await c.send('add a status line, but smaller');
-    expect(driver.start.mock.calls[0]?.[0]).toMatchObject({
-      resumeSessionId: 's-old',
-      rewindToMessageId: 'u-1',
-      forkSession: true,
-    });
+    const input = driver.start.mock.calls[0]?.[0];
+    expect(input?.prompt).toBe('add a status line, but smaller');
+    expect(input?.resumeSessionId).toBeUndefined();
+    expect(input?.rewindToMessageId).toBeUndefined();
+    expect(input?.forkSession).toBeUndefined();
   });
 
   it('refuses a prompt that is not in the conversation', () => {

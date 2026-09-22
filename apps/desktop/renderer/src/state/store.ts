@@ -5040,6 +5040,122 @@ export function closePane(paneId: PaneId): void {
   savePrefs();
 }
 
+/**
+ * Where on another pane a dragged pane was dropped.
+ *
+ * The centre trades places with it. An edge takes the pane out of wherever it
+ * was and puts it on that side: `left` and `right` join the target's row, `up`
+ * and `down` add a full-width row above or below the target's — the same
+ * asymmetry {@link splitPane} has, because a row is the only thing the grid
+ * can put a pane "under".
+ */
+export type PaneDropZone = 'centre' | 'left' | 'right' | 'up' | 'down';
+
+/**
+ * The grid after a drop, or `null` if the drop would change nothing.
+ *
+ * Pure, so the drop targets can ask it of every zone while the drag is in
+ * flight and offer only the ones that would do something — the rule the
+ * session drop keeps for edges the grid has no room for. `mint` makes the row
+ * an `up` or `down` drop adds: the store's `createRow` for a real move, and a
+ * throwaway for a question, so asking does not spend row ids.
+ *
+ * "Nothing" is judged by pane ids alone. Dropping the lone pane of a row on the
+ * top edge of the row beneath it takes the row out and puts a new one back in
+ * the same place; that is the old picture, and writing it would only make the
+ * panel library lay it out again under a new row id.
+ */
+function arrangeMove(
+  grid: readonly PaneRow[],
+  paneId: PaneId,
+  targetId: PaneId,
+  zone: PaneDropZone,
+  mint: (panes: readonly Pane[]) => PaneRow,
+): PaneRow[] | null {
+  if (paneId === targetId) return null;
+  const from = locate(grid, paneId);
+  const to = locate(grid, targetId);
+  if (!from || !to) return null;
+
+  const moving = (grid[from.row] as PaneRow).panes[from.column] as Pane;
+  const target = (grid[to.row] as PaneRow).panes[to.column] as Pane;
+
+  let next: PaneRow[];
+  if (zone === 'centre') {
+    next = grid.map((row) =>
+      row.panes.some((p) => p.id === paneId || p.id === targetId)
+        ? {
+            ...row,
+            panes: row.panes.map((p) =>
+              p.id === paneId ? target : p.id === targetId ? moving : p,
+            ),
+          }
+        : row,
+    );
+  } else {
+    next = [];
+    for (const row of grid) {
+      const panes = row.panes.filter((p) => p.id !== paneId);
+      if (panes.length === 0) continue;
+      next.push(panes.length === row.panes.length ? row : { ...row, panes });
+    }
+    // Located again, because taking the pane out can shift the target left
+    // within its row or up a row.
+    const at = locate(next, targetId) as { readonly row: number; readonly column: number };
+    if (zone === 'left' || zone === 'right') {
+      const row = next[at.row] as PaneRow;
+      const panes = [...row.panes];
+      panes.splice(zone === 'right' ? at.column + 1 : at.column, 0, moving);
+      next[at.row] = { ...row, panes };
+    } else {
+      next.splice(zone === 'down' ? at.row + 1 : at.row, 0, mint([moving]));
+    }
+  }
+
+  const shape = (rows: readonly PaneRow[]): string =>
+    rows.map((row) => row.panes.map((p) => p.id).join(' ')).join('|');
+  return shape(next) === shape(grid) ? null : next;
+}
+
+/** Would dropping this pane there change the grid? Asked by the drop targets. */
+export function canMovePane(
+  paneId: PaneId,
+  targetId: PaneId,
+  zone: PaneDropZone,
+  state: AppState = useApp.getState(),
+): boolean {
+  return arrangeMove(state.grid, paneId, targetId, zone, (panes) => ({ id: '', panes })) !== null;
+}
+
+/**
+ * Move a pane to another place in the grid, by dropping it on another pane.
+ *
+ * The action behind dragging a caption. Nothing is opened, closed or handed
+ * over — the same conversations stay on screen, in the same `Pane` objects, so
+ * a run streaming into the moved pane carries on streaming into it — which is
+ * why the pane limit does not come into it.
+ *
+ * A row the pane leaves empty goes, as it does in {@link closePane}. Rows that
+ * survive keep their ids, so the panel library keeps their dividers where the
+ * user put them. The moved pane takes the focus: it is the one the user just
+ * had in hand.
+ *
+ * Returns whether the grid changed; see {@link arrangeMove} for what does not.
+ *
+ * Persisted the way {@link splitPane} and {@link closePane} persist theirs:
+ * the grid itself is window state, and `savePrefs` records what outlives it —
+ * the focused conversation's seeds, which the move changes, and the divider
+ * shares, which are keyed by position (`AppState.paneLayout`) and so need no
+ * rewriting when a different pane comes to occupy a place.
+ */
+export function movePane(paneId: PaneId, targetId: PaneId, zone: PaneDropZone): boolean {
+  const grid = arrangeMove(useApp.getState().grid, paneId, targetId, zone, createRow);
+  if (grid === null) return false;
+  useApp.setState({ grid, focusedPaneId: paneId });
+  savePrefs();
+  return true;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Selectors                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -9423,13 +9539,34 @@ export async function rewindConversationTo(
    * {@link resolveRewindAnchor} — and the checks re-run after it, because the
    * pane can move to another conversation while the read is in flight.
    */
-  const anchor = await resolveRewindAnchor(pane, sessionId, itemId, item);
-  if (anchor === null) return;
+  const resolved = await resolveRewindAnchor(pane, sessionId, itemId, item);
+  if (resolved === null) return;
+  const { anchor, first } = resolved;
 
   const after = paneState(pane);
   if (isLive(after) && !fork) return;
   if ((after.resumeSessionId ?? after.run?.sessionId ?? null) !== sessionId) return;
   if (pane.transcript.getItem(itemId)?.kind !== 'user') return;
+
+  /*
+   * Back to before the first message is back to before the conversation.
+   *
+   * There is no entry in front of the opening prompt for a truncating resume
+   * to re-enter at, so the provider refuses it — and it would be the wrong
+   * answer even if it did not: a conversation wound back to nothing has no
+   * history for the next run to be bound to, and binding it anyway pins the
+   * column to the account and session the user has just thrown away. So this
+   * is a new session with the message back in the composer, fork or not; a
+   * copy of nothing and a cut to nothing are the same blank. That is also
+   * what frees the account switcher, which a column still naming a session
+   * would route through a hand-off. A live run is set aside intact by
+   * `newSession`, which is what a fork of one asks for.
+   */
+  if (first) {
+    const target = newSession(pane, { adoptRecommendedProfile: false });
+    setPaneState(target, { draft: item.text });
+    return;
+  }
 
   /*
    * A branch off something that is still working goes in a column of its own,
@@ -9599,12 +9736,24 @@ async function resolveRewindAnchor(
   sessionId: SessionId,
   itemId: string,
   item: { readonly messageId?: string; readonly text: string },
-): Promise<string | null> {
-  // `:prompt:` marks the registry's retention ids — see `#recordPrompt` — and
-  // is unmintable by the provider, whose uuids have no colons.
-  if (item.messageId !== undefined && !item.messageId.includes(':prompt:')) {
-    return item.messageId;
+): Promise<{ readonly anchor: string; readonly first: boolean } | null> {
+  const rows = pane.transcript.getListSnapshot();
+  const userRows: { id: string; text: string }[] = [];
+  for (const rowId of rows) {
+    const row = pane.transcript.getItem(rowId);
+    if (row?.kind === 'user') userRows.push({ id: row.id, text: row.text });
   }
+  const position = userRows.findIndex((row) => row.id === itemId);
+  if (position < 0) return null;
+
+  // `:prompt:` marks the registry's retention ids — see `#recordPrompt` — and
+  // is unmintable by the provider, whose uuids have no colons. A row with a
+  // user message above it on screen is not the first, so its own id is the
+  // whole answer; only the top row has to ask the store whether anything came
+  // before it that this screen is not showing.
+  const known =
+    item.messageId !== undefined && !item.messageId.includes(':prompt:') ? item.messageId : undefined;
+  if (known !== undefined && position > 0) return { anchor: known, first: false };
 
   const { bridge } = resolveBridge();
   if (!bridge) return null;
@@ -9626,23 +9775,23 @@ async function resolveRewindAnchor(
     return null;
   }
 
-  const rows = pane.transcript.getListSnapshot();
-  const userRows: { id: string; text: string }[] = [];
-  for (const rowId of rows) {
-    const row = pane.transcript.getItem(rowId);
-    if (row?.kind === 'user') userRows.push({ id: row.id, text: row.text });
-  }
-  const position = userRows.findIndex((row) => row.id === itemId);
-  if (position < 0) return null;
-  const fromEnd = userRows.length - position;
-
   const stored: { messageId: string; text: string }[] = [];
   for (const event of res.value.events) {
     if (event.type === 'text.complete' && event.role === 'user' && event.messageId !== undefined) {
       stored.push({ messageId: event.messageId, text: event.text });
     }
   }
-  const target = stored[stored.length - fromEnd];
+  // First only when the read holds the whole conversation: `hasMore` means the
+  // store kept older turns back, and the top of the page is not the top.
+  const firstOf = (at: number): boolean => at === 0 && !res.value.hasMore;
+
+  if (known !== undefined) {
+    return { anchor: known, first: firstOf(stored.findIndex((one) => one.messageId === known)) };
+  }
+
+  const fromEnd = userRows.length - position;
+  const at = stored.length - fromEnd;
+  const target = stored[at];
   if (target === undefined) {
     pushBanner(
       'warn',
@@ -9659,7 +9808,7 @@ async function resolveRewindAnchor(
     );
     return null;
   }
-  return target.messageId;
+  return { anchor: target.messageId, first: firstOf(at) };
 }
 
 export function setScreen(screen: Screen): void {
