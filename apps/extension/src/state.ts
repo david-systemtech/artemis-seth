@@ -24,6 +24,15 @@ export const LOCAL_KEYS = {
   port: 'artemis.port',
   /** `{ browserId, secret }` from pairing. The one secret this extension holds. */
   credential: 'artemis.credential',
+  /**
+   * What the user called this browser when they paired it.
+   *
+   * Stored rather than derived, because it is a label a person typed and not a
+   * fact about the machine. `naming.ts` can only say "Chrome on Windows",
+   * which is what two profiles on one computer both say — and telling them
+   * apart is the whole reason Artemis asks for a name.
+   */
+  browserName: 'artemis.browserName',
   /** The last policy Artemis sent, so a verb can be refused before it connects. */
   policy: 'artemis.policy',
   /** Which conversation has which tab, and the Artemis group. */
@@ -65,6 +74,15 @@ export interface ExtensionState {
   /** Why, when there is a why: a refusal from Artemis, or a bad port. */
   readonly detail?: string;
   readonly port: number;
+  /**
+   * What this browser calls itself: the label the user gave it, or — before
+   * they have given one — what `naming.ts` can work out on its own.
+   *
+   * One field for both because both are the same thing to every reader of it:
+   * the name this browser goes by. The options page shows it, and offers it as
+   * the pairing field's starting text, which is where the machine-derived
+   * version earns its keep.
+   */
   readonly browserName: string;
   readonly extensionVersion: string;
   /** True once pairing has produced a credential, whatever the socket is doing. */
@@ -77,7 +95,7 @@ export interface ExtensionState {
 /** Options page or popup → worker. */
 export type UiRequest =
   | { readonly type: 'state' }
-  | { readonly type: 'pair'; readonly code: string }
+  | { readonly type: 'pair'; readonly code: string; readonly browserName: string }
   | { readonly type: 'unpair' }
   | { readonly type: 'setPort'; readonly port: number }
   | { readonly type: 'stop' }
@@ -104,10 +122,24 @@ export function asUiRequest(message: unknown): UiRequest | null {
     case 'resume':
     case 'audit':
       return { type: value['type'] } as UiRequest;
-    case 'pair':
-      return typeof value['code'] === 'string' && value['code'].length > 0 && value['code'].length <= 128
-        ? { type: 'pair', code: value['code'] }
-        : null;
+    case 'pair': {
+      /*
+       * Both fields required, and the name is the one worth saying why about.
+       * A pairing with no name produces a browser called "Chrome on Windows"
+       * in Artemis, which is exactly the row a second profile would be
+       * indistinguishable from — so the page makes the field required and this
+       * refuses a message that arrived without one rather than quietly pairing
+       * an unnamed browser. Bounded here at the length Artemis stores; the
+       * control characters are stripped there, once, by `nameOf`.
+       */
+      const code = value['code'];
+      const browserName = value['browserName'];
+      if (typeof code !== 'string' || code.length === 0 || code.length > 128) return null;
+      if (typeof browserName !== 'string') return null;
+      const named = browserName.trim();
+      if (named.length === 0 || named.length > 80) return null;
+      return { type: 'pair', code, browserName: named };
+    }
     case 'setPort':
       return typeof value['port'] === 'number' ? { type: 'setPort', port: value['port'] } : null;
     default:

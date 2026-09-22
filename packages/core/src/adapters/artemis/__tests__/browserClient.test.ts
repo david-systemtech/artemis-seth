@@ -176,7 +176,7 @@ describe('one relayed call becomes one method on the driver', () => {
       { verb: 'evaluate', expression: '1' },
       { verb: 'close' },
     ] as const) {
-      await performBrowserCall(driver, call(verb as never));
+      await performBrowserCall(() => driver, call(verb as never));
     }
 
     expect(asked).toEqual([
@@ -200,7 +200,7 @@ describe('one relayed call becomes one method on the driver', () => {
     // report to. Across a wire there is a deadline, so "it is done" is sent.
     const { driver } = fakeDriver();
 
-    expect(await performBrowserCall(driver, call({ verb: 'close' } as never))).toEqual({
+    expect(await performBrowserCall(() => driver, call({ verb: 'close' } as never))).toEqual({
       ok: true,
       value: null,
     });

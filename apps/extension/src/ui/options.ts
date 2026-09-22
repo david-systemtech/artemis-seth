@@ -25,6 +25,8 @@ const browserName = el<HTMLParagraphElement>('browser-name');
 const pairSection = el<HTMLElement>('pair-section');
 const pairedSection = el<HTMLElement>('paired-section');
 const codeInput = el<HTMLInputElement>('code');
+const labelInput = el<HTMLInputElement>('browser-label');
+const pairProblem = el<HTMLParagraphElement>('pair-problem');
 const portInput = el<HTMLInputElement>('port');
 const policySummary = el<HTMLParagraphElement>('policy-summary');
 const auditBody = el<HTMLTableSectionElement>('audit');
@@ -37,6 +39,22 @@ async function ask(request: unknown): Promise<UiResponse> {
 let portEdited = false;
 portInput.addEventListener('input', () => {
   portEdited = true;
+});
+
+/**
+ * Whether the name field holds something the user typed and has not paired
+ * with yet.
+ *
+ * The same rule the port field follows, and it matters more here. The worker
+ * announces a change on every reconnect attempt — about once a second while
+ * Artemis is not running, which is exactly when somebody is on this page
+ * getting ready to pair — and re-filling the field then would take the name
+ * out from under them between typing it and pressing Pair.
+ */
+let labelEdited = false;
+labelInput.addEventListener('input', () => {
+  labelEdited = true;
+  pairProblem.textContent = '';
 });
 
 function render(state: ExtensionState): void {
@@ -54,6 +72,14 @@ function render(state: ExtensionState): void {
   // correcting the port. Overwriting the field then takes the number out from
   // under them between typing it and pressing Save.
   if (!portEdited) portInput.value = String(state.port);
+  /*
+   * The name this browser goes by, as the field's starting text: the label
+   * from a previous pairing, or what the browser can work out about itself.
+   * The second is the useful one — "Chrome on Windows" is a reasonable draft
+   * for the first browser somebody pairs, and a terrible name for the second,
+   * which is why it is a default rather than the answer.
+   */
+  if (!labelEdited) labelInput.value = state.browserName;
 
   if (state.policy === null) {
     policySummary.className = 'empty';
@@ -113,9 +139,20 @@ async function refreshAudit(): Promise<void> {
 
 el<HTMLButtonElement>('pair').addEventListener('click', () => {
   const code = codeInput.value.trim();
+  const browserName = labelInput.value.trim();
   if (code.length === 0) return;
+  // Said rather than silently ignored. An empty name is the one thing on this
+  // form a person can leave out without noticing, and the cost of pairing
+  // without one is a browser they cannot tell from the next one they pair.
+  if (browserName.length === 0) {
+    pairProblem.textContent = 'Give this browser a name first, so you can tell it apart in Artemis.';
+    labelInput.focus();
+    return;
+  }
+  pairProblem.textContent = '';
   codeInput.value = '';
-  void ask({ type: 'pair', code }).then(refresh);
+  labelEdited = false;
+  void ask({ type: 'pair', code, browserName }).then(refresh);
 });
 
 el<HTMLButtonElement>('unpair').addEventListener('click', () => {

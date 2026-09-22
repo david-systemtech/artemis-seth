@@ -91,11 +91,10 @@ import {
 } from '../state/modelFacts';
 import { hiddenModelCount, navigatorColumns, navigatorFooter, navigatorModelRows } from '../state/runNavigator';
 import {
+  browserChoiceOf,
   effectiveBrowserSummary,
   paneBrowserChoice,
   paneBrowserOptions,
-  paneModeFor,
-  type PaneBrowserChoice,
 } from '../state/browserChoice';
 import {
   groupServedAccounts,
@@ -1082,6 +1081,12 @@ function EffortColumn(): ReactElement | null {
  * told them where to go. Pairing itself stays in Settings → Browser, which is
  * a thing you do once.
  *
+ * Under "My Chrome" there is a row per paired browser — "My Chrome: Work" —
+ * because two Chrome profiles carry two sets of logins and a conversation
+ * about work is not the same question as one about a personal project. The
+ * plain row above them still means whichever of them is open, and is what
+ * somebody with one browser sees and never thinks about.
+ *
  * Note what the trigger shows: the *effective* browser, with `(default)` when
  * this conversation has not chosen. Two panes both on the built-in browser can
  * be in different states — one following the window, one having picked it —
@@ -1095,15 +1100,24 @@ export function BrowserRow(): ReactElement {
   const pane = usePaneRef();
   const providerId = usePane((s) => s.activeProviderId);
   const paneMode = usePane((s) => s.browserMode);
+  const paneBrowserId = usePane((s) => s.browserExtensionId);
   const windowMode = useApp((s) => s.browserMode);
+  const windowBrowserId = useApp((s) => s.browserExtensionId);
   const reach = useApp((s) => s.extensionReach);
   // The list, not a derived object: a selector that built one would return a
   // new value on every store notification, which `useApp` compares by identity.
   const pairedBrowsers = useApp((s) => s.extensionBridge?.browsers);
 
   const context = browserModeContext(pairedBrowsers, providerId);
-  const options = paneBrowserOptions({ windowMode, reach, context });
-  const summary = effectiveBrowserSummary({ windowMode, reach, paneMode, context });
+  const options = paneBrowserOptions({ windowMode, windowBrowserId, reach, context });
+  const summary = effectiveBrowserSummary({
+    windowMode,
+    windowBrowserId,
+    reach,
+    paneMode,
+    paneBrowserId,
+    context,
+  });
 
   return (
     <DropdownMenuSub>
@@ -1129,8 +1143,11 @@ export function BrowserRow(): ReactElement {
           Which browser should this conversation use?
         </DropdownMenuLabel>
         <DropdownMenuRadioGroup
-          value={paneBrowserChoice(paneMode)}
-          onValueChange={(value) => setPaneBrowserMode(paneModeFor(value as PaneBrowserChoice), pane)}
+          value={paneBrowserChoice(paneMode, paneBrowserId)}
+          onValueChange={(value) => {
+            const chosen = browserChoiceOf(value);
+            setPaneBrowserMode(chosen.mode, chosen.browserId, pane);
+          }}
         >
           {options.map((option) => (
             <DropdownMenuRadioItem

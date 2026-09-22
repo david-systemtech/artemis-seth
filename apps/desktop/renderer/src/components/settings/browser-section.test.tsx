@@ -29,7 +29,7 @@
 
 import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { DEFAULT_BLOCKED_SITES, type ExtensionBridgeState } from '@rx-artemis/protocol';
 
 import { BrowserSection } from '@/components/settings/BrowserSection';
@@ -71,6 +71,7 @@ const CONNECTED: ExtensionBridgeState = {
 
 let paired: { offer: boolean }[] = [];
 let unpaired: { browserId: string }[] = [];
+let renamed: { browserId: string; browserName: string }[] = [];
 let policies: unknown[] = [];
 let savedBundle = 0;
 
@@ -83,6 +84,10 @@ let savedBundle = 0;
     },
     unpair: async (request: { browserId: string }) => {
       unpaired.push(request);
+      return ok({ state: CONNECTED });
+    },
+    rename: async (request: { browserId: string; browserName: string }) => {
+      renamed.push(request);
       return ok({ state: CONNECTED });
     },
     policy: async (request: unknown) => {
@@ -107,6 +112,27 @@ async function renderPane(state: ExtensionBridgeState | null = CONNECTED): Promi
   await act(async () => {});
 }
 
+/** The name field of one paired browser, found by the name it currently holds. */
+function nameField(browserName: string): HTMLInputElement {
+  return screen.getByLabelText(`Name for ${browserName}`) as HTMLInputElement;
+}
+
+/** Type a new name into a browser's field and leave it, which is what saves. */
+async function rename(browserName: string, next: string): Promise<void> {
+  const field = nameField(browserName);
+  await act(async () => {
+    fireEvent.change(field, { target: { value: next } });
+  });
+  // `fireEvent.blur` and not a hand-built `blur` event: React listens for
+  // `focusout` at the root, so an event dispatched straight at the element
+  // never reaches `onBlur` and the commit would look broken here and work in
+  // the app.
+  await act(async () => {
+    fireEvent.blur(field);
+  });
+  await act(async () => {});
+}
+
 async function click(name: string | RegExp): Promise<void> {
   await act(async () => {
     screen.getByRole('button', { name }).click();
@@ -117,6 +143,7 @@ async function click(name: string | RegExp): Promise<void> {
 beforeEach(() => {
   paired = [];
   unpaired = [];
+  renamed = [];
   policies = [];
   savedBundle = 0;
 });
@@ -172,8 +199,51 @@ describe('the paired browsers', () => {
   it('lists a browser by name, with whether it is connected', async () => {
     await renderPane();
 
-    expect(screen.getByText('Chrome on Windows')).toBeTruthy();
+    // The name is a field rather than a label: with two Chrome profiles paired
+    // it is the one thing on the row somebody actually has to change.
+    expect(nameField('Chrome on Windows').value).toBe('Chrome on Windows');
     expect(screen.getByText(/Connected\./u)).toBeTruthy();
+  });
+
+  it('sends a new name to main when the field is left', async () => {
+    await renderPane();
+
+    await rename('Chrome on Windows', 'Work');
+
+    expect(renamed).toEqual([{ browserId: 'b1', browserName: 'Work' }]);
+  });
+
+  it('does not save a name somebody cleared, and puts the old one back', async () => {
+    // An unnamed browser is not a thing the pickers can draw, and an empty
+    // field is far more often a half-finished edit than an intention.
+    await renderPane();
+
+    await rename('Chrome on Windows', '   ');
+
+    expect(renamed).toEqual([]);
+    expect(nameField('Chrome on Windows').value).toBe('Chrome on Windows');
+  });
+
+  it('says nothing to main when the name comes back unchanged', async () => {
+    // Every save is a write to disk and a redraw of every picker in the app;
+    // clicking into a field and out of it is not a rename.
+    await renderPane();
+
+    await rename('Chrome on Windows', 'Chrome on Windows');
+
+    expect(renamed).toEqual([]);
+  });
+
+  it('tells a user with two browsers that a conversation can be set to one', async () => {
+    await renderPane({
+      ...CONNECTED,
+      browsers: [
+        { ...CONNECTED.browsers[0]!, browserName: 'Work' },
+        { browserId: 'b2', browserName: 'Personal', pairedAt: 1, connected: false },
+      ],
+    });
+
+    expect(screen.getByText(/set to one of these by name/u)).toBeTruthy();
   });
 
   it('says a browser is not connected, and what to do about it', async () => {

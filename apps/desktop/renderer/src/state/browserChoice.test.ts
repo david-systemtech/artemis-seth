@@ -11,22 +11,54 @@
 
 import { describe, expect, it } from 'vitest';
 
+import type { PairedBrowserInfo, ProviderId } from '@rx-artemis/protocol';
+
 import {
+  browserChoiceOf,
+  browserChoiceValue,
   browserFlagsFor,
   browserModeFromPrefs,
   browserModeUnavailable,
   effectiveBrowserMode,
+  effectiveBrowserSelection,
   effectiveBrowserSummary,
   FOLLOW_WINDOW,
+  pairedBrowserUnavailable,
   paneBrowserChoice,
   paneBrowserOptions,
-  paneModeFor,
   type BrowserModeContext,
 } from './browserChoice';
 
-/** A machine with a paired browser that is awake, unless a test says otherwise. */
-function context(over: Partial<BrowserModeContext> = {}): BrowserModeContext {
-  return { providerId: 'claude', anyPaired: true, anyConnected: true, ...over };
+/** One paired browser, named and awake unless a test says otherwise. */
+function browser(
+  browserId: string,
+  browserName: string,
+  connected = true,
+): PairedBrowserInfo {
+  return { browserId, browserName, pairedAt: 0, connected };
+}
+
+/**
+ * A machine with a paired browser that is awake, unless a test says otherwise.
+ *
+ * `anyPaired` and `anyConnected` are still how most of these tests describe a
+ * machine, because most of them are about the four modes and not about which
+ * browser — so the helper turns them into the one-browser list they always
+ * meant. A test that cares about several passes `browsers` instead.
+ */
+function context(
+  over: {
+    readonly providerId?: ProviderId | null;
+    readonly anyPaired?: boolean;
+    readonly anyConnected?: boolean;
+    readonly browsers?: readonly PairedBrowserInfo[];
+  } = {},
+): BrowserModeContext {
+  const providerId = over.providerId ?? 'claude';
+  if (over.browsers !== undefined) return { providerId, browsers: over.browsers };
+  const paired = over.anyPaired ?? true;
+  const connected = over.anyConnected ?? true;
+  return { providerId, browsers: paired ? [browser('b-work', 'Work', connected)] : [] };
 }
 
 describe('the old switches become the new choice', () => {
@@ -268,6 +300,9 @@ describe('a conversation’s own browser picker', () => {
       FOLLOW_WINDOW,
       'embedded',
       'extension',
+      // The one paired browser, by id, directly under the row that means
+      // "whichever of them is open".
+      'extension:b-work',
       'chrome',
       'external',
     ]);
@@ -336,8 +371,8 @@ describe('what a conversation’s picker is set to', () => {
     // The difference that makes the follow row a row rather than a fifth
     // browser: a conversation following the default moves when the window
     // changes, and one that picked the same browser does not.
-    expect(paneModeFor(FOLLOW_WINDOW)).toBeNull();
-    expect(paneModeFor('embedded')).toBe('embedded');
+    expect(browserChoiceOf(FOLLOW_WINDOW)).toEqual({ mode: null, browserId: null });
+    expect(browserChoiceOf('embedded')).toEqual({ mode: 'embedded', browserId: null });
   });
 });
 

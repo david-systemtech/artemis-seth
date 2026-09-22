@@ -96,11 +96,9 @@ import {
 } from '../../state/store';
 import { usePane } from '../../state/paneContext';
 import {
-  BROWSER_MODES,
-  BROWSER_MODE_LABELS,
-  BROWSER_MODE_NOTES,
-  browserModeUnavailable,
-  type BrowserMode,
+  browserChoiceOf,
+  browserChoiceValue,
+  browserPickerOptions,
   type ExtensionReach,
 } from '../../state/browserChoice';
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
@@ -163,6 +161,7 @@ export function PermissionsSection(): ReactElement {
   const providerLabel = usePane(activeProviderLabel);
   const providerId = usePane((s) => s.activeProviderId);
   const browserMode = useApp((s) => s.browserMode);
+  const browserExtensionId = useApp((s) => s.browserExtensionId);
   const reach = useApp((s) => s.extensionReach);
   /*
    * Selected as the array, then folded here.
@@ -177,22 +176,24 @@ export function PermissionsSection(): ReactElement {
   const browserContext = browserModeContext(pairedBrowsers, providerId);
 
   /**
-   * The four options, each carrying its own reason for being unavailable.
+   * The four modes plus a row per paired browser, each carrying its own reason
+   * for being unavailable.
    *
-   * Built here rather than held as a constant because two of the four depend
-   * on the machine right now — which provider this conversation runs as, and
-   * whether a paired browser is awake — and a picker that offered an option
-   * the run would then decline would be a control that changed nothing.
+   * Built here rather than held as a constant because most of it depends on
+   * the machine right now — which provider this conversation runs as, which
+   * browsers are paired, and which of those are awake — and a picker that
+   * offered an option the run would then decline would be a control that
+   * changed nothing. The rows themselves come from `browserPickerOptions`, so
+   * this list and the one in a conversation's own menu cannot drift.
    */
-  const browserChoices: readonly Choice<BrowserMode>[] = BROWSER_MODES.map((id) => {
-    const unavailable = browserModeUnavailable(id, browserContext);
-    return {
-      id,
-      label: BROWSER_MODE_LABELS[id],
-      note: BROWSER_MODE_NOTES[id],
-      ...(unavailable === null ? {} : { disabled: true, reason: unavailable }),
-    };
-  });
+  const browserChoices: readonly Choice<string>[] = browserPickerOptions(browserContext).map(
+    (option) => ({
+      id: option.id,
+      label: option.label,
+      note: option.note,
+      ...(option.disabled === true ? { disabled: true, reason: option.note } : {}),
+    }),
+  );
 
   /**
    * A stored mode the current provider does not accept.
@@ -257,9 +258,16 @@ export function PermissionsSection(): ReactElement {
       <SettingsGroup label="Browser">
         <ChoiceList
           label="Which browser the agent uses"
-          value={browserMode}
+          value={browserChoiceValue(browserMode, browserExtensionId)}
           choices={browserChoices}
-          onChange={setBrowserMode}
+          onChange={(value) => {
+            // `null` cannot come back here: the window's picker has no "follow
+            // the default" row, so every row it draws names a mode. The
+            // fallback is what keeps that a compile-time fact rather than a
+            // hope about the rows.
+            const chosen = browserChoiceOf(value);
+            setBrowserMode(chosen.mode ?? 'embedded', chosen.browserId);
+          }}
         />
         <p className="px-3 py-2.5 text-2xs leading-relaxed text-ink-faint">
           Applies to the next run. A run already in flight keeps the browser it started with.

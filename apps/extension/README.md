@@ -120,6 +120,15 @@ And what is **not** asked for, each of which was measured rather than assumed:
 - **No `cookies` permission.** It grants cookies for every site at once.
   `Network.getCookies` on the attached tab gives the cookies for the page the
   agent is on, which is the only set it should ever see.
+- **No `identity`.** Several Chrome profiles can be paired with one Artemis,
+  and each is named by hand at pairing — "Work", "Personal" — because Chrome
+  offers no API for a profile's own display name. `identity` would allow
+  `chrome.identity.getProfileUserInfo`, whose email could be offered as the
+  field's default text instead of "Chrome on Windows", and that is the whole of
+  what it would buy. It reads in the install prompt as knowing who you are
+  signed in to Google as, which is a poor trade for a better first draft of a
+  label the user is typing anyway. Worth revisiting if naming browsers turns
+  out to be the step people get wrong.
 
 ---
 
