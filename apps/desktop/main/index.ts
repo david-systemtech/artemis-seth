@@ -70,6 +70,7 @@ import {
   agentBrowserServers,
   browserToolServer,
   externalBrowserToolServer,
+  releaseEmbeddedDriver,
 } from './browserTools.js';
 import { suggestedTaskToolServer } from './taskTools.js';
 import { banksForRun, isMasterEnabled, memoryToolServerOptions } from './memoryBanks.js';
@@ -216,6 +217,7 @@ let stopAskNotifying: (() => void) | null = null;
 let stopSuggestionForwarding: (() => void) | null = null;
 let stopTerminalForwarding: (() => void) | null = null;
 let stopBrowserForwarding: (() => void) | null = null;
+let stopBrowserRunCleanup: (() => void) | null = null;
 let stopPlanUsagePolling: (() => void) | null = null;
 let stopUpdater: (() => void) | null = null;
 let serverHost: ServerHost | null = null;
@@ -589,6 +591,28 @@ async function bootstrap(): Promise<void> {
     : null;
   stopTerminalForwarding = forwardTerminalEvents(terminals);
   stopBrowserForwarding = forwardBrowserEvents(browsers);
+  /*
+   * A run that has ended lets go of the dock tab it was driving.
+   *
+   * Not a close: the tab belongs to the user's strip and they may still be
+   * reading it. What is released is what the driver attached to it — a
+   * `console-message` handler, a `did-fail-load` handler, a console buffer and
+   * a slot in the session's request recorder. A driver is built per *run*, so
+   * without this a conversation's twentieth turn left twenty of each on one
+   * `webContents`, in a process the user cannot restart without losing their
+   * work.
+   *
+   * On the run's own event stream rather than in the tool factory, because the
+   * factory is called when a run starts and has no hook for when it stops.
+   * `apps/server/src/host.ts` closes a served run's tab off the same kind of
+   * feed, for a related but different reason: that tab is nobody's.
+   */
+  stopBrowserRunCleanup = engineHost.ready
+    ? engineHost.require().subscribe((event) => {
+        if (event.type !== 'run.end') return;
+        releaseEmbeddedDriver(event.runId);
+      })
+    : null;
   // Reads every profile's plan limits on a timer, so the profile menu can say
   // which account has room. Started after IPC so its first push has somewhere
   // to land, and before the window so the schedule does not depend on how long
@@ -690,6 +714,7 @@ app.on('before-quit', (event) => {
   stopSuggestionForwarding?.();
   stopTerminalForwarding?.();
   stopBrowserForwarding?.();
+  stopBrowserRunCleanup?.();
   stopPlanUsagePolling?.();
   stopUpdater?.();
   // Before the race below, and not part of it: an open listener keeps the port

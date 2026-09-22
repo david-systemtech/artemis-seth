@@ -32,6 +32,14 @@
  * Same rule and the same numbers as the embedded driver: a page with a logging
  * loop must not grow a buffer without limit, and `browser_console` answers
  * "since the last time you asked". The oldest go first.
+ *
+ * The console bound is **entries × characters**, and both halves are needed. A
+ * cap on entries alone is not a cap on memory: one `console.log` of a
+ * serialised application state is routinely a hundred kilobytes, so two hundred
+ * of them is twenty megabytes held for a listing that would have shown the
+ * first two thousand characters of each. The clip is applied as the entry is
+ * pushed, to `MAX_ENTRY_CHARS` — the same number `pageTools.ts` renders with,
+ * imported from there so the two cannot drift.
  */
 
 import type {
@@ -45,6 +53,9 @@ import type {
 } from '@rx-artemis/protocol';
 
 import type { CdpConnection } from './cdp.js';
+// The one place the per-entry bound lives. See its comment on why a driver
+// applies it as well as the renderer.
+import { MAX_ENTRY_CHARS } from './pageTools.js';
 
 /**
  * How long a verb waits for a navigation to settle before reporting anyway.
@@ -168,6 +179,18 @@ const FIRE_CHANGE_FN = `function () {
 function push<T>(buffer: T[], entry: T, max: number): void {
   buffer.push(entry);
   if (buffer.length > max) buffer.splice(0, buffer.length - max);
+}
+
+/**
+ * One console entry's text, cut to the bound before it is kept.
+ *
+ * Cut here rather than only at render, because what is held between two
+ * `browser_console` calls is held in this process — see the file header on why
+ * a cap on entries is not a cap on memory. The ellipsis is the same mark the
+ * renderer uses, so a clipped entry reads as clipped wherever it is seen.
+ */
+function clipped(text: string): string {
+  return text.length > MAX_ENTRY_CHARS ? `${text.slice(0, MAX_ENTRY_CHARS)}…` : text;
 }
 
 /**
@@ -1030,7 +1053,7 @@ export class CdpPage {
 
     on('Runtime.consoleAPICalled', (params) => {
       const args = Array.isArray(params['args']) ? (params['args'] as Record<string, unknown>[]) : [];
-      const text = args.map((arg) => describeRemote(arg)).join(' ');
+      const text = clipped(args.map((arg) => describeRemote(arg)).join(' '));
       const source = frameOf(params['stackTrace']);
       push(
         this.#console,
@@ -1047,9 +1070,10 @@ export class CdpPage {
     on('Runtime.exceptionThrown', (params) => {
       const details = (params['exceptionDetails'] ?? {}) as Record<string, unknown>;
       const thrown = details['exception'] as Record<string, unknown> | undefined;
-      const text =
+      const text = clipped(
         (typeof thrown?.['description'] === 'string' ? thrown['description'] : undefined) ??
-        (typeof details['text'] === 'string' ? details['text'] : 'An uncaught error.');
+          (typeof details['text'] === 'string' ? details['text'] : 'An uncaught error.'),
+      );
       const source = frameOf(details['stackTrace']) ?? urlOf(details);
       push(
         this.#console,
@@ -1076,7 +1100,7 @@ export class CdpPage {
         this.#console,
         {
           level: level === 'warning' ? 'warn' : level === 'error' ? 'error' : level === 'verbose' ? 'debug' : 'info',
-          text: `[${String(entry['source'] ?? 'browser')}] ${String(entry['text'] ?? '')}`,
+          text: clipped(`[${String(entry['source'] ?? 'browser')}] ${String(entry['text'] ?? '')}`),
           // One-based, as `frameOf` renders a stack frame and as an editor
           // counts: CDP's line numbers are zero-based everywhere.
           ...(typeof entry['url'] === 'string' && entry['url'].length > 0

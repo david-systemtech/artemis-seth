@@ -94,10 +94,16 @@ bound, so it is not implemented and not implemented-and-disabled. A window a
 
 **A context closes with its run, and "its run" means one turn.** The proposal
 said contexts close with their run; in practice a `PageDriver` is built per run
-(the `agentToolServers` seam is per run) and nothing in the contract closes one
-— `PageDriver.close` exists and the desktop never calls it, because its tab
-belongs to the user's dock. Here the tab is nobody's, so `apps/server/src/host.ts`
-closes it from the registry's lifecycle feed when the run ends. Without that, a
+(the `agentToolServers` seam is per run) and nothing in the contract closes one,
+so each driver has to be closed from its app's own run-end feed.
+`apps/server/src/host.ts` does it from the registry's lifecycle feed and
+`apps/desktop/main/index.ts` from a `run.end` subscription. What `close` means
+differs by browser and that is the part it is easy to get wrong: on the desktop
+it releases the driver's listeners and buffers and leaves the page alone,
+because the tab belongs to the user's dock; here the tab is nobody's, so it
+really is closed. The desktop's was written as "the desktop never calls close",
+which was true and was a bug — a conversation's twentieth turn left twenty
+console handlers on one `webContents`. Without the server's, a
 conversation taking three quick turns would meet a limit meant for three
 conversations. The cost is that a page does not survive to the next turn; the
 agent calls `browser_open` with the address, which is a sentence in the tool's

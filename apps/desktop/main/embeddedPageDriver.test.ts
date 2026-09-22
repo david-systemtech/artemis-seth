@@ -24,9 +24,15 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { MAX_ENTRY_CHARS } from '@rx-artemis/core';
 import type { BrowserId, BrowserState, RunId } from '@rx-artemis/protocol';
 
-import { embeddedPageDriver, recorderFor, type BrowserToolContext } from './embeddedPageDriver';
+import {
+  embeddedPageDriver,
+  recorderFor,
+  releaseEmbeddedDriver,
+  type BrowserToolContext,
+} from './embeddedPageDriver';
 
 const RUN = 'run-1' as RunId;
 const ID = 'browser-1' as BrowserId;
@@ -62,6 +68,8 @@ function fakePage(session: unknown, webContentsId = 7): {
   contents: Record<string, unknown>;
   emit: (event: string, ...args: unknown[]) => void;
   listening: () => string[];
+  /** How many listeners are on one event. The count is the leak, not the name. */
+  countOf: (event: string) => number;
 } {
   const listeners = new Map<string, Set<Listener>>();
   const contents: Record<string, unknown> = {
@@ -85,6 +93,7 @@ function fakePage(session: unknown, webContentsId = 7): {
     },
     listening: () =>
       [...listeners.entries()].filter(([, set]) => set.size > 0).map(([event]) => event),
+    countOf: (event) => listeners.get(event)?.size ?? 0,
   };
 }
 
@@ -202,6 +211,26 @@ describe('the console buffer holds what happened since the last check', () => {
     expect(result.ok && result.value[0]?.text).toBe('line 50');
   });
 
+  it('clips one enormous line rather than keeping all of it', async () => {
+    /*
+     * Two hundred entries is not two hundred lines' worth of memory. One
+     * `console.log` of a serialised application state is routinely a hundred
+     * kilobytes, so a full buffer of them is twenty megabytes held in a process
+     * the user cannot restart — for a listing that would have shown the first
+     * two thousand characters of each anyway. The bound is entries × chars.
+     */
+    const page = fakePage(fakeWebRequest());
+    const driver = embeddedPageDriver(RUN, contextFor(page.contents));
+    await driver.open();
+
+    page.emit('console-message', consoleMessage({ message: 'x'.repeat(100_000) }));
+    const result = await driver.console();
+
+    const text = result.ok ? (result.value[0]?.text ?? '') : '';
+    expect(text).toHaveLength(MAX_ENTRY_CHARS + 1);
+    expect(text.endsWith('…')).toBe(true);
+  });
+
   it('refuses rather than buffering when the conversation has no page yet', async () => {
     const page = fakePage(fakeWebRequest());
     const driver = embeddedPageDriver(RUN, contextFor(page.contents, null));
@@ -210,6 +239,96 @@ describe('the console buffer holds what happened since the last check', () => {
       ok: false,
       reason: 'No browser is open for this conversation. Use browser_open first.',
     });
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* What a finished run leaves on the tab                                      */
+/* -------------------------------------------------------------------------- */
+
+describe('a run that has ended lets go of the tab', () => {
+  it('leaves one set of listeners on a tab two runs have driven', async () => {
+    /*
+     * A driver is built per run and each one attaches a `console-message`
+     * handler, a `did-fail-load` handler and a buffer. Only `close` takes them
+     * off, and nothing used to call it — "the desktop does not end the tab" had
+     * become "the desktop does not release" — so a conversation's twentieth
+     * turn left twenty of each on one `webContents`, in a process the user
+     * cannot restart without losing their work.
+     */
+    const page = fakePage(fakeWebRequest());
+    const first = 'run-first' as RunId;
+    const second = 'run-second' as RunId;
+
+    const one = embeddedPageDriver(first, contextFor(page.contents));
+    await one.open('https://example.com');
+    expect(page.countOf('console-message')).toBe(1);
+
+    const two = embeddedPageDriver(second, contextFor(page.contents));
+    await two.open('https://example.com');
+    expect(page.countOf('console-message')).toBe(2);
+
+    releaseEmbeddedDriver(first);
+
+    expect(page.countOf('console-message')).toBe(1);
+    expect(page.countOf('did-fail-load')).toBe(1);
+
+    // And the one set that is left is the live run's: a line logged now is
+    // reported once, by the run that is still driving the page.
+    page.emit('console-message', consoleMessage({ message: 'still here' }));
+    expect(await two.console()).toEqual({
+      ok: true,
+      value: [expect.objectContaining({ text: 'still here' })],
+    });
+
+    releaseEmbeddedDriver(second);
+    expect(page.countOf('console-message')).toBe(0);
+  });
+
+  it('does not blind a run that is still watching the same tab', async () => {
+    /*
+     * The recorder's buffers are keyed by tab, not by driver, so the first run
+     * to finish must not take away the buffer the second is still filling —
+     * which is what "let go of the tab" meant before anything called it.
+     */
+    const wr = fakeWebRequest();
+    const page = fakePage(wr);
+    const one = embeddedPageDriver('run-first' as RunId, contextFor(page.contents));
+    const two = embeddedPageDriver('run-second' as RunId, contextFor(page.contents));
+    await one.open('https://example.com');
+    await two.open('https://example.com');
+
+    releaseEmbeddedDriver('run-first' as RunId);
+    wr.fire('onCompleted', details());
+
+    expect(await two.network()).toEqual({
+      ok: true,
+      value: [expect.objectContaining({ url: 'https://example.com/api/orders' })],
+    });
+    releaseEmbeddedDriver('run-second' as RunId);
+  });
+
+  it('leaves the page itself alone, because the tab is the user’s', async () => {
+    // The distinction the bug came from: releasing is not closing. The driver
+    // has no way to end a page at all — `BrowserToolContext.host` offers
+    // `contentsFor`, `stateFor` and `navigate` and nothing that closes — and
+    // the tab is still there to be driven after the run that opened it ended.
+    const page = fakePage(fakeWebRequest());
+    const driver = embeddedPageDriver('run-solo' as RunId, contextFor(page.contents));
+    await driver.open('https://example.com');
+
+    releaseEmbeddedDriver('run-solo' as RunId);
+
+    const next = embeddedPageDriver('run-after' as RunId, contextFor(page.contents));
+    expect(await next.read()).toEqual({
+      ok: true,
+      value: { url: 'https://example.com', title: 'Example', text: 'the page text', truncated: false },
+    });
+    releaseEmbeddedDriver('run-after' as RunId);
+  });
+
+  it('is safe for a run that never opened a browser', async () => {
+    expect(() => releaseEmbeddedDriver('run-never' as RunId)).not.toThrow();
   });
 });
 

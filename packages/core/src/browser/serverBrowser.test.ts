@@ -33,6 +33,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { hostOf, type PageDriver } from '@rx-artemis/protocol';
 
 import type { CdpTransport } from './cdp.js';
+import { MAX_ENTRY_CHARS } from './pageTools.js';
 import { createServerBrowser, type BrowserTimers, type ServerBrowser } from './serverBrowser.js';
 import { isAddressLiteral } from './serverBrowserPolicy.js';
 
@@ -868,6 +869,37 @@ describe('the console', () => {
     expect(said.ok && said.value).toHaveLength(200);
     // The oldest go first: what an agent asks about is what just happened.
     expect(said.ok && said.value[0]?.text).toBe('line 60');
+  });
+
+  it('clips one enormous line rather than keeping all of it', async () => {
+    /*
+     * Two hundred entries is not two hundred lines' worth of memory. One
+     * `console.log` of a serialised application state is routinely a hundred
+     * kilobytes, so a full buffer of them is twenty megabytes held for a
+     * listing that would have shown the first two thousand characters of each
+     * anyway. The bound is entries × chars, and this is the second half.
+     */
+    const { driver } = await openAt();
+    const session = chromium.sessionIds()[0] as string;
+    chromium.emit(
+      'Runtime.consoleAPICalled',
+      { type: 'log', args: [{ value: 'x'.repeat(100_000) }] },
+      session,
+    );
+    chromium.emit(
+      'Runtime.exceptionThrown',
+      { exceptionDetails: { exception: { description: 'y'.repeat(100_000) } } },
+      session,
+    );
+    chromium.emit('Log.entryAdded', { entry: { level: 'error', text: 'z'.repeat(100_000) } }, session);
+
+    const said = await driver.console();
+    const texts = said.ok ? said.value.map((one) => one.text) : [];
+    expect(texts).toHaveLength(3);
+    for (const text of texts) {
+      expect(text).toHaveLength(MAX_ENTRY_CHARS + 1);
+      expect(text.endsWith('…')).toBe(true);
+    }
   });
 });
 
